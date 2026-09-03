@@ -66,8 +66,8 @@ use crate::config::loader::{load_config, save_config};
 use crate::repl::commands::{unique_direct_model_match, ModelEntry, ReplContext};
 use crate::turn_stream::{Completion, TurnEvent, TurnStream};
 use app::{
-    draw_outro, Action, App, BackgroundJob, Footer, SessionPick, SessionRow, StreamingAction,
-    SubmittedTurn,
+    capacity_footer_label, draw_outro, Action, App, BackgroundJob, Footer, SessionPick, SessionRow,
+    StreamingAction, SubmittedTurn,
 };
 
 /// Immutable per-session handles a single turn needs to drive the agent.
@@ -222,11 +222,18 @@ fn footer_snapshot(core: &SharedCoreHandle) -> Footer {
         .ok()
         .map(|p| home_relative(&p))
         .unwrap_or_else(|| "?".into());
+    // Effective live limits beside the configured ctx ceiling above; `None`
+    // (cloud / pre-discovery) renders no capacity segment at all.
+    let capacity = core
+        .capacity
+        .describe(&core.swappable().token_budget, 0)
+        .map(|d| capacity_footer_label(&d));
     Footer {
         cwd,
         model,
         ctx_used: used,
         ctx_max: max,
+        capacity,
     }
 }
 
@@ -1117,6 +1124,7 @@ mod tests {
             model: "local:test".into(),
             ctx_used: 0,
             ctx_max: 4096,
+            capacity: None,
         };
 
         let mut cancelled = App::new();
@@ -1215,6 +1223,7 @@ mod tests {
             model: "local:test".into(),
             ctx_used: 1,
             ctx_max: 10,
+            capacity: None,
         };
         let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
         term.draw(|f| app.draw(f, &footer)).unwrap();
@@ -1238,6 +1247,7 @@ mod tests {
             model: "local:test".into(),
             ctx_used: 0,
             ctx_max: 0,
+            capacity: None,
         };
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         term.draw(|f| app.draw(f, &footer)).unwrap();

@@ -32,6 +32,60 @@ fn reset_prompt_state_after_runtime_switch(
     counters.reset_session_prompt_state(session_id);
 }
 
+/// Configured-vs-effective capacity lines for `/ctx`: the configured ceiling
+/// always, plus the effective live limits with source (adaptive/legacy),
+/// basis, pressure, and boot/generation when a snapshot is installed.
+/// Degrades to a configured-only note for cloud providers and pre-discovery.
+fn capacity_status_lines(
+    configured: &crate::agent::token_budget::TokenBudget,
+    capacity: &crate::agent::capacity::CapacityRuntime,
+) -> Vec<String> {
+    use crate::agent::capacity::{CapacityBasis, CapacityPressure, CapacitySource};
+    use crate::turn_stream::format_k_tokens;
+
+    let fmt = |n: usize| format_k_tokens(n as u64);
+    let mut lines = vec![format!(
+        "  Configured ceiling: {} ctx / {} out",
+        fmt(configured.max_context()),
+        fmt(configured.response_reserve())
+    )];
+    match capacity.describe(configured, 0) {
+        Some(d) => {
+            let source = match d.source {
+                CapacitySource::Adaptive { basis } => match basis {
+                    CapacityBasis::Conservative => "adaptive (conservative)",
+                    CapacityBasis::Learned => "adaptive (learned)",
+                },
+                CapacitySource::Unavailable => "unavailable — keeping configured ceiling",
+                CapacitySource::Legacy => "legacy fallback (no /v1/capacity)",
+            };
+            let mut line = format!(
+                "  Effective live:     {} ctx / {} out · {}",
+                fmt(d.total_tokens),
+                fmt(d.output_tokens),
+                source
+            );
+            if let Some(pressure) = d.pressure {
+                if pressure != CapacityPressure::Normal {
+                    line.push_str(" · ");
+                    line.push_str(match pressure {
+                        CapacityPressure::Normal => "normal",
+                        CapacityPressure::Constrained => "constrained",
+                        CapacityPressure::Critical => "critical",
+                    });
+                }
+            }
+            if !d.boot_id.is_empty() {
+                line.push_str(&format!(" · boot {} gen {}", d.boot_id, d.generation));
+            }
+            lines.push(line);
+        }
+        None => lines
+            .push("  Effective live:     configured only (no live capacity snapshot)".to_string()),
+    }
+    lines
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ModelSwitchReport {
     pub(crate) model_id: String,
@@ -301,6 +355,14 @@ impl ReplContext {
                 let current = self.config.agents.defaults.local_max_context_tokens;
                 println!("\n  Current: {}K", current / 1024);
                 println!("  Auto-detected optimal: {}K", auto / 1024);
+                // Configured ceiling vs the live effective limits the loop
+                // actually requests with (adaptive / legacy Higgs capacity).
+                for line in capacity_status_lines(
+                    &self.core_handle.swappable().token_budget,
+                    &self.core_handle.capacity,
+                ) {
+                    println!("{line}");
+                }
                 if self.config.trio.enabled {
                     let budget = self.compute_current_vram_budget();
                     let total_gb = budget.total_vram_bytes as f64 / 1e9;
@@ -1569,6 +1631,90 @@ impl ReplContext {
         self.config.agents.default_lane = Some(new_lane.to_string());
         self.apply_and_rebuild();
         println!("\n  Lane switched to: {}\n", new_lane);
+    }
+}
+
+#[cfg(test)]
+mod capacity_status_tests {
+    use super::capacity_status_lines;
+    use crate::agent::capacity::{CapacityRuntime, HiggsCapacityProfile};
+    use crate::agent::token_budget::TokenBudget;
+    use serde_json::json;
+
+    fn constrained_profile() -> HiggsCapacityProfile {
+        serde_json::from_value(json!({
+            "schemaVersion": 1,
+            "model": "escha-35b-a3b",
+            "modelFingerprint": "sha256:abc",
+            "bootId": "boot-9",
+            "generation": 12,
+            "availability": "available",
+            "pressure": "constrained",
+            "safeTotalTokens": 49_152,
+            "recommendedOutputTokens": 4_096,
+            "maxPromptTokens": 45_056,
+            "retainedSessionTokens": 45_056,
+            "retainedBytes": 0_u64,
+            "prefixCacheBytes": 0_u64,
+            "basis": "learned"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn configured_and_effective_shown_separately_with_adaptive_labels() {
+        let runtime = CapacityRuntime::default();
+        runtime.install_profile(
+            "http://127.0.0.1:1/v1",
+            "escha-35b-a3b",
+            constrained_profile(),
+        );
+        let lines = capacity_status_lines(&TokenBudget::new(65_536, 8_192), &runtime);
+
+        assert_eq!(lines.len(), 2);
+        assert!(
+            lines[0].starts_with("  Configured ceiling: 64K ctx / 8K out"),
+            "configured ceiling must lead, verbatim: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("48K ctx / 4K out"),
+            "effective limits must be the narrowed live numbers: {}",
+            lines[1]
+        );
+        assert!(lines[1].contains("adaptive (learned)"), "{}", lines[1]);
+        assert!(lines[1].contains("constrained"), "{}", lines[1]);
+        assert!(lines[1].contains("boot boot-9 gen 12"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn legacy_fallback_is_labeled_legacy_not_adaptive() {
+        let runtime = CapacityRuntime::default();
+        runtime.install_legacy("http://127.0.0.1:1/v1", "escha-35b-a3b");
+        let lines = capacity_status_lines(&TokenBudget::new(65_536, 8_192), &runtime);
+
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains("legacy"), "{}", lines[1]);
+        assert!(lines[1].contains("16K ctx / 4K out"), "{}", lines[1]);
+        assert!(!lines[1].contains("adaptive"), "{}", lines[1]);
+        // The legacy fallback has no boot/generation telemetry.
+        assert!(!lines[1].contains("boot"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn no_snapshot_degrades_to_configured_only() {
+        let lines = capacity_status_lines(
+            &TokenBudget::new(65_536, 8_192),
+            &CapacityRuntime::default(),
+        );
+
+        assert_eq!(
+            lines,
+            vec![
+                "  Configured ceiling: 64K ctx / 8K out".to_string(),
+                "  Effective live:     configured only (no live capacity snapshot)".to_string(),
+            ]
+        );
     }
 }
 

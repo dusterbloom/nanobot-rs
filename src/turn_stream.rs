@@ -343,6 +343,154 @@ pub(crate) enum ControlMarker {
     /// the summarizer; `Finished` fires after the checkpoint is installed.
     /// Renderers show an animated progress indicator between the two.
     Compaction(CompactionStatus),
+    /// Live-capacity event for the current turn. See [`CapacityStatus`].
+    Capacity(CapacityStatus),
+}
+
+/// Live-capacity event for the current turn, emitted agent-side whenever the
+/// effective budget is resolved against the live Higgs snapshot (fetch,
+/// proactive reduction, typed retry/unavailable handling). Payload is
+/// integers plus closed enumerated labels: raw server display strings and
+/// prompt content must never ride the delta channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapacityStatus {
+    /// Effective total before this event (the configured ceiling until the
+    /// first snapshot lands).
+    pub(crate) prior_total: u64,
+    /// Effective total now: min(configured ceiling, live safe total).
+    pub(crate) current_total: u64,
+    /// Effective whole-prompt limit.
+    pub(crate) prompt_limit: u64,
+    /// Effective output limit.
+    pub(crate) output_limit: u64,
+    pub(crate) pressure: CapacityPressureLabel,
+    pub(crate) basis: CapacityBasisLabel,
+    /// Capacity generation within the current server boot (0 for legacy).
+    pub(crate) generation: u64,
+    pub(crate) action: CapacityAction,
+}
+
+/// Server pressure label for a capacity event. Closed vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapacityPressureLabel {
+    Normal,
+    Constrained,
+    Critical,
+}
+
+/// Which capacity source produced the effective limits. `Legacy` is the
+/// frozen pre-`/v1/capacity` fallback (16,384 total / 4,096 output) and must
+/// render as "legacy", never as adaptive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapacityBasisLabel {
+    Conservative,
+    Learned,
+    Legacy,
+}
+
+/// What the agent is doing about capacity right now. Closed vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapacityAction {
+    Fetch,
+    Reduced,
+    Wait,
+    Retry,
+    Unavailable,
+    Recovery,
+}
+
+impl CapacityPressureLabel {
+    fn as_wire(self) -> &'static str {
+        match self {
+            CapacityPressureLabel::Normal => "normal",
+            CapacityPressureLabel::Constrained => "constrained",
+            CapacityPressureLabel::Critical => "critical",
+        }
+    }
+
+    fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "normal" => Some(CapacityPressureLabel::Normal),
+            "constrained" => Some(CapacityPressureLabel::Constrained),
+            "critical" => Some(CapacityPressureLabel::Critical),
+            _ => None,
+        }
+    }
+}
+
+impl CapacityBasisLabel {
+    fn as_wire(self) -> &'static str {
+        match self {
+            CapacityBasisLabel::Conservative => "conservative",
+            CapacityBasisLabel::Learned => "learned",
+            CapacityBasisLabel::Legacy => "legacy",
+        }
+    }
+
+    fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "conservative" => Some(CapacityBasisLabel::Conservative),
+            "learned" => Some(CapacityBasisLabel::Learned),
+            "legacy" => Some(CapacityBasisLabel::Legacy),
+            _ => None,
+        }
+    }
+}
+
+impl CapacityAction {
+    fn as_wire(self) -> &'static str {
+        match self {
+            CapacityAction::Fetch => "fetch",
+            CapacityAction::Reduced => "reduced",
+            CapacityAction::Wait => "wait",
+            CapacityAction::Retry => "retry",
+            CapacityAction::Unavailable => "unavailable",
+            CapacityAction::Recovery => "recovery",
+        }
+    }
+
+    fn from_wire(raw: &str) -> Option<Self> {
+        match raw {
+            "fetch" => Some(CapacityAction::Fetch),
+            "reduced" => Some(CapacityAction::Reduced),
+            "wait" => Some(CapacityAction::Wait),
+            "retry" => Some(CapacityAction::Retry),
+            "unavailable" => Some(CapacityAction::Unavailable),
+            "recovery" => Some(CapacityAction::Recovery),
+            _ => None,
+        }
+    }
+}
+
+impl CapacityStatus {
+    /// Compact human form for turn lines:
+    /// `capacity 49K -> 36K · constrained · reduced`. A legacy snapshot
+    /// renders `legacy` in place of the pressure label — the fallback
+    /// carries no server telemetry and must never read as adaptive.
+    pub(crate) fn render(&self) -> String {
+        let middle = if self.basis == CapacityBasisLabel::Legacy {
+            "legacy"
+        } else {
+            self.pressure.as_wire()
+        };
+        format!(
+            "capacity {} -> {} · {} · {}",
+            format_k_tokens(self.prior_total),
+            format_k_tokens(self.current_total),
+            middle,
+            self.action.as_wire()
+        )
+    }
+}
+
+/// Integer-K token abbreviation (`50_176` -> `49K`, `900` -> `900`) — the
+/// REPL's `/ctx 32K` = 32,768 convention, shared by every capacity surface.
+pub(crate) fn format_k_tokens(n: u64) -> String {
+    if n >= 1024 {
+        format!("{}K", n / 1024)
+    } else {
+        n.to_string()
+    }
 }
 
 /// LCM compaction progress marker carried on the delta channel.
@@ -501,6 +649,20 @@ impl ControlMarker {
             ControlMarker::Compaction(status) => {
                 format!("\x00compaction:{}", status.as_wire())
             }
+            ControlMarker::Capacity(status) => {
+                let s = status;
+                format!(
+                    "\x00capacity:{}/{}:{}:{}:{}:{}:{}:{}",
+                    s.prior_total,
+                    s.current_total,
+                    s.prompt_limit,
+                    s.output_limit,
+                    s.pressure.as_wire(),
+                    s.basis.as_wire(),
+                    s.generation,
+                    s.action.as_wire()
+                )
+            }
         }
     }
 }
@@ -593,6 +755,21 @@ pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
     }
     if let Some(compaction) = rest.strip_prefix("compaction:") {
         return CompactionStatus::from_wire(compaction).map(ControlMarker::Compaction);
+    }
+    if let Some(capacity) = rest.strip_prefix("capacity:") {
+        // capacity:{prior}/{current}:{prompt}:{output}:{pressure}:{basis}:{generation}:{action}
+        let (prior, rest) = capacity.split_once('/')?;
+        let mut parts = rest.split(':');
+        return Some(ControlMarker::Capacity(CapacityStatus {
+            prior_total: prior.parse().ok()?,
+            current_total: parts.next()?.parse().ok()?,
+            prompt_limit: parts.next()?.parse().ok()?,
+            output_limit: parts.next()?.parse().ok()?,
+            pressure: CapacityPressureLabel::from_wire(parts.next()?)?,
+            basis: CapacityBasisLabel::from_wire(parts.next()?)?,
+            generation: parts.next()?.parse().ok()?,
+            action: CapacityAction::from_wire(parts.next()?)?,
+        }));
     }
     None
 }
@@ -700,6 +877,26 @@ mod tests {
             }),
             ControlMarker::Compaction(CompactionStatus::Started { messages: 48 }),
             ControlMarker::Compaction(CompactionStatus::Finished),
+            ControlMarker::Capacity(CapacityStatus {
+                prior_total: 65_536,
+                current_total: 36_864,
+                prompt_limit: 32_768,
+                output_limit: 4_096,
+                pressure: CapacityPressureLabel::Constrained,
+                basis: CapacityBasisLabel::Learned,
+                generation: 7,
+                action: CapacityAction::Reduced,
+            }),
+            ControlMarker::Capacity(CapacityStatus {
+                prior_total: 65_536,
+                current_total: 16_384,
+                prompt_limit: 12_288,
+                output_limit: 4_096,
+                pressure: CapacityPressureLabel::Normal,
+                basis: CapacityBasisLabel::Legacy,
+                generation: 0,
+                action: CapacityAction::Unavailable,
+            }),
         ];
         for m in variants {
             let wire = m.encode();
@@ -715,6 +912,168 @@ mod tests {
         }
         // Plain text never parses as a marker.
         assert_eq!(parse_control_marker("hello"), None);
+    }
+
+    /// Every pressure × basis × action combination must survive the wire —
+    /// the marker protocol stays correct by construction as labels evolve.
+    #[test]
+    fn capacity_marker_round_trips_every_label_combination() {
+        let pressures = [
+            CapacityPressureLabel::Normal,
+            CapacityPressureLabel::Constrained,
+            CapacityPressureLabel::Critical,
+        ];
+        let bases = [
+            CapacityBasisLabel::Conservative,
+            CapacityBasisLabel::Learned,
+            CapacityBasisLabel::Legacy,
+        ];
+        let actions = [
+            CapacityAction::Fetch,
+            CapacityAction::Reduced,
+            CapacityAction::Wait,
+            CapacityAction::Retry,
+            CapacityAction::Unavailable,
+            CapacityAction::Recovery,
+        ];
+        for pressure in pressures {
+            for basis in bases {
+                for action in actions {
+                    let m = ControlMarker::Capacity(CapacityStatus {
+                        prior_total: 50_176,
+                        current_total: 36_864,
+                        prompt_limit: 32_768,
+                        output_limit: 4_096,
+                        pressure,
+                        basis,
+                        generation: 7,
+                        action,
+                    });
+                    assert_eq!(parse_control_marker(&m.encode()), Some(m.clone()));
+                }
+            }
+        }
+        // Malformed capacity bodies never parse (no silent label fallback).
+        for bad in [
+            "\x00capacity:",
+            "\x00capacity:1/2:3:4:5",
+            "\x00capacity:1/2:3:4:unknown:learned:7:fetch",
+            "\x00capacity:1/2:3:4:normal:measured:7:fetch",
+            "\x00capacity:1/2:3:4:normal:learned:7:compacting",
+            "\x00capacity:x/2:3:4:normal:learned:7:fetch",
+        ] {
+            assert_eq!(parse_control_marker(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The compact human form pinned by the plan:
+    /// `capacity 49K -> 36K · constrained · reduced`.
+    #[test]
+    fn capacity_marker_renders_compact_human_form() {
+        let marker = CapacityStatus {
+            prior_total: 50_176,
+            current_total: 36_864,
+            prompt_limit: 32_768,
+            output_limit: 4_096,
+            pressure: CapacityPressureLabel::Constrained,
+            basis: CapacityBasisLabel::Conservative,
+            generation: 7,
+            action: CapacityAction::Reduced,
+        };
+        assert_eq!(
+            marker.render(),
+            "capacity 49K -> 36K · constrained · reduced"
+        );
+        // Sub-K totals render raw.
+        assert_eq!(format_k_tokens(900), "900");
+        assert_eq!(format_k_tokens(16_384), "16K");
+    }
+
+    /// The legacy fallback is labeled "legacy" where a live snapshot would
+    /// show its pressure — never "adaptive".
+    #[test]
+    fn capacity_marker_labels_legacy_instead_of_pressure() {
+        let marker = CapacityStatus {
+            prior_total: 65_536,
+            current_total: 16_384,
+            prompt_limit: 12_288,
+            output_limit: 4_096,
+            pressure: CapacityPressureLabel::Normal,
+            basis: CapacityBasisLabel::Legacy,
+            generation: 0,
+            action: CapacityAction::Reduced,
+        };
+        let rendered = marker.render();
+        assert_eq!(rendered, "capacity 64K -> 16K · legacy · reduced");
+        assert!(!rendered.contains("adaptive"));
+        assert!(!rendered.contains("normal"));
+    }
+
+    /// Structural no-free-text guarantee: every non-numeric segment of the
+    /// capacity wire form and render is one of the enumerated labels. The
+    /// payload carries only integers and closed enums — there is no field a
+    /// server display string or prompt content could ride through, and a
+    /// smuggled label fails the closed-vocabulary check below.
+    #[test]
+    fn capacity_marker_wire_is_closed_vocabulary() {
+        const VOCAB: &[&str] = &[
+            "normal",
+            "constrained",
+            "critical",
+            "conservative",
+            "learned",
+            "legacy",
+            "fetch",
+            "reduced",
+            "wait",
+            "retry",
+            "unavailable",
+            "recovery",
+        ];
+        for pressure in [
+            CapacityPressureLabel::Normal,
+            CapacityPressureLabel::Constrained,
+            CapacityPressureLabel::Critical,
+        ] {
+            for basis in [
+                CapacityBasisLabel::Conservative,
+                CapacityBasisLabel::Learned,
+                CapacityBasisLabel::Legacy,
+            ] {
+                for action in [
+                    CapacityAction::Fetch,
+                    CapacityAction::Reduced,
+                    CapacityAction::Wait,
+                    CapacityAction::Retry,
+                    CapacityAction::Unavailable,
+                    CapacityAction::Recovery,
+                ] {
+                    let status = CapacityStatus {
+                        prior_total: 1,
+                        current_total: 2,
+                        prompt_limit: 3,
+                        output_limit: 4,
+                        pressure,
+                        basis,
+                        generation: 5,
+                        action,
+                    };
+                    let wire = ControlMarker::Capacity(status).encode();
+                    let body = wire
+                        .strip_prefix("\x00capacity:")
+                        .expect("capacity markers are NUL-prefixed with the capacity tag");
+                    for segment in body.split(|c| c == '/' || c == ':') {
+                        if segment.parse::<u64>().is_ok() {
+                            continue;
+                        }
+                        assert!(
+                            VOCAB.contains(&segment),
+                            "unrecognized label {segment:?} — free text on the marker channel"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

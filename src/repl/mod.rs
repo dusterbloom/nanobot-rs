@@ -1035,6 +1035,20 @@ async fn stream_and_render_inner(
                                     ControlMarker::BackendActivity { .. } => {}
                                     ControlMarker::CacheStatus(_) => {}
                                     ControlMarker::Compaction(_) => {}
+                                    // One dim line per capacity event (fetch,
+                                    // reduction, wait, retry, unavailable,
+                                    // recovery), printed like a tool-event
+                                    // line so the incremental renderer's
+                                    // partial reply is preserved.
+                                    ControlMarker::Capacity(c) => {
+                                        prefill.clear();
+                                        renderer.flush_pending();
+                                        renderer.clear_partial();
+                                        renderer.emit_marker();
+                                        print!("\r\x1b[2m  · {}\x1b[0m", c.render());
+                                        std::io::stdout().flush().ok();
+                                        renderer.restore_partial();
+                                    }
                                 }
                             } else {
                                 prefill.clear();

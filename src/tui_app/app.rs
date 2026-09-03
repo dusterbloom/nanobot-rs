@@ -52,11 +52,14 @@ use unicode_width::UnicodeWidthChar;
 
 use super::render;
 use crate::agent::audit::ToolEvent;
+use crate::agent::capacity::{
+    CapacityBasis, CapacityDescription, CapacityPressure, CapacitySource,
+};
 use crate::agent::token_budget::TokenBudget;
 use crate::repl::commands::ModelEntry;
 use crate::repl::{parse_control_marker, CacheResetReason, CacheStatus, ControlMarker};
 use crate::session::db::SessionSnapshot;
-use crate::turn_stream::{BackendActivity, CompactionStatus};
+use crate::turn_stream::{format_k_tokens, BackendActivity, CapacityStatus, CompactionStatus};
 
 const BRAND: &str = "\u{259e}"; // ▞  the nanobot wordmark glyph
 /// Double-Esc cancel window while streaming — same value as the classic
@@ -263,6 +266,10 @@ pub(crate) struct Footer {
     pub model: String,
     pub ctx_used: usize,
     pub ctx_max: usize,
+    /// Compact live-capacity segment (`16K/4K legacy`), `None` when no
+    /// snapshot is installed (cloud provider, pre-discovery) — the footer
+    /// then degrades to configured-only and shows nothing.
+    pub capacity: Option<String>,
 }
 
 /// How a submitted idle event should steer the outer loop.
@@ -489,6 +496,7 @@ enum Cell {
         prefill_tps_estimated: bool,
         backend_idle_ms: Option<u64>,
         cache: Option<CacheStatus>,
+        capacity: Option<CapacityStatus>,
     },
     /// Assistant text. Streamed deltas append here until a tool interrupts.
     Reply(String),
@@ -556,6 +564,9 @@ pub(crate) struct App {
     turn_prefill_estimate: u64,
     /// Cache status for the turn's first LLM call, unless a later call diverges.
     turn_cache: Option<CacheStatus>,
+    /// Latest live-capacity event for the turn (effective-budget narrowing),
+    /// rendered as a segment of the active turn line.
+    turn_capacity: Option<CapacityStatus>,
     /// Server-reported prefill progress `(processed, total)`, when available.
     prefill: Option<(u64, u64)>,
     /// Estimated uncached prompt work for the currently visible prefill row.
@@ -651,6 +662,7 @@ impl App {
             turn_prompt_tokens: 0,
             turn_prefill_estimate: 0,
             turn_cache: None,
+            turn_capacity: None,
             prefill: None,
             prefill_estimate: None,
             prefill_tps: None,
@@ -1049,6 +1061,7 @@ impl App {
             prefill_tps_estimated: false,
             backend_idle_ms: None,
             cache: None,
+            capacity: None,
         });
         self.streaming = true;
         self.cursor_on = true; // solid cursor while streaming (blink is idle-only)
@@ -1061,6 +1074,7 @@ impl App {
         self.turn_prompt_tokens = 0;
         self.turn_prefill_estimate = 0;
         self.turn_cache = None;
+        self.turn_capacity = None;
         self.turn_text.clear();
         self.prefill = None;
         self.prefill_estimate = None;
@@ -1123,6 +1137,11 @@ impl App {
             }
             Some(ControlMarker::RetractReply) => self.retract_streamed_reply(),
             Some(ControlMarker::FinishReason(_)) => {}
+            Some(ControlMarker::Capacity(status)) => {
+                if self.streaming {
+                    self.remember_capacity(status);
+                }
+            }
             None => {
                 // Between the thinking ANSI markers, deltas are reasoning text;
                 // accumulate them into a muted Thinking block instead of the reply.
@@ -1275,6 +1294,7 @@ impl App {
                 prefill_tps_estimated: rate_estimated,
                 backend_idle_ms: Some(idle_ms),
                 cache: self.turn_cache,
+                capacity: self.turn_capacity,
             });
         }
     }
@@ -1306,6 +1326,7 @@ impl App {
                 prefill_tps_estimated: rate_estimated,
                 backend_idle_ms: None,
                 cache: None,
+                capacity: self.turn_capacity,
             });
         }
     }
@@ -1348,6 +1369,7 @@ impl App {
                         prefill_tps_estimated: rate_estimated,
                         backend_idle_ms: None,
                         cache: None,
+                        capacity: self.turn_capacity,
                     });
                 }
             }
@@ -1401,6 +1423,7 @@ impl App {
                 prefill_tps_estimated: self.activity_prefill_rate().1,
                 backend_idle_ms: None,
                 cache: Some(cache),
+                capacity: self.turn_capacity,
             });
         }
     }
@@ -1408,6 +1431,23 @@ impl App {
     fn remember_cache_status(&mut self, cache: CacheStatus) {
         if should_replace_cache_status(self.turn_cache, cache) {
             self.turn_cache = Some(cache);
+        }
+    }
+
+    /// Record a live-capacity event for the active turn line. Mirrors the
+    /// cache-status flow: the latest event is kept on `self` (so later
+    /// activity upserts re-render it) and stamped into the live Activity
+    /// cell. Mid-turn events after text started re-open the turn line so a
+    /// reduction/retry/wait state stays visible until replaced.
+    fn remember_capacity(&mut self, status: CapacityStatus) {
+        self.turn_capacity = Some(status);
+        if !self.streaming {
+            return;
+        }
+        if let Some(Cell::Activity { capacity: c, .. }) = self.transcript.last_mut() {
+            *c = Some(status);
+        } else {
+            self.upsert_activity(ActivityPhase::WaitingForBackend, None);
         }
     }
 
@@ -1598,6 +1638,7 @@ impl App {
         self.turn_prompt_tokens = 0;
         self.turn_prefill_estimate = 0;
         self.turn_cache = None;
+        self.turn_capacity = None;
         self.turn_prefill_tps = None;
         self.turn_decode_secs = 0.0;
         self.turn_text.clear();
@@ -3117,7 +3158,41 @@ fn footer_line(
     } else {
         spans.push(Span::styled("\u{2014}", dim())); // —
     }
+    if let Some(label) = &footer.capacity {
+        spans.push(Span::styled("   capacity ", dim()));
+        spans.push(Span::styled(label.clone(), dim_color(WARN_COLOR)));
+    }
     Line::from(spans)
+}
+
+/// Footer segment for the installed capacity snapshot: effective live limits
+/// plus the source label (`16K/4K legacy`, `48K/4K adaptive · constrained`).
+/// An unavailable snapshot keeps the configured ceiling and says so.
+pub(crate) fn capacity_footer_label(d: &CapacityDescription) -> String {
+    let limits = format!(
+        "{}/{}",
+        format_k_tokens(d.total_tokens as u64),
+        format_k_tokens(d.output_tokens as u64)
+    );
+    let mut label = match d.source {
+        CapacitySource::Adaptive { basis } => match basis {
+            CapacityBasis::Conservative => "adaptive (conservative)".to_string(),
+            CapacityBasis::Learned => "adaptive (learned)".to_string(),
+        },
+        CapacitySource::Unavailable => "unavailable · configured".to_string(),
+        CapacitySource::Legacy => "legacy".to_string(),
+    };
+    if let Some(pressure) = d.pressure {
+        if pressure != CapacityPressure::Normal {
+            label.push_str(" · ");
+            label.push_str(match pressure {
+                CapacityPressure::Normal => "normal",
+                CapacityPressure::Constrained => "constrained",
+                CapacityPressure::Critical => "critical",
+            });
+        }
+    }
+    format!("{limits} {label}")
 }
 
 /// The one footer animation: a single light sweeps across the status word —
@@ -3528,6 +3603,7 @@ fn cell_lines_with_reply_mark(
             prefill_tps_estimated,
             backend_idle_ms,
             cache,
+            capacity,
         } => {
             let mut segs = vec![
                 ("  ".to_string(), Style::default()),
@@ -3662,6 +3738,12 @@ fn cell_lines_with_reply_mark(
                     }
                     segs.push((format!("  {:.1}s", compaction_elapsed), dim()));
                 }
+            }
+            // Capacity state rides every phase — it explains why the turn is
+            // fetching, reduced, waiting, retrying, unavailable, or recovering.
+            if let Some(cap) = capacity {
+                segs.push((" · ".to_string(), dim()));
+                segs.push((cap.render(), dim_color(WARN_COLOR)));
             }
             vec![segs]
         }
@@ -4035,6 +4117,7 @@ fn compact_output_line(line: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::turn_stream::{CapacityAction, CapacityBasisLabel, CapacityPressureLabel};
 
     #[test]
     fn palette_index_0_is_monochrome() {
@@ -4092,6 +4175,7 @@ mod tests {
             model: "bonsai-8b-mlx".into(),
             ctx_used: 2200,
             ctx_max: 65500,
+            capacity: None,
         }
     }
 
@@ -4866,6 +4950,131 @@ mod tests {
         assert!(
             !rendered.contains("decoding"),
             "stale decoding placeholder leaked before tool:\n{rendered}"
+        );
+    }
+
+    fn capacity_status(
+        prior_total: u64,
+        current_total: u64,
+        pressure: CapacityPressureLabel,
+        basis: CapacityBasisLabel,
+        action: CapacityAction,
+    ) -> CapacityStatus {
+        CapacityStatus {
+            prior_total,
+            current_total,
+            prompt_limit: 32_768,
+            output_limit: 4_096,
+            pressure,
+            basis,
+            generation: 7,
+            action,
+        }
+    }
+
+    #[test]
+    fn capacity_marker_renders_on_the_active_turn_line() {
+        let mut app = App::new();
+        app.begin_turn("summarize");
+        app.on_delta(
+            &ControlMarker::Capacity(capacity_status(
+                50_176,
+                36_864,
+                CapacityPressureLabel::Constrained,
+                CapacityBasisLabel::Conservative,
+                CapacityAction::Reduced,
+            ))
+            .encode(),
+        );
+        let rendered = flatten_text(Text::from(app.transcript_rows(120)));
+        assert!(
+            rendered.contains("capacity 49K -> 36K · constrained · reduced"),
+            "capacity event missing from turn line:\n{rendered}"
+        );
+        // The marker is never rendered as assistant text.
+        assert_eq!(reply_text(&app), "");
+    }
+
+    #[test]
+    fn capacity_marker_labels_legacy_fallback_not_adaptive() {
+        let mut app = App::new();
+        app.begin_turn("summarize");
+        app.on_delta(
+            &ControlMarker::Capacity(capacity_status(
+                65_536,
+                16_384,
+                CapacityPressureLabel::Normal,
+                CapacityBasisLabel::Legacy,
+                CapacityAction::Reduced,
+            ))
+            .encode(),
+        );
+        let rendered = flatten_text(Text::from(app.transcript_rows(120)));
+        assert!(
+            rendered.contains("capacity 64K -> 16K · legacy · reduced"),
+            "legacy capacity event missing from turn line:\n{rendered}"
+        );
+        assert!(!rendered.contains("adaptive"));
+    }
+
+    #[test]
+    fn capacity_footer_segment_degrades_gracefully() {
+        // No snapshot installed (cloud / pre-discovery): no capacity segment.
+        let plain = flatten_text(Text::from(footer_line(
+            &test_footer(),
+            Mode::Calm,
+            false,
+            Status::Ready,
+            0,
+        )));
+        assert!(!plain.contains("capacity"), "footer: {plain}");
+
+        let legacy = capacity_footer_label(&CapacityDescription {
+            source: CapacitySource::Legacy,
+            pressure: None,
+            generation: 0,
+            boot_id: String::new(),
+            total_tokens: 16_384,
+            output_tokens: 4_096,
+        });
+        assert_eq!(legacy, "16K/4K legacy");
+
+        let adaptive = capacity_footer_label(&CapacityDescription {
+            source: CapacitySource::Adaptive {
+                basis: CapacityBasis::Learned,
+            },
+            pressure: Some(CapacityPressure::Constrained),
+            generation: 7,
+            boot_id: "boot-1".into(),
+            total_tokens: 49_152,
+            output_tokens: 4_096,
+        });
+        assert_eq!(adaptive, "48K/4K adaptive (learned) · constrained");
+        // Normal pressure stays quiet — the footer is calm by design.
+        let calm = capacity_footer_label(&CapacityDescription {
+            source: CapacitySource::Adaptive {
+                basis: CapacityBasis::Conservative,
+            },
+            pressure: Some(CapacityPressure::Normal),
+            generation: 1,
+            boot_id: "boot-1".into(),
+            total_tokens: 49_152,
+            output_tokens: 4_096,
+        });
+        assert_eq!(calm, "48K/4K adaptive (conservative)");
+
+        let mut footer = test_footer();
+        footer.capacity = Some(legacy);
+        let with_capacity = flatten_text(Text::from(footer_line(
+            &footer,
+            Mode::Calm,
+            false,
+            Status::Ready,
+            0,
+        )));
+        assert!(
+            with_capacity.contains("capacity 16K/4K legacy"),
+            "footer: {with_capacity}"
         );
     }
 

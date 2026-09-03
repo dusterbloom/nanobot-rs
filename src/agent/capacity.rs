@@ -225,6 +225,34 @@ pub(crate) enum CapacityRefresh {
     Invalidated,
 }
 
+/// Which source produced the current effective limits, for status surfaces.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CapacitySource {
+    /// Live `/v1/capacity` snapshot narrowed by the configured ceiling.
+    Adaptive { basis: CapacityBasis },
+    /// Snapshot reports unavailable: the configured ceiling is kept and the
+    /// request path surfaces the typed 503.
+    Unavailable,
+    /// Old Higgs without `/v1/capacity`: frozen 16,384-total/4,096-output
+    /// fallback. Renderers must label this "legacy", never "adaptive".
+    Legacy,
+}
+
+/// Status-surface view of the installed capacity: the effective limits (after
+/// the same config-ceiling minima as [`CapacityRuntime::effective_budget`])
+/// plus the snapshot identity. `None` when nothing is installed (cloud
+/// provider, pre-discovery) — callers degrade to configured-only.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CapacityDescription {
+    pub(crate) source: CapacitySource,
+    /// Live pressure; `None` for the legacy fallback (no server telemetry).
+    pub(crate) pressure: Option<CapacityPressure>,
+    pub(crate) generation: u64,
+    pub(crate) boot_id: String,
+    pub(crate) total_tokens: usize,
+    pub(crate) output_tokens: usize,
+}
+
 impl CapacityRuntime {
     pub(crate) fn shared() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::default())
@@ -321,6 +349,45 @@ impl CapacityRuntime {
                 }
             }
             None => TokenBudget::new(configured.max_context(), configured.response_reserve()),
+        }
+    }
+
+    /// One-call capacity diagnostics for TUI/REPL status surfaces. The
+    /// effective numbers always match [`CapacityRuntime::effective_budget`]
+    /// for the same inputs (they are computed through that path), so the
+    /// turn line, footer, and `/ctx` can never disagree with the request
+    /// budget the loop actually uses.
+    pub(crate) fn describe(
+        &self,
+        configured: &TokenBudget,
+        immutable_prefix_tokens: usize,
+    ) -> Option<CapacityDescription> {
+        let budget = self.effective_budget(configured, immutable_prefix_tokens);
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match &state.installed {
+            Some(InstalledCapacity::Profile(profile)) => Some(CapacityDescription {
+                source: if profile.availability() == CapacityAvailability::Available {
+                    CapacitySource::Adaptive {
+                        basis: profile.basis(),
+                    }
+                } else {
+                    CapacitySource::Unavailable
+                },
+                pressure: Some(profile.pressure()),
+                generation: profile.generation(),
+                boot_id: profile.boot_id().to_owned(),
+                total_tokens: budget.max_context(),
+                output_tokens: budget.response_reserve(),
+            }),
+            Some(InstalledCapacity::Legacy) => Some(CapacityDescription {
+                source: CapacitySource::Legacy,
+                pressure: None,
+                generation: 0,
+                boot_id: String::new(),
+                total_tokens: budget.max_context(),
+                output_tokens: budget.response_reserve(),
+            }),
+            None => None,
         }
     }
 }
@@ -605,6 +672,88 @@ mod tests {
                 max_prompt_tokens: 29_000,
                 output_tokens: 3_000,
             }
+        );
+    }
+
+    fn unavailable_profile_value() -> serde_json::Value {
+        let mut value = available_profile();
+        value["availability"] = json!("unavailable");
+        for field in [
+            "safeTotalTokens",
+            "recommendedOutputTokens",
+            "maxPromptTokens",
+            "retainedSessionTokens",
+            "retainedBytes",
+            "prefixCacheBytes",
+        ] {
+            value[field] = json!(0);
+        }
+        value
+    }
+
+    #[test]
+    fn describe_reports_adaptive_snapshot_and_matches_effective_budget() {
+        let runtime = CapacityRuntime::default();
+        let profile = serde_json::from_value::<HiggsCapacityProfile>(available_profile()).unwrap();
+        runtime.install_profile("http://127.0.0.1:1/v1", "escha-35b-a3b", profile);
+        let configured = TokenBudget::new(100_000, 8_000);
+
+        let described = runtime.describe(&configured, 2_000).unwrap();
+        assert_eq!(
+            described.source,
+            CapacitySource::Adaptive {
+                basis: CapacityBasis::Learned
+            }
+        );
+        assert_eq!(described.pressure, Some(CapacityPressure::Normal));
+        assert_eq!(described.generation, 7);
+        assert_eq!(described.boot_id, "boot-1");
+        // Effective numbers are exactly the request budget the loop uses.
+        assert_eq!(
+            described.total_tokens,
+            runtime.effective_budget(&configured, 2_000).max_context()
+        );
+        assert_eq!(
+            described.output_tokens,
+            runtime
+                .effective_budget(&configured, 2_000)
+                .response_reserve()
+        );
+    }
+
+    #[test]
+    fn describe_labels_the_legacy_fallback() {
+        let runtime = CapacityRuntime::default();
+        runtime.install_legacy("http://127.0.0.1:1/v1", "escha-35b-a3b");
+
+        let described = runtime
+            .describe(&TokenBudget::new(100_000, 8_000), 1_000)
+            .unwrap();
+        assert_eq!(described.source, CapacitySource::Legacy);
+        assert_eq!(described.pressure, None);
+        assert_eq!(described.total_tokens, 16_384);
+        assert_eq!(described.output_tokens, 4_096);
+    }
+
+    #[test]
+    fn describe_marks_unavailable_snapshots_and_keeps_the_configured_ceiling() {
+        let runtime = CapacityRuntime::default();
+        let profile =
+            serde_json::from_value::<HiggsCapacityProfile>(unavailable_profile_value()).unwrap();
+        runtime.install_profile("http://127.0.0.1:1/v1", "escha-35b-a3b", profile);
+        let configured = TokenBudget::new(100_000, 8_000);
+
+        let described = runtime.describe(&configured, 2_000).unwrap();
+        assert_eq!(described.source, CapacitySource::Unavailable);
+        assert_eq!(described.total_tokens, configured.max_context());
+        assert_eq!(described.output_tokens, configured.response_reserve());
+    }
+
+    #[test]
+    fn describe_is_none_without_an_installed_snapshot() {
+        assert_eq!(
+            CapacityRuntime::default().describe(&TokenBudget::new(1_000, 100), 0),
+            None
         );
     }
 
