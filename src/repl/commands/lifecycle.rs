@@ -1510,6 +1510,9 @@ impl ReplContext {
             self.persist_local_config();
             self.apply_and_rebuild_with(true);
             reset_prompt_state_after_runtime_switch(&self.core_handle.counters, &self.session_id);
+            // Model/local runtime switched: the installed capacity snapshot
+            // belongs to the previous endpoint; the next Higgs turn refetches.
+            self.core_handle.capacity.invalidate();
             tui::print_mode_banner(&self.srv.local_port, true);
         } else {
             // Toggle OFF — switch to cloud mode.
@@ -1535,6 +1538,9 @@ impl ReplContext {
             self.persist_local_config();
             self.apply_and_rebuild_with(false);
             reset_prompt_state_after_runtime_switch(&self.core_handle.counters, &self.session_id);
+            // Model/local runtime switched: the installed capacity snapshot
+            // belongs to the previous endpoint; the next Higgs turn refetches.
+            self.core_handle.capacity.invalidate();
             tui::print_mode_banner(&self.srv.local_port, false);
         }
     }

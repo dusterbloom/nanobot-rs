@@ -663,6 +663,13 @@ impl AgentLoopShared {
         };
 
         drop(compaction_admission);
+        // Configured budget snapshot: the turn's effective budget starts as
+        // the immutable ceiling and may be narrowed by the live Higgs
+        // snapshot before its first consumer.
+        let configured_budget = TokenBudget::new(
+            core.token_budget.max_context(),
+            core.token_budget.response_reserve(),
+        );
         TurnContext {
             core,
             request_id,
@@ -702,6 +709,8 @@ impl AgentLoopShared {
             retained_route_cleanup: Default::default(),
             content_gate,
             counters: self.core_handle.counters.clone(),
+            capacity: self.core_handle.capacity.clone(),
+            effective_budget: configured_budget,
             flow: FlowControl {
                 router_preflight_done: false,
                 tool_guard,

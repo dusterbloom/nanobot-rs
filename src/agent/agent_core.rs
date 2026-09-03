@@ -1301,6 +1301,10 @@ impl RuntimeCounters {
 pub struct AgentHandle {
     core: Arc<parking_lot::RwLock<Arc<SwappableCore>>>,
     pub counters: Arc<RuntimeCounters>,
+    /// Live Higgs capacity snapshot; persists across core swaps exactly like
+    /// `counters`, so a model switch invalidates it without losing the
+    /// runtime itself.
+    pub capacity: Arc<crate::agent::capacity::CapacityRuntime>,
 }
 
 impl AgentHandle {
@@ -1309,6 +1313,7 @@ impl AgentHandle {
         Self {
             core: Arc::new(parking_lot::RwLock::new(Arc::new(core))),
             counters,
+            capacity: crate::agent::capacity::CapacityRuntime::shared(),
         }
     }
 

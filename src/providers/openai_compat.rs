@@ -35,13 +35,7 @@ use super::constants::{
 };
 use super::jit_gate::JitGate;
 use super::retry;
-use crate::agent::capacity::HiggsCapacityProfile;
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum HiggsCapacityFetch {
-    Profile(HiggsCapacityProfile),
-    Legacy,
-}
+use crate::agent::capacity::{HiggsCapacityFetch, HiggsCapacityProfile};
 
 /// An LLM provider that talks to any OpenAI-compatible chat completions endpoint.
 pub struct OpenAICompatProvider {
@@ -1576,6 +1570,22 @@ impl LLMProvider for OpenAICompatProvider {
 
     fn supports_higgs_session_cache(&self) -> bool {
         self.higgs_session_cache
+    }
+
+    fn fetch_higgs_capacity<'a>(
+        &'a self,
+        model: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<HiggsCapacityFetch>, crate::errors::ProviderError>,
+                > + Send
+                + 'a,
+        >,
+    > {
+        // Delegate to the inherent method so the HTTP shape, auth, and
+        // typed-error classification stay in exactly one place.
+        Box::pin(OpenAICompatProvider::fetch_higgs_capacity(self, model))
     }
 }
 

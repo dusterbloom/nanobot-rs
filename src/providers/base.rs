@@ -329,6 +329,28 @@ pub trait LLMProvider: Send + Sync {
     fn supports_higgs_session_cache(&self) -> bool {
         false
     }
+
+    /// Fetch the live Higgs `/v1/capacity` profile for `model`. The default
+    /// is "not a Higgs-capable endpoint" (`None`), so ordinary providers are
+    /// untouched; the OpenAI-compatible provider overrides it when
+    /// `localBackend=higgs`. This stays a boxed optional capability — never a
+    /// generic capacity method on every provider.
+    fn fetch_higgs_capacity<'a>(
+        &'a self,
+        _model: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Option<crate::agent::capacity::HiggsCapacityFetch>,
+                        crate::errors::ProviderError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(std::future::ready(Ok(None)))
+    }
 }
 
 #[cfg(test)]

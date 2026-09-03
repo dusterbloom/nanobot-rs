@@ -12978,3 +12978,410 @@ async fn idle_turn_e2e_injects_journaled_quiet_turn() {
     run_handle.abort();
     let _ = std::fs::remove_dir_all(&workspace);
 }
+
+// ---------------------------------------------------------------------------
+// Task 3: live Higgs capacity runtime
+// ---------------------------------------------------------------------------
+
+mod capacity_runtime {
+    use super::*;
+    use crate::agent::agent_loop::shared::resolve_live_capacity;
+    use crate::agent::capacity::{CapacityRuntime, HiggsCapacityFetch, HiggsCapacityProfile};
+    use crate::agent::token_budget::TokenBudget;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    fn profile_json(boot_id: &str, safe_total: u64, output: u64) -> serde_json::Value {
+        serde_json::json!({
+            "schemaVersion": 1,
+            "model": "escha",
+            "modelFingerprint": "sha256:abc",
+            "bootId": boot_id,
+            "generation": 7,
+            "availability": "available",
+            "pressure": "normal",
+            "safeTotalTokens": safe_total,
+            "recommendedOutputTokens": output,
+            "maxPromptTokens": safe_total - output,
+            "retainedSessionTokens": 0,
+            "retainedBytes": 0,
+            "prefixCacheBytes": 0,
+            "basis": "conservative"
+        })
+    }
+
+    /// Higgs-capable mock that counts fetches and serves queued profiles.
+    struct CapacityMockLLM {
+        fetches: AtomicU64,
+        next: Mutex<Vec<HiggsCapacityFetch>>,
+        legacy: bool,
+    }
+
+    impl CapacityMockLLM {
+        fn serving(profiles: Vec<HiggsCapacityFetch>) -> Arc<Self> {
+            Arc::new(Self {
+                fetches: AtomicU64::new(0),
+                next: Mutex::new(profiles),
+                legacy: false,
+            })
+        }
+
+        fn fetches(&self) -> u64 {
+            self.fetches.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for CapacityMockLLM {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            Ok(crate::providers::base::LLMResponse {
+                content: Some("mock".to_string()),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "escha"
+        }
+
+        fn get_api_base(&self) -> Option<&str> {
+            Some("http://127.0.0.1:9000")
+        }
+
+        fn supports_higgs_session_cache(&self) -> bool {
+            true
+        }
+
+        fn fetch_higgs_capacity<'a>(
+            &'a self,
+            _model: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<Option<HiggsCapacityFetch>, crate::errors::ProviderError>,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async {
+                self.fetches.fetch_add(1, Ordering::SeqCst);
+                let mut queue = self.next.lock().unwrap();
+                Ok(queue.pop_front_owned())
+            })
+        }
+    }
+
+    /// `Vec::pop` from the front without shifting: take from the front.
+    trait PopFrontOwned {
+        fn pop_front_owned(&mut self) -> Option<HiggsCapacityFetch>;
+    }
+
+    impl PopFrontOwned for Vec<HiggsCapacityFetch> {
+        fn pop_front_owned(&mut self) -> Option<HiggsCapacityFetch> {
+            if self.is_empty() {
+                if self.capacity() == 0 {
+                    // Exhausted queue behaves as legacy marker holder: None
+                    // means "no more profiles"; the loop then invalidates.
+                    return None;
+                }
+                return None;
+            }
+            Some(self.remove(0))
+        }
+    }
+
+    fn configured() -> TokenBudget {
+        TokenBudget::new(131_072, 8_192)
+    }
+
+    #[tokio::test]
+    async fn first_turn_fetches_and_narrows_the_effective_budget() {
+        let capacity = CapacityRuntime::shared();
+        let counters = test_runtime_counters(131_072);
+        let provider = CapacityMockLLM::serving(vec![HiggsCapacityFetch::Profile(
+            serde_json::from_value::<HiggsCapacityProfile>(profile_json("boot-1", 53_248, 4_096))
+                .unwrap(),
+        )]);
+
+        let budget = resolve_live_capacity(
+            &capacity,
+            provider.as_ref(),
+            "escha",
+            &configured(),
+            &counters,
+            "session",
+        )
+        .await;
+
+        assert_eq!(provider.fetches(), 1, "discovery must fetch once");
+        assert_eq!(budget.max_context(), 53_248.min(131_072));
+        assert_eq!(budget.response_reserve(), 4_096.min(8_192));
+    }
+
+    #[tokio::test]
+    async fn same_boot_refetch_keeps_the_epoch_stable() {
+        let capacity = CapacityRuntime::shared();
+        let counters = test_runtime_counters(131_072);
+        let provider = CapacityMockLLM::serving(vec![
+            HiggsCapacityFetch::Profile(
+                serde_json::from_value::<HiggsCapacityProfile>(profile_json(
+                    "boot-1", 53_248, 4_096,
+                ))
+                .unwrap(),
+            ),
+            HiggsCapacityFetch::Profile(
+                serde_json::from_value::<HiggsCapacityProfile>(profile_json(
+                    "boot-1", 53_248, 4_096,
+                ))
+                .unwrap(),
+            ),
+        ]);
+
+        for _ in 0..2 {
+            resolve_live_capacity(
+                &capacity,
+                provider.as_ref(),
+                "escha",
+                &configured(),
+                &counters,
+                "session",
+            )
+            .await;
+        }
+        // Two turns → two fetches (a server reboot must be observable), but
+        // the same boot never rotates the retained epoch.
+        assert_eq!(provider.fetches(), 2);
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert("session".to_string(), 4_096);
+        resolve_live_capacity(
+            &capacity,
+            provider.as_ref(), // queue exhausted → Ok(None) → invalidate is wrong here
+            "escha",
+            &configured(),
+            &counters,
+            "session",
+        )
+        .await;
+        assert!(
+            counters
+                .prompt_cache_watermark
+                .lock()
+                .contains_key("session"),
+            "same-boot refresh must not rotate the epoch"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_change_refetches_and_rotates_the_retained_epoch() {
+        let capacity = CapacityRuntime::shared();
+        let counters = test_runtime_counters(131_072);
+        let provider = CapacityMockLLM::serving(vec![
+            HiggsCapacityFetch::Profile(
+                serde_json::from_value::<HiggsCapacityProfile>(profile_json(
+                    "boot-1", 53_248, 4_096,
+                ))
+                .unwrap(),
+            ),
+            HiggsCapacityFetch::Profile(
+                serde_json::from_value::<HiggsCapacityProfile>(profile_json(
+                    "boot-2", 49_152, 4_096,
+                ))
+                .unwrap(),
+            ),
+        ]);
+
+        resolve_live_capacity(
+            &capacity,
+            provider.as_ref(),
+            "escha",
+            &configured(),
+            &counters,
+            "session",
+        )
+        .await;
+        // Warm prompt-cache state from the old boot.
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert("session".to_string(), 4_096);
+
+        let budget = resolve_live_capacity(
+            &capacity,
+            provider.as_ref(),
+            "escha",
+            &configured(),
+            &counters,
+            "session",
+        )
+        .await;
+
+        assert_eq!(provider.fetches(), 2, "boot change must refetch");
+        assert_eq!(budget.max_context(), 49_152);
+        assert!(
+            !counters
+                .prompt_cache_watermark
+                .lock()
+                .contains_key("session"),
+            "boot change must reset the prompt-cache watermark"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_provider_bypasses_capacity_entirely() {
+        let capacity = CapacityRuntime::shared();
+        let counters = test_runtime_counters(131_072);
+        // Install a Higgs snapshot first, then take over with a cloud mock.
+        let higgs = CapacityMockLLM::serving(vec![HiggsCapacityFetch::Profile(
+            serde_json::from_value::<HiggsCapacityProfile>(profile_json("boot-1", 53_248, 4_096))
+                .unwrap(),
+        )]);
+        resolve_live_capacity(
+            &capacity,
+            higgs.as_ref(),
+            "escha",
+            &configured(),
+            &counters,
+            "session",
+        )
+        .await;
+
+        let budget = resolve_live_capacity(
+            &capacity,
+            MockLLM::named("cloud").as_ref(), // supports=false
+            "escha",
+            &configured(),
+            &counters,
+            "session",
+        )
+        .await;
+
+        assert_eq!(
+            budget.max_context(),
+            131_072,
+            "cloud turn must keep the configured ceiling"
+        );
+        assert_eq!(
+            budget.response_reserve(),
+            8_192,
+            "cloud turn must keep the configured reserve"
+        );
+        // The stale snapshot is dropped: the next Higgs turn refetches.
+        assert!(!capacity.cached_for("http://127.0.0.1:9000", "escha"));
+    }
+
+    #[tokio::test]
+    async fn legacy_higgs_uses_the_conservative_fallback() {
+        let capacity = CapacityRuntime::shared();
+        let counters = test_runtime_counters(131_072);
+        let provider = CapacityMockLLM::serving(vec![HiggsCapacityFetch::Legacy]);
+
+        let budget = resolve_live_capacity(
+            &capacity,
+            provider.as_ref(),
+            "escha",
+            &configured(),
+            &counters,
+            "session",
+        )
+        .await;
+
+        assert_eq!(provider.fetches(), 1);
+        assert_eq!(budget.max_context(), 16_384.min(131_072));
+        assert_eq!(budget.response_reserve(), 4_096.min(8_192));
+    }
+
+    #[tokio::test]
+    async fn fetch_failure_fails_open_to_the_configured_ceiling() {
+        let capacity = CapacityRuntime::shared();
+        let counters = test_runtime_counters(131_072);
+
+        struct FailingLLM;
+        #[async_trait]
+        impl LLMProvider for FailingLLM {
+            async fn chat(
+                &self,
+                _messages: &[Value],
+                _tools: Option<&[Value]>,
+                _model: Option<&str>,
+                _max_tokens: u32,
+                _temperature: f64,
+                _thinking_budget: Option<u32>,
+                _top_p: Option<f64>,
+            ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+                unreachable!("capacity fetch test never chats")
+            }
+            fn get_default_model(&self) -> &str {
+                "escha"
+            }
+            fn get_api_base(&self) -> Option<&str> {
+                Some("http://127.0.0.1:9000")
+            }
+            fn supports_higgs_session_cache(&self) -> bool {
+                true
+            }
+            fn fetch_higgs_capacity<'a>(
+                &'a self,
+                _model: &'a str,
+            ) -> std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Result<
+                                Option<HiggsCapacityFetch>,
+                                crate::errors::ProviderError,
+                            >,
+                        > + Send
+                        + 'a,
+                >,
+            > {
+                Box::pin(async {
+                    Err(crate::errors::ProviderError::HttpError(
+                        "unreachable".to_string(),
+                    ))
+                })
+            }
+        }
+
+        let budget = resolve_live_capacity(
+            &capacity,
+            &FailingLLM,
+            "escha",
+            &configured(),
+            &counters,
+            "session",
+        )
+        .await;
+
+        assert_eq!(budget.max_context(), 131_072);
+        assert_eq!(budget.response_reserve(), 8_192);
+    }
+
+    #[test]
+    fn runtime_snapshot_never_persists_configured_limits() {
+        // The runtime narrows a view; it holds no config path and cannot
+        // rewrite `config.json` (structural invariant of Task 3).
+        let capacity = CapacityRuntime::shared();
+        capacity.install_legacy("http://127.0.0.1:9000", "escha");
+        let budget = capacity.effective_budget(&configured(), 0);
+        assert_eq!(budget.max_context(), 16_384);
+        // Invalidate restores the configured ceiling — proof the narrowing
+        // lives in the runtime view, not in any persisted configuration.
+        capacity.invalidate();
+        assert_eq!(
+            capacity.effective_budget(&configured(), 0).max_context(),
+            131_072
+        );
+    }
+}

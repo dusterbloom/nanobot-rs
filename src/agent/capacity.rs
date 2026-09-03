@@ -75,6 +75,14 @@ pub(crate) struct EffectiveCapacity {
     pub(crate) output_tokens: usize,
 }
 
+/// One `/v1/capacity` fetch result: the live profile, or the marker for an
+/// old Higgs whose route-absent 404 selects the conservative legacy fallback.
+#[derive(Debug)]
+pub(crate) enum HiggsCapacityFetch {
+    Profile(HiggsCapacityProfile),
+    Legacy,
+}
+
 impl EffectiveCapacity {
     pub(crate) fn legacy_higgs(
         configured: &TokenBudget,
@@ -175,6 +183,153 @@ impl HiggsCapacityProfile {
             configured,
             immutable_prefix_tokens,
         )
+    }
+}
+
+/// Loop-level holder for the live Higgs capacity snapshot. Lives beside
+/// `RuntimeCounters` on the `AgentHandle` (persists across core swaps), keyed
+/// by endpoint+model so an unchanged provider tuple never refetches. The
+/// configured `SwappableCore.token_budget` stays immutable; the effective
+/// request budget is derived at use time and can shrink per boot/generation
+/// without a config rewrite or core rebuild.
+pub(crate) struct CapacityRuntime {
+    state: std::sync::Mutex<CapacityRuntimeState>,
+}
+
+#[derive(Default)]
+struct CapacityRuntimeState {
+    /// Identity of the installed snapshot: endpoint + model.
+    key: Option<(String, String)>,
+    /// The installed live snapshot, or the frozen legacy fallback.
+    installed: Option<InstalledCapacity>,
+}
+
+enum InstalledCapacity {
+    Profile(Box<HiggsCapacityProfile>),
+    Legacy,
+}
+
+/// What a refresh observed, so the caller can rotate retained state through
+/// the existing epoch path when the server restarted underneath it.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum CapacityRefresh {
+    /// No snapshot installed yet, or the endpoint/model changed.
+    Fetched,
+    /// Same endpoint+model tuple as the installed snapshot: no fetch.
+    Unchanged,
+    /// Same endpoint+model but the boot ID changed: the snapshot was
+    /// re-fetched and every retained session from the old boot is stale.
+    BootChanged,
+    /// Endpoint+model changed away from a previously installed Higgs pair
+    /// (model switch or cloud takeover): the snapshot is dropped.
+    Invalidated,
+}
+
+impl CapacityRuntime {
+    pub(crate) fn shared() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    /// Whether a live snapshot is already installed for this endpoint+model.
+    /// The loop consults this before issuing a fetch: an unchanged tuple
+    /// never refetches.
+    pub(crate) fn cached_for(&self, endpoint: &str, model: &str) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(&state.key, Some(key) if key.0 == endpoint && key.1 == model)
+    }
+
+    /// Install a fetched profile. Returns the refresh classification for the
+    /// caller's retained-epoch handling.
+    pub(crate) fn install_profile(
+        &self,
+        endpoint: &str,
+        model: &str,
+        profile: HiggsCapacityProfile,
+    ) -> CapacityRefresh {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let refresh = match (&state.key, &state.installed) {
+            (Some(key), Some(InstalledCapacity::Profile(previous))) if key.0 == endpoint => {
+                if previous.boot_id() == profile.boot_id() {
+                    CapacityRefresh::Unchanged
+                } else {
+                    CapacityRefresh::BootChanged
+                }
+            }
+            _ => CapacityRefresh::Fetched,
+        };
+        state.key = Some((endpoint.to_owned(), model.to_owned()));
+        state.installed = Some(InstalledCapacity::Profile(Box::new(profile)));
+        refresh
+    }
+
+    /// Freeze the conservative legacy fallback for an old Higgs without
+    /// `/v1/capacity`: 16,384 total tokens, at most 4,096 output.
+    pub(crate) fn install_legacy(&self, endpoint: &str, model: &str) -> CapacityRefresh {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let refresh = if state.installed.is_some() {
+            CapacityRefresh::BootChanged
+        } else {
+            CapacityRefresh::Fetched
+        };
+        state.key = Some((endpoint.to_owned(), model.to_owned()));
+        state.installed = Some(InstalledCapacity::Legacy);
+        refresh
+    }
+
+    /// Drop the installed snapshot (model switch, runtime toggle). The next
+    /// Higgs-capable request refetches from discovery.
+    pub(crate) fn invalidate(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.installed.is_some() {
+            state.key = None;
+            state.installed = None;
+        }
+    }
+
+    /// The effective request budget: the configured ceiling narrowed by the
+    /// live snapshot. Without a snapshot (cloud provider, pre-discovery,
+    /// unavailable profile) this is exactly the configured budget.
+    pub(crate) fn effective_budget(
+        &self,
+        configured: &TokenBudget,
+        immutable_prefix_tokens: usize,
+    ) -> TokenBudget {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match &state.installed {
+            Some(InstalledCapacity::Profile(profile)) => {
+                match profile.effective_capacity(configured, immutable_prefix_tokens) {
+                    Ok(effective) => TokenBudget::new(
+                        effective.total_tokens.min(configured.max_context()),
+                        effective.output_tokens.min(configured.response_reserve()),
+                    ),
+                    // Unavailable profile: keep the configured ceiling; the
+                    // request path surfaces typed 503 from the server rather
+                    // than silently shrinking to zero.
+                    Err(_) => {
+                        TokenBudget::new(configured.max_context(), configured.response_reserve())
+                    }
+                }
+            }
+            Some(InstalledCapacity::Legacy) => {
+                match EffectiveCapacity::legacy_higgs(configured, immutable_prefix_tokens) {
+                    Ok(effective) => {
+                        TokenBudget::new(effective.total_tokens, effective.output_tokens)
+                    }
+                    Err(_) => {
+                        TokenBudget::new(configured.max_context(), configured.response_reserve())
+                    }
+                }
+            }
+            None => TokenBudget::new(configured.max_context(), configured.response_reserve()),
+        }
+    }
+}
+
+impl Default for CapacityRuntime {
+    fn default() -> Self {
+        Self {
+            state: std::sync::Mutex::new(CapacityRuntimeState::default()),
+        }
     }
 }
 

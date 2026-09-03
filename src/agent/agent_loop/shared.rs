@@ -414,6 +414,14 @@ pub(crate) struct TurnContext {
 
     // --- Observability ---
     pub(crate) counters: Arc<RuntimeCounters>,
+    /// Loop-level live-capacity runtime (shared across turns). The snapshot
+    /// refresh happens before the first budget use each turn.
+    pub(crate) capacity: Arc<crate::agent::capacity::CapacityRuntime>,
+    /// Effective request budget for this turn: the immutable configured
+    /// ceiling narrowed by the live Higgs snapshot. Resolved once per turn
+    /// before any budget consumer; identical to `core.token_budget` for
+    /// cloud providers and pre-discovery turns.
+    pub(crate) effective_budget: TokenBudget,
 
     // --- Flow control ---
     pub(crate) flow: FlowControl,
@@ -1562,6 +1570,69 @@ fn should_attempt_forced_recovery(
             || validation::has_raw_json_hallucinated_tool_call(content))
 }
 
+/// Resolve the effective request budget against the live Higgs snapshot
+/// (Task 3). Free function so the refresh contract is testable without a
+/// full loop: cloud bypass, fetch-once, boot-change epoch rotation, legacy
+/// fallback, and fail-open on fetch errors.
+pub(crate) async fn resolve_live_capacity(
+    capacity: &std::sync::Arc<crate::agent::capacity::CapacityRuntime>,
+    provider: &dyn crate::providers::base::LLMProvider,
+    model: &str,
+    configured: &TokenBudget,
+    counters: &std::sync::Arc<RuntimeCounters>,
+    session_key: &str,
+) -> TokenBudget {
+    use crate::agent::capacity::{CapacityRefresh, HiggsCapacityFetch};
+
+    if !provider.supports_higgs_session_cache() {
+        // Cloud provider (or higgs backend off): any installed snapshot is
+        // stale. Invalidate is a no-op when nothing was installed.
+        capacity.invalidate();
+        return TokenBudget::new(configured.max_context(), configured.response_reserve());
+    }
+    let Some(endpoint) = provider.get_api_base() else {
+        return TokenBudget::new(configured.max_context(), configured.response_reserve());
+    };
+    let endpoint = endpoint.to_owned();
+    {
+        // One fetch per resolve; the loop resolves once per turn, so tool
+        // continuations within the turn reuse the installed snapshot while
+        // the next turn still observes a server reboot.
+        match provider.fetch_higgs_capacity(model).await {
+            Ok(Some(HiggsCapacityFetch::Profile(profile))) => {
+                let refresh = capacity.install_profile(&endpoint, model, profile);
+                if refresh == CapacityRefresh::BootChanged {
+                    // Server restarted underneath this session: every
+                    // retained session from the old boot is garbage. Rotate
+                    // through the existing epoch path — watermark reset plus
+                    // retained-session drop — so the next request starts a
+                    // fresh server-side session.
+                    counters.reset_session_prompt_state(session_key);
+                    counters.retire_higgs_session(
+                        session_key,
+                        crate::agent::agent_core::SessionRetirement::Drop,
+                    );
+                    warn!(session = %session_key, "higgs_boot_changed_rotated_retained_session");
+                }
+            }
+            Ok(Some(HiggsCapacityFetch::Legacy)) => {
+                // Old Higgs without /v1/capacity: freeze the documented
+                // conservative 16K/4K fallback keyed to this tuple.
+                capacity.install_legacy(&endpoint, model);
+            }
+            Ok(None) => {
+                capacity.invalidate();
+            }
+            Err(error) => {
+                // Fail open: keep the configured ceiling and let the typed
+                // request path (413/503) surface real rejection.
+                warn!(session = %session_key, error = %error, "higgs_capacity_fetch_failed");
+            }
+        }
+    }
+    capacity.effective_budget(configured, 0)
+}
+
 impl AgentLoopShared {
     pub(crate) async fn compaction_handle_for_session(&self, session_id: &str) -> CompactionHandle {
         let mut handles = self.compaction_handles.lock().await;
@@ -1651,8 +1722,30 @@ impl AgentLoopShared {
         model = %ctx.core.model,
         streaming = ctx.streaming,
     ))]
+    /// Resolve `ctx.effective_budget` against the live Higgs snapshot
+    /// (Task 3). The immutable `SwappableCore.token_budget` is never mutated:
+    /// the effective budget is derived per turn and may shrink per
+    /// boot/generation without a config rewrite or core rebuild.
+    async fn resolve_effective_budget(&self, ctx: &mut TurnContext) {
+        let budget = resolve_live_capacity(
+            &ctx.capacity,
+            ctx.core.provider.as_ref(),
+            &ctx.core.model,
+            &ctx.core.token_budget,
+            &ctx.counters,
+            &ctx.session_key,
+        )
+        .await;
+        ctx.effective_budget = budget;
+    }
+
     async fn run_agent_loop(&self, ctx: &mut TurnContext) {
         ctx.turn_outcome = TurnOutcome::LimitExhausted;
+        // Live Higgs capacity resolves before the first budget consumer of
+        // the turn (prepare/pre-call/compaction all read
+        // `ctx.effective_budget`). Cloud providers keep the configured
+        // ceiling; an unchanged endpoint+model tuple never refetches.
+        self.resolve_effective_budget(ctx).await;
         // Auto-decompose: detect numbered steps in user message and build a plan.
         // This helps small models that can't call the plan tool themselves.
         if ctx.core.reasoning_config.enabled && ctx.core.reasoning_config.auto_decompose {
@@ -2182,7 +2275,7 @@ impl AgentLoopShared {
                 || history_window_near(
                     ctx.messages.len(),
                     ctx.turn_count,
-                    ctx.core.token_budget.max_context(),
+                    ctx.effective_budget.max_context(),
                     ctx.core.max_history_turns,
                 );
         self.install_pending_compaction(ctx, allow_checkpoint).await;
@@ -2359,7 +2452,7 @@ impl AgentLoopShared {
             .copied()
             .unwrap_or(0);
         let (trimmed_messages, trim_disposition) = ctx.core.retention.apply_budget(
-            &ctx.core.token_budget,
+            &ctx.effective_budget,
             &ctx.messages,
             tool_def_tokens,
             crate::agent::retention::BudgetMode::Normal {
@@ -2417,7 +2510,7 @@ impl AgentLoopShared {
                 if !user_text.is_empty() {
                     let intent = crate::agent::proactive::extract_intent(&user_text);
                     if intent.confidence >= 0.2 {
-                        let budget = (ctx.core.token_budget.max_context() / 20).min(500);
+                        let budget = (ctx.effective_budget.max_context() / 20).min(500);
                         // learnings removed; proactive grounding no longer uses tool-pattern hints
                         let learning_context = String::new();
                         let ks_guard = self.knowledge_store.as_ref().map(|ks| ks.lock());
@@ -3204,7 +3297,7 @@ impl AgentLoopShared {
                 return;
             }
             engine.set_current_turn(current_turn);
-            let available = ctx.core.token_budget.available_budget(tool_def_tokens);
+            let available = ctx.effective_budget.available_budget(tool_def_tokens);
             let hard_message_limit = (available as f64 * engine.tau_hard()) as usize;
             let provider_prompt_limit = ctx
                 .core
@@ -3212,7 +3305,7 @@ impl AgentLoopShared {
                 .max_context()
                 .saturating_sub(max_tokens as usize);
             (
-                engine.plan_auto_expansion(&ctx.core.token_budget, tool_def_tokens, wire_tokens),
+                engine.plan_auto_expansion(&ctx.effective_budget, tool_def_tokens, wire_tokens),
                 hard_message_limit
                     .saturating_add(tool_def_tokens)
                     .min(provider_prompt_limit),
