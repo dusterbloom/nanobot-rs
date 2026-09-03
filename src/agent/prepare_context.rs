@@ -710,6 +710,7 @@ impl AgentLoopShared {
             content_gate,
             counters: self.core_handle.counters.clone(),
             capacity: self.core_handle.capacity.clone(),
+            capacity_recovery: Default::default(),
             effective_budget: configured_budget,
             flow: FlowControl {
                 router_preflight_done: false,

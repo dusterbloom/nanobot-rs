@@ -829,6 +829,12 @@ impl LcmEngine {
         // soft mode now take the same deterministic truncation the blocking
         // path uses.
         const MAX_COMPACTION_BLOCK_MESSAGES: usize = 80;
+        // Capacity fit-guard (Task 4): a model-authored summary is itself a
+        // provider request. When the block cannot fit the effective budget,
+        // the summarizer call would be rejected (or would evict the main
+        // turn), so the escalation skips straight to deterministic level-3
+        // reduction — zero provider calls, durable source handles.
+        let summarizer_request_fits = block_tokens <= budget.available_budget(0);
         let (summary_text, fresh_manifest, level) = if block_messages.len()
             > MAX_COMPACTION_BLOCK_MESSAGES
         {
@@ -836,6 +842,15 @@ impl LcmEngine {
                 "LCM: block too large ({} msgs > {}) for LLM summarization, using deterministic truncation",
                 block_messages.len(),
                 MAX_COMPACTION_BLOCK_MESSAGES
+            );
+            let truncated =
+                deterministic_truncate(&block_messages, self.config.deterministic_target);
+            (truncated, SummaryManifest::default(), 3)
+        } else if !summarizer_request_fits {
+            info!(
+                block_tokens,
+                available = budget.available_budget(0),
+                "LCM: block exceeds the effective budget, using deterministic truncation without a provider call"
             );
             let truncated =
                 deterministic_truncate(&block_messages, self.config.deterministic_target);

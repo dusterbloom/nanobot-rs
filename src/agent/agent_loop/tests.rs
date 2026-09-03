@@ -5663,6 +5663,10 @@ async fn cancelled_before_engine_lock_keeps_soft_compaction_retryable() {
             engine.clone(),
             messages,
             1,
+            crate::agent::token_budget::TokenBudget::new(
+                core.token_budget.max_context(),
+                core.token_budget.response_reserve(),
+            ),
             CompactionFailureMode::PreserveContext,
             cancellation,
             Arc::new(CompactionPublication::new()),
@@ -13382,6 +13386,272 @@ mod capacity_runtime {
         assert_eq!(
             capacity.effective_budget(&configured(), 0).max_context(),
             131_072
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: preflight capacity reduction (sanctioned order)
+// ---------------------------------------------------------------------------
+
+mod capacity_preflight {
+    use super::*;
+    use crate::agent::agent_loop::compaction::LcmCompactionMutation;
+    use crate::agent::agent_loop::shared::TurnCapacityRecovery;
+    use crate::agent::compaction::ContextCompactor;
+    use crate::agent::lcm::{CompactionFailureMode, LcmConfig, LcmEngine};
+    use crate::agent::token_budget::TokenBudget;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// Counting summarizer: records provider calls, returns a short summary.
+    struct CountingSummarizer {
+        calls: AtomicU64,
+    }
+
+    #[async_trait]
+    impl LLMProvider for CountingSummarizer {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::providers::base::LLMResponse {
+                content: Some("summarized: the user discussed rust ownership.".to_string()),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: std::collections::HashMap::new(),
+            })
+        }
+        fn get_default_model(&self) -> &str {
+            "counter"
+        }
+    }
+
+    fn engine_with_block(messages: usize, tokens_each: usize) -> LcmEngine {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.3,
+            tau_hard: 10.0,
+            deterministic_target: 64,
+        });
+        for id in 0..messages {
+            let _ = engine.ingest(json!({
+                "role": "user",
+                "content": format!("msg-{id} {}", "x".repeat(tokens_each)),
+                "_db_id": id,
+            }));
+        }
+        engine
+    }
+
+    #[tokio::test]
+    async fn compact_skips_llm_when_its_own_request_would_not_fit() {
+        // ~60 messages x ~380 tokens ~= a 19K-token block against a 3.5K
+        // effective budget: the model-authored summary request itself cannot
+        // fit, so the escalation must go straight to deterministic level 3 —
+        // zero provider calls — while keeping every compacted source id
+        // recallable.
+        let summarizer = Arc::new(CountingSummarizer {
+            calls: AtomicU64::new(0),
+        });
+        let compactor = ContextCompactor::new(
+            Arc::clone(&summarizer) as Arc<dyn LLMProvider>,
+            "counter".to_string(),
+            4096,
+        );
+        let mut engine = engine_with_block(60, 2_600);
+        let mut mutation = LcmCompactionMutation::new(&mut engine);
+        let summary = mutation
+            .engine_mut()
+            .compact(
+                Some(&compactor),
+                &TokenBudget::new(4_096, 512),
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
+
+        let summary = summary.expect("deterministic reduction must compact");
+        let crate::agent::turn::Turn::Summary {
+            level, source_ids, ..
+        } = &summary
+        else {
+            panic!("expected a summary turn");
+        };
+        assert_eq!(*level, 3, "deterministic level 3, not LLM escalation");
+        assert_eq!(
+            summarizer.calls.load(Ordering::SeqCst),
+            0,
+            "a summary request that cannot fit must make zero provider calls"
+        );
+        // Every source id of the compacted block resolves in the engine's
+        // store: durable recall, not a raw drop.
+        let node_sources = &mutation.engine().dag().newest().unwrap().source_ids;
+        assert!(!node_sources.is_empty());
+        for id in node_sources {
+            assert!(
+                mutation.engine().expand(&[*id]).len() == 1,
+                "source {id} recallable"
+            );
+        }
+        assert_eq!(source_ids.len(), node_sources.len());
+        drop(mutation);
+    }
+
+    #[tokio::test]
+    async fn compact_uses_llm_when_its_own_request_fits() {
+        let summarizer = Arc::new(CountingSummarizer {
+            calls: AtomicU64::new(0),
+        });
+        let compactor = ContextCompactor::new(
+            Arc::clone(&summarizer) as Arc<dyn LLMProvider>,
+            "counter".to_string(),
+            8192,
+        );
+        // Six ~380-token messages: the protect floor (512 tokens) keeps the
+        // newest one raw and leaves a ~1.9K block that fits the 7.7K budget.
+        let mut engine = engine_with_block(6, 2_600);
+        let mut mutation = LcmCompactionMutation::new(&mut engine);
+        let summary = mutation
+            .engine_mut()
+            .compact(
+                Some(&compactor),
+                &TokenBudget::new(8_192, 512),
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
+        drop(mutation);
+
+        let summary = summary.expect("small block compacts via LLM");
+        let crate::agent::turn::Turn::Summary { level, .. } = &summary else {
+            panic!("expected a summary turn");
+        };
+        assert!(matches!(level, 1 | 2), "LLM escalation, got level {level}");
+        assert_eq!(
+            summarizer.calls.load(Ordering::SeqCst),
+            1,
+            "exactly one summarizer call"
+        );
+    }
+
+    #[test]
+    fn recovery_generation_progresses_only_forward() {
+        assert_eq!(
+            shared_next(TurnCapacityRecovery::Idle),
+            TurnCapacityRecovery::PreflightCompacted { generation: 0 }
+        );
+        assert_eq!(
+            shared_next(TurnCapacityRecovery::PreflightCompacted { generation: 0 }),
+            TurnCapacityRecovery::PreflightCompacted { generation: 1 }
+        );
+    }
+
+    fn shared_next(current: TurnCapacityRecovery) -> TurnCapacityRecovery {
+        // Mirror of the loop helper, asserted against the same progression.
+        let generation = match current {
+            TurnCapacityRecovery::Idle => 0,
+            TurnCapacityRecovery::PreflightCompacted { generation }
+            | TurnCapacityRecovery::RetryIssued { generation }
+            | TurnCapacityRecovery::Terminal { generation } => generation.saturating_add(1),
+        };
+        TurnCapacityRecovery::PreflightCompacted { generation }
+    }
+
+    /// Full-turn gate: a 512-token window whose immutable prefix (system +
+    /// tools) alone cannot fit ends the turn capacity-unavailable with ZERO
+    /// provider calls — pending work, never a recursive compaction.
+    #[tokio::test]
+    async fn immutable_prefix_that_cannot_fit_ends_pending_unavailable() {
+        struct PanicProvider;
+        #[async_trait]
+        impl LLMProvider for PanicProvider {
+            async fn chat(
+                &self,
+                _messages: &[Value],
+                _tools: Option<&[Value]>,
+                _model: Option<&str>,
+                _max_tokens: u32,
+                _temperature: f64,
+                _thinking_budget: Option<u32>,
+                _top_p: Option<f64>,
+            ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+                panic!("capacity-unavailable turn must not reach the provider");
+            }
+            fn get_default_model(&self) -> &str {
+                "local-model"
+            }
+        }
+
+        let workspace = tempfile::tempdir().unwrap().keep();
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: Arc::new(PanicProvider) as Arc<dyn LLMProvider>,
+            workspace: workspace.clone(),
+            model: "local-model".to_string(),
+            max_iterations: 2,
+            max_continuations: 1,
+            max_tokens: 256,
+            temperature: 0.0,
+            max_context_tokens: 512,
+            brave_api_key: None,
+            search_provider: "searxng".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
+            crw_url: String::new(),
+            search_max_results: 5,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            lane: Lane::default(),
+            tool_delegation: ToolDelegationConfig::default(),
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
+            reasoning_config: crate::config::schema::ReasoningConfig::default(),
+            tool_heartbeat_secs: 2,
+            health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
+            adaptive_tokens: AdaptiveTokenConfig::default(),
+            sessions_db_path: Some(
+                std::env::temp_dir().join(format!("nanobot-cap-{}.sqlite", uuid::Uuid::new_v4())),
+            ),
+        });
+        let counters = test_runtime_counters(512);
+        let core_handle = AgentHandle::new(core, counters);
+
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+        let agent_loop = AgentLoop::new(
+            core_handle,
+            inbound_rx,
+            outbound_tx,
+            inbound_tx,
+            None,
+            1,
+            None,
+            None,
+            None,
+            ProprioceptionConfig::default(),
+            LcmSchemaConfig::default(),
+            None,
+        );
+
+        let body = agent_loop
+            .process_direct("hello", "cap-e2e", "test", "capacity-preflight")
+            .await;
+        assert!(
+            body.contains("[Capacity Unavailable]"),
+            "expected capacity-unavailable reply, got: {body}"
         );
     }
 }

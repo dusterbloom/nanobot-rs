@@ -334,6 +334,32 @@ impl RouterSyntheticCallSequence {
     }
 }
 
+/// Turn-local capacity recovery progression. Task 4 exercises the preflight
+/// states; Task 5 owns the retry/terminal transitions on the same enum.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TurnCapacityRecovery {
+    Idle,
+    PreflightCompacted { generation: u64 },
+    RetryIssued { generation: u64 },
+    Terminal { generation: u64 },
+}
+
+impl Default for TurnCapacityRecovery {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+fn next_preflight_generation(current: TurnCapacityRecovery) -> TurnCapacityRecovery {
+    let generation = match current {
+        TurnCapacityRecovery::Idle => 0,
+        TurnCapacityRecovery::PreflightCompacted { generation }
+        | TurnCapacityRecovery::RetryIssued { generation }
+        | TurnCapacityRecovery::Terminal { generation } => generation.saturating_add(1),
+    };
+    TurnCapacityRecovery::PreflightCompacted { generation }
+}
+
 pub(crate) struct TurnContext {
     // --- Config (set during prepare, immutable after) ---
     pub(crate) core: Arc<SwappableCore>,
@@ -417,6 +443,9 @@ pub(crate) struct TurnContext {
     /// Loop-level live-capacity runtime (shared across turns). The snapshot
     /// refresh happens before the first budget use each turn.
     pub(crate) capacity: Arc<crate::agent::capacity::CapacityRuntime>,
+    /// Turn-local capacity recovery state (Task 4 preflight, Task 5 retry).
+    /// One typed progression — never a retry counter or behavior boolean.
+    pub(crate) capacity_recovery: TurnCapacityRecovery,
     /// Effective request budget for this turn: the immutable configured
     /// ceiling narrowed by the live Higgs snapshot. Resolved once per turn
     /// before any budget consumer; identical to `core.token_budget` for
@@ -932,6 +961,10 @@ struct SoftCompactionRequest {
     compaction: CompactionHandle,
     turn_cancellation: Option<tokio_util::sync::CancellationToken>,
     prompt_prefix: Vec<Value>,
+    /// Effective budget snapshot from the requesting turn: soft compaction
+    /// admits its (optional) summarizer call against live capacity, not the
+    /// wider configured ceiling.
+    compaction_budget: TokenBudget,
 }
 
 impl SoftCompactionRequest {
@@ -956,6 +989,10 @@ impl SoftCompactionRequest {
             compaction: ctx.compaction.clone(),
             turn_cancellation: ctx.cancellation_token.clone(),
             prompt_prefix,
+            compaction_budget: TokenBudget::new(
+                ctx.effective_budget.max_context(),
+                ctx.effective_budget.response_reserve(),
+            ),
         })
     }
 
@@ -1507,6 +1544,11 @@ pub(crate) enum TurnOutcome {
     Cancelled,
     Empty,
     LimitExhausted,
+    /// The effective (live) capacity cannot admit this turn even after the
+    /// sanctioned reduction order — the immutable prefix alone exceeds the
+    /// envelope. Distinct from Error so Task 6 can persist it as resumable
+    /// pending work instead of a failed turn.
+    CapacityUnavailable,
 }
 
 impl TurnOutcome {
@@ -1517,6 +1559,7 @@ impl TurnOutcome {
             Self::Cancelled => "cancelled",
             Self::Empty => "empty",
             Self::LimitExhausted => "limit_exhausted",
+            Self::CapacityUnavailable => "capacity_unavailable",
         }
     }
 }
@@ -2597,17 +2640,29 @@ impl AgentLoopShared {
         // Adaptive max_tokens: size the response budget to the task.
         let effective_max_tokens = self.compute_adaptive_max_tokens(ctx);
 
-        // Pre-flight overflow check, gated on the EXACT prompt cap this
-        // request will send (context window minus this call's response budget
-        // — what higgs enforces as max_prompt_tokens), not the raw window: a
-        // raw-window gate sits above the server cap and lets the request 400
-        // with context_length_exceeded instead of trimming (session
-        // 20260827_083227: ~31,054 estimated tokens passed 0.95 × 32,768 and
-        // hit the 30,720 cap). The estimate must include tool definitions:
-        // the server renders them into the prompt and counts them.
+        // Task 4 preflight capacity gate, on the EXACT prompt cap this
+        // request will send — now computed from the EFFECTIVE budget (live
+        // Higgs capacity narrowed with the configured ceiling), not the raw
+        // configured window. The estimate must include tool definitions: the
+        // server renders them into the prompt and counts them.
+        //
+        // Sanctioned reduction order (everything before this gate already
+        // ran inside `manage_compaction` against the same effective budget:
+        // completed checkpoint first, then blocking LCM whose own request
+        // must fit, then deterministic level-3 reduction with durable source
+        // handles and zero provider calls):
+        //   1. install any completed checkpoint again — capacity pressure
+        //      outranks cache-warmth deferral;
+        //   2. if the IMMUTABLE prefix (system + tool definitions) alone
+        //      cannot fit, end the turn as capacity-unavailable pending
+        //      work instead of recursively compacting — there is nothing
+        //      reducible left;
+        //   3. otherwise the request flies as-is: a genuine server-side
+        //      rejection takes the typed recovery path (Task 5), never the
+        //      CRITICAL `apply_emergency_trim`, which stays exclusively on
+        //      the server-oracle context-length recovery path.
         let prompt_cap = ctx
-            .core
-            .token_budget
+            .effective_budget
             .max_context()
             .saturating_sub(effective_max_tokens as usize);
         let trim_threshold = overflow_trim_threshold(prompt_cap);
@@ -2619,12 +2674,38 @@ impl AgentLoopShared {
                 trim_threshold,
                 prompt_cap,
                 model = %ctx.core.model,
-                "context_overflow_emergency_trim"
+                "capacity_preflight_reduction"
             );
-            // Leave room for the tool definitions the server renders
-            // alongside the messages.
-            let message_budget = trim_threshold.saturating_sub(gate_tool_def_tokens);
-            self.apply_emergency_trim(ctx, message_budget).await;
+            let installed = self.install_pending_compaction(ctx, true).await;
+            if installed {
+                ctx.capacity_recovery = next_preflight_generation(ctx.capacity_recovery);
+            }
+            // Immutable-prefix check: system + tool definitions alone against
+            // the exact prompt cap.
+            let immutable_prefix_tokens = TokenBudget::estimate_tokens(
+                &ctx.rendered_messages
+                    .iter()
+                    .filter(|message| {
+                        matches!(
+                            message.get("role").and_then(Value::as_str),
+                            Some("system" | "developer")
+                        )
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ) + gate_tool_def_tokens;
+            if immutable_prefix_tokens > 0 && immutable_prefix_tokens >= prompt_cap {
+                warn!(
+                    immutable_prefix_tokens,
+                    prompt_cap, "capacity_preflight_immutable_prefix_unavailable"
+                );
+                ctx.capacity_recovery = TurnCapacityRecovery::Terminal { generation: 1 };
+                return StepResult::Done(IterationOutcome::Complete {
+                    content: "[Capacity Unavailable] The system prompt and tool                               definitions alone exceed the live capacity window.                               Reduce the tool surface or reconnect capacity."
+                        .to_owned(),
+                    outcome: TurnOutcome::CapacityUnavailable,
+                });
+            }
         }
 
         self.apply_planned_auto_expansion(ctx, &tool_defs, effective_max_tokens)
@@ -2996,6 +3077,7 @@ impl AgentLoopShared {
         let mut messages = request.prompt_prefix;
         messages.extend(history);
         let turn_cancellation = request.turn_cancellation;
+        let compaction_budget = request.compaction_budget;
         let _ = request
             .compaction
             .try_start_admitted(&admission, move |job_cancellation, publication| {
@@ -3006,6 +3088,7 @@ impl AgentLoopShared {
                     lcm_engine,
                     messages,
                     session_turn,
+                    compaction_budget,
                     CompactionFailureMode::PreserveContext,
                     cancellation.clone(),
                     publication,
@@ -3070,7 +3153,15 @@ impl AgentLoopShared {
             }
 
             let budget_core = ctx.core.clone();
-            let budget = &budget_core.token_budget;
+            // Task 4: compaction limits follow the EFFECTIVE budget (live
+            // Higgs capacity narrowed with the configured ceiling), so an
+            // over-budget turn compacts before its first provider call and
+            // the summarizer fit-guard inside `compact()` sees the same
+            // envelope the main request will be admitted against.
+            let budget = TokenBudget::new(
+                ctx.effective_budget.max_context(),
+                ctx.effective_budget.response_reserve(),
+            );
             let (mut action, conv_tokens, available, hard_limit, soft_limit) = {
                 let engine = lcm_engine.lock().await;
                 let available = budget.available_budget(tool_def_tokens);
@@ -3130,6 +3221,10 @@ impl AgentLoopShared {
                 let core = ctx.core.clone();
                 let session_id = ctx.session_id.clone();
                 let messages = ctx.messages.to_vec();
+                let compaction_budget = TokenBudget::new(
+                    ctx.effective_budget.max_context(),
+                    ctx.effective_budget.response_reserve(),
+                );
                 // SQLite message_count is a durable, concrete-session sequence.
                 // The process-global learning counter remains telemetry only and
                 // must not order one session's working-memory checkpoints.
@@ -3159,6 +3254,7 @@ impl AgentLoopShared {
                             compaction_engine,
                             messages,
                             session_turn,
+                            compaction_budget,
                             CompactionFailureMode::Deterministic,
                             cancellation.clone(),
                             publication,

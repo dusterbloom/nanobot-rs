@@ -413,6 +413,10 @@ pub(super) async fn execute_lcm_compaction(
     lcm: Arc<tokio::sync::Mutex<LcmEngine>>,
     messages: Vec<Value>,
     session_turn: u64,
+    // Effective (live-capacity) budget for this turn — the compactor's own
+    // request and the deterministic fit-guard are admitted against the same
+    // envelope the main request uses, never the wider configured ceiling.
+    compaction_budget: TokenBudget,
     failure_mode: CompactionFailureMode,
     cancellation: tokio_util::sync::CancellationToken,
     publication: Arc<CompactionPublication>,
@@ -456,12 +460,10 @@ pub(super) async fn execute_lcm_compaction(
             mutation.engine_mut().clear_async_compaction_pending();
             None
         }
-        summary = mutation.engine_mut().compact(
-            Some(&compactor),
-            &core.token_budget,
-            0,
-            failure_mode,
-        ) => summary,
+        summary = mutation
+            .engine_mut()
+            .compact(Some(&compactor), &compaction_budget, 0, failure_mode)
+            => summary,
     };
     let compacted_conversation = mutation.engine().active_context();
     let summary_node = summary_turn.as_ref().and_then(|turn| {
