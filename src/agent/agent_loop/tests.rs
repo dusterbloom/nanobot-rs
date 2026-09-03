@@ -13863,3 +13863,278 @@ mod capacity_exceeded {
         assert_eq!(model_requests, 2, "exactly two journaled requests");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Task 6: durable interrupted / suspended turns
+// ---------------------------------------------------------------------------
+
+mod interrupted {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    enum CapacityFailure {
+        Interrupted,
+        Unavailable,
+    }
+
+    struct CapacityFailingProvider {
+        requests: AtomicU64,
+        failure: CapacityFailure,
+    }
+
+    #[async_trait]
+    impl LLMProvider for CapacityFailingProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            Err(match self.failure {
+                CapacityFailure::Interrupted => {
+                    crate::errors::ProviderError::HiggsCapacityInterrupted {
+                        boot_id: "boot-1".to_string(),
+                        generation: 9,
+                        partial_output_tokens: 7,
+                        partial_stream_bytes: crate::errors::PartialStreamBytes::new(
+                            b"partial streamed text".to_vec(),
+                        ),
+                    }
+                    .into()
+                }
+                CapacityFailure::Unavailable => {
+                    crate::errors::ProviderError::HiggsCapacityUnavailable {
+                        boot_id: "boot-1".to_string(),
+                        generation: 9,
+                        retry_after_ms: 5_000,
+                    }
+                    .into()
+                }
+            })
+        }
+        fn get_default_model(&self) -> &str {
+            "local-model"
+        }
+        fn get_api_base(&self) -> Option<&str> {
+            Some("http://127.0.0.1:9000")
+        }
+        fn supports_higgs_session_cache(&self) -> bool {
+            true
+        }
+    }
+
+    async fn drive(
+        failure: CapacityFailure,
+    ) -> (
+        Arc<CapacityFailingProvider>,
+        std::sync::Arc<crate::session::db::SessionDb>,
+        String,
+        String,
+        Vec<crate::session::db::SessionEvent>,
+        Vec<Value>,
+    ) {
+        let provider = Arc::new(CapacityFailingProvider {
+            requests: AtomicU64::new(0),
+            failure,
+        });
+        let workspace = tempfile::tempdir().unwrap().keep();
+        let core = build_swappable_core(SwappableCoreConfig {
+            provider: Arc::clone(&provider) as Arc<dyn LLMProvider>,
+            workspace: workspace.clone(),
+            model: "local-model".to_string(),
+            max_iterations: 2,
+            max_continuations: 1,
+            max_tokens: 256,
+            temperature: 0.0,
+            max_context_tokens: 4_096,
+            brave_api_key: None,
+            search_provider: "searxng".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
+            crw_url: String::new(),
+            search_max_results: 5,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config: MemoryConfig::default(),
+            is_local: true,
+            lane: Lane::default(),
+            tool_delegation: ToolDelegationConfig::default(),
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
+            reasoning_config: crate::config::schema::ReasoningConfig::default(),
+            tool_heartbeat_secs: 2,
+            health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
+            adaptive_tokens: AdaptiveTokenConfig::default(),
+            sessions_db_path: Some(
+                std::env::temp_dir().join(format!("nanobot-int-{}.sqlite", uuid::Uuid::new_v4())),
+            ),
+        });
+        let counters = test_runtime_counters(4_096);
+        let core_handle = AgentHandle::new(core, counters);
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+        let agent_loop = AgentLoop::new(
+            core_handle,
+            inbound_rx,
+            outbound_tx,
+            inbound_tx,
+            None,
+            1,
+            None,
+            None,
+            None,
+            ProprioceptionConfig::default(),
+            LcmSchemaConfig::default(),
+            None,
+        );
+        let session_key = "cap-int";
+        let reply = agent_loop
+            .process_direct("please answer", session_key, "test", "capacity-interrupted")
+            .await;
+
+        let sessions = agent_loop.shared.core_handle.swappable().sessions.clone();
+        let concrete = sessions
+            .get_latest_session(session_key)
+            .await
+            .expect("session exists");
+        let events = sessions.load_session_events(&concrete.id).await.unwrap();
+        let history = sessions.get_history(&concrete.id, 100, 100).await;
+        (provider, sessions, concrete.id, reply, events, history)
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_persists_partial_artifact_never_success() {
+        let (provider, sessions, session_id, reply, events, history) =
+            drive(CapacityFailure::Interrupted).await;
+
+        assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+        assert!(
+            reply.contains("[Capacity Interrupted]"),
+            "reply must explain the interruption: {reply}"
+        );
+        // Typed interrupted event present.
+        assert!(
+            events
+                .iter()
+                .any(|event| event.payload.kind() == "model_interrupted"),
+            "model_interrupted event must be journaled"
+        );
+        // Replay folds the call as incomplete with the partial artifact and
+        // no successful response.
+        let replay = sessions.load_session_replay(&session_id).await.unwrap();
+        let call = replay.model_calls.last().expect("the interrupted call");
+        assert!(call.response.is_none(), "never a successful response");
+        let failure = call.failure.as_ref().expect("failure recorded");
+        let partial = call.partial_output.as_ref().expect("partial artifact");
+        assert_eq!(partial, &b"partial streamed text".to_vec());
+        assert!(
+            String::from_utf8_lossy(failure).contains("interrupted"),
+            "error artifact carries the typed reason"
+        );
+        // No assistant success row: history ends at the user turn.
+        let last_role = history
+            .last()
+            .and_then(|message| message.get("role"))
+            .and_then(|role| role.as_str())
+            .unwrap_or("");
+        assert_ne!(last_role, "assistant", "no assistant row may be committed");
+    }
+
+    #[tokio::test]
+    async fn unavailable_turn_stays_resumable_pending() {
+        let (provider, sessions, session_id, reply, events, history) =
+            drive(CapacityFailure::Unavailable).await;
+
+        assert_eq!(
+            provider.requests.load(Ordering::SeqCst),
+            1,
+            "no busy-loop model requests"
+        );
+        assert!(
+            reply.contains("[Capacity Unavailable]"),
+            "reply must explain the suspension: {reply}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.payload.kind() == "turn_suspended"),
+            "turn_suspended event must be journaled"
+        );
+        // The user turn is retained durably...
+        let last_role = history
+            .last()
+            .and_then(|message| message.get("role"))
+            .and_then(|role| role.as_str())
+            .unwrap_or("");
+        assert_eq!(last_role, "user", "the user turn stays durable");
+        // ...and as a due resumable pending row after the 5s backoff.
+        let now_ms = crate::agent::agent_core::RuntimeCounters::now_epoch_ms();
+        let due = sessions
+            .due_pending_capacity_turns(now_ms + 6_000)
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 1, "exactly one pending turn");
+        assert_eq!(due[0].content, "please answer");
+        assert_eq!(due[0].session_id, session_id);
+        // No assistant row was committed for the suspended turn.
+        let _ = sessions;
+    }
+
+    #[test]
+    fn capacity_retry_delay_honors_clamps_and_exponential_backoff() {
+        use crate::session::db::capacity_retry_delay_ms as delay;
+        // Schema-v1 default: 5s.
+        assert_eq!(delay(None, 0), 5_000);
+        // Server values clamp into the 5–30s window.
+        assert_eq!(delay(Some(1), 0), 5_000);
+        assert_eq!(delay(Some(5000), 0), 5_000);
+        assert_eq!(delay(Some(99_000), 0), 30_000);
+        // Exponential growth capped at 30s.
+        assert_eq!(delay(Some(5000), 1), 10_000);
+        assert_eq!(delay(Some(5000), 2), 20_000);
+        assert_eq!(delay(Some(5000), 3), 30_000);
+        assert_eq!(delay(Some(5000), 9), 30_000);
+    }
+
+    #[tokio::test]
+    async fn new_inbound_replaces_the_pending_turn_for_its_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("pending.sqlite");
+        let sessions = crate::session::db::SessionDb::new(&db_path);
+        let session_id = sessions.create_session("pending-chat").await.id;
+        sessions
+            .record_pending_capacity_turn(&session_id, "test", "chat-1", "u", "first", false, 0)
+            .await
+            .unwrap();
+        sessions
+            .record_pending_capacity_turn(&session_id, "test", "chat-1", "u", "second", false, 0)
+            .await
+            .unwrap();
+        sessions
+            .record_pending_capacity_turn(&session_id, "test", "chat-2", "u", "other", false, 0)
+            .await
+            .unwrap();
+        let due = sessions
+            .due_pending_capacity_turns(4_102_444_800_000) // 2100-01-01
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 2, "one pending per chat");
+        assert!(due
+            .iter()
+            .any(|turn| turn.chat_id == "chat-1" && turn.content == "second"));
+        assert!(due
+            .iter()
+            .any(|turn| turn.chat_id == "chat-2" && turn.content == "other"));
+    }
+}

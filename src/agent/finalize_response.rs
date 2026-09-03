@@ -163,7 +163,10 @@ impl AgentLoopShared {
         // Bug 1 fix: if strip_dangling_tool_calls already converted a tool-call
         // assistant message into a plain text assistant message, merging here
         // prevents two consecutive assistant messages from being persisted.
-        if !ctx.final_content.is_empty() {
+        // Capacity-unavailable turns never commit an assistant row: the reply
+        // is a transient explanation and the user turn stays resumable
+        // pending work (Task 6) — a success row would duplicate on resume.
+        if !ctx.final_content.is_empty() && ctx.turn_outcome != TurnOutcome::CapacityUnavailable {
             let last_can_absorb_final_text = ctx
                 .messages
                 .last()

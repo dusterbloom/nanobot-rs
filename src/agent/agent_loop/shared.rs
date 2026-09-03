@@ -114,10 +114,86 @@ impl ProviderRequestRetryPolicy {
 }
 
 /// Per-instance state that differs between the REPL agent and gateway agents.
+/// Scheduler for capacity-suspended turns (Task 6). Runs outside any tool
+/// loop or DB transaction; every tick it re-injects due pending turns whose
+/// endpoint reports an available profile. Unavailable endpoints reschedule
+/// with exponential 5–30s backoff, so a static-unavailable server produces
+/// one capacity GET per backoff tick — never a model request, never a loop.
+pub(crate) async fn capacity_resume_poller(
+    shared: std::sync::Weak<AgentLoopShared>,
+    inbound_tx: tokio::sync::mpsc::UnboundedSender<crate::bus::events::InboundMessage>,
+) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        let due = match shared
+            .core_handle
+            .swappable()
+            .sessions
+            .due_pending_capacity_turns(RuntimeCounters::now_epoch_ms())
+            .await
+        {
+            Ok(due) => due,
+            Err(error) => {
+                warn!(error = %error, "pending_capacity_turns_load_failed");
+                continue;
+            }
+        };
+        for pending in due {
+            let core = shared.core_handle.swappable();
+            if core.provider.supports_higgs_session_cache() {
+                match core.provider.fetch_higgs_capacity(&core.model).await {
+                    Ok(Some(crate::agent::capacity::HiggsCapacityFetch::Profile(profile)))
+                        if profile.availability()
+                            == crate::agent::capacity::CapacityAvailability::Available =>
+                    {
+                        // Capacity recovered: resume the deferred turn.
+                        info!(
+                            chat_id = %pending.chat_id,
+                            "pending_capacity_turn_resumed"
+                        );
+                    }
+                    _ => {
+                        // Still unavailable (or fetch failed): exponential
+                        // backoff, no model request issued.
+                        let attempt = pending.retry_count.saturating_add(1);
+                        let delay = crate::session::db::capacity_retry_delay_ms(None, attempt);
+                        let next = RuntimeCounters::now_epoch_ms().saturating_add(delay);
+                        let _ = core
+                            .sessions
+                            .update_pending_capacity_retry(pending.id, attempt, next)
+                            .await;
+                        continue;
+                    }
+                }
+            }
+            // Cloud takeover or recovered capacity: re-inject the durable
+            // user turn through the bus and drop the pending row.
+            let _ = inbound_tx.send(crate::bus::events::InboundMessage {
+                channel: pending.channel.clone(),
+                sender_id: pending.sender.clone(),
+                chat_id: pending.chat_id.clone(),
+                content: pending.content.clone(),
+                timestamp: chrono::Local::now(),
+                media: Vec::new(),
+                metadata: Default::default(),
+            });
+            let _ = core.sessions.delete_pending_capacity_turn(pending.id).await;
+        }
+    }
+}
+
 pub(crate) struct AgentLoopShared {
     pub(crate) core_handle: SharedCoreHandle,
     pub(crate) subagents: Arc<SubagentManager>,
     pub(crate) bus_outbound_tx: UnboundedSender<OutboundMessage>,
+    /// Inbound re-injection for capacity-resumed turns (Task 6). Set once at
+    /// construction; the resume poller spawns lazily on first suspension.
+    pub(crate) bus_inbound_tx:
+        tokio::sync::mpsc::UnboundedSender<crate::bus::events::InboundMessage>,
+    pub(crate) capacity_resume_poller_started: std::sync::atomic::AtomicBool,
     pub(crate) cron_service: Option<Arc<CronService>>,
     pub(crate) email_config: Option<EmailConfig>,
     pub(crate) repl_display_tx: Option<UnboundedSender<String>>,
@@ -1690,6 +1766,22 @@ pub(crate) async fn resolve_live_capacity(
 }
 
 impl AgentLoopShared {
+    /// Ensure exactly one resume poller runs for this loop. Spawned lazily
+    /// when the first turn is capacity-suspended — not at construction, so
+    /// `set_idle_runtime`'s `Arc::get_mut` precondition still holds.
+    pub(crate) fn ensure_capacity_resume_poller(self: &Arc<Self>) {
+        if self
+            .capacity_resume_poller_started
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        tokio::spawn(capacity_resume_poller(
+            std::sync::Arc::downgrade(self),
+            self.bus_inbound_tx.clone(),
+        ));
+    }
+
     pub(crate) async fn compaction_handle_for_session(&self, session_id: &str) -> CompactionHandle {
         let mut handles = self.compaction_handles.lock().await;
         handles
@@ -2407,6 +2499,114 @@ impl AgentLoopShared {
         // Re-render after trim to rebuild protocol-correct wire format.
         ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
         TokenBudget::estimate_tokens(&ctx.rendered_messages) < rendered_before
+    }
+
+    /// Typed capacity interruption/unavailability handling (Task 6). An
+    /// interrupted stream persists its partial bytes as an incomplete
+    /// artifact (never an assistant success), retracts transient streamed
+    /// output, and ends the turn for later regeneration. An unavailable
+    /// server suspends the turn: the durable user message becomes resumable
+    /// pending work the scheduler retries with schema-v1 backoff.
+    async fn handle_capacity_interruption(
+        &self,
+        ctx: &mut TurnContext,
+        error: &anyhow::Error,
+        model_call_id: &str,
+    ) -> Option<StepResult> {
+        use crate::errors::ProviderError;
+
+        let provider_error = error.downcast_ref::<ProviderError>()?;
+        match provider_error {
+            ProviderError::HiggsCapacityInterrupted {
+                partial_output_tokens,
+                partial_stream_bytes,
+                ..
+            } => {
+                if let Err(record_error) = ctx
+                    .core
+                    .sessions
+                    .record_model_interrupted(
+                        &ctx.session_id,
+                        &ctx.request_id,
+                        ctx.turn_count,
+                        model_call_id,
+                        &error.to_string(),
+                        partial_stream_bytes.as_slice(),
+                        *partial_output_tokens,
+                    )
+                    .await
+                {
+                    warn!(error = %record_error, "capacity_interrupted_artifact_persist_failed");
+                }
+                // Retract whatever the client already saw stream by.
+                if ctx.flow.content_was_streamed {
+                    send_retract_reply_marker(&ctx.text_delta_tx);
+                    ctx.flow.content_was_streamed = false;
+                }
+                warn!(
+                    session = %ctx.session_key,
+                    partial_tokens = partial_output_tokens,
+                    "higgs_capacity_interrupted_turn_regenerates_after_recovery"
+                );
+                Some(StepResult::Done(IterationOutcome::Complete {
+                    content: "[Capacity Interrupted] Partial output was saved as an \
+                              incomplete artifact; this turn regenerates once memory \
+                              pressure recovers."
+                        .to_owned(),
+                    outcome: TurnOutcome::CapacityUnavailable,
+                }))
+            }
+            ProviderError::HiggsCapacityUnavailable { retry_after_ms, .. } => {
+                // The user message is already durable (persisted before the
+                // first provider call); defer the turn as resumable work.
+                let delay_ms =
+                    crate::session::db::capacity_retry_delay_ms(Some(*retry_after_ms), 0);
+                if let Err(record_error) = ctx
+                    .core
+                    .sessions
+                    .record_turn_suspended(
+                        &ctx.session_id,
+                        &ctx.request_id,
+                        ctx.turn_count,
+                        *retry_after_ms,
+                    )
+                    .await
+                {
+                    warn!(error = %record_error, "turn_suspended_persist_failed");
+                }
+                let next_retry_at = RuntimeCounters::now_epoch_ms().saturating_add(delay_ms);
+                if let Err(record_error) = ctx
+                    .core
+                    .sessions
+                    .record_pending_capacity_turn(
+                        &ctx.session_id,
+                        &ctx.channel,
+                        &ctx.chat_id,
+                        "",
+                        &ctx.user_content,
+                        ctx.is_voice_message,
+                        next_retry_at,
+                    )
+                    .await
+                {
+                    warn!(error = %record_error, "pending_capacity_turn_persist_failed");
+                }
+
+                warn!(
+                    session = %ctx.session_key,
+                    retry_after_ms = delay_ms,
+                    "higgs_capacity_unavailable_turn_suspended"
+                );
+                Some(StepResult::Done(IterationOutcome::Complete {
+                    content: "[Capacity Unavailable] The local model is out of capacity. \
+                              Your message is saved and will resume automatically once \
+                              capacity recovers."
+                        .to_owned(),
+                    outcome: TurnOutcome::CapacityUnavailable,
+                }))
+            }
+            _ => None,
+        }
     }
 
     /// Typed Higgs 413 recovery (Task 5). The rejection carries the
@@ -4677,6 +4877,13 @@ impl AgentLoopShared {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
                         }
+                        if let Some(step) = self
+                            .handle_capacity_interruption(ctx, &e, &model_call_id)
+                            .await
+                        {
+                            counters.mark_inference_finished();
+                            return step;
+                        }
                         match self.attempt_capacity_exceeded_recovery(ctx, &e).await {
                             CapacityExceededRecovery::NotApplicable => {}
                             CapacityExceededRecovery::RetryScheduled => {
@@ -4743,6 +4950,13 @@ impl AgentLoopShared {
                         if Self::handle_retained_route_error(ctx, &e) {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
+                        }
+                        if let Some(step) = self
+                            .handle_capacity_interruption(ctx, &e, &model_call_id)
+                            .await
+                        {
+                            counters.mark_inference_finished();
+                            return step;
                         }
                         match self.attempt_capacity_exceeded_recovery(ctx, &e).await {
                             CapacityExceededRecovery::NotApplicable => {}
@@ -5008,6 +5222,13 @@ impl AgentLoopShared {
                     if Self::handle_retained_route_error(ctx, &e) {
                         counters.mark_inference_finished();
                         return StepResult::Done(IterationOutcome::Continue);
+                    }
+                    if let Some(step) = self
+                        .handle_capacity_interruption(ctx, &e, &model_call_id)
+                        .await
+                    {
+                        counters.mark_inference_finished();
+                        return step;
                     }
                     match self.attempt_capacity_exceeded_recovery(ctx, &e).await {
                         CapacityExceededRecovery::NotApplicable => {}

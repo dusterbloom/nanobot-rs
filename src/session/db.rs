@@ -148,6 +148,23 @@ CREATE TABLE IF NOT EXISTS working_memory (
 CREATE INDEX IF NOT EXISTS idx_working_memory_status
     ON working_memory(status, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS pending_capacity_turns (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    channel       TEXT NOT NULL,
+    chat_id       TEXT NOT NULL,
+    sender        TEXT NOT NULL,
+    content       TEXT NOT NULL,
+    is_voice      INTEGER NOT NULL DEFAULT 0,
+    retry_count   INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER NOT NULL,
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_capacity_chat
+    ON pending_capacity_turns(chat_id);
+CREATE INDEX IF NOT EXISTS idx_pending_capacity_due
+    ON pending_capacity_turns(next_retry_at);
+
 CREATE TABLE IF NOT EXISTS legacy_imports (
     source_path    TEXT PRIMARY KEY,
     content_sha256 TEXT NOT NULL,
@@ -364,6 +381,15 @@ pub enum SessionEventPayload {
         call_id: String,
         error_digest: String,
     },
+    /// A typed capacity interruption after streaming began: the call carries
+    /// real partial output that must survive as an INCOMPLETE artifact —
+    /// never folded as a successful response.
+    ModelInterrupted {
+        call_id: String,
+        error_digest: String,
+        partial_output_digest: String,
+        partial_output_tokens: u64,
+    },
     ToolPreExecute {
         tool_call_id: String,
         tool_name: String,
@@ -384,6 +410,12 @@ pub enum SessionEventPayload {
     TurnFinished {
         outcome: String,
     },
+    /// The turn could not run because live capacity was unavailable; the
+    /// user turn is retained as resumable pending work and the scheduler
+    /// retries after `retry_after_ms` (clamped 5–30s, exponential).
+    TurnSuspended {
+        retry_after_ms: u64,
+    },
 }
 
 impl SessionEventPayload {
@@ -393,10 +425,12 @@ impl SessionEventPayload {
             Self::ModelRequest { .. } => "model_request",
             Self::ModelResponse { .. } => "model_response",
             Self::ModelFailed { .. } => "model_failed",
+            Self::ModelInterrupted { .. } => "model_interrupted",
             Self::ToolPreExecute { .. } => "tool_pre_execute",
             Self::ToolExecute { .. } => "tool_execute",
             Self::ToolPostExecute { .. } => "tool_post_execute",
             Self::TurnFinished { .. } => "turn_finished",
+            Self::TurnSuspended { .. } => "turn_suspended",
         }
     }
 }
@@ -428,9 +462,41 @@ pub struct RecordedModelCall {
     pub request: Vec<u8>,
     pub response: Option<Vec<u8>>,
     pub failure: Option<Vec<u8>>,
+    /// Partial streamed output persisted for an interrupted call (Task 6):
+    /// an incomplete artifact, present only when `failure` is set and the
+    /// interruption carried real bytes.
+    pub partial_output: Option<Vec<u8>>,
 }
 
-/// Read-only fold of one session's durable replay events.
+/// One deferred turn awaiting capacity recovery (Task 6). The user content
+/// is durably retained here and re-injected by the scheduler once the live
+/// capacity snapshot can admit the minimum request.
+pub struct PendingCapacityTurn {
+    pub id: i64,
+    pub session_id: String,
+    pub channel: String,
+    pub chat_id: String,
+    pub sender: String,
+    pub content: String,
+    pub is_voice: bool,
+    pub retry_count: u32,
+}
+
+/// Schema-v1 retry policy: honor the server's `retryAfterMs` (default
+/// 5000ms), clamp any compatible future value to 5–30 seconds, and back off
+/// exponentially per attempt. Pure so the schedule is unit-testable.
+#[must_use]
+pub fn capacity_retry_delay_ms(retry_after_ms: Option<u64>, attempt: u32) -> u64 {
+    const FLOOR_MS: u64 = 5_000;
+    const CEILING_MS: u64 = 30_000;
+    let base = retry_after_ms
+        .unwrap_or(FLOOR_MS)
+        .clamp(FLOOR_MS, CEILING_MS);
+    let shift = attempt.min(16);
+    base.saturating_mul(1_u64 << shift).min(CEILING_MS)
+}
+
+/// Read-only fold of one session's durable replay events./// Read-only fold of one session's durable replay events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionReplay {
     pub availability: ReplayAvailability,
@@ -1475,6 +1541,159 @@ impl SessionDb {
         Ok(())
     }
 
+    /// Close a recorded provider request whose stream was interrupted by a
+    /// typed capacity event, persisting the partial output as its own
+    /// artifact. Replay folds this as an incomplete call, never a success.
+    pub(crate) async fn record_model_interrupted(
+        &self,
+        session_id: &str,
+        turn_request_id: &str,
+        turn_tag: u64,
+        call_id: &str,
+        error: &str,
+        partial_output: &[u8],
+        partial_output_tokens: u64,
+    ) -> Result<(), ReplayError> {
+        let error_digest = self
+            .store_replay_artifact(session_id, "text/plain; charset=utf-8", error.as_bytes())
+            .await?;
+        let partial_output_digest = self
+            .store_replay_artifact(session_id, "text/plain; charset=utf-8", partial_output)
+            .await?;
+        self.append_session_event(
+            session_id,
+            turn_request_id,
+            turn_tag,
+            &SessionEventPayload::ModelInterrupted {
+                call_id: call_id.to_string(),
+                error_digest,
+                partial_output_digest,
+                partial_output_tokens,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Record a capacity-suspended turn: the durable resumable marker the
+    /// scheduler polls. Distinct from terminal `TurnFinished`.
+    pub(crate) async fn record_turn_suspended(
+        &self,
+        session_id: &str,
+        turn_request_id: &str,
+        turn_tag: u64,
+        retry_after_ms: u64,
+    ) -> Result<(), ReplayError> {
+        self.ensure_turn_started(session_id, turn_request_id, turn_tag)
+            .await?;
+        self.append_session_event(
+            session_id,
+            turn_request_id,
+            turn_tag,
+            &SessionEventPayload::TurnSuspended { retry_after_ms },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Defer a turn as resumable pending capacity work. A new inbound on the
+    /// same chat replaces (cancels) any older pending turn for that chat.
+    pub(crate) async fn record_pending_capacity_turn(
+        &self,
+        session_id: &str,
+        channel: &str,
+        chat_id: &str,
+        sender: &str,
+        content: &str,
+        is_voice: bool,
+        next_retry_at_epoch_ms: u64,
+    ) -> Result<(), ReplayError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM pending_capacity_turns WHERE chat_id = ?1",
+            params![chat_id],
+        )?;
+        conn.execute(
+            "INSERT INTO pending_capacity_turns \
+             (session_id, channel, chat_id, sender, content, is_voice, retry_count, next_retry_at, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
+            params![
+                session_id,
+                channel,
+                chat_id,
+                sender,
+                content,
+                i64::from(is_voice),
+                i64::try_from(next_retry_at_epoch_ms)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Pending turns whose retry deadline has passed.
+    pub(crate) async fn due_pending_capacity_turns(
+        &self,
+        now_epoch_ms: u64,
+    ) -> Result<Vec<PendingCapacityTurn>, ReplayError> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, channel, chat_id, sender, content, is_voice, retry_count \
+             FROM pending_capacity_turns WHERE next_retry_at <= ?1 ORDER BY next_retry_at ASC",
+        )?;
+        let rows = stmt
+            .query_map(
+                params![i64::try_from(now_epoch_ms)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?],
+                |row| {
+                    Ok(PendingCapacityTurn {
+                        id: row.get(0)?,
+                        session_id: row.get(1)?,
+                        channel: row.get(2)?,
+                        chat_id: row.get(3)?,
+                        sender: row.get(4)?,
+                        content: row.get(5)?,
+                        is_voice: row.get::<_, i64>(6)? != 0,
+                        retry_count: u32::try_from(row.get::<_, i64>(7)?).unwrap_or(0),
+                    })
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Reschedule a pending turn with the next exponential backoff, or drop
+    /// it from the resumable set when the caller cancels.
+    pub(crate) async fn update_pending_capacity_retry(
+        &self,
+        id: i64,
+        retry_count: u32,
+        next_retry_at_epoch_ms: u64,
+    ) -> Result<(), ReplayError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "UPDATE pending_capacity_turns SET retry_count = ?2, next_retry_at = ?3 WHERE id = ?1",
+            params![
+                id,
+                i64::from(retry_count),
+                i64::try_from(next_retry_at_epoch_ms)
+                    .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a pending turn (resumed or cancelled).
+    pub(crate) async fn delete_pending_capacity_turn(&self, id: i64) -> Result<(), ReplayError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM pending_capacity_turns WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     /// Mark the durable end of a foreground turn after all model/tool effects
     /// that can affect its outcome have been journaled.
     pub(crate) async fn record_turn_finished(
@@ -1765,6 +1984,7 @@ impl SessionDb {
                         request,
                         response: None,
                         failure: None,
+                        partial_output: None,
                     });
                 }
                 SessionEventPayload::ModelResponse {
@@ -1785,6 +2005,44 @@ impl SessionDb {
                         self.resolve_replay_artifact(session_id, response_digest)
                             .await?,
                     );
+                }
+                SessionEventPayload::ModelInterrupted {
+                    call_id,
+                    error_digest,
+                    partial_output_digest,
+                    ..
+                } => {
+                    // Interrupted calls fold exactly like failures — the
+                    // response stays None — plus their partial artifact, so
+                    // replay shows what the client actually saw. A turn whose
+                    // last model call is interrupted is incomplete by
+                    // construction, never a success.
+                    let Some(index) = call_indices.get(call_id).copied() else {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!("model interruption {call_id} has no request"),
+                        });
+                    };
+                    // The loop journals the generic failure first, then the
+                    // typed interruption enriches the same call with its
+                    // partial artifact — an upgrade, not a second terminal.
+                    if calls[index].response.is_some() || calls[index].partial_output.is_some() {
+                        return Err(ReplayError::InvalidTransition {
+                            detail: format!("model call {call_id} has two terminal events"),
+                        });
+                    }
+                    calls[index].failure = Some(
+                        self.resolve_replay_artifact(session_id, error_digest)
+                            .await?,
+                    );
+                    calls[index].partial_output = Some(
+                        self.resolve_replay_artifact(session_id, partial_output_digest)
+                            .await?,
+                    );
+                }
+                SessionEventPayload::TurnSuspended { .. } => {
+                    // Suspended turns never fold as finished: their calls stay
+                    // in the open turn and replay remains incomplete until a
+                    // later resumed turn completes with TurnFinished.
                 }
                 SessionEventPayload::ModelFailed {
                     call_id,

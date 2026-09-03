@@ -168,6 +168,8 @@ impl AgentLoop {
         let shared = Arc::new(AgentLoopShared {
             core_handle,
             subagents,
+            bus_inbound_tx: bus_inbound_tx.clone(),
+            capacity_resume_poller_started: std::sync::atomic::AtomicBool::new(false),
             bus_outbound_tx,
             cron_service,
             email_config,
@@ -272,6 +274,10 @@ impl AgentLoop {
 
         // Spawn background reflection if completed SQLite working memory has accumulated.
         Self::spawn_background_reflection(&self.shared);
+        // Task 6: resume poller for capacity-suspended turns — started at
+        // loop run (after set_idle_runtime's get_mut window), dies with the
+        // loop via its weak reference.
+        self.shared.ensure_capacity_resume_poller();
 
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent_chats));
         // Per-session locks to serialize messages within the same conversation.
