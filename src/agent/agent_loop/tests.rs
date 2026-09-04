@@ -8315,6 +8315,78 @@ async fn plan_guided_failed_plan_step_stops_at_step_budget() {
 }
 
 #[tokio::test]
+async fn plan_checkpoint_rewind_preserves_active_step_at_step_budget() {
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-main",
+        vec![
+            crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc-plan-checkpoint-setup".to_string(),
+                    name: "plan".to_string(),
+                    arguments: HashMap::from([
+                        ("steps".to_string(), json!([{"goal": "inspect and report"}])),
+                        ("step_budget".to_string(), json!(3)),
+                    ]),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: HashMap::new(),
+            },
+            crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc-plan-checkpoint-save".to_string(),
+                    name: "checkpoint".to_string(),
+                    arguments: HashMap::from([("label".to_string(), json!("before-report"))]),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: HashMap::new(),
+            },
+            crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc-plan-checkpoint-work".to_string(),
+                    name: "list_dir".to_string(),
+                    arguments: HashMap::from([("path".to_string(), json!("."))]),
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: HashMap::new(),
+            },
+            WireRecordingProvider::text_response("recovered after checkpoint"),
+        ],
+    ));
+    let reasoning = crate::config::schema::ReasoningConfig {
+        enabled: true,
+        ..Default::default()
+    };
+    let (agent_loop, workspace) = build_local_harness_with_runtime_options(
+        provider.clone() as Arc<dyn LLMProvider>,
+        8,
+        reasoning,
+        ToolDelegationConfig::default(),
+        None,
+    );
+    let session_key = format!("plan-checkpoint-rewind-{}", uuid::Uuid::new_v4());
+
+    let response = agent_loop
+        .process_direct(
+            "Inspect the workspace and report the result.",
+            &session_key,
+            "test",
+            "offline",
+        )
+        .await;
+
+    assert_eq!(
+        provider.call_count(),
+        4,
+        "checkpoint recovery must preserve the active plan step"
+    );
+    assert_eq!(response, "recovered after checkpoint");
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
 async fn model_failure_journal_failure_prevents_retry() {
     let provider = Arc::new(RetryableFailureProvider {
         name: "local-main".to_string(),

@@ -2137,7 +2137,6 @@ impl AgentLoopShared {
                         if *engine.mode() != ReasoningMode::Linear
                             && engine.step_budget_remaining() == 0
                         {
-                            engine.mark_current_failed("iteration budget exhausted");
                             if let Some(cp) = engine.pop_checkpoint() {
                                 drop(engine);
                                 // Same contract as the pending-restore rewind
@@ -2154,6 +2153,7 @@ impl AgentLoopShared {
                                 }
                                 continue;
                             }
+                            engine.mark_current_failed("iteration budget exhausted");
                             drop(engine);
                             // The step's own hard stop is terminal; do not let the
                             // global limit fallback issue another provider call.
