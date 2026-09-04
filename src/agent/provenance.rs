@@ -633,33 +633,38 @@ pub fn verify_turn_claims(response: &str, entries: &[AuditEntry]) -> (Vec<Annota
 /// Redact unverified claims from text, replacing each span with a placeholder.
 ///
 /// Returns the redacted text and the number of redactions made.
-/// Claims are processed from end to start to preserve byte offsets.
+/// Overlapping or adjacent claims are redacted as one span. Merged spans are
+/// processed from end to start to preserve byte offsets.
 pub fn redact_fabrications(text: &str, claims: &[AnnotatedClaim]) -> (String, usize) {
-    // Filter to Claimed status only.
-    let mut to_redact: Vec<&AnnotatedClaim> = claims
+    let mut spans: Vec<(usize, usize)> = claims
         .iter()
         .filter(|c| c.status == ClaimStatus::Claimed)
+        .map(|c| c.span)
+        .filter(|&(start, end)| text.get(start..end).is_some())
         .collect();
 
-    if to_redact.is_empty() {
+    if spans.is_empty() {
         return (text.to_string(), 0);
     }
 
-    // Sort by span start descending (process from end to preserve offsets).
-    to_redact.sort_by(|a, b| b.span.0.cmp(&a.span.0));
-
-    let mut result = text.to_string();
-    let mut count = 0usize;
-
-    for claim in &to_redact {
-        let (start, end) = claim.span;
-        if start <= result.len() && end <= result.len() && start <= end {
-            result.replace_range(start..end, "[unverified claim removed]");
-            count += 1;
+    spans.sort_unstable_by_key(|span| span.0);
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        if let Some(last) = merged.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
         }
+        merged.push((start, end));
     }
 
-    (result, count)
+    let mut result = text.to_string();
+    for &(start, end) in merged.iter().rev() {
+        result.replace_range(start..end, "[unverified claim removed]");
+    }
+
+    (result, merged.len())
 }
 
 /// Result of phantom detection.
@@ -1316,6 +1321,30 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_claims_do_not_leak() {
+        let text = "I wrote `/tmp/fake.txt` with fabricated contents. Safe.";
+        let claims = vec![
+            AnnotatedClaim {
+                span: (0, 49),
+                claim_type: "action_claim".to_string(),
+                status: ClaimStatus::Claimed,
+                text: "I wrote `/tmp/fake.txt` with fabricated contents.".to_string(),
+            },
+            AnnotatedClaim {
+                span: (2, 23),
+                claim_type: "file_ref".to_string(),
+                status: ClaimStatus::Claimed,
+                text: "wrote `/tmp/fake.txt`".to_string(),
+            },
+        ];
+
+        let (result, count) = redact_fabrications(text, &claims);
+
+        assert_eq!(result, "[unverified claim removed] Safe.");
+        assert_eq!(count, 1);
+    }
+
+    #[test]
     fn test_redact_fabrications_preserves_offsets() {
         // Two claims: the second claim's offsets should still be valid after
         // the first is redacted (because we process from end to start).
@@ -1335,6 +1364,10 @@ mod tests {
             },
         ];
         let (result, count) = redact_fabrications(text, &claims);
+        assert_eq!(
+            result,
+            "[unverified claim removed] BBB [unverified claim removed]"
+        );
         assert_eq!(count, 2);
         assert!(result.contains("BBB"));
         assert!(!result.contains("AAA"));
