@@ -70,11 +70,11 @@ use crate::turn_stream::{BackendActivity, CacheResetReason, CacheStatus, Control
 use super::budget::{
     advertised_tool_names, attach_higgs_session_control, clear_prompt_cache_state,
     conversation_token_count, divergent_message_digest, history_window_near,
-    invalidate_prompt_cache_for_rewrite, overflow_trim_threshold,
-    proactive_grounding_preserves_prefix_cache, send_cache_reset_marker, send_compaction_marker,
-    send_retract_reply_marker, should_allow_checkpoint, should_inject_heartbeat_grounding,
-    strip_higgs_session_lease_control, OVERFLOW_RECOVERY_HEADROOM, OVERFLOW_RECOVERY_MARGIN,
-    MAX_OVERFLOW_RECOVERIES,
+    invalidate_prompt_cache_for_rewrite, overflow_recovery_fallback_budget,
+    overflow_trim_threshold, proactive_grounding_preserves_prefix_cache, send_cache_reset_marker,
+    send_compaction_marker, send_retract_reply_marker, should_allow_checkpoint,
+    should_inject_heartbeat_grounding, strip_higgs_session_lease_control, MAX_OVERFLOW_RECOVERIES,
+    OVERFLOW_RECOVERY_HEADROOM,
 };
 use super::compaction::execute_lcm_compaction;
 use super::local_stream::{
@@ -2147,13 +2147,21 @@ impl AgentLoopShared {
     /// Server-oracle overflow recovery: the provider rejected the request with
     /// `context_length_exceeded`, which proves the client's tokenizer estimate
     /// wrong for this content (cl100k under-counts the server's BPE, up to
-    /// ~20% on entity-heavy content). When the error carries the server's
-    /// exact numbers, trim by its overshoot RATIO — a ratio target is
-    /// invariant to the estimator's bias — leaving headroom under the cap.
-    /// Otherwise fall back to the smallest possible prompt cap (window minus
-    /// the base response budget) with a fat margin. One-shot per turn: if the
-    /// retry still overflows, fall through to the normal error path.
-    async fn attempt_overflow_recovery(&self, ctx: &mut TurnContext, error: &anyhow::Error) -> bool {
+    /// ~20% on entity-heavy content). When the error carries the server's exact
+    /// numbers, trim by its overshoot RATIO — a ratio target is invariant to
+    /// the estimator's bias — leaving headroom under the cap. Otherwise fall
+    /// back to a fraction of the prompt cap THIS call sent (window minus
+    /// `max_tokens`, the call's effective response budget — possibly widened
+    /// above the static base by `/long`, a long-form prompt, a local
+    /// Rich-artifact action, or a thinking budget) with a fat margin. One-shot
+    /// per turn: if the retry still overflows, fall through to the normal
+    /// error path.
+    async fn attempt_overflow_recovery(
+        &self,
+        ctx: &mut TurnContext,
+        error: &anyhow::Error,
+        max_tokens: u32,
+    ) -> bool {
         if ctx.flow.retries.overflow_trim_recoveries >= MAX_OVERFLOW_RECOVERIES
             || !crate::errors::is_context_overflow_error(error)
         {
@@ -2172,12 +2180,9 @@ impl AgentLoopShared {
                 ((prompt_cap as f64 * OVERFLOW_RECOVERY_HEADROOM) as usize)
                     .saturating_sub(tool_cost)
             }
-            None => ((ctx
-                .core
-                .token_budget
-                .max_context()
-                .saturating_sub(ctx.core.max_tokens as usize)) as f64
-                * OVERFLOW_RECOVERY_MARGIN) as usize,
+            None => {
+                overflow_recovery_fallback_budget(ctx.core.token_budget.max_context(), max_tokens)
+            }
         };
         let before_messages = ctx.messages.len();
         if !self.apply_emergency_trim(ctx, message_budget).await {
@@ -4070,7 +4075,7 @@ impl AgentLoopShared {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
                         }
-                        if self.attempt_overflow_recovery(ctx, &e).await {
+                        if self.attempt_overflow_recovery(ctx, &e, max_tokens).await {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
                         }
@@ -4105,7 +4110,7 @@ impl AgentLoopShared {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
                         }
-                        if self.attempt_overflow_recovery(ctx, &e).await {
+                        if self.attempt_overflow_recovery(ctx, &e, max_tokens).await {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
                         }
@@ -4317,7 +4322,7 @@ impl AgentLoopShared {
                         counters.mark_inference_finished();
                         return StepResult::Done(IterationOutcome::Continue);
                     }
-                    if self.attempt_overflow_recovery(ctx, &e).await {
+                    if self.attempt_overflow_recovery(ctx, &e, max_tokens).await {
                         counters.mark_inference_finished();
                         return StepResult::Done(IterationOutcome::Continue);
                     }
