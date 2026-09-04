@@ -193,6 +193,10 @@ fn signal_key(key: &str) -> bool {
         || k.contains("code")
         || k.contains("max")
         || k.contains("min")
+        || k.contains("message")
+        || k.contains("msg")
+        || k.contains("reason")
+        || k.contains("detail")
 }
 
 fn scalar_string(v: &Value) -> Option<String> {
@@ -218,9 +222,32 @@ fn is_ok_status(s: &str) -> bool {
     )
 }
 
+/// Extract a human-readable error message from an `error` field that may be
+/// either a plain string (`"error": "checksum mismatch"`) or an object shaped
+/// like `{"error": {"code": 500, "message": "..."}}` (common in batch/REST
+/// responses). For objects, prefers `message`, then `reason`, `detail`, `msg`.
+/// Returns the truncated message without surrounding quotes.
+fn error_message_value(error: &Value) -> Option<String> {
+    match error {
+        Value::String(s) => {
+            if s.trim().is_empty() {
+                None
+            } else {
+                Some(s.chars().take(120).collect())
+            }
+        }
+        Value::Object(map) => ["message", "reason", "detail", "msg"]
+            .iter()
+            .find_map(|k| map.get(*k).and_then(|v| v.as_str()))
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.chars().take(120).collect()),
+        _ => None,
+    }
+}
+
 fn anomaly_line_for_object(path: &str, map: &serde_json::Map<String, Value>) -> Option<String> {
     let status = map.get("status").and_then(|v| v.as_str());
-    let error = map.get("error").and_then(|v| v.as_str());
+    let error = map.get("error").and_then(error_message_value);
     let latency = map.get("latencyMs").and_then(|v| v.as_i64());
 
     let mut notes = Vec::new();
@@ -335,6 +362,21 @@ fn collect_signal_facts(value: &Value, path: &str, out: &mut Vec<String>, limit:
                                 out.push(format!("{}.{} = {}", child, key, val));
                             }
                         }
+                        // Object-valued errors (e.g. `{"error":{"code":500,"message":"..."}}`)
+                        // are dropped by `scalar_string` above; descend one level so the
+                        // nested `code`/`message`/`reason`/`detail` survive in Extracted
+                        // Facts. This replaces the need to recurse the whole anomaly item
+                        // (which would duplicate the scalar sub-facts already emitted).
+                        if let Some(error_map) = map.get("error").and_then(Value::as_object) {
+                            for key in ["code", "message", "reason", "detail", "msg"] {
+                                if out.len() >= limit {
+                                    return;
+                                }
+                                if let Some(val) = error_map.get(key).and_then(scalar_string) {
+                                    out.push(format!("{}.error.{} = {}", child, key, val));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -380,6 +422,9 @@ fn collect_key_lines(content: &str, limit: usize) -> Vec<String> {
             || lower.contains("\"latency")
             || lower.contains("\"path\"")
             || lower.contains("\"invoice")
+            || lower.contains("\"message\"")
+            || lower.contains("\"reason\"")
+            || lower.contains("\"detail\"")
         {
             out.push(line.trim().chars().take(220).collect::<String>());
         }
@@ -604,5 +649,174 @@ mod tests {
         let after = gate.budget.available();
 
         assert!(after < initial, "budget should decrease after admit");
+    }
+
+    // -- JSON briefing: object-valued embedded errors (the bug) --
+
+    #[test]
+    fn test_json_briefing_object_error_extracts_code_and_message() {
+        // Object-valued `error` (common in batch/REST responses) must surface
+        // both its `code` and `message` in Extracted Facts — not just
+        // `status="error"`. Previously every extractor assumed `error` was a
+        // string and silently dropped the object case.
+        let content = r#"{
+  "requestId": "batch-42",
+  "results": [
+    {"id": 1, "status": "ok", "latencyMs": 11},
+    {"id": 13, "status": "error", "error": {"code": 500, "message": "database connection refused"}}
+  ]
+}"#;
+        let briefing = build_json_briefing(content, 360).expect("json briefing expected");
+        assert!(briefing.contains("JSON Summary"));
+        assert!(
+            briefing.contains("error.code = 500"),
+            "nested error.code missing from Extracted Facts: {briefing}"
+        );
+        assert!(
+            briefing.contains("error.message = \"database connection refused\""),
+            "nested error.message missing from Extracted Facts: {briefing}"
+        );
+        // The anomaly line must carry the message too, not just `status="error"`.
+        assert!(
+            briefing.contains("error=\"database connection refused\""),
+            "anomaly line dropped object-valued error message: {briefing}"
+        );
+    }
+
+    #[test]
+    fn test_json_briefing_object_error_reason_and_detail_variants() {
+        // error objects that use `reason`/`detail` (or `msg`) instead of
+        // `message` should also surface, and the anomaly line picks the first
+        // available message-like field.
+        let content = r#"{"results":[{"id":1,"status":"error","error":{"code":503,"reason":"upstream timeout","detail":"db pool exhausted"}}]}"#;
+        let briefing = build_json_briefing(content, 360).expect("json briefing expected");
+        assert!(
+            briefing.contains("error.code = 503"),
+            "code missing: {briefing}"
+        );
+        assert!(
+            briefing.contains("error.reason = \"upstream timeout\""),
+            "reason missing: {briefing}"
+        );
+        assert!(
+            briefing.contains("error.detail = \"db pool exhausted\""),
+            "detail missing: {briefing}"
+        );
+        // anomaly line prefers message -> reason -> detail -> msg; `reason` wins.
+        assert!(
+            briefing.contains("error=\"upstream timeout\""),
+            "anomaly line missing reason: {briefing}"
+        );
+    }
+
+    #[test]
+    fn test_json_briefing_pretty_printed_message_survives_in_key_lines() {
+        // Pretty-printed JSON (the output format of several tools in this
+        // codebase) places `"message": "..."` on its own line. That line must
+        // survive in Key Source Lines — previously `collect_key_lines` did not
+        // match `"message"`, so the message was dropped for pretty-print bodies.
+        let content = r#"{
+  "requestId": "batch-42",
+  "results": [
+    {"id": 1, "status": "ok", "latencyMs": 11},
+    {
+      "id": 13,
+      "status": "error",
+      "error": {
+        "code": 500,
+        "message": "database connection refused"
+      }
+    }
+  ]
+}"#;
+        let briefing = build_json_briefing(content, 360).expect("json briefing expected");
+        assert!(
+            briefing.contains("\"message\": \"database connection refused\""),
+            "message line dropped from Key Source Lines: {briefing}"
+        );
+        assert!(
+            briefing.contains("error.code = 500"),
+            "nested error.code missing: {briefing}"
+        );
+    }
+
+    #[test]
+    fn test_json_briefing_root_object_message_extracted() {
+        // `signal_key` now treats `message` as a signal key, so a message
+        // anywhere in the structure (here at the root, outside any array anomaly)
+        // is recovered by the recursive pass rather than silently dropped. Use
+        // the exact Extracted Facts form so the assertion isolates the
+        // `signal_key` path from any Key Source Lines leak.
+        let content = r#"{"status":"error","message":"root failure","requestId":"r-1"}"#;
+        let briefing = build_json_briefing(content, 240).expect("json briefing expected");
+        assert!(
+            briefing.contains("$.message = \"root failure\""),
+            "root-level message not extracted as a signal fact: {briefing}"
+        );
+        assert!(briefing.contains("r-1"), "requestId regression: {briefing}");
+    }
+
+    #[test]
+    fn test_json_briefing_string_error_still_surfaces() {
+        // Regression guard: the original string-valued `error` shape that the
+        // summarizer was written against must keep working unchanged.
+        let content = r#"{"results":[{"id":7,"status":"error","error":"checksum mismatch"}]}"#;
+        let briefing = build_json_briefing(content, 240).expect("json briefing expected");
+        assert!(
+            briefing.contains("checksum mismatch"),
+            "string-valued error regressed: {briefing}"
+        );
+        assert!(
+            briefing.contains("error=\"checksum mismatch\""),
+            "string-valued anomaly line regressed: {briefing}"
+        );
+    }
+
+    #[test]
+    fn test_e2e_depleted_budget_embedded_error() {
+        // End-to-end via `admit_simple` with a depleted budget, mirroring the
+        // bug report scenario: an inline (<= 4096-byte) JSON body containing an
+        // embedded error object is summarized by `build_json_briefing`. Both the
+        // error code and human-readable message must survive the briefing.
+        let mut ok_items = String::new();
+        for i in 1..=12 {
+            ok_items.push_str(&format!(
+                "    {{\"id\": {}, \"status\": \"ok\", \"latencyMs\": {}}},\n",
+                i,
+                10 + i
+            ));
+        }
+        let content = format!(
+            "{{\n  \"requestId\": \"batch-42\",\n  \"results\": [\n{}    {{\"id\": 13, \"status\": \"error\", \"error\": {{\"code\": 500, \"message\": \"database connection refused\"}}}}\n  ]\n}}",
+            ok_items
+        );
+        assert!(
+            content.len() <= 4096,
+            "body must be inline-sized to reach build_json_briefing: {} bytes",
+            content.len()
+        );
+
+        // 8000-token context, 20% reserve -> ceiling 6400. Deplete so the
+        // remaining budget is far below the body's token estimate.
+        let mut gate = ContentGate::new(8_000, 0.20);
+        gate.budget.consume(6_370);
+        assert!(
+            TokenBudget::estimate_str_tokens(&content) > gate.budget.available(),
+            "body must exceed remaining budget to trigger the briefing path"
+        );
+
+        let text = gate.admit_simple(&content).into_text();
+        assert!(
+            text.contains("JSON Summary"),
+            "expected JSON briefing path to run: {text}"
+        );
+        assert!(
+            text.contains("database connection refused"),
+            "error message lost in briefing: {text}"
+        );
+        assert!(
+            text.contains("error.code = 500"),
+            "error code lost in briefing: {text}"
+        );
     }
 }
