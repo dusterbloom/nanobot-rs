@@ -9670,6 +9670,248 @@ mod runtime_mode_parity_tests {
         assert_eq!(core.compactor.model(), "local-model");
     }
 
+    // -- Cross-vendor memory-provider resolution hazard -------------------
+    //
+    // `resolve_memory_provider` derives the reflector's model id from the
+    // *main* agent provider's identity. When `memory.provider` points at a
+    // different-vendor endpoint and `memory.model` is empty, that id is force-fed
+    // to the foreign memory provider, which a strict-validation server rejects.
+    // The fix is a non-blocking boot-time `warn!` naming the model id and the
+    // endpoint; the behaviour is otherwise unchanged, so the tests below pin
+    // both the (preserved) mis-resolution and the new warning.
+
+    /// Build a minimal `SwappableCore` with an explicit memory config for the
+    /// cross-vendor hazard tests. Mirrors `build_test_core` but lets the caller
+    /// supply the memory config, runtime mode, and main model id so the
+    /// warning path in `resolve_memory_provider` can be exercised.
+    fn build_core_with_memory_config(
+        is_local: bool,
+        memory_config: MemoryConfig,
+        main_model: &str,
+    ) -> SwappableCore {
+        let workspace = tempfile::tempdir().unwrap().keep();
+        let sessions_db = workspace.join("sessions.db");
+        let main = MockLLM::named("main-provider");
+        build_swappable_core(SwappableCoreConfig {
+            provider: main,
+            workspace,
+            model: main_model.to_string(),
+            max_iterations: 10,
+            max_continuations: 2,
+            max_tokens: 4096,
+            temperature: 0.7,
+            max_context_tokens: 16_384,
+            brave_api_key: None,
+            search_provider: "searxng".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
+            crw_url: String::new(),
+            search_max_results: 5,
+            exec_timeout: 30,
+            restrict_to_workspace: false,
+            memory_config,
+            is_local,
+            lane: Lane::default(),
+            tool_delegation: ToolDelegationConfig::default(),
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+            model_capabilities_overrides: std::collections::HashMap::new(),
+            reasoning_config: crate::config::schema::ReasoningConfig::default(),
+            tool_heartbeat_secs: 2,
+            health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
+            adaptive_tokens: AdaptiveTokenConfig::default(),
+            sessions_db_path: Some(sessions_db),
+        })
+    }
+
+    /// Install a thread-local `tracing` subscriber that buffers WARN+ output
+    /// into a shared byte vector. Returns the buffer and the dispatch guard;
+    /// the guard must be held for as long as the captured code runs. Mirrors
+    /// the `CompactionLogWriter` pattern from
+    /// `panicked_owned_job_reaps_with_session_phase_context`.
+    fn install_warn_capture() -> (
+        Arc<std::sync::Mutex<Vec<u8>>>,
+        tracing::subscriber::DefaultGuard,
+    ) {
+        let output: Arc<std::sync::Mutex<Vec<u8>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || CompactionLogWriter(writer.clone()))
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        (output, guard)
+    }
+
+    fn foreign_memory_provider(base: &str, key: &str) -> MemoryConfig {
+        MemoryConfig {
+            provider: Some(ProviderConfig {
+                api_key: key.to_string(),
+                api_base: Some(base.to_string()),
+            }),
+            ..MemoryConfig::default()
+        }
+    }
+
+    /// Reproduces the cross-vendor mis-resolution in the Cloud branch of
+    /// `resolve_memory_provider`. An Anthropic-native main (`get_api_base()`
+    /// is `None` for `MockLLM` → wins the "haiku" branch) with a foreign
+    /// `memory.provider` and empty `memory.model` bakes the main-derived
+    /// "haiku" into the foreign provider as the Claude id
+    /// `claude-haiku-4-5-20251001`. The reflector then passes `Some("haiku")`
+    /// to every chat call, which `build_chat_request` normalises to that
+    /// Claude id and POSTs to the foreign endpoint — a model a
+    /// strict-validation foreign server does not serve. This pins the
+    /// preserved (unchanged) behaviour so the warning fix below can assert
+    /// the hazard it surfaces is real.
+    #[test]
+    fn repro_foreign_memory_provider_bakes_in_main_vendor_model_id_cloud() {
+        let memory_config = foreign_memory_provider("https://foreign.example/v1", "foreign-key");
+        let core = build_core_with_memory_config(false, memory_config, "cloud-model");
+
+        // The foreign memory provider is wired through unchanged.
+        assert_eq!(
+            core.memory_provider.get_api_base(),
+            Some("https://foreign.example/v1")
+        );
+        // The main-derived "haiku" is normalised to a Claude id and baked into
+        // the foreign provider's default model — the mis-resolution.
+        assert_eq!(
+            core.memory_provider.get_default_model(),
+            "claude-haiku-4-5-20251001"
+        );
+        // The reflector's own model id is the raw main-derived "haiku", which
+        // it passes verbatim as `Some(&self.model)` on every reflection tick.
+        assert_eq!(core.memory_model, "haiku");
+        // LCM stays bound to the foreground model.
+        assert_eq!(core.compactor.model(), "cloud-model");
+    }
+
+    /// Same defect in the Local branch: a second local server configured as
+    /// `memory.provider` with an empty `memory.model` gets the *first*
+    /// server's model id, not its own. The memory provider never runs
+    /// `/v1/models` adoption, so its default stays whatever the main model was.
+    #[test]
+    fn repro_foreign_memory_provider_bakes_in_main_model_id_local() {
+        let memory_config = foreign_memory_provider("http://localhost:8001/v1", "local");
+        let core = build_core_with_memory_config(true, memory_config, "local-model");
+
+        assert_eq!(
+            core.memory_provider.get_api_base(),
+            Some("http://localhost:8001/v1"),
+            "the second local server is wired as the memory provider"
+        );
+        assert_eq!(
+            core.memory_provider.get_default_model(),
+            "local-model",
+            "the second local server is force-fed the first server's model id"
+        );
+        assert_eq!(core.memory_model, "local-model");
+        assert_eq!(core.compactor.model(), "local-model");
+    }
+
+    /// The fix: when `memory.provider` is set and `memory.model` is empty,
+    /// `resolve_memory_provider` emits a single boot-time `warn!` naming both
+    /// the derived model id and the foreign endpoint, so the hazard surfaces
+    /// at startup instead of only as repeating per-tick warnings after the
+    /// 5000-token reflection threshold is crossed. Cloud branch.
+    #[test]
+    fn resolve_memory_provider_warns_on_foreign_provider_with_empty_model_cloud() {
+        let (output, _guard) = install_warn_capture();
+        let memory_config = foreign_memory_provider("https://foreign.example/v1", "foreign-key");
+        let core = build_core_with_memory_config(false, memory_config, "cloud-model");
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("haiku"),
+            "warning must name the derived model id: {logs}"
+        );
+        assert!(
+            logs.contains("https://foreign.example/v1"),
+            "warning must name the configured endpoint: {logs}"
+        );
+        assert!(
+            logs.contains("memory.model"),
+            "warning must advise setting memory.model: {logs}"
+        );
+        // Behaviour is unchanged — the mis-resolution is surfaced, not blocked.
+        assert_eq!(core.memory_model, "haiku");
+    }
+
+    /// The boot-time warning fires in the Local branch too: a second local
+    /// server as `memory.provider` with an empty `memory.model` bakes in the
+    /// first server's model id. The hazard is the same, so the warning must
+    /// surface it at boot here as well.
+    #[test]
+    fn resolve_memory_provider_warns_on_foreign_provider_with_empty_model_local() {
+        let (output, _guard) = install_warn_capture();
+        let memory_config = foreign_memory_provider("http://localhost:8001/v1", "local");
+        let core = build_core_with_memory_config(true, memory_config, "local-model");
+
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("local-model"),
+            "warning must name the derived model id: {logs}"
+        );
+        assert!(
+            logs.contains("http://localhost:8001/v1"),
+            "warning must name the configured endpoint: {logs}"
+        );
+        assert_eq!(core.memory_model, "local-model");
+    }
+
+    /// The warning is suppressed when `memory.model` is set explicitly, even
+    /// with a foreign `memory.provider`: the user has taken responsibility for
+    /// the model id, so there is no hazard to surface. Mirrors the working
+    /// configuration in `configured_memory_provider_is_reflection_only`
+    /// (cli/mod.rs): a foreign provider paired with an explicit model.
+    #[test]
+    fn resolve_memory_provider_silent_when_memory_model_is_explicit() {
+        let (output, _guard) = install_warn_capture();
+        let memory_config = MemoryConfig {
+            model: "reflection-model".to_string(),
+            provider: Some(ProviderConfig {
+                api_key: "reflection-key".to_string(),
+                api_base: Some("https://reflection.example/v1".to_string()),
+            }),
+            ..MemoryConfig::default()
+        };
+        let core = build_core_with_memory_config(false, memory_config, "cloud-model");
+
+        assert_eq!(core.memory_model, "reflection-model");
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs.contains("derived from the main agent provider"),
+            "no hazard warning when memory.model is explicit: {logs}"
+        );
+    }
+
+    /// The warning is suppressed when there is no separate `memory.provider`:
+    /// the main provider's own identity is the correct source of the model id,
+    /// so no cross-vendor hazard exists. This guards the default config used
+    /// by the majority of sessions.
+    #[test]
+    fn resolve_memory_provider_silent_when_no_memory_provider() {
+        let (output, _guard) = install_warn_capture();
+        // Default memory config: no provider, empty model — the main provider
+        // is reused, so the Cloud branch derives "haiku" with no foreign endpoint.
+        let core = build_core_with_memory_config(false, MemoryConfig::default(), "cloud-model");
+        assert_eq!(core.memory_model, "haiku");
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs.contains("derived from the main agent provider"),
+            "no hazard warning when memory.provider is unset: {logs}"
+        );
+    }
+
     /// Caps carried inside `Local { caps }` match the capabilities resolved
     /// for the model. Ensures `mode_accessor_round_trip` (VALIDATION.md):
     /// construction inputs are consistent with the mode's payload.
