@@ -395,9 +395,9 @@ pub(super) fn make_local_providers(
 
 /// Build a `SwappableCoreConfig` from shared config + per-call overrides.
 ///
-/// Centralises the 25-field struct construction that was previously copy-pasted
+/// Centralises the 26-field struct construction that was previously copy-pasted
 /// across `build_core_handle` and `rebuild_core`.
-fn core_config_from(
+pub(crate) fn core_config_from(
     config: &Config,
     provider: Arc<dyn LLMProvider>,
     model: String,
@@ -456,6 +456,12 @@ fn core_config_from(
         code_execution: config.tools.code_execution.clone(),
         python_kernel: config.tools.python_kernel.clone(),
         cua: config.tools.cua.clone(),
+        instructions_path: config
+            .agents
+            .defaults
+            .instructions_path
+            .as_deref()
+            .map(crate::utils::helpers::expand_tilde),
     }
 }
 

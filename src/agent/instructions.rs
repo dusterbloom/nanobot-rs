@@ -12,7 +12,10 @@
 //! Resolution order: `base` messages → matching `model_profiles` → matching
 //! `task_profiles`. All matching sections are concatenated in that order.
 
+use std::path::Path;
+
 use serde::Deserialize;
+use tracing::warn;
 
 /// A single instruction message to inject into the prompt.
 #[derive(Debug, Clone, Deserialize)]
@@ -79,6 +82,35 @@ impl InstructionProfiles {
         }
 
         result
+    }
+}
+
+/// Load instruction profiles from a YAML file.
+///
+/// Returns `Some(profiles)` on success. Returns `None` and emits a `warn!`
+/// when the file is unreadable or unparseable, so a misconfigured
+/// `instructions_path` never bricks the agent — it falls back to no injection
+/// rather than panicking or silently swallowing the error. Callers pass
+/// `None` (unset path) up-front and never call this loader for the unset case.
+pub fn load_from_path(path: &Path) -> Option<InstructionProfiles> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => match serde_yaml::from_str::<InstructionProfiles>(&raw) {
+            Ok(profiles) => Some(profiles),
+            Err(e) => {
+                warn!(
+                    "instructions_path {:?} failed to parse: {} — ignoring instruction profiles",
+                    path, e
+                );
+                None
+            }
+        },
+        Err(e) => {
+            warn!(
+                "instructions_path {:?} could not be read: {} — ignoring instruction profiles",
+                path, e
+            );
+            None
+        }
     }
 }
 
@@ -191,6 +223,40 @@ task_profiles:
         assert!(profiles.base.is_empty());
         assert!(profiles.model_profiles.is_empty());
         assert!(profiles.task_profiles.is_empty());
+    }
+
+    // ----- load_from_path -----
+
+    #[test]
+    fn test_load_from_path_reads_valid_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("instructions.yaml");
+        std::fs::write(
+            &path,
+            "base:\n  - role: developer\n    content: \"Be concise.\"\n",
+        )
+        .unwrap();
+        let profiles = load_from_path(&path).expect("valid yaml should load");
+        assert_eq!(profiles.base.len(), 1);
+        assert_eq!(profiles.base[0].role, "developer");
+        assert_eq!(profiles.base[0].content, "Be concise.");
+    }
+
+    #[test]
+    fn test_load_from_path_missing_file_returns_none() {
+        // A path that does not point at a file must not panic; it returns None
+        // and warns (verified via behavior, not the log line).
+        let path = std::path::Path::new("/nonexistent/nanobot-test-instructions-missing.yaml");
+        assert!(load_from_path(path).is_none());
+    }
+
+    #[test]
+    fn test_load_from_path_invalid_yaml_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("bad.yaml");
+        // `base` must be a sequence; a scalar is a parse error.
+        std::fs::write(&path, "base: not-a-list\n").unwrap();
+        assert!(load_from_path(&path).is_none());
     }
 
     // ----- resolve -----
