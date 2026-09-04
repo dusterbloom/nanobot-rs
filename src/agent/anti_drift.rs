@@ -363,12 +363,6 @@ fn collapse_repetitive_attempts(messages: &mut Vec<Value>, min_count: usize) -> 
                     "[{} previous similar attempts removed]",
                     run_len - 1
                 ));
-                // Remove tool_calls to avoid orphans
-                if messages[msg_idx].get("tool_calls").is_some() {
-                    messages[msg_idx]
-                        .as_object_mut()
-                        .map(|o| o.remove("tool_calls"));
-                }
                 collapsed += 1;
             }
             k = run_end;
@@ -649,6 +643,49 @@ mod tests {
             messages[3]["content"].as_str().unwrap(),
             "Let me try reading the file now"
         );
+    }
+
+    #[test]
+    fn anti_drift_collapse_preserves_tool_pairing() {
+        let assistant_attempt = |id: &str| {
+            json!({
+                "role": "assistant",
+                "content": "Let me read the file.",
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"}
+                }]
+            })
+        };
+        let mut messages = vec![
+            assistant_attempt("t1"),
+            json!({"role": "tool", "content": "Error", "tool_call_id": "t1"}),
+            assistant_attempt("t2"),
+            json!({"role": "tool", "content": "Error", "tool_call_id": "t2"}),
+            assistant_attempt("t3"),
+            json!({"role": "tool", "content": "ok", "tool_call_id": "t3"}),
+        ];
+
+        assert_eq!(collapse_repetitive_attempts(&mut messages, 3), 2);
+
+        let announced_ids: HashSet<&str> = messages
+            .iter()
+            .filter(|message| msg_role(message) == "assistant")
+            .filter_map(|message| message.get("tool_calls")?.as_array())
+            .flatten()
+            .filter_map(|call| call.get("id")?.as_str())
+            .collect();
+        for result_id in messages
+            .iter()
+            .filter(|message| msg_role(message) == "tool")
+            .filter_map(|message| message.get("tool_call_id")?.as_str())
+        {
+            assert!(
+                announced_ids.contains(result_id),
+                "tool result {result_id} must retain its assistant tool_calls announcement"
+            );
+        }
     }
 
     #[test]
