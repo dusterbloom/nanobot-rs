@@ -209,6 +209,29 @@ fn build_step_prompt(prompt: &str, context_so_far: &str) -> String {
     }
 }
 
+/// Decide whether the pipeline renders with [`LocalProtocol`] or
+/// [`CloudProtocol`](crate::agent::protocol::CloudProtocol).
+///
+/// The decision is routed off the backend the pipeline is *actually* talking to
+/// (the provider's api_base), not the model string — mirroring the main agent
+/// loop (`RuntimeMode::is_local()`) and the subagent path
+/// (`is_local_api_base` on the resolved endpoint). A bare served model id (no
+/// `local:` tag) reaches the pipeline for a shared/remote LM Studio server
+/// (`localApiBase` set) and for namespaced HF-style ids (`"qwen/qwen3-vl-8b"`).
+/// A `local:`-prefix check would mis-class those as cloud and hand a local
+/// server `role:tool`-bearing `CloudProtocol` output, violating the strict
+/// alternation invariants `LocalProtocol` maintains. Cloud providers report
+/// `get_api_base() == None`, so explicit cloud delegation stays on
+/// `CloudProtocol`. MLX models are in-process and speak cloud protocol even
+/// when reachable locally, so the `mlx:` prefix keeps the main-loop exception.
+fn pipeline_targets_local(provider: &dyn LLMProvider, model: &str) -> bool {
+    provider
+        .get_api_base()
+        .map(crate::providers::openai_compat::is_local_api_base)
+        .unwrap_or(false)
+        && !model.starts_with("mlx:")
+}
+
 /// Execute a tool-equipped pipeline step as a mini agent loop.
 ///
 /// Builds a ToolRegistry with the requested tools, then runs an
@@ -253,8 +276,9 @@ async fn execute_step_with_tools(
 
     let mut final_content = String::new();
 
-    // Detect local models for strict alternation repair.
-    let is_local = crate::agent::policy::is_local_model(model);
+    // Select the wire protocol off the backend the pipeline is actually talking
+    // to (provider api_base), not the model string — see `pipeline_targets_local`.
+    let is_local = pipeline_targets_local(provider, model);
 
     for iteration in 0..max_iter {
         debug!(
@@ -640,5 +664,208 @@ mod tests {
         assert!(prompt.contains("Previous steps"));
         assert!(prompt.contains("Step 0 output"));
         assert!(prompt.contains("What is 2+2?"));
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // Wire-protocol selection: `pipeline_targets_local`
+    // ───────────────────────────────────────────────────────────
+    //
+    // The pipeline decides LocalProtocol vs CloudProtocol off the backend it is
+    // actually talking to (the provider's api_base), mirroring the subagent path
+    // and the main loop's `RuntimeMode::is_local()`. These tests pin the
+    // selection so a bare served model id (no `local:` tag) on a local server is
+    // no longer mis-classified as cloud.
+
+    /// Test provider exposing a configurable api_base, to exercise
+    /// `pipeline_targets_local` across local, LAN and cloud backends.
+    struct EndpointProvider {
+        api_base: Option<String>,
+        default_model: String,
+    }
+
+    impl EndpointProvider {
+        fn new(api_base: Option<&str>, default_model: &str) -> Self {
+            Self {
+                api_base: api_base.map(str::to_string),
+                default_model: default_model.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for EndpointProvider {
+        async fn chat(
+            &self,
+            _messages: &[serde_json::Value],
+            _tools: Option<&[serde_json::Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<LLMResponse> {
+            Ok(LLMResponse {
+                content: Some("ok".to_string()),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: HashMap::new(),
+            })
+        }
+        fn get_default_model(&self) -> &str {
+            &self.default_model
+        }
+        fn get_api_base(&self) -> Option<&str> {
+            self.api_base.as_deref()
+        }
+    }
+
+    #[test]
+    fn test_pipeline_targets_local_bare_id_on_shared_server() {
+        // Scenario A: a shared/remote LM Studio server (`localApiBase` set)
+        // returns a bare served id (no `local:` tag) from get_default_model.
+        // The prefix-only predicate returned false here; the fix must not.
+        let provider =
+            EndpointProvider::new(Some("http://192.168.1.22:1234/v1"), "qwen3.6-35b-a3b-4bit");
+        assert!(
+            pipeline_targets_local(&provider, "qwen3.6-35b-a3b-4bit"),
+            "bare id on a LAN local server must select LocalProtocol"
+        );
+        // The same served model tagged (fully-default config path) still works.
+        assert!(
+            pipeline_targets_local(&provider, "local:qwen3.6-35b-a3b-4bit"),
+            "tagged id on a local server must still select LocalProtocol"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_targets_local_namespaced_bare_id() {
+        // Scenario B: a namespaced HF-style id (`"qwen/qwen3-vl-8b"`) survives
+        // through the `model.contains('/')` branch as a bare id. The fix must
+        // recognise it as local when served by a local backend.
+        let provider = EndpointProvider::new(Some("http://localhost:1234/v1"), "qwen/qwen3-vl-8b");
+        assert!(
+            pipeline_targets_local(&provider, "qwen/qwen3-vl-8b"),
+            "namespaced bare id on a local server must select LocalProtocol"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_targets_local_localhost_and_loopback() {
+        let localhost = EndpointProvider::new(Some("http://localhost:8080/v1"), "m");
+        let loopback = EndpointProvider::new(Some("http://127.0.0.1:8080/v1"), "m");
+        let anyaddr = EndpointProvider::new(Some("http://0.0.0.0:8080/v1"), "m");
+        assert!(pipeline_targets_local(&localhost, "any-bare-id"));
+        assert!(pipeline_targets_local(&loopback, "any-bare-id"));
+        assert!(pipeline_targets_local(&anyaddr, "any-bare-id"));
+    }
+
+    #[test]
+    fn test_pipeline_targets_local_cloud_provider_returns_false() {
+        // Cloud providers report get_api_base() == None (trait default). Even a
+        // bare id that *looks* local-style must NOT flip a cloud backend to
+        // LocalProtocol — that would regress explicit cloud delegation.
+        let provider = EndpointProvider::new(None, "qwen3.6-35b-a3b-4bit");
+        assert!(
+            !pipeline_targets_local(&provider, "qwen3.6-35b-a3b-4bit"),
+            "cloud provider must stay on CloudProtocol even for a local-style bare id"
+        );
+        // A `local:` tag alone does not make a cloud backend local either.
+        assert!(
+            !pipeline_targets_local(&provider, "local:qwen3.6-35b-a3b-4bit"),
+            "tag must not override the cloud api_base decision"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_targets_local_explicit_cloud_model_is_cloud() {
+        // An explicit cloud delegation model on a cloud backend stays cloud.
+        let provider = EndpointProvider::new(None, "anthropic/claude-opus-4-5");
+        assert!(
+            !pipeline_targets_local(&provider, "anthropic/claude-opus-4-5"),
+            "cloud namespaced model on a cloud provider must stay cloud"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_targets_local_public_api_base_is_not_local() {
+        // A public (non-loopback, non-private) api_base is treated as cloud.
+        let provider = EndpointProvider::new(Some("https://api.openai.com/v1"), "gpt-4o");
+        assert!(
+            !pipeline_targets_local(&provider, "gpt-4o"),
+            "public api_base must not be classified local"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_targets_local_mlx_exception() {
+        // MLX models are in-process and speak cloud protocol even when the
+        // provider api_base is local — mirrors the main-loop `mlx:` exception.
+        let provider =
+            EndpointProvider::new(Some("http://localhost:8080/v1"), "mlx:Qwen3-8B-MLX-4bit");
+        assert!(
+            !pipeline_targets_local(&provider, "mlx:Qwen3-8B-MLX-4bit"),
+            "mlx: model must use CloudProtocol despite a local api_base"
+        );
+        // The exception is specific to the `mlx:` prefix; a bare id still wins.
+        assert!(
+            pipeline_targets_local(&provider, "qwen3-8b"),
+            "non-mlx bare id on a local server must still select LocalProtocol"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_renders_local_textual_model_without_role_tool() {
+        // End-to-end wire format: a bare id on a local server selects
+        // LocalProtocol::auto_for_model. For a textual-replay model (no native
+        // tool_calls) LocalProtocol folds tool results into role:user and never
+        // emits role:tool — the invariant the main loop maintains and the bug
+        // broke for the pipeline. CloudProtocol on the same conversation emits
+        // role:tool verbatim.
+        let provider = EndpointProvider::new(Some("http://127.0.0.1:1234/v1"), "vibethinker-3b");
+        let model = "vibethinker-3b";
+        let is_local = pipeline_targets_local(&provider, model);
+        assert!(
+            is_local,
+            "bare id on a local server must select LocalProtocol"
+        );
+
+        let messages = vec![
+            json!({"role":"system","content":"You are a pipeline step executor."}),
+            json!({"role":"user","content":"Run step 1."}),
+            json!({"role":"assistant","content":null,"tool_calls":[
+                {"id":"tc_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}
+            ]}),
+            json!({"role":"tool","tool_call_id":"tc_1","name":"read_file","content":"hello"}),
+        ];
+
+        let local_protocol = crate::agent::protocol::LocalProtocol::auto_for_model(model);
+        let wire = crate::agent::protocol::render_to_wire(&local_protocol, &messages);
+        assert!(
+            !wire
+                .iter()
+                .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")),
+            "LocalProtocol (textual) must not emit role:tool to a local server; got {wire:?}"
+        );
+        let last_role = wire
+            .last()
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str());
+        assert_eq!(
+            last_role,
+            Some("user"),
+            "local textual render must end with role:user; got {wire:?}"
+        );
+
+        // The same conversation on the buggy CloudProtocol path emits role:tool.
+        let cloud_wire = crate::agent::protocol::render_to_wire(
+            &crate::agent::protocol::CloudProtocol,
+            &messages,
+        );
+        assert!(
+            cloud_wire
+                .iter()
+                .any(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool")),
+            "CloudProtocol must emit role:tool (the divergent output the fix avoids); got {cloud_wire:?}"
+        );
     }
 }
