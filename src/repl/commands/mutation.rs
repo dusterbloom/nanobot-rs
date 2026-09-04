@@ -226,9 +226,12 @@ impl ReplContext {
             println!("\n  Nothing to learn yet — no completed working sessions accumulated.\n  Sessions become learnable after they idle out (see memory.sessionCompleteAfterSecs).\n");
             return;
         }
-        // Reflection is one long LLM call over the whole completed corpus;
-        // on a local model this runs at decode speed — tell the user up
-        // front so the silence is not read as a hang.
+        // ANNOUNCEMENT (intent, not result): this count is an unlocked snapshot
+        // of what is currently pending. It is printed only to set expectations
+        // ("about to attempt distilling N"); the RESULT line below never reuses
+        // it, because a concurrent reflector can consume these rows before this
+        // call acquires `memory_transaction_lock` — reusing N as the result
+        // count would credit this invocation for distillation it did not perform.
         println!(
             "\n  Distilling {session_count} completed session{} (~{wm_tokens} tok) — \
              this can take a few minutes on a local model...",
@@ -243,15 +246,14 @@ impl ReplContext {
             core.sessions.clone(),
             core.memory_file_max_words,
         );
-        let result = reflector.reflect().await;
+        // `reflect_with_counts` reports what THIS call distilled, counted under
+        // the lock that performed the distillation — never a stale pre-flight
+        // snapshot. On a no-op (a concurrent pass consumed the rows first) it
+        // returns `Ok(ReflectionReport { 0, 0 })` rather than a signalled error.
+        let result = reflector.reflect_with_counts().await;
         let elapsed = started.elapsed().as_secs();
         match result {
-            Ok(()) => println!(
-                "  Learned {} session{} (~{wm_tokens} tok) in {elapsed}s → \
-                 workspace/memory/MEMORY.md updated.\n",
-                session_count,
-                if session_count == 1 { "" } else { "s" },
-            ),
+            Ok(report) => print!("{}", format_learn_result(&report, elapsed)),
             Err(e) => println!(
                 "  Reflection failed after {elapsed}s: {e}\n  The completed sessions were NOT \
                  consumed — try again (e.g. /learn) once the provider is reachable.\n"
@@ -568,6 +570,37 @@ fn format_lcm_stats(stats: &LcmStats) -> String {
     out
 }
 
+/// Render the `/learn` RESULT line for sessions this invocation actually
+/// distilled.
+///
+/// Counts come from [`crate::agent::reflector::Reflector::reflect_with_counts`],
+/// taken under the same `memory_transaction_lock` that performed the
+/// distillation, so this can never echo a stale pre-flight count for work a
+/// concurrent reflector performed while this call was blocked on the lock.
+/// A no-op (`sessions_distilled == 0`) prints an explicit "nothing learned —
+/// handled by another pass" line instead of the stale pre-flight count.
+///
+/// Pure — unit-tested below.
+fn format_learn_result(
+    report: &crate::agent::reflector::ReflectionReport,
+    elapsed_secs: u64,
+) -> String {
+    let sessions_distilled = report.sessions_distilled;
+    let tokens_distilled = report.tokens_distilled;
+    if sessions_distilled == 0 {
+        format!(
+            "  Nothing learned in {elapsed_secs}s — the completed sessions were already \
+             handled by another reflection pass. workspace/memory/MEMORY.md is up to date.\n"
+        )
+    } else {
+        format!(
+            "  Learned {sessions_distilled} session{} (~{tokens_distilled} tok) in {elapsed_secs}s \
+             → workspace/memory/MEMORY.md updated.\n",
+            if sessions_distilled == 1 { "" } else { "s" },
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,5 +632,69 @@ mod tests {
         assert!(s.contains("12000"));
         assert!(s.contains("33000"), "should show tokens saved: {}", s);
         assert!(s.contains("42s"));
+    }
+
+    // --- format_learn_result: /learn RESULT line integrity ---
+
+    fn report(sessions: usize, tokens: usize) -> crate::agent::reflector::ReflectionReport {
+        crate::agent::reflector::ReflectionReport {
+            sessions_distilled: sessions,
+            tokens_distilled: tokens,
+        }
+    }
+
+    #[test]
+    fn learn_result_reports_what_this_invocation_distilled() {
+        let s = format_learn_result(&report(3, 450), 12);
+        assert!(s.contains("Learned 3 sessions"), "plural form + count: {s}");
+        assert!(s.contains("~450 tok"), "real token total: {s}");
+        assert!(s.contains("12s"), "elapsed: {s}");
+        assert!(
+            s.contains("workspace/memory/MEMORY.md updated"),
+            "file path on success: {s}"
+        );
+    }
+
+    #[test]
+    fn learn_result_singular_for_one_session() {
+        let s = format_learn_result(&report(1, 30), 4);
+        assert!(s.contains("Learned 1 session "), "singular 'session': {s}");
+        assert!(!s.contains("Learned 1 sessions"), "no plural: {s}");
+        assert!(s.contains("~30 tok"));
+        assert!(s.contains("4s"));
+    }
+
+    /// No-op (a concurrent pass consumed the rows first) must print an explicit
+    /// "nothing learned" line — never a stale pre-flight count. `format_learn_result`
+    /// takes only the locked report, so it is *structurally* incapable of
+    /// echoing a pre-flight snapshot; this test pins that invariant.
+    #[test]
+    fn learn_result_no_op_does_not_print_a_stale_count() {
+        let s = format_learn_result(&report(0, 0), 9);
+        assert!(
+            s.contains("Nothing learned"),
+            "no-op must be explicit, not a count: {s}"
+        );
+        assert!(
+            !s.contains("Learned 1"),
+            "no-op must not look like a 1-session distillation: {s}"
+        );
+        assert!(
+            !s.contains("Learned 0"),
+            "no-op must not print 'Learned 0' either: {s}"
+        );
+        assert!(
+            !s.contains("~450 tok") && !s.contains("~30 tok") && !s.contains("~"),
+            "no-op must not carry any stale token figure: {s}"
+        );
+        assert!(
+            s.contains("another reflection pass"),
+            "must explain the no-op cause: {s}"
+        );
+        assert!(
+            s.contains("MEMORY.md is up to date"),
+            "must reassure the file state: {s}"
+        );
+        assert!(s.contains("9s"), "real wait time is still reported: {s}");
     }
 }
