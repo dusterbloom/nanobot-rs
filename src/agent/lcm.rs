@@ -27,10 +27,11 @@
 
 #![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use anyhow::Result;
 use async_trait::async_trait;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -1958,10 +1959,16 @@ fn parse_message_ids(v: &Value) -> Vec<usize> {
 
 /// Parse integer IDs and `a-b` ranges out of a free-form string.
 fn parse_id_runs(s: &str) -> Vec<usize> {
+    static SPACED_RANGE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"([0-9]+)[\t\n\x0B\x0C\r ]*-[\t\n\x0B\x0C\r ]*([0-9]+)")
+            .expect("spaced message range regex is valid")
+    });
+
     let mut ids = Vec::new();
+    let normalized = SPACED_RANGE.replace_all(s, "$1-$2");
     // Tokens are runs of digits and '-'; everything else (commas, brackets,
     // spaces, prose) is a separator.
-    for tok in s.split(|c: char| !c.is_ascii_digit() && c != '-') {
+    for tok in normalized.split(|c: char| !c.is_ascii_digit() && c != '-') {
         let tok = tok.trim_matches('-');
         if tok.is_empty() {
             continue;
@@ -5358,6 +5365,10 @@ mod tests {
         assert_eq!(parse_message_ids(&json!("[5,6,7,8]")), vec![5, 6, 7, 8]);
         // Inclusive range.
         assert_eq!(parse_message_ids(&json!("5-8")), vec![5, 6, 7, 8]);
+        // ASCII whitespace around a range dash is tolerated.
+        assert_eq!(parse_message_ids(&json!("5 - 8")), vec![5, 6, 7, 8]);
+        // Plain whitespace remains a separator between individual IDs.
+        assert_eq!(parse_message_ids(&json!("5 6 7 8")), vec![5, 6, 7, 8]);
         // Mixed singles and a range.
         assert_eq!(parse_message_ids(&json!("1, 5-7")), vec![1, 5, 6, 7]);
         // Numbers embedded in prose.
@@ -5370,6 +5381,7 @@ mod tests {
         assert!(parse_message_ids(&json!("none")).is_empty());
         // Runaway range is rejected, not expanded to millions.
         assert!(parse_message_ids(&json!("0-999999")).is_empty());
+        assert!(parse_message_ids(&json!("0 - 999999")).is_empty());
     }
 
     // -----------------------------------------------------------------------
