@@ -127,7 +127,7 @@ pub(crate) fn resolve_spawn_settings(
     let model = explicit_model
         .map(resolve)
         .or_else(|| profile.and_then(|p| p.model.as_deref()).map(resolve))
-        .or_else(|| default_subagent_model.map(str::to_string))
+        .or_else(|| default_subagent_model.map(resolve))
         .unwrap_or_else(|| {
             warn!(
                 "EXPENSIVE: Using main model '{}' as subagent — set defaultSubagentModel in config",
@@ -145,6 +145,25 @@ pub(crate) fn resolve_spawn_settings(
             .and_then(|p| p.max_iterations)
             .unwrap_or(default_max_iterations),
     }
+}
+
+/// Pure resolution of the model for `run_loop` from override, default, and parent.
+///
+/// Mirrors `resolve_spawn_settings`'s env-resolution rule so tier aliases
+/// (`haiku`/`sonnet`/`opus`/`local`) resolve to the active local model in local
+/// mode and to cloud model ids in cloud mode — instead of being shipped verbatim
+/// to the LLM server. Provider-prefixed names (e.g. `groq/llama-3.3-70b`) and
+/// full model ids pass through unchanged.
+pub(crate) fn resolve_loop_model(
+    model_override: Option<&str>,
+    default_subagent_model: Option<&str>,
+    parent_model: &str,
+    is_local: bool,
+) -> String {
+    let raw = model_override
+        .or(default_subagent_model)
+        .unwrap_or(parent_model);
+    agent_profiles::resolve_model_for_env(raw, is_local, parent_model)
 }
 
 /// Error message for an unknown profile name, listing what's available.
@@ -713,9 +732,12 @@ impl SubagentManager {
         model_override: Option<String>,
         working_dir: Option<String>,
     ) -> String {
-        let effective_model = model_override
-            .or_else(|| self.default_subagent_model.clone())
-            .unwrap_or_else(|| self.model.clone());
+        let effective_model = resolve_loop_model(
+            model_override.as_deref(),
+            self.default_subagent_model.as_deref(),
+            &self.model,
+            self.is_local,
+        );
 
         let (provider, resolved_model, targets_local) =
             self.resolve_provider_for_model(&effective_model);
@@ -1485,6 +1507,85 @@ mod tests {
         assert!(!s.read_only);
         assert_eq!(s.base_iterations, 20);
         assert!(s.system_prompt.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // default_subagent_model tier env-resolution (regression for the
+    // alias-shipped-verbatim-to-local-server bug, commit 77b1014). The
+    // explicit_model and profile.model tiers wrap their value in
+    // resolve_model_for_env; the default tier must do the same so a
+    // documented alias like "haiku" resolves to the active model in
+    // local mode (and to the cloud id in cloud mode) instead of being
+    // shipped verbatim to the LLM server.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_default_subagent_model_alias_resolves_in_local_mode() {
+        // The documented alias `"haiku"` must resolve to the active local model
+        // (the parent model) in local mode, exactly as `profile.model: haiku`
+        // already does. Before the fix the default tier shipped the alias
+        // verbatim — the local server 404'd on the unknown model name.
+        for alias in ["haiku", "sonnet", "opus", "local"] {
+            let s = resolve_spawn_settings(None, None, Some(alias), "parent-local-model", true, 20);
+            assert_eq!(
+                s.model, "parent-local-model",
+                "alias {alias:?} should resolve to the parent local model in local mode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_subagent_model_alias_resolves_in_cloud_mode() {
+        // Cloud mode: the default-tier alias must map to the same cloud model
+        // id that the profile tier produces (precedence-chain consistency).
+        for (alias, cloud_id) in [
+            ("haiku", "claude-haiku-4-5-20251001"),
+            ("sonnet", "claude-sonnet-4-5-20250929"),
+            ("opus", "claude-opus-4-6"),
+        ] {
+            let s = resolve_spawn_settings(None, None, Some(alias), "parent-model", false, 20);
+            assert_eq!(
+                s.model, cloud_id,
+                "alias {alias:?} should resolve to cloud id {cloud_id:?} in cloud mode"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // resolve_loop_model — the run_loop model-selection path. The same
+    // env-resolution defect existed here: model_override / default-tier
+    // aliases were shipped verbatim to resolve_provider_for_model, which
+    // has no env-resolution pass of its own.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn test_resolve_loop_model_alias_resolves_in_local_mode() {
+        // Both the override path and the default-tier path must resolve a tier
+        // alias to the active local (parent) model in local mode.
+        for alias in ["haiku", "sonnet", "opus", "local"] {
+            assert_eq!(
+                resolve_loop_model(Some(alias), None, "parent-local-model", true),
+                "parent-local-model",
+                "override alias {alias:?} should resolve to parent in local mode"
+            );
+            assert_eq!(
+                resolve_loop_model(None, Some(alias), "parent-local-model", true),
+                "parent-local-model",
+                "default alias {alias:?} should resolve to parent in local mode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_resolve_loop_model_alias_resolves_in_cloud_mode() {
+        assert_eq!(
+            resolve_loop_model(Some("haiku"), None, "parent-model", false),
+            "claude-haiku-4-5-20251001"
+        );
+        assert_eq!(
+            resolve_loop_model(None, Some("sonnet"), "parent-model", false),
+            "claude-sonnet-4-5-20250929"
+        );
     }
 
     #[test]
