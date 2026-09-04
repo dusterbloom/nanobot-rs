@@ -253,7 +253,7 @@ impl SkillsLoader {
 
         for record in &skill_records {
             let name = _escape_xml(&record.info.name);
-            let path = &record.info.path;
+            let path = _escape_xml(&record.info.path);
             let desc = _escape_xml(&record.description());
             let available = _check_requirements(&record.skill_meta);
             let version_attr = record
@@ -971,8 +971,74 @@ mod tests {
         .unwrap();
         let loader = SkillsLoader::new(tmp.path(), Some(&tmp.path().join("no_builtin")));
         let summary = loader.build_skills_summary();
+        // <name> and <description> are entity-escaped.
         assert!(summary.contains("a&amp;b"));
         assert!(summary.contains("x &lt; y"));
+        // The <location> path must ALSO be escaped (regression check): the raw
+        // path must not leak, and the entity-escaped path must be present.
+        let escaped_location = format!(
+            "<location>{}/skills/a&amp;b/SKILL.md</location>",
+            tmp.path().display()
+        );
+        assert!(
+            summary.contains(&escaped_location),
+            "expected escaped <location> not found; got: {summary}"
+        );
+        assert!(
+            !summary.contains("a&b/SKILL.md"),
+            "raw unescaped path leaked into summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn test_build_skills_summary_escapes_location_with_xml_special_dir_name() {
+        // Regression: a skill directory whose name contains a left angle bracket
+        // and an ampersand (e.g. installed from a remote GitHub tree path like
+        // `foo<bar&baz/SKILL.md`) must not emit those bytes raw into the
+        // <location> element text. Before the fix, a raw left-bracket inside the
+        // path looked like a nested tag start and a raw ampersand looked like an
+        // entity reference, while the sibling <name> was correctly escaped,
+        // making the <skills> block ambiguous to the model.
+        let tmp = TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("skills").join("foo<bar&baz");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "---\ndescription: d\n---\nbody").unwrap();
+        let loader = SkillsLoader::new(tmp.path(), Some(&tmp.path().join("no_builtin")));
+        let summary = loader.build_skills_summary();
+
+        // The raw, unescaped path must NOT appear anywhere in the block: a bare
+        // left-bracket in the path would look like a tag start, and a raw
+        // ampersand would look like an entity reference.
+        assert!(
+            !summary.contains("foo<bar&baz/SKILL.md"),
+            "raw unescaped path leaked into summary: {summary}"
+        );
+
+        // The <location> element must contain the entity-escaped path, in lock
+        // step with the (already-escaped) <name> element for the same skill.
+        let escaped_location = format!(
+            "<location>{}/skills/foo&lt;bar&amp;baz/SKILL.md</location>",
+            tmp.path().display()
+        );
+        assert!(
+            summary.contains(&escaped_location),
+            "expected escaped <location> element not found; got: {summary}"
+        );
+        assert!(
+            summary.contains("<name>foo&lt;bar&amp;baz</name>"),
+            "expected escaped <name> element not found; got: {summary}"
+        );
+
+        // Round-trip: unescaping the entities must reconstruct the real on-disk
+        // path, proving it is recoverable and unambiguous from the escaped text.
+        let real_path = format!("{}/skills/foo<bar&baz/SKILL.md", tmp.path().display());
+        let recovered = escaped_location
+            .trim_start_matches("<location>")
+            .trim_end_matches("</location>")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&");
+        assert_eq!(recovered, real_path);
     }
 
     // ----- load_skills_for_context -----
