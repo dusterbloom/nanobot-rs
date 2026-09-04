@@ -1855,6 +1855,7 @@ async fn parse_sse_stream(
     let mut full_inline_thinking = String::new(); // inline <think> tags — fallback when content empty
     let mut split_state = ThinkSplitState::default();
     let mut finish_reason = FinishReason::Stop;
+    let mut finish_reason_seen = false;
     let mut usage: HashMap<String, i64> = HashMap::new();
 
     // Tool call accumulation: index → (id, name, arguments_json_str)
@@ -2022,6 +2023,7 @@ async fn parse_sse_stream(
                     // Update finish_reason if present (wire boundary: parse once here).
                     if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
                         finish_reason = FinishReason::parse_finish_reason(fr);
+                        finish_reason_seen = true;
                     }
 
                     if let Some(delta) = choice.get("delta") {
@@ -2119,8 +2121,14 @@ async fn parse_sse_stream(
 
     // Stream ended without [DONE] — SLM may have crashed or dropped connection.
     // Treat an abnormal termination during content generation as "length" so
-    // the auto-continue mechanism can detect and recover from it.
-    if finish_reason == FinishReason::Stop {
+    // the auto-continue mechanism can detect and recover from it — but only
+    // when the model never reported a `finish_reason` on the wire. An explicit
+    // `finish_reason: "stop"` means the model itself signalled completion; the
+    // only thing missing is the trailing `[DONE]` sentinel, which is a
+    // transport artifact, not truncation. Overriding an observed `stop` here
+    // would mislabel a complete answer as truncated and trigger a spurious
+    // `Continue.` round (case B).
+    if !finish_reason_seen && finish_reason == FinishReason::Stop {
         finish_reason = FinishReason::Length;
     }
     warn!(
@@ -4509,6 +4517,107 @@ mod tests {
             FinishReason::Length,
             "stream ending without [DONE] must yield finish_reason=length"
         );
+    }
+
+    #[tokio::test]
+    async fn test_sse_stream_no_done_keeps_explicit_stop() {
+        // Case B: the model sent `finish_reason: "stop"` in the terminal chunk,
+        // but the connection closed before the separate `data: [DONE]` sentinel
+        // arrived — a transport drop on a non-local OpenAI-compatible backend.
+        // The model itself signalled completion, so the response must arrive
+        // with `finish_reason: Stop`. The abnormal-termination override must
+        // only fire when `finish_reason` was *never* observed on the wire (case
+        // A, covered above); an observed `stop` with a missing `[DONE]` sentinel
+        // is a transport artifact, not truncation. See bug report on agent
+        // auto-continuing completed answers.
+        let chunks = sse_bytes(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"index\":0}]}",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}",
+            // No "data: [DONE]" — connection dropped after the terminal chunk.
+        ]);
+
+        let stream = futures_util::stream::iter(chunks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        parse_sse_stream(stream, tx).await;
+
+        let mut deltas = Vec::new();
+        let mut done_response = None;
+        while let Ok(chunk) = rx.try_recv() {
+            match chunk {
+                StreamChunk::TextDelta(d) => deltas.push(d),
+                StreamChunk::Done(resp) => done_response = Some(resp),
+                _ => {}
+            }
+        }
+
+        // Content already streamed must be preserved verbatim.
+        assert!(!deltas.is_empty(), "should have received text deltas");
+        assert!(
+            deltas.join("").contains("hello"),
+            "content should contain 'hello'"
+        );
+
+        let resp = done_response.expect("should have received Done chunk");
+        assert_eq!(
+            resp.content.as_deref(),
+            Some("hello"),
+            "assembled content must be preserved"
+        );
+        // Bug: current code overrides an observed Stop to Length here. After
+        // the fix, the explicit `finish_reason: "stop"` survives the missing
+        // `[DONE]` sentinel and the answer is not mislabelled as truncated.
+        assert_eq!(
+            resp.finish_reason,
+            FinishReason::Stop,
+            "explicit finish_reason=stop must survive a missing [DONE] sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_no_done_keeps_explicit_stop() {
+        // End-to-end at the provider boundary: a real HTTP SSE exchange where
+        // the backend emits the terminal `finish_reason: "stop"` chunk and then
+        // closes the socket *without* sending `data: [DONE]` (case B — the
+        // transport-drop scenario from the bug report). `chat_stream` must
+        // deliver a `Done` chunk whose `finish_reason` is `Stop`, not `Length`,
+        // so the downstream agent loop does not auto-continue a complete answer.
+        use std::time::Duration;
+        let (base, server) = spawn_timed_sse_server(vec![
+            (
+                Duration::from_millis(0),
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"},\"index\":0}]}\n\n",
+            ),
+            (
+                Duration::from_millis(0),
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\",\"index\":0}]}\n\n",
+            ),
+            // No "data: [DONE]" — connection drops after the terminal chunk.
+        ])
+        .await;
+        let provider =
+            OpenAICompatProvider::new("local", Some(&base), Some("mock")).with_timeout(5);
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let mut stream = provider
+            .chat_stream(&messages, None, None, 16, 0.0, None, None)
+            .await
+            .expect("stream starts");
+        let response = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(StreamChunk::Done(response)) = stream.rx.recv().await {
+                    break response;
+                }
+            }
+        })
+        .await
+        .expect("stream must complete within timeout");
+        assert_eq!(
+            response.finish_reason,
+            FinishReason::Stop,
+            "explicit finish_reason=stop must survive a missing [DONE] over real HTTP/SSE"
+        );
+        assert_eq!(response.content.as_deref(), Some("hello"));
+        server.await.expect("mock SSE server task");
     }
 
     #[tokio::test]
