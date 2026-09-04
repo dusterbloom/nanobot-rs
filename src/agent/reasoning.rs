@@ -205,6 +205,17 @@ impl ReasoningEngine {
                 if let Some(step) = plan.node_weight_mut(idx) {
                     step.status = StepStatus::Failed(reason.to_string());
                 }
+                // A failed step is terminal: clear `current_step` so the dead
+                // step stops being reported as the live objective
+                // (`step_instruction`), stops pinning the per-step budget at 0
+                // (`step_budget_remaining` / `consume_iteration`), and can no
+                // longer be silently reclassified as `Completed` by a later
+                // `mark_current_completed` call (which is a no-op without a
+                // current step). Without this `Failed` has no terminal
+                // transition — the agent loop would re-inject the dead
+                // objective and burn the remaining iteration budget, or, on a
+                // bare-text `Finished` event, overwrite `Failed` -> `Completed`.
+                self.current_step = None;
             }
         }
     }
@@ -213,6 +224,16 @@ impl ReasoningEngine {
         if let Some(plan) = self.plan.as_mut() {
             if let Some(idx) = self.current_step {
                 if let Some(step) = plan.node_weight_mut(idx) {
+                    // A `Failed` step is terminal — never overwrite it with
+                    // `Completed`. `mark_current_failed` already clears
+                    // `current_step`, so a failed step should not be the live
+                    // step here, but this guard is defense-in-depth: any
+                    // future caller that re-points `current_step` at a failed
+                    // step must not be able to silently reclassify it as
+                    // completed (the mislabel path).
+                    if matches!(step.status, StepStatus::Failed(_)) {
+                        return;
+                    }
                     step.status = StepStatus::Completed;
                     step.result = result;
                 }
@@ -502,6 +523,60 @@ mod tests {
         engine.consume_iteration();
         engine.consume_iteration();
         assert_eq!(engine.step_budget_remaining(), 0);
+    }
+
+    // --- Failed-step terminal-transition tests ---
+    //
+    // Regression coverage for the bug where a plan step that exhausted its
+    // `step_budget` with no checkpoint to rewind to was left pinned as the
+    // engine's `current_step`: `step_instruction()` kept reporting it as the
+    // live `[Current objective]`, `step_budget_remaining()` stayed at 0, and a
+    // later bare-text `Finished` event silently overwrote `Failed` -> `Completed`
+    // via `mark_current_completed`. `Failed` now has a terminal transition.
+
+    #[test]
+    fn test_mark_current_failed_clears_current_step() {
+        let plan = linear_plan();
+        let mut engine = ReasoningEngine::new_with_plan(plan, 2);
+        // Sanity: the root step is live and Active with the full budget.
+        assert!(engine.current_step.is_some());
+        assert_eq!(engine.step_budget_remaining(), 2);
+
+        engine.mark_current_failed("iteration budget exhausted");
+
+        // A failed step is terminal: `current_step` is cleared so the dead
+        // step stops being the live objective / pinning the step budget.
+        assert!(engine.current_step.is_none());
+        assert!(engine.step_instruction().is_none());
+        // With no current step the budget reports its default, not pinned 0.
+        assert_eq!(engine.step_budget_remaining(), 2);
+        // The step is genuinely Failed, not Completed — the plan is not done.
+        assert!(!engine.is_complete());
+    }
+
+    #[test]
+    fn test_mark_current_completed_does_not_overwrite_failed() {
+        // Simulate the mislabel path: a step is failed, then a bare-text
+        // `Finished` event calls mark_current_completed on it. Before the fix
+        // this silently reclassified Failed -> Completed and recorded the
+        // model's answer.
+        let plan = linear_plan();
+        let mut engine = ReasoningEngine::new_with_plan(plan, 5);
+        engine.mark_current_failed("iteration budget exhausted");
+        // current_step is cleared, so this is a no-op regardless; the guard
+        // below is defense-in-depth for any future caller that re-points
+        // current_step at a failed step.
+        engine.mark_current_completed(Some("model answer".into()));
+
+        assert!(!engine.is_complete());
+        let plan = engine.plan.as_ref().unwrap();
+        let step = plan.node_weight(NodeIndex::new(0)).unwrap();
+        assert!(
+            matches!(step.status, StepStatus::Failed(_)),
+            "expected Failed, got {:?}",
+            step.status,
+        );
+        assert!(step.result.is_none(), "model answer must be discarded");
     }
 
     // --- Backtracking integration test ---

@@ -1811,6 +1811,11 @@ impl AgentLoopShared {
                         if *engine.mode() != ReasoningMode::Linear
                             && engine.step_budget_remaining() == 0
                         {
+                            // Capture the live objective before failing the
+                            // step — `mark_current_failed` clears
+                            // `current_step`, so `step_instruction()` would
+                            // return `None` afterward.
+                            let step_goal = engine.step_instruction();
                             engine.mark_current_failed("iteration budget exhausted");
                             if let Some(cp) = engine.pop_checkpoint() {
                                 drop(engine);
@@ -1828,6 +1833,33 @@ impl AgentLoopShared {
                                 }
                                 continue;
                             }
+                            // No checkpoint to rewind to: the step genuinely
+                            // exhausted its budget with no recovery point
+                            // (read-only tool sequences save no auto-
+                            // checkpoint). `mark_current_failed` has already
+                            // made the step terminal and cleared
+                            // `current_step`, so falling through to the
+                            // outer `continue` would re-enter this same
+                            // branch every round (budget pinned at 0 for
+                            // the dead step) and burn the remaining
+                            // iteration budget re-injecting a dead
+                            // objective — the stall path. Stop the turn
+                            // with an error instead.
+                            drop(engine);
+                            let objective = step_goal.as_deref().unwrap_or("current step");
+                            warn!(
+                                "plan_step_failed: step '{}' exhausted its \
+                                 iteration budget with no checkpoint to rewind \
+                                 to; stopping turn",
+                                objective,
+                            );
+                            ctx.final_content = format!(
+                                "I couldn't complete plan step ({objective}) within its \
+                                 iteration budget and had no saved checkpoint to \
+                                 fall back to, so I stopped. Try breaking the task \
+                                 into smaller steps or rephrasing the request.",
+                            );
+                            break;
                         }
                     }
                     continue;
