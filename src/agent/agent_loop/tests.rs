@@ -10480,3 +10480,149 @@ async fn idle_turn_e2e_injects_journaled_quiet_turn() {
     run_handle.abort();
     let _ = std::fs::remove_dir_all(&workspace);
 }
+
+/// Provider that records every foreground (non-compaction) `chat` call's wire
+/// and replays a scripted `LLMResponse` queue, branching LCM compaction
+/// requests off to a synthetic summary so they do not consume a scripted
+/// foreground response. Mirrors `WireRecordingProvider` with compaction
+/// branching — kept separate so the renewal test stays self-contained.
+struct LeaseRenewalProvider {
+    name: String,
+    responses: std::sync::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
+    calls: std::sync::Mutex<Vec<Vec<Value>>>,
+}
+
+impl LeaseRenewalProvider {
+    fn new(name: &str, responses: Vec<crate::providers::base::LLMResponse>) -> Self {
+        Self {
+            name: name.to_string(),
+            responses: std::sync::Mutex::new(responses.into()),
+            calls: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn calls(&self) -> Vec<Vec<Value>> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LLMProvider for LeaseRenewalProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        if is_lcm_compaction_request(messages) {
+            return Ok(WireRecordingProvider::plain_text_response(
+                "- Persistent project details and constraints remain available.",
+            ));
+        }
+        self.calls.lock().unwrap().push(messages.to_vec());
+        let mut queue = self.responses.lock().unwrap();
+        Ok(if queue.len() > 1 {
+            queue.pop_front().unwrap()
+        } else {
+            queue
+                .front()
+                .cloned()
+                .unwrap_or_else(|| WireRecordingProvider::text_response("done"))
+        })
+    }
+
+    fn get_default_model(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Regression for tool-lease renewal (see `src/agent/agent_loop/response.rs`,
+/// `ResponseKind::Text` arm). When the default lease (`TOOLS_PER_LEASE` = 12)
+/// exhausts mid-turn and the model emits a three-field checkpoint, the loop
+/// renews the lease and loops back to `PreCall`. The checkpoint text must be
+/// persisted as an assistant message so the post-renewal call can see the
+/// model's committed `next:`/`will:` plan; the renewal nudge alone ("proceed
+/// with the plan from your checkpoint") names a plan the wire never delivered.
+///
+/// 12 distinct `read_file` calls exhaust the lease. `read_file` is read-only
+/// and auto-renew fires only on the *blocked* 13th tool call — which this
+/// script never makes: the 13th foreground response is the text checkpoint.
+/// Distinct paths dodge `ToolGuard` dedup.
+#[tokio::test]
+async fn lease_renewal_persists_assistant_checkpoint_to_post_renewal_wire() {
+    let checkpoint =
+        "findings: read 12 sample files.\nnext: confirm sizes.\nwill: write the summary.";
+
+    let read_call = |id: usize, path: String| {
+        let mut arguments = std::collections::HashMap::new();
+        arguments.insert("path".to_string(), json!(path));
+        crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: vec![crate::providers::base::ToolCallRequest {
+                id: format!("tc_read_{id}"),
+                name: "read_file".to_string(),
+                arguments,
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            usage: std::collections::HashMap::new(),
+        }
+    };
+
+    let mut responses: Vec<crate::providers::base::LLMResponse> = (0..12)
+        .map(|i| read_call(i, format!("sample_{i}.txt")))
+        .collect();
+    responses.push(WireRecordingProvider::text_response(checkpoint));
+    responses.push(WireRecordingProvider::text_response("done."));
+
+    let provider = Arc::new(LeaseRenewalProvider::new("local-qwen-test", responses));
+    let (agent_loop, workspace) =
+        build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 30);
+    let session_key = format!("lease-renewal-ckpt-{}", uuid::Uuid::new_v4());
+
+    for i in 0..12 {
+        std::fs::write(workspace.join(format!("sample_{i}.txt")), "x").unwrap();
+    }
+
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        agent_loop.process_direct(
+            "read every sample file then summarize",
+            &session_key,
+            "test",
+            "offline",
+        ),
+    )
+    .await
+    .expect("turn must terminate");
+
+    let calls = provider.calls();
+    let post_renewal = calls
+        .iter()
+        .find(|c| {
+            c.iter().any(|m| {
+                m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| s.contains("Lease renewed"))
+            })
+        })
+        .expect("a post-renewal call carrying the lease-renewal nudge must occur");
+
+    let checkpoint_present = post_renewal.iter().any(|m| {
+        m.get("role").and_then(Value::as_str) == Some("assistant")
+            && m.get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|c| c.contains("findings:") && c.contains("will:"))
+    });
+    assert!(
+        checkpoint_present,
+        "the renewal checkpoint must be persisted as an assistant message in \
+         the post-renewal wire so the model can see its own next:/will: plan; \
+         the nudge alone is present without an antecedent checkpoint"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
