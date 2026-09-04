@@ -1640,7 +1640,7 @@ fn resolve_memory_provider(
     provider: &Arc<dyn LLMProvider>,
     specialist_provider: Option<&Arc<dyn LLMProvider>>,
 ) -> (Arc<dyn LLMProvider>, String) {
-    match mode {
+    let (mem_provider, mem_model) = match mode {
         RuntimeMode::Local { .. } => {
             let mem_model = if !memory_config.model.is_empty() {
                 memory_config.model.clone()
@@ -1691,6 +1691,49 @@ fn resolve_memory_provider(
                 };
             (mem_provider, mem_model)
         }
+    };
+
+    // Surface the cross-vendor memory-provider hazard at boot (see
+    // `warn_if_foreign_memory_provider_missing_model`).
+    warn_if_foreign_memory_provider_missing_model(memory_config, &mem_provider, &mem_model);
+
+    (mem_provider, mem_model)
+}
+
+/// Emit a boot-time `warn!` when the cross-vendor memory-provider hazard is
+/// reachable.
+///
+/// When `memory.provider` points at a separate endpoint but `memory.model` is
+/// left empty, the reflector's model id is derived from the *main* agent
+/// provider's identity (e.g. "haiku" for an Anthropic/OpenRouter main, the
+/// main local server's served id for Local) and sent verbatim to the foreign
+/// memory endpoint on every reflection tick — `Reflector::reflect` passes
+/// `Some(&self.model)`, which `build_chat_request` normalises and POSTs in the
+/// request body's `model` field. A strict-validation foreign server (`OpenAI`
+/// direct, Gemini-compat, `DeepSeek`, Groq, allowlist vLLM) rejects a model id it
+/// does not serve, so reflection fails and the completed rows keep re-firing
+/// every tick (`mark_reflected_all` only runs after a successful chat).
+///
+/// The warning is non-blocking: a single-model LM Studio ignores the `model`
+/// field (immune), a same-vendor proxy fronting the main model still matches,
+/// and any other working "cheap cloud API" config behaves exactly as before.
+/// It only makes the hazard visible at boot instead of leaving the user to
+/// discover it through repeating per-tick `warn!` lines after the 5000-token
+/// reflection threshold is crossed. Recovery is manual: set `memory.model` to
+/// a model the endpoint serves, and the next tick reflects the stuck rows.
+fn warn_if_foreign_memory_provider_missing_model(
+    memory_config: &MemoryConfig,
+    mem_provider: &Arc<dyn LLMProvider>,
+    mem_model: &str,
+) {
+    if memory_config.provider.is_some() && memory_config.model.is_empty() {
+        tracing::warn!(
+            "Memory provider at {} will use model '{}' (derived from the main agent provider, \
+             not the memory provider). If this endpoint does not serve that model, set \
+             memory.model explicitly.",
+            mem_provider.get_api_base().unwrap_or("(default)"),
+            mem_model,
+        );
     }
 }
 
