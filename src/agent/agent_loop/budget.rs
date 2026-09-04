@@ -355,12 +355,12 @@ pub(super) fn history_window_near(
 const OVERFLOW_TRIM_MARGIN: f64 = 0.93;
 
 /// Trim target for server-oracle overflow recovery (see
-/// `attempt_overflow_recovery`), as a fraction of the SMALLEST possible
-/// prompt cap (window minus the BASE response budget). The server already
-/// proved the client estimate wrong for this content — the bias measured up
-/// to ~20% on entity-heavy content — so the recovery target sits far enough
-/// under every possible cap that even a badly biased estimate lands safely.
-pub(super) const OVERFLOW_RECOVERY_MARGIN: f64 = 0.80;
+/// `attempt_overflow_recovery`), as a fraction of the request's prompt cap.
+/// The server already proved the client estimate wrong for this content — the
+/// bias measured up to ~20% on entity-heavy content — so the recovery target
+/// sits far enough under the cap that even a badly biased estimate lands
+/// safely.
+const OVERFLOW_RECOVERY_MARGIN: f64 = 0.80;
 
 /// Headroom under the server-reported cap for the RATIO-based recovery
 /// target (the error carries exact token counts). 10% absorbs the tool-def
@@ -383,4 +383,9 @@ pub(super) const MAX_OVERFLOW_RECOVERIES: u32 = 3;
 /// overflowing kills the turn.
 pub(super) fn overflow_trim_threshold(prompt_cap: usize) -> usize {
     (prompt_cap as f64 * OVERFLOW_TRIM_MARGIN) as usize
+}
+
+pub(super) fn overflow_recovery_fallback_budget(window: usize, effective_max_tokens: u32) -> usize {
+    (window.saturating_sub(effective_max_tokens as usize) as f64 * OVERFLOW_RECOVERY_MARGIN)
+        as usize
 }
