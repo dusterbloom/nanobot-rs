@@ -51,9 +51,6 @@ pub struct ModelCapabilities {
     pub max_reliable_output: usize,
     pub scratch_pad_rounds: usize,
     pub reader_tier: ReaderTier,
-    /// Optional parser override name (e.g. "hermes", "qwen", "llama", "deepseek").
-    /// When set, the parser registry will use this parser regardless of model name matching.
-    pub parser: Option<String>,
     /// Whether the model accepts image input (multimodal). Set in [`lookup`] from
     /// [`is_vision_model`]; the literal value in `builtin_capabilities` is just a
     /// placeholder. A config override (`modelCapabilities.<name>.vision`) wins —
@@ -74,9 +71,6 @@ pub struct ModelCapabilitiesOverride {
     pub max_reliable_output: Option<usize>,
     pub scratch_pad_rounds: Option<usize>,
     pub reader_tier: Option<ReaderTier>,
-    /// Parser override: selects a specific textual tool call parser by name.
-    /// Valid values: "hermes", "qwen", "llama", "deepseek".
-    pub parser: Option<String>,
     /// Declare image (multimodal) input support for models whose name doesn't
     /// reveal it — e.g. `"qwen3.6-35b-a3b": { "vision": true }`.
     pub vision: Option<bool>,
@@ -217,7 +211,6 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 512,
             scratch_pad_rounds: 3,
             reader_tier: ReaderTier::Minimal,
-            parser: None,
             vision: false,
         };
     }
@@ -231,7 +224,6 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 512,
             scratch_pad_rounds: 2,
             reader_tier: ReaderTier::Minimal,
-            parser: None,
             vision: false,
         };
     }
@@ -256,7 +248,6 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             } else {
                 ReaderTier::Standard
             },
-            parser: None,
             vision: false,
         };
     }
@@ -280,7 +271,6 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             } else {
                 ReaderTier::Standard
             },
-            parser: None,
             vision: false,
         };
     }
@@ -294,7 +284,6 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 1024,
             scratch_pad_rounds: 4,
             reader_tier: ReaderTier::Minimal,
-            parser: None,
             vision: false,
         };
     }
@@ -308,7 +297,6 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 1024,
             scratch_pad_rounds: 4,
             reader_tier: ReaderTier::Minimal,
-            parser: None,
             vision: false,
         };
     }
@@ -323,7 +311,6 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 4096,
             scratch_pad_rounds: 10,
             reader_tier: ReaderTier::Standard,
-            parser: None,
             vision: false,
         };
     }
@@ -345,7 +332,6 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 16384,
             scratch_pad_rounds: 10,
             reader_tier: ReaderTier::Advanced,
-            parser: None,
             vision: false,
         };
     }
@@ -362,7 +348,6 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 4096,
             scratch_pad_rounds: 4,
             reader_tier: ReaderTier::Minimal,
-            parser: None,
             vision: false,
         };
     }
@@ -380,7 +365,6 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 4096,
             scratch_pad_rounds: 6,
             reader_tier: ReaderTier::Minimal,
-            parser: None,
             vision: false,
         };
     }
@@ -396,7 +380,6 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 2048,
             scratch_pad_rounds: 4,
             reader_tier: ReaderTier::Minimal,
-            parser: None,
             vision: false,
         };
     }
@@ -418,7 +401,6 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
             max_reliable_output: 1024,
             scratch_pad_rounds: 4,
             reader_tier: ReaderTier::Minimal,
-            parser: None,
             vision: false,
         };
     }
@@ -432,7 +414,6 @@ fn builtin_capabilities(lower: &str) -> ModelCapabilities {
         max_reliable_output: 4096,
         scratch_pad_rounds: 10,
         reader_tier: ReaderTier::Standard,
-        parser: None,
         vision: false,
     }
 }
@@ -461,9 +442,6 @@ fn apply_override(caps: &mut ModelCapabilities, ovr: &ModelCapabilitiesOverride)
     }
     if let Some(v) = ovr.reader_tier {
         caps.reader_tier = v;
-    }
-    if ovr.parser.is_some() {
-        caps.parser = ovr.parser.clone();
     }
     if let Some(v) = ovr.vision {
         caps.vision = v;
