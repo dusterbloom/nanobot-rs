@@ -395,6 +395,9 @@ impl ReplContext {
         let mut restarted = false;
         while let Ok(req) = self.restart_rx.try_recv() {
             if req.role == "main" {
+                if server::check_local_health(&self.srv.local_port).await {
+                    continue;
+                }
                 let _ = self.display_tx.send(format!(
                     "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m Auto-restarting main server...\n"
                 ));

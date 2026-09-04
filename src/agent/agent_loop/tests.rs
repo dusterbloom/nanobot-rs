@@ -6390,6 +6390,55 @@ fn repl_context_for_clear_test(
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn handle_restart_requests_skips_stale_restart() {
+    let provider = MockLLM::named("stale-restart-test");
+    let (agent_loop, workspace) = build_local_inline_harness(provider);
+    let core_handle = agent_loop.shared.core_handle.clone();
+    let mut ctx = repl_context_for_clear_test(
+        agent_loop,
+        core_handle,
+        "stale-restart-test".to_string(),
+        workspace,
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    ctx.srv.local_port = listener.local_addr().unwrap().port().to_string();
+    ctx.config.agents.defaults.local_backend = "lmstudio".to_string();
+    ctx.config.agents.defaults.local_autostart = crate::config::schema::LocalAutostart::Lmstudio;
+    ctx.restart_tx
+        .send(crate::server::RestartRequest {
+            role: "main".to_string(),
+        })
+        .unwrap();
+
+    let health = tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let read = stream.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            let healthy = request.starts_with("GET /health ");
+            assert!(healthy || request.starts_with("GET /props "));
+            let response = if healthy {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
+            } else {
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .as_slice()
+            };
+            stream.write_all(response).await.unwrap();
+            if healthy {
+                break;
+            }
+        }
+    });
+
+    assert!(!ctx.handle_restart_requests().await);
+    assert!(ctx.display_rx.try_recv().is_err());
+    health.await.unwrap();
+}
+
 #[tokio::test]
 async fn interactive_clear_is_atomic_against_session_admission() {
     let provider = MockLLM::named("interactive-clear-admission-test");
