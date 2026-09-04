@@ -470,6 +470,14 @@ impl WebSearchTool {
                                     if let Some(msg) =
                                         searxng_throttled_message(&data, query, &self.searxng_url)
                                     {
+                                        if !self.api_key.is_empty() {
+                                            tracing::warn!(
+                                                "SearXNG throttled, falling back to Brave Search"
+                                            );
+                                            let mut result = self.execute_brave(query, count).await;
+                                            result.push_str("\n(Fell back to Brave Search)");
+                                            return result;
+                                        }
                                         return msg;
                                     }
                                     return format!("No results for: {}", query);
@@ -1655,6 +1663,107 @@ mod tests {
         assert!(
             searxng_throttled_message(&data, "zzzqqq", "http://localhost:8080").is_none(),
             "empty unresponsive_engines must not be treated as throttle"
+        );
+    }
+
+    async fn spawn_stub_searxng(status_line: &str, body: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let status_line = status_line.to_string();
+        let body = body.to_string();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            let resp = format!(
+                "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {len}\r\nConnection: close\r\n\r\n{body}",
+                len = body.len()
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+        format!("http://127.0.0.1:{}", addr.port())
+    }
+
+    #[tokio::test]
+    async fn searxng_throttle_falls_back_to_brave_when_key_set() {
+        let searxng_url = spawn_stub_searxng(
+            "200 OK",
+            r#"{"results":[],"unresponsive_engines":[["duckduckgo","CAPTCHA"]]}"#,
+        )
+        .await;
+        let tool = WebSearchTool::new(
+            Some("fake-brave-key".to_string()),
+            5,
+            "searxng".to_string(),
+            searxng_url,
+        );
+        let mut params = HashMap::new();
+        params.insert("query".to_string(), serde_json::json!("test"));
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+        assert!(
+            result.contains("Fell back to Brave Search"),
+            "throttle branch must fall back to Brave when a key is set, got: {result}"
+        );
+        assert!(
+            !result.contains("suspension window to clear"),
+            "with a Brave key the raw throttle error must not be surfaced, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn searxng_throttle_returns_error_when_no_brave_key() {
+        let searxng_url = spawn_stub_searxng(
+            "200 OK",
+            r#"{"results":[],"unresponsive_engines":[["duckduckgo","CAPTCHA"]]}"#,
+        )
+        .await;
+        let tool = WebSearchTool::new(Some(String::new()), 5, "searxng".to_string(), searxng_url);
+        let mut params = HashMap::new();
+        params.insert("query".to_string(), serde_json::json!("test"));
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+        assert!(
+            result.contains("throttling") && result.contains("60s"),
+            "no-key throttle path must surface the wait error, got: {result}"
+        );
+        assert!(
+            !result.contains("Fell back to Brave Search"),
+            "no Brave key -> no fallback marker, got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn searxng_genuinely_empty_does_not_fall_back_to_brave() {
+        let searxng_url = spawn_stub_searxng("200 OK", r#"{"results":[]}"#).await;
+        let tool = WebSearchTool::new(
+            Some("fake-brave-key".to_string()),
+            5,
+            "searxng".to_string(),
+            searxng_url,
+        );
+        let mut params = HashMap::new();
+        params.insert("query".to_string(), serde_json::json!("test"));
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+        assert!(
+            result.contains("No results for:"),
+            "genuinely-empty result must surface 'No results for:', got: {result}"
+        );
+        assert!(
+            !result.contains("Fell back to Brave Search"),
+            "no-throttle empty result must NOT spuriously fall back to Brave, got: {result}"
         );
     }
 
