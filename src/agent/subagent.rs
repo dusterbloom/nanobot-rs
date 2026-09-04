@@ -127,7 +127,7 @@ pub(crate) fn resolve_spawn_settings(
     let model = explicit_model
         .map(resolve)
         .or_else(|| profile.and_then(|p| p.model.as_deref()).map(resolve))
-        .or_else(|| default_subagent_model.map(str::to_string))
+        .or_else(|| default_subagent_model.map(resolve))
         .unwrap_or_else(|| {
             warn!(
                 "EXPENSIVE: Using main model '{}' as subagent — set defaultSubagentModel in config",
@@ -145,6 +145,21 @@ pub(crate) fn resolve_spawn_settings(
             .and_then(|p| p.max_iterations)
             .unwrap_or(default_max_iterations),
     }
+}
+
+fn resolve_loop_model(
+    model_override: Option<&str>,
+    default_subagent_model: Option<&str>,
+    parent_model: &str,
+    is_local: bool,
+) -> String {
+    agent_profiles::resolve_model_for_env(
+        model_override
+            .or(default_subagent_model)
+            .unwrap_or(parent_model),
+        is_local,
+        parent_model,
+    )
 }
 
 /// Error message for an unknown profile name, listing what's available.
@@ -713,9 +728,12 @@ impl SubagentManager {
         model_override: Option<String>,
         working_dir: Option<String>,
     ) -> String {
-        let effective_model = model_override
-            .or_else(|| self.default_subagent_model.clone())
-            .unwrap_or_else(|| self.model.clone());
+        let effective_model = resolve_loop_model(
+            model_override.as_deref(),
+            self.default_subagent_model.as_deref(),
+            &self.model,
+            self.is_local,
+        );
 
         let (provider, resolved_model, targets_local) =
             self.resolve_provider_for_model(&effective_model);
@@ -1468,6 +1486,16 @@ mod tests {
             20,
         );
         assert_eq!(s.model, "default-model");
+    }
+
+    #[test]
+    fn default_subagent_model_alias_resolves_in_local_mode() {
+        let settings = resolve_spawn_settings(None, None, Some("haiku"), "served-local", true, 20);
+        assert_eq!(settings.model, "served-local");
+        assert_eq!(
+            resolve_loop_model(Some("haiku"), None, "served-local", true),
+            "served-local"
+        );
     }
 
     #[test]
