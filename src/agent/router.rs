@@ -1642,6 +1642,7 @@ pub(crate) async fn route_tool_calls(
     let mut calls = Vec::with_capacity(original_count);
     let mut allowed_count = 0usize;
     let mut blocked_count = 0usize;
+    let mut all_blocked_uncached = true;
     for tc in routed_tool_calls {
         let key = crate::agent::tool_runner::normalize_call_key(&tc.name, &tc.arguments);
         let rejection = if !seen_in_batch.insert(key) {
@@ -1658,6 +1659,7 @@ pub(crate) async fn route_tool_calls(
             blocked_count += 1;
             let guard_key = ToolGuard::key(&tc.name, &tc.arguments);
             let cached = ctx.flow.tool_guard.get_cached_result(&guard_key);
+            all_blocked_uncached &= cached.is_none();
             let receipt = if let Some(cached) = cached {
                 duplicate_receipt(
                     &tc.name,
@@ -1689,6 +1691,15 @@ pub(crate) async fn route_tool_calls(
         // All tool calls were blocked.
         if blocked_count == original_count {
             ctx.flow.consecutive_all_blocked += 1;
+            if all_blocked_uncached && ctx.flow.consecutive_all_blocked == 2 {
+                ctx.messages
+                    .push_draft(crate::agent::markers::scaffold_user(
+                        "[system] Your last several tool calls were duplicates or blocked. \
+                     You already have the data you need from your previous tool results. \
+                     Do NOT call any more tools. Write your final answer now using the \
+                     information you gathered.",
+                    ));
+            }
             // A cached duplicate produces only a compact protocol receipt; it
             // does not execute a tool or add evidence. Count every all-blocked
             // round as zero progress so cached receipts cannot livelock the
@@ -1716,8 +1727,203 @@ pub(crate) async fn route_tool_calls(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::TrioConfig;
+    use std::sync::Arc;
+
+    use crate::agent::agent_core::{build_swappable_core, RuntimeCounters, SwappableCoreConfig};
+    use crate::agent::agent_loop::{
+        CompactionHandle, FlowControl, HiggsSessionRoute, MessageLog, ProviderCallMode,
+        ProviderRequestState, RetainedRouteCleanupGuard, RouterSyntheticCallSequence,
+        TurnCapacityRecovery, TurnOutcome,
+    };
+    use crate::agent::lane::Lane;
+    use crate::agent::protocol::CloudProtocol;
+    use crate::agent::reasoning::ReasoningEngine;
+    use crate::agent::tools::reasoning_tools::SharedEngine;
+    use crate::config::schema::{
+        AdaptiveTokenConfig, CircuitBreakerConfig, CodeExecutionConfig, CuaToolConfig,
+        MemoryConfig, ProvenanceConfig, PythonKernelConfig, ReasoningConfig, ToolDelegationConfig,
+        TrioConfig,
+    };
+    use crate::providers::base::{FinishReason, LLMProvider, LLMResponse};
+    use async_trait::async_trait;
     use serde_json::json;
+
+    struct TestProvider;
+
+    #[async_trait]
+    impl LLMProvider for TestProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<LLMResponse> {
+            Ok(LLMResponse {
+                content: None,
+                tool_calls: Vec::new(),
+                finish_reason: FinishReason::Stop,
+                usage: HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "router-test"
+        }
+    }
+
+    fn test_turn_context() -> TurnContext {
+        let workspace = tempfile::tempdir().unwrap().keep();
+        let core = Arc::new(build_swappable_core(SwappableCoreConfig {
+            provider: Arc::new(TestProvider),
+            workspace: workspace.clone(),
+            model: "router-test".to_string(),
+            max_iterations: 5,
+            max_continuations: 2,
+            max_tokens: 512,
+            temperature: 0.3,
+            max_context_tokens: 4096,
+            brave_api_key: None,
+            search_provider: "searxng".to_string(),
+            searxng_url: "http://localhost:8888".to_string(),
+            crw_url: String::new(),
+            search_max_results: 5,
+            exec_timeout: 30,
+            restrict_to_workspace: true,
+            memory_config: MemoryConfig::default(),
+            is_local: false,
+            lane: Lane::default(),
+            tool_delegation: ToolDelegationConfig::default(),
+            provenance: ProvenanceConfig::default(),
+            max_tool_result_chars: 2000,
+            delegation_provider: None,
+            specialist_provider: None,
+            trio_config: TrioConfig::default(),
+            model_capabilities_overrides: HashMap::new(),
+            reasoning_config: ReasoningConfig::default(),
+            tool_heartbeat_secs: 2,
+            health_check_timeout_secs: 2,
+            code_execution: CodeExecutionConfig::default(),
+            python_kernel: PythonKernelConfig::default(),
+            cua: CuaToolConfig::default(),
+            adaptive_tokens: AdaptiveTokenConfig::default(),
+            sessions_db_path: Some(workspace.join("sessions.db")),
+        }));
+        let counters = Arc::new(RuntimeCounters::new_with_config(
+            4096,
+            &CircuitBreakerConfig::default(),
+        ));
+        let reasoning: SharedEngine = Arc::new(parking_lot::Mutex::new(ReasoningEngine::new()));
+
+        TurnContext {
+            core,
+            request_id: "router-test-request".to_string(),
+            session_key: "router-test-session".to_string(),
+            session_id: "router-test-session".to_string(),
+            session_policy: policy::SessionPolicy::default(),
+            strict_local_only: false,
+            turn_count: 1,
+            streaming: false,
+            audit: None,
+            tools: ToolRegistry::new(),
+            user_content: "run it".to_string(),
+            channel: "test".to_string(),
+            chat_id: "test".to_string(),
+            is_voice_message: false,
+            detected_language: None,
+            text_delta_tx: None,
+            tool_event_tx: None,
+            cancellation_token: None,
+            priority_rx: None,
+            messages: MessageLog::committed(vec![json!({"role": "user", "content": "run it"})]),
+            new_start: 1,
+            rendered_messages: Vec::new(),
+            protocol: Arc::new(CloudProtocol),
+            advertised_tool_names: None,
+            used_tools: Default::default(),
+            final_content: String::new(),
+            turn_outcome: TurnOutcome::LimitExhausted,
+            turn_tool_entries: Vec::new(),
+            router_synthetic_call_sequence: RouterSyntheticCallSequence::default(),
+            iterations_used: 0,
+            turn_start: std::time::Instant::now(),
+            compaction: CompactionHandle::new(),
+            soft_compaction_requested: false,
+            staged_auto_expansion: None,
+            higgs_session_route: HiggsSessionRoute::default(),
+            retained_route_cleanup: RetainedRouteCleanupGuard::default(),
+            content_gate: crate::agent::context_gate::ContentGate::new(4096, 0.25),
+            counters,
+            capacity: Arc::new(crate::agent::capacity::CapacityRuntime::default()),
+            capacity_recovery: TurnCapacityRecovery::default(),
+            effective_budget: crate::agent::token_budget::TokenBudget::new(4096, 512),
+            flow: FlowControl {
+                router_preflight_done: false,
+                tool_guard: ToolGuard::new(1),
+                iterations_since_compaction: 0,
+                content_was_streamed: false,
+                consecutive_all_blocked: 0,
+                consecutive_no_progress_rounds: 0,
+                round_executed_no_tools: false,
+                emergency_write_used: false,
+                lease: crate::agent::lease::Lease::new(
+                    crate::agent::lease::DEFAULT_TOOLS_PER_LEASE,
+                    crate::agent::lease::DEFAULT_MAX_LEASES_PER_TURN,
+                ),
+                llm_call_start: None,
+                ttft_ms: None,
+                provider_prompt_estimate: None,
+                retries: crate::agent::agent_loop::RetryState::new(),
+                restore_thinking_budget: None,
+                provider_request: ProviderRequestState::default(),
+                tool_rounds_completed: 0,
+                pending_request_metrics: None,
+                last_round_keys: Vec::new(),
+                prev_round_keys: Vec::new(),
+                consecutive_repeat_rounds: 0,
+                provider_call_mode: ProviderCallMode::Normal,
+                terminal_attempted: false,
+                infra_error: None,
+            },
+            health_registry: None,
+            taint_state: crate::agent::taint::TaintState::new(),
+            reasoning,
+        }
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_scaffold_is_injected() {
+        let mut ctx = test_turn_context();
+        let arguments = HashMap::from([("command".to_string(), json!("pwd"))]);
+        assert!(ctx.flow.tool_guard.allow("exec", &arguments).is_ok());
+
+        for id in ["blocked-1", "blocked-2"] {
+            let result = route_tool_calls(
+                &mut ctx,
+                None,
+                vec![ToolCallRequest {
+                    id: id.to_string(),
+                    name: "exec".to_string(),
+                    arguments: arguments.clone(),
+                }],
+                ToolRouting::AlreadyRouted,
+            )
+            .await;
+            assert!(matches!(result, RouteResult::Execute(_)));
+        }
+
+        assert!(ctx.messages.iter().any(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| {
+                    content.contains("Your last several tool calls were duplicates or blocked")
+                })
+        }));
+    }
 
     // Duplicate receipts escalate: hit 1 replays the cached bytes, later
     // hits switch to a directive + progress signal.
