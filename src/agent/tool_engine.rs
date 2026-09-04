@@ -249,6 +249,145 @@ fn render_tool_result_handle(
     )
 }
 
+/// Scan a JSON string starting at `bytes[i]` (which must be the opening
+/// `"`), returning the index just past the closing unescaped `"`. Honors
+/// `\"` / `\\` / `\u…` escapes so a quote inside the string can't be mistaken
+/// for the terminator. The returned span includes both quotes.
+const fn skip_json_string(bytes: &[u8], mut i: usize, n: usize) -> usize {
+    i += 1; // opening quote
+    while i < n {
+        if bytes[i] == b'\\' {
+            i += 2; // skip the escaped char (and its backslash)
+            continue;
+        }
+        i += 1;
+        if bytes[i - 1] == b'"' {
+            break;
+        }
+    }
+    i
+}
+
+/// Scan a JSON object or array starting at `bytes[i]` (which must be the
+/// opening `{` or `[`), returning the index just past the matching close.
+/// Tracks a bracket stack and skips nested strings, so a `]`/`}`/`|` inside a
+/// string value can't fool the depth counter. `args` renders as a
+/// `Vec`-of-pairs array, so arrays must be handled alongside objects.
+fn skip_json_bracketed(bytes: &[u8], mut i: usize, n: usize) -> usize {
+    let mut stack: Vec<u8> = Vec::new();
+    stack.push(bytes[i]);
+    i += 1;
+    while i < n && !stack.is_empty() {
+        match bytes[i] {
+            b'"' => i = skip_json_string(bytes, i, n),
+            b'{' | b'[' => {
+                stack.push(bytes[i]);
+                i += 1;
+            }
+            b'}' => {
+                if stack.last() == Some(&b'{') {
+                    stack.pop();
+                }
+                i += 1;
+            }
+            b']' => {
+                if stack.last() == Some(&b'[') {
+                    stack.pop();
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+/// Walk the `name:value` fields of a rendered handle body — the text after
+/// [`TOOL_RESULT_HANDLE_MARKER`]. Fields are separated by ` | `; each value is
+/// either a JSON string (`"…"`), a JSON array/object (`[…]`/`{…}` — `args` is
+/// `serde_json::to_string` of a `Vec` of pairs, so an array), or a bare
+/// scalar (`true`/`false`, a number, or the bare hex `sha256`). A naïve
+/// `split(" | ")` is unsafe because JSON string/array values may themselves
+/// contain ` | ` (e.g. a `path` arg or an `excerpt` whose first line has a
+/// pipe). This walker reads field names and JSON values boundary-aware, so it
+/// is robust against `|`, `:` and field names appearing inside values —
+/// exactly the shape [`render_tool_result_handle`] emits when a tool's first
+/// output line contains a pipe, `:`, or a field name like `excerpt:`.
+///
+/// Each yielded `value` spans the raw token boundaries: for a JSON string it
+/// includes the surrounding quotes so a caller can `serde_json::from_str` it
+/// directly.
+fn split_handle_fields(body: &str) -> Vec<(&str, &str)> {
+    let bytes = body.as_bytes();
+    let n = bytes.len();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        while i < n && (bytes[i] == b' ' || bytes[i] == b'|') {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let name_start = i;
+        while i < n && bytes[i] != b':' {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let name = &body[name_start..i];
+        i += 1;
+        while i < n && bytes[i] == b' ' {
+            i += 1;
+        }
+        let value_start = i;
+        if i >= n {
+            out.push((name, &body[value_start..i]));
+            break;
+        }
+        i = match bytes[i] {
+            b'"' => skip_json_string(bytes, i, n),
+            b'{' | b'[' => skip_json_bracketed(bytes, i, n),
+            _ => {
+                while i < n && bytes[i] != b'|' {
+                    i += 1;
+                }
+                i
+            }
+        };
+        let mut value_end = i;
+        while value_end > value_start && bytes[value_end - 1] == b' ' {
+            value_end -= 1;
+        }
+        out.push((name, &body[value_start..value_end]));
+    }
+    out
+}
+
+/// Parse the `excerpt:"…"` field out of a `TOOL_RESULT_HANDLE` receipt and
+/// return the decoded excerpt, or `None` if `content` is not a handle or is
+/// malformed.
+///
+/// [`render_tool_result_handle`] emits the entire receipt as a single line
+/// with the excerpt embedded inline as a JSON-encoded `excerpt:"…"` field —
+/// there is no "line after the marker". This helper finds the handle even
+/// when it is not the first line (the delegated execution path prepends a
+/// lease-progress signal: `"{lease_signal}\n{handle}"`), and decodes the
+/// excerpt using the same JSON encoder the renderer used, so escapes
+/// (`\"`, `\\`, …) round-trip exactly.
+pub(crate) fn extract_handle_excerpt(content: &str) -> Option<String> {
+    let marker = TOOL_RESULT_HANDLE_MARKER;
+    let start = content.find(marker)?;
+    let body = &content[start + marker.len()..];
+    for (name, value) in split_handle_fields(body) {
+        if name == "excerpt" {
+            return serde_json::from_str::<String>(value).ok();
+        }
+    }
+    None
+}
+
 /// The provider-facing ingestion chokepoint for completed tool output.
 ///
 /// Store exact bytes before rendering anything for the model. Ordinary results
@@ -3312,6 +3451,190 @@ mod tests {
             "handle with a 500-char first line must stay small; got len={}",
             h2.len()
         );
+    }
+
+    /// `extract_handle_excerpt` must round-trip the canonical renderer's
+    /// excerpt exactly — including exotic content (a first line carrying
+    /// `|`, `:`, the literal field name `excerpt:`, embedded quotes). This
+    /// is the robustness anchor: a naïve `split(" | ")` or `find("excerpt:")`
+    /// would misparse every one of these. `handle_excerpt` normalizes
+    /// whitespace runs to a single space before JSON-encoding, so the
+    /// decoded excerpt is the normalized first line.
+    #[test]
+    fn extract_handle_excerpt_round_trips_rendered_handle() {
+        // (raw first line, expected decoded excerpt after handle_excerpt)
+        let cases: [(&str, &str); 8] = [
+            ("first 160 chars of file", "first 160 chars of file"),
+            ("line | one | with | pipes", "line | one | with | pipes"),
+            ("field excerpt: name", "field excerpt: name"),
+            ("she said \"hi\" and left", "she said \"hi\" and left"),
+            ("back\\slash path", "back\\slash path"),
+            ("a | excerpt: trap | b", "a | excerpt: trap | b"),
+            ("tabs\tand  spaces", "tabs and spaces"),
+            ("héllo wörld 🦀", "héllo wörld 🦀"),
+        ];
+        for (first_line, expected) in cases {
+            let body = format!("{first_line}\nsecond line\nthird line");
+            let args = HashMap::new();
+            let handle = render_tool_result_handle("c1", "read_file", true, body.as_bytes(), &args);
+            assert_eq!(
+                extract_handle_excerpt(&handle).as_deref(),
+                Some(expected),
+                "round-trip failed for {first_line:?}: handle={handle}"
+            );
+        }
+    }
+
+    /// The inline path stores the bare handle as a single-line tool message.
+    /// `extract_handle_excerpt` must find the marker at offset 0 and return
+    /// the excerpt (not `None`, not the marker line).
+    #[test]
+    fn extract_handle_excerpt_inline_path_bare_handle() {
+        let handle = format!(
+            r#"{MARKER} id:"c1" | tool:"read_file" | ok:true | chars:5000 | sha256:deadbeef | args:{{}} | excerpt:"first 160 chars of file" | fetch:"inspect_tool_result""#,
+            MARKER = TOOL_RESULT_HANDLE_MARKER,
+        );
+        assert_eq!(handle.lines().count(), 1, "receipt is a single line");
+        assert_eq!(
+            extract_handle_excerpt(&handle).as_deref(),
+            Some("first 160 chars of file"),
+        );
+    }
+
+    /// The delegated path prepends a lease progress-signal line. The marker
+    /// is NOT at offset 0; `extract_handle_excerpt` must skip the lease line
+    /// and still decode the inline excerpt (rather than surfacing the lease
+    /// counter as the headline, the original bug on this path).
+    #[test]
+    fn extract_handle_excerpt_delegated_path_skips_lease_signal() {
+        let handle = format!(
+            r#"{MARKER} id:"c1" | tool:"read_file" | ok:true | chars:5000 | sha256:deadbeef | args:{{}} | excerpt:"first 160 chars of file" | fetch:"inspect_tool_result""#,
+            MARKER = TOOL_RESULT_HANDLE_MARKER,
+        );
+        let delegated = format!("[Tool call 1 of 3 this lease — 2 leases remaining]\n{handle}");
+        assert_eq!(
+            extract_handle_excerpt(&delegated).as_deref(),
+            Some("first 160 chars of file"),
+            "must decode the inline excerpt, not the lease counter; got content:\n{delegated}"
+        );
+    }
+
+    /// A `path` arg whose value contains ` | ` and `excerpt:` must not fool
+    /// the field walker into picking the wrong field: `args` is a JSON array
+    /// scanned boundary-aware, and `excerpt` is still selected by name.
+    #[test]
+    fn extract_handle_excerpt_resists_pipe_in_args() {
+        let mut args = HashMap::new();
+        args.insert(
+            "path".to_string(),
+            Value::String("dir | excerpt: trap | file".to_string()),
+        );
+        let body = "the real first line of output\nsecond";
+        let handle = render_tool_result_handle("c1", "read_file", true, body.as_bytes(), &args);
+        assert!(
+            handle.contains("dir | excerpt: trap | file"),
+            "precondition: args value with pipe must be in the handle; got: {handle}"
+        );
+        assert_eq!(
+            extract_handle_excerpt(&handle).as_deref(),
+            Some("the real first line of output"),
+            "must pick the excerpt field, not a decoy inside args; got:\n{handle}"
+        );
+    }
+
+    /// An empty excerpt (`excerpt:""`) decodes to an empty string, and a body
+    /// whose first non-empty line is empty yields exactly that — so callers
+    /// can treat `Some("")` as "handle present, nothing to show".
+    #[test]
+    fn extract_handle_excerpt_empty_excerpt_decodes_to_empty() {
+        // A body that is entirely whitespace produces an empty excerpt.
+        let body = "   \n\n   \n";
+        let args = HashMap::new();
+        let handle = render_tool_result_handle("c1", "exec", true, body.as_bytes(), &args);
+        assert_eq!(
+            extract_handle_excerpt(&handle).as_deref(),
+            Some(""),
+            "empty excerpt must round-trip as Some(\"\"); got: {handle}"
+        );
+    }
+
+    /// Non-handle content (small inline tool result, raw body) must return
+    /// `None` so the caller can fall back to the first non-empty line.
+    #[test]
+    fn extract_handle_excerpt_none_for_non_handle_content() {
+        assert_eq!(extract_handle_excerpt("plain tool output line one"), None);
+        assert_eq!(extract_handle_excerpt(""), None);
+        assert_eq!(extract_handle_excerpt("[Tool call 1 of 3 this lease — 2 leases remaining]\nplain output without a handle marker"), None);
+    }
+
+    /// `split_handle_fields` walks every field type (JSON string, JSON array
+    /// — the real `args` shape that `render_tool_result_handle` emits, a
+    /// `Vec` of `[key, value]` pairs — bool, number, bare hex) and returns
+    /// each `name` paired with the raw value span. This pins the parser's
+    /// behavior for the full template.
+    #[test]
+    fn split_handle_fields_walks_full_template() {
+        // `args:[["path","src/main.rs"]]` is the actual shape produced by
+        // serde_json::to_string(Vec<(&str, String)>); the walker must scan the
+        // nested array boundary-aware.
+        let body = r#" id:"c1" | tool:"read_file" | ok:true | chars:5000 | sha256:deadbeef | args:[["path","src/main.rs"]] | excerpt:"first line" | fetch:"inspect_tool_result""#;
+        let fields = split_handle_fields(body);
+        let names: Vec<&str> = fields.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec!["id", "tool", "ok", "chars", "sha256", "args", "excerpt", "fetch"],
+            "field order must match render_tool_result_handle's template"
+        );
+        let as_map: std::collections::HashMap<&str, &str> = fields.into_iter().collect();
+        assert_eq!(as_map["id"], r#""c1""#);
+        assert_eq!(as_map["tool"], r#""read_file""#);
+        assert_eq!(as_map["ok"], "true");
+        assert_eq!(as_map["chars"], "5000");
+        assert_eq!(as_map["sha256"], "deadbeef");
+        assert_eq!(as_map["args"], r#"[["path","src/main.rs"]]"#);
+        assert_eq!(as_map["excerpt"], r#""first line""#);
+        assert_eq!(as_map["fetch"], r#""inspect_tool_result""#);
+    }
+
+    /// A JSON array/object value containing `]`/`}` inside a nested string
+    /// must not terminate the scan early — the depth stack respects string
+    /// boundaries. A JSON string value containing `|`, `:` or `"` (escaped)
+    /// must not be split into multiple fields. Covers the real array `args`
+    /// shape AND the object shape (robustness).
+    #[test]
+    fn split_handle_fields_resists_string_and_bracket_contents() {
+        // Realistic array args carrying a value with pipes and `excerpt:`.
+        let body = r#" id:"a|b" | tool:"name\"with\"quotes" | ok:false | chars:3 | sha256:ff | args:[["path","a]b|x:y"],["command","rm -rf | grep"]] | excerpt:"e|excerpt: x" | fetch:"inspect_tool_result""#;
+        let fields = split_handle_fields(body);
+        let as_map: std::collections::HashMap<&str, &str> = fields.into_iter().collect();
+        assert_eq!(
+            as_map["id"], r#""a|b""#,
+            "pipe inside JSON string stays in value"
+        );
+        assert_eq!(
+            as_map["tool"], r#""name\"with\"quotes""#,
+            "escaped quotes keep the string intact"
+        );
+        assert_eq!(as_map["ok"], "false");
+        assert_eq!(
+            as_map["args"], r#"[["path","a]b|x:y"],["command","rm -rf | grep"]]"#,
+            "']', '|' and ':' inside an args string value stay in the array"
+        );
+        assert_eq!(
+            as_map["excerpt"], r#""e|excerpt: x""#,
+            "pipe and field-name-like content stay in the excerpt value"
+        );
+
+        // Object shape (robustness for hand-written / future renderers): a
+        // close-brace inside a string value must not close the object early.
+        let body_obj = r#" id:"x" | tool:"t" | ok:true | chars:0 | sha256:abc | args:{"path":"a}b|z"} | excerpt:"o|k" | fetch:"inspect_tool_result""#;
+        let fields_obj = split_handle_fields(body_obj);
+        let map_obj: std::collections::HashMap<&str, &str> = fields_obj.into_iter().collect();
+        assert_eq!(
+            map_obj["args"], r#"{"path":"a}b|z"}"#,
+            "'}}' and '|' inside an object string value stay in the object"
+        );
+        assert_eq!(map_obj["excerpt"], r#""o|k""#);
     }
 
     const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
