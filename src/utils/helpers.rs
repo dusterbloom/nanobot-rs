@@ -311,4 +311,51 @@ mod tests {
         assert!(t.len() <= 9); // 6 + "..." at most
         assert!(t.ends_with("..."));
     }
+
+    // Regression tests for the WhatsApp/Telegram/voice-pipeline log-slice
+    // panic: those log statements used to truncate transcriptions with
+    // `&text[..text.len().min(N)]`, which slices by byte index and panics
+    // (end index not a char boundary) when N lands inside a multibyte UTF-8
+    // code point. Routing the cut through `floor_char_boundary` collapses N
+    // to the largest char boundary <= N, so the preview slice is always valid.
+    #[test]
+    fn test_floor_char_boundary_cjk_voice_log_cut_60() {
+        // "a" + 20×'中' (3 bytes each) = 61 bytes. Byte 60 is the 2nd byte of
+        // the last '中' (bytes 58..61) — not a char boundary, so `&s[..60]`
+        // would panic. Channel sites (whatsapp.rs / telegram.rs) cut at 60.
+        let s = format!("a{}", "中".repeat(20));
+        assert_eq!(s.len(), 61);
+        assert!(!s.is_char_boundary(60));
+        let end = floor_char_boundary(&s, 60);
+        assert!(s.is_char_boundary(end));
+        assert_eq!(end, 58);
+        let _ = &s[..end]; // must not panic
+    }
+
+    #[test]
+    fn test_floor_char_boundary_cjk_voice_log_cut_80() {
+        // "a" + 27×'中' = 82 bytes. Byte 80 is the 2nd byte of '中' #27
+        // (bytes 79..82) — not a char boundary. The voice pipeline cuts at 80.
+        let s = format!("a{}", "中".repeat(27));
+        assert_eq!(s.len(), 82);
+        assert!(!s.is_char_boundary(80));
+        let end = floor_char_boundary(&s, 80);
+        assert!(s.is_char_boundary(end));
+        assert_eq!(end, 79);
+        let _ = &s[..end]; // must not panic
+    }
+
+    #[test]
+    fn test_floor_char_boundary_cjk_voice_log_cut_100() {
+        // "ab" + 33×'中' = 101 bytes. Byte 100 is the 2nd byte of '中' #33
+        // (bytes 98..101) — not a char boundary. The WhatsApp invalid-JSON
+        // branch cuts at 100.
+        let s = format!("ab{}", "中".repeat(33));
+        assert_eq!(s.len(), 101);
+        assert!(!s.is_char_boundary(100));
+        let end = floor_char_boundary(&s, 100);
+        assert!(s.is_char_boundary(end));
+        assert_eq!(end, 98);
+        let _ = &s[..end]; // must not panic
+    }
 }
