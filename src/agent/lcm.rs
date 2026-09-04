@@ -1550,21 +1550,31 @@ fn mechanical_headlines(messages: &[Value]) -> (String, SummaryManifest) {
         if content.trim().is_empty() || role == "system" {
             continue;
         }
-        // For tool results: use the TOOL_RESULT_HANDLE excerpt (first line
-        // after the marker, already truncated to 160 chars at ingestion).
-        let first_line = if role == "tool" {
-            content
-                .lines()
-                .find(|l| !l.trim().is_empty() && !l.starts_with("TOOL_RESULT_HANDLE"))
-                .unwrap_or("")
-                .trim()
+        // For tool results: a large receipt is a single line built by
+        // `render_tool_result_handle` with the excerpt embedded inline as a
+        // JSON `excerpt:"…"` field — there is no "line after the marker". On
+        // the delegated execution path the receipt is preceded by a lease
+        // progress-signal line. Decode the inline excerpt in both shapes;
+        // fall back to the first non-empty line for small inline results
+        // (raw body, no marker) or malformed receipts so the message still
+        // gets a `· tool:` breadcrumb instead of being dropped.
+        let first_line: String = if role == "tool" {
+            match crate::agent::tool_engine::extract_handle_excerpt(content) {
+                Some(excerpt) if !excerpt.is_empty() => excerpt,
+                _ => content
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+            }
         } else {
-            content.lines().next().unwrap_or("").trim()
+            content.lines().next().unwrap_or("").trim().to_string()
         };
         if first_line.is_empty() {
             continue;
         }
-        let boundary = crate::utils::helpers::floor_char_boundary(first_line, 150);
+        let boundary = crate::utils::helpers::floor_char_boundary(&first_line, 150);
         let headline = &first_line[..boundary];
         match role {
             "user" => lines.push(format!("· user: {headline}")),
@@ -1957,6 +1967,7 @@ fn parse_id_runs(s: &str) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER;
     use crate::agent::tools::base::Tool;
     use crate::providers::base::{FinishReason, LLMProvider, LLMResponse};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -5324,5 +5335,183 @@ mod tests {
         // Stopwords should be excluded.
         assert!(!keywords.contains("and"));
         assert!(!keywords.contains("in"));
+    }
+
+    // -----------------------------------------------------------------------
+    // mechanical_headlines — Level 0 tool-handle excerpt surfacing
+    //
+    // Reproduces the bug report: a large tool result stored as a single-line
+    // `TOOL_RESULT_HANDLE v1 | …` receipt was either dropped (inline path) or
+    // replaced by the lease progress counter (delegated path). These tests
+    // pin the fix: the inline `excerpt:"…"` field is decoded and surfaced as
+    // the `· tool:` headline in both shapes, and small inline results keep
+    // their first-line behavior.
+    // -----------------------------------------------------------------------
+
+    fn handle_receipt(excerpt: &str) -> String {
+        format!(
+            r#"{MARKER} id:"c1" | tool:"read_file" | ok:true | chars:5000 | sha256:deadbeef | args:{{}} | excerpt:{excerpt_j} | fetch:"inspect_tool_result""#,
+            MARKER = TOOL_RESULT_HANDLE_MARKER,
+            excerpt_j = serde_json::to_string(excerpt).unwrap(),
+        )
+    }
+
+    /// Inline path (bare single-line handle): the `· tool:` headline must
+    /// be present and carry the decoded excerpt. Before the fix the handle
+    /// line was rejected and the message was dropped entirely.
+    #[test]
+    fn mechanical_headlines_inline_large_handle_emits_excerpt() {
+        let handle = handle_receipt("first 160 chars of file");
+        assert_eq!(handle.lines().count(), 1, "receipt is a single line");
+        assert!(handle.starts_with("TOOL_RESULT_HANDLE"));
+
+        let messages = vec![
+            json!({"role": "user", "content": "What files are in src?"}),
+            json!({"role": "assistant", "content": "Let me check the directory listing now."}),
+            json!({"role": "tool", "content": handle}),
+            json!({"role": "user", "content": "Now refactor the auth module into a trait plus impl across mod and impl files."}),
+            json!({"role": "assistant", "content": "I will split auth.rs into a trait in auth/mod.rs and the concrete impl in auth/impl.rs."}),
+            json!({"role": "user", "content": "Looks good, proceed with the refactor."}),
+            json!({"role": "assistant", "content": "Done. Created src/auth/mod.rs and src/auth/impl.rs with the trait and concrete implementation."}),
+        ];
+        let (summary, _) = mechanical_headlines(&messages);
+        assert!(
+            summary.chars().count() >= 200,
+            "span must clear the Level 0 200-char gate; got {} chars:\n{summary}",
+            summary.chars().count()
+        );
+        let tool_line = summary
+            .lines()
+            .find(|l| l.starts_with("· tool:"))
+            .unwrap_or_else(|| panic!("expected a · tool: headline but got:\n{summary}"));
+        assert!(
+            tool_line.contains("first 160 chars of file"),
+            "· tool: line must carry the decoded excerpt; got: {tool_line}"
+        );
+        assert!(
+            !tool_line.contains("TOOL_RESULT_HANDLE"),
+            "· tool: line must not leak the raw marker; got: {tool_line}"
+        );
+    }
+
+    /// Delegated path (`{lease_signal}\n{handle}`): the `· tool:` headline must
+    /// carry the decoded excerpt, NOT the lease progress counter. Before the
+    /// fix the first non-marker line (the lease counter) was surfaced.
+    #[test]
+    fn mechanical_headlines_delegated_large_handle_emits_excerpt_not_lease_counter() {
+        let handle = handle_receipt("first 160 chars of file");
+        let lease_signal = "[Tool call 1 of 3 this lease — 2 leases remaining]";
+        let delegated = format!("{lease_signal}\n{handle}");
+        let messages = vec![
+            json!({"role": "user", "content": "What files are in src?"}),
+            json!({"role": "assistant", "content": "Let me check the directory listing now."}),
+            json!({"role": "tool", "content": delegated}),
+            json!({"role": "user", "content": "Now refactor the auth module into a trait plus impl across mod and impl files."}),
+            json!({"role": "assistant", "content": "I will split auth.rs into a trait in auth/mod.rs and the concrete impl in auth/impl.rs."}),
+            json!({"role": "user", "content": "Looks good, proceed with the refactor."}),
+            json!({"role": "assistant", "content": "Done. Created src/auth/mod.rs and src/auth/impl.rs with the trait and concrete implementation."}),
+        ];
+        let (summary, _) = mechanical_headlines(&messages);
+        assert!(
+            summary.chars().count() >= 200,
+            "span must clear the Level 0 200-char gate; got {} chars:\n{summary}",
+            summary.chars().count()
+        );
+        let tool_line = summary
+            .lines()
+            .find(|l| l.starts_with("· tool:"))
+            .unwrap_or_else(|| panic!("expected a · tool: headline but got:\n{summary}"));
+        assert!(
+            tool_line.contains("first 160 chars of file"),
+            "· tool: line must carry the decoded excerpt; got: {tool_line}"
+        );
+        assert!(
+            !tool_line.contains("Tool call"),
+            "· tool: line must NOT carry the lease counter; got: {tool_line}"
+        );
+    }
+
+    /// Regression: a small inline tool result (raw body, no handle marker)
+    /// keeps the pre-fix behavior — the first non-empty line is the headline.
+    #[test]
+    fn mechanical_headlines_small_inline_result_uses_first_line() {
+        let messages = vec![
+            json!({"role": "user", "content": "What files are in src?"}),
+            json!({"role": "assistant", "content": "Let me check the directory listing now."}),
+            json!({"role": "tool", "content": "src/main.rs\nsrc/lib.rs\nsrc/utils.rs"}),
+            json!({"role": "user", "content": "Now refactor the auth module into a trait plus impl across mod and impl files."}),
+            json!({"role": "assistant", "content": "I will split auth.rs into a trait in auth/mod.rs and the concrete impl in auth/impl.rs."}),
+            json!({"role": "user", "content": "Looks good, proceed with the refactor."}),
+            json!({"role": "assistant", "content": "Done. Created src/auth/mod.rs and src/auth/impl.rs with the trait and concrete implementation."}),
+        ];
+        let (summary, _) = mechanical_headlines(&messages);
+        let tool_line = summary
+            .lines()
+            .find(|l| l.starts_with("· tool:"))
+            .unwrap_or_else(|| panic!("expected a · tool: headline but got:\n{summary}"));
+        assert!(
+            tool_line.contains("src/main.rs"),
+            "small inline result must surface its first line; got: {tool_line}"
+        );
+    }
+
+    /// A large handle whose excerpt is empty (e.g. an all-whitespace body)
+    /// falls back to a `· tool:` breadcrumb (the handle line on the inline
+    /// path) rather than being silently dropped — the minimal-fix guarantee.
+    #[test]
+    fn mechanical_headlines_empty_excerpt_falls_back_to_breadcrumb() {
+        let handle = handle_receipt("");
+        assert_eq!(handle.lines().count(), 1, "receipt is a single line");
+        let messages = vec![
+            json!({"role": "user", "content": "Read the large mostly-empty file."}),
+            json!({"role": "assistant", "content": "Reading it now, the output is large and mostly whitespace."}),
+            json!({"role": "tool", "content": handle}),
+            json!({"role": "user", "content": "Now refactor the auth module into a trait plus impl across mod and impl files."}),
+            json!({"role": "assistant", "content": "I will split auth.rs into a trait in auth/mod.rs and the concrete impl in auth/impl.rs."}),
+            json!({"role": "user", "content": "Looks good, proceed with the refactor."}),
+            json!({"role": "assistant", "content": "Done. Created src/auth/mod.rs and src/auth/impl.rs with the trait and concrete implementation."}),
+        ];
+        let (summary, _) = mechanical_headlines(&messages);
+        assert!(
+            summary.lines().any(|l| l.starts_with("· tool:")),
+            "empty-excerpt handle must still get a · tool: breadcrumb; got:\n{summary}"
+        );
+    }
+
+    /// End-to-end through `escalated_summary`: a span with a large handle
+    /// and enough surrounding conversation returns Level 0 (the compactor is
+    /// a PanickingMock that aborts if any LLM call is attempted) and the
+    /// persisted summary carries the excerpt.
+    #[tokio::test]
+    async fn escalated_summary_level_0_surfaces_handle_excerpt_no_llm_call() {
+        let handle = handle_receipt("first 160 chars of file");
+        let messages = vec![
+            json!({"role": "user", "content": "What files are in src?"}),
+            json!({"role": "assistant", "content": "Let me check the directory listing now."}),
+            json!({"role": "tool", "content": handle}),
+            json!({"role": "user", "content": "Now refactor the auth module into a trait plus impl across mod and impl files."}),
+            json!({"role": "assistant", "content": "I will split auth.rs into a trait in auth/mod.rs and the concrete impl in auth/impl.rs."}),
+            json!({"role": "user", "content": "Looks good, proceed with the refactor."}),
+            json!({"role": "assistant", "content": "Done. Created src/auth/mod.rs and src/auth/impl.rs with the trait and concrete implementation."}),
+        ];
+        // Panicking if the LLM is invoked proves Level 0 (mechanical
+        // headlines) handled this span with zero LLM calls.
+        let compactor = ContextCompactor::new(
+            Arc::new(PanickingMock) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            4096,
+        );
+        let result = escalated_summary(&messages, 64, Some(&compactor))
+            .await
+            .expect("Level 0 must not error");
+        let (summary, _manifest, level) =
+            result.expect("Level 0 must produce a summary for this handle-bearing span");
+        assert_eq!(level, 0, "span with a tool result must resolve at Level 0");
+        assert!(
+            summary
+                .lines()
+                .any(|l| l.starts_with("· tool:") && l.contains("first 160 chars of file")),
+            "Level 0 summary must surface the handle excerpt; got:\n{summary}"
+        );
     }
 }
