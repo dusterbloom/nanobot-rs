@@ -569,6 +569,17 @@ impl AgentLoopShared {
                             "tool_lease_renewed"
                         );
                         ctx.flow.retries.lease_renewal_rejections = 0;
+                        // Persist the checkpoint the model committed to so the
+                        // post-renewal call can see its own findings:/next:/will:
+                        // plan. The next prompt is rendered from `ctx.messages`
+                        // alone, so without this push the forward-looking plan
+                        // the renewal nudge refers to ("proceed with the plan
+                        // from your checkpoint") is absent from the wire. Mirrors
+                        // the `handle_validation_error` nudge-and-resume pattern.
+                        ctx.messages.push_draft(json!({
+                            "role": "assistant",
+                            "content": content
+                        }));
                         // Nudge the model so it knows tools are available
                         // again. Without this, a small local model may
                         // emit another text answer instead of tool calls
