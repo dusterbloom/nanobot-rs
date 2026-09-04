@@ -352,7 +352,10 @@ async fn vote_on_step(
             .copied()
             .unwrap_or(0);
 
-        if max_count >= second_max + ahead_by_k {
+        // Saturating arithmetic prevents overflow/wraparound in the margin
+        // check even if a future change lets a large `ahead_by_k` through
+        // (defense-in-depth; the parse already clamps to `MAX_AHEAD_BY_K`).
+        if max_count >= second_max.saturating_add(ahead_by_k) {
             debug!(
                 "Vote converged after {} voters: '{}'",
                 voters_used, normalized

@@ -15,6 +15,28 @@ use crate::agent::host_bridge::{
 };
 use crate::errors::ToolError;
 
+/// Maximum allowed MAKER voting margin (`ahead_by_k`).
+///
+/// `ahead_by_k` is a cost multiplier: the runner derives `max_voters =
+/// 2·ahead_by_k + 1` and issues up to that many LLM calls per text-only
+/// pipeline step before the step returns. With no upper bound, a single
+/// `spawn` tool call carrying a model-emitted (or prompt-injection-driven)
+/// large value forces an unbounded number of LLM calls — a cost /
+/// denial-of-service vector reachable through the cloud-model `SpawnTool`
+/// surface. The schema describes it as a small "voting margin", so a cap of
+/// 32 keeps the worst case to a bounded handful of calls per step. Values
+/// above this are clamped at parse time and rejected by the schema `maximum`.
+pub(crate) const MAX_AHEAD_BY_K: usize = 32;
+
+/// Maximum allowed refinement-loop rounds (`max_rounds`).
+///
+/// `max_rounds` bounds `SubagentManager::run_loop`'s `for round in
+/// 0..max_rounds` loop and is a cost multiplier with the same unbounded-loop
+/// risk as [`MAX_AHEAD_BY_K`]. It had no upstream validation, so it is
+/// clamped at parse time and rejected by the schema `maximum` for the same
+/// reason.
+pub(crate) const MAX_LOOP_ROUNDS: u32 = 32;
+
 /// Tool to spawn a subagent for background task execution.
 ///
 /// The subagent runs asynchronously and announces its result back
@@ -194,10 +216,14 @@ impl SpawnAction {
                         )))
                     }
                 };
+                // Bound the cost multiplier at the parse boundary: unbounded
+                // `ahead_by_k` makes `max_voters = 2·k+1` unbounded, and the
+                // downstream `* 2 + 1` derivation overflows for very large
+                // values. Clamp to `MAX_AHEAD_BY_K` rather than the type max.
                 let ahead_by_k = params
                     .get("ahead_by_k")
                     .and_then(|v| v.as_u64())
-                    .map(|v| usize::try_from(v).unwrap_or(usize::MAX))
+                    .map(|v| usize::try_from(v).unwrap_or(usize::MAX).min(MAX_AHEAD_BY_K))
                     .unwrap_or(0);
                 Ok(SpawnAction::Pipeline { steps, ahead_by_k })
             }
@@ -206,7 +232,7 @@ impl SpawnAction {
                 max_rounds: params
                     .get("max_rounds")
                     .and_then(|v| v.as_u64())
-                    .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+                    .map(|v| u32::try_from(v).unwrap_or(u32::MAX).min(MAX_LOOP_ROUNDS))
                     .unwrap_or(5),
                 tools: params.get("tools").and_then(|v| v.as_array()).map(|arr| {
                     arr.iter()
@@ -378,7 +404,9 @@ impl Tool for SpawnTool {
                 },
                 "ahead_by_k": {
                     "type": "integer",
-                    "description": "MAKER voting margin (pipeline). 0 = no voting (default)"
+                    "minimum": 0,
+                    "maximum": MAX_AHEAD_BY_K,
+                    "description": "MAKER voting margin (pipeline). 0 = no voting (default). Bounded to a small margin; values above the maximum are clamped to cap cost (each vote issues one LLM call per text-only step)."
                 },
                 "task": {
                     "type": "string",
@@ -414,7 +442,9 @@ impl Tool for SpawnTool {
                 },
                 "max_rounds": {
                     "type": "integer",
-                    "description": "Max loop rounds (default: 5)"
+                    "minimum": 0,
+                    "maximum": MAX_LOOP_ROUNDS,
+                    "description": "Max loop rounds (default: 5). Bounded; values above the maximum are clamped to cap cost."
                 },
                 "tools": {
                     "type": "array",
@@ -926,5 +956,192 @@ mod tests {
         // Origin never travels on the wire.
         assert!(!wire.contains("channel"));
         assert!(!wire.contains("chat_id"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // `ahead_by_k` / `max_rounds` cost-multiplier bounding (cost/DoS fix).
+    //
+    // Both parameters are cost multipliers with no upstream validation: a
+    // model-emitted (or prompt-injection-driven) large value forces an
+    // unbounded number of LLM calls before the action returns. The parse
+    // clamps them to `MAX_AHEAD_BY_K` / `MAX_LOOP_ROUNDS`, and the schema
+    // advertises the bound. These tests pin the parse boundary; the
+    // end-to-end behavior is covered in `tool_wiring::agent_host_tests`.
+    // ---------------------------------------------------------------------------
+
+    fn parse_ok(params: &HashMap<String, serde_json::Value>) -> SpawnAction {
+        SpawnAction::parse(params).unwrap_or_else(|_| panic!("SpawnAction::parse should succeed"))
+    }
+
+    #[test]
+    fn parse_ahead_by_k_defaults_to_zero() {
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("pipeline"));
+        params.insert("steps".to_string(), json!([{"prompt": "one"}]));
+        let SpawnAction::Pipeline { ahead_by_k, .. } = parse_ok(&params) else {
+            panic!("expected Pipeline action");
+        };
+        assert_eq!(ahead_by_k, 0);
+    }
+
+    #[test]
+    fn parse_ahead_by_k_below_max_is_unchanged() {
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("pipeline"));
+        params.insert("steps".to_string(), json!([{"prompt": "one"}]));
+        params.insert("ahead_by_k".to_string(), json!(2));
+        let SpawnAction::Pipeline { ahead_by_k, .. } = parse_ok(&params) else {
+            panic!("expected Pipeline action");
+        };
+        assert_eq!(ahead_by_k, 2);
+    }
+
+    #[test]
+    fn parse_ahead_by_k_at_max_is_accepted_unchanged() {
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("pipeline"));
+        params.insert("steps".to_string(), json!([{"prompt": "one"}]));
+        params.insert("ahead_by_k".to_string(), json!(MAX_AHEAD_BY_K));
+        let SpawnAction::Pipeline { ahead_by_k, .. } = parse_ok(&params) else {
+            panic!("expected Pipeline action");
+        };
+        assert_eq!(ahead_by_k, MAX_AHEAD_BY_K);
+    }
+
+    #[test]
+    fn parse_clamps_ahead_by_k_above_max() {
+        // A moderate value like 1_000_000 used to pass through unchanged and
+        // force up to 2_000_001 LLM calls per text-only pipeline step. It must
+        // now be clamped to the safe bound.
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("pipeline"));
+        params.insert("steps".to_string(), json!([{"prompt": "one"}]));
+        params.insert("ahead_by_k".to_string(), json!(1_000_000u64));
+        let SpawnAction::Pipeline { ahead_by_k, .. } = parse_ok(&params) else {
+            panic!("expected Pipeline action");
+        };
+        assert_eq!(ahead_by_k, MAX_AHEAD_BY_K);
+    }
+
+    #[test]
+    fn parse_clamps_ahead_by_k_u64max() {
+        // u64::MAX passed through unchanged on 64-bit (the `unwrap_or` clamp
+        // was dead code there) and overflowed the downstream `* 2 + 1`
+        // derivation. It must now be clamped — no overflow, no `usize::MAX`.
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("pipeline"));
+        params.insert("steps".to_string(), json!([{"prompt": "one"}]));
+        params.insert("ahead_by_k".to_string(), json!(u64::MAX));
+        let SpawnAction::Pipeline { ahead_by_k, .. } = parse_ok(&params) else {
+            panic!("expected Pipeline action");
+        };
+        assert_eq!(ahead_by_k, MAX_AHEAD_BY_K);
+    }
+
+    #[test]
+    fn parse_ahead_by_k_negative_falls_back_to_zero() {
+        // serde_json parses negative integers as f64, so `as_u64()` is `None`
+        // and the value falls back to the default (0), not clamped to the max.
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("pipeline"));
+        params.insert("steps".to_string(), json!([{"prompt": "one"}]));
+        params.insert("ahead_by_k".to_string(), json!(-5));
+        let SpawnAction::Pipeline { ahead_by_k, .. } = parse_ok(&params) else {
+            panic!("expected Pipeline action");
+        };
+        assert_eq!(ahead_by_k, 0);
+    }
+
+    #[test]
+    fn parse_max_rounds_defaults_to_five() {
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("loop"));
+        params.insert("task".to_string(), json!("refine"));
+        let SpawnAction::Loop { max_rounds, .. } = parse_ok(&params) else {
+            panic!("expected Loop action");
+        };
+        assert_eq!(max_rounds, 5);
+    }
+
+    #[test]
+    fn parse_max_rounds_below_max_is_unchanged() {
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("loop"));
+        params.insert("task".to_string(), json!("refine"));
+        params.insert("max_rounds".to_string(), json!(3));
+        let SpawnAction::Loop { max_rounds, .. } = parse_ok(&params) else {
+            panic!("expected Loop action");
+        };
+        assert_eq!(max_rounds, 3);
+    }
+
+    #[test]
+    fn parse_max_rounds_at_max_is_accepted_unchanged() {
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("loop"));
+        params.insert("task".to_string(), json!("refine"));
+        params.insert("max_rounds".to_string(), json!(MAX_LOOP_ROUNDS));
+        let SpawnAction::Loop { max_rounds, .. } = parse_ok(&params) else {
+            panic!("expected Loop action");
+        };
+        assert_eq!(max_rounds, MAX_LOOP_ROUNDS);
+    }
+
+    #[test]
+    fn parse_clamps_max_rounds_above_max() {
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("loop"));
+        params.insert("task".to_string(), json!("refine"));
+        params.insert("max_rounds".to_string(), json!(1_000_000u64));
+        let SpawnAction::Loop { max_rounds, .. } = parse_ok(&params) else {
+            panic!("expected Loop action");
+        };
+        assert_eq!(max_rounds, MAX_LOOP_ROUNDS);
+    }
+
+    #[test]
+    fn parse_clamps_max_rounds_u64max() {
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("loop"));
+        params.insert("task".to_string(), json!("refine"));
+        params.insert("max_rounds".to_string(), json!(u64::MAX));
+        let SpawnAction::Loop { max_rounds, .. } = parse_ok(&params) else {
+            panic!("expected Loop action");
+        };
+        assert_eq!(max_rounds, MAX_LOOP_ROUNDS);
+    }
+
+    #[test]
+    fn spawn_tool_schema_bounds_ahead_by_k_and_max_rounds() {
+        // The schema advertises the bound so conformant providers reject
+        // out-of-range values before they reach the runner.
+        let tool = SpawnTool::new(test_host(EchoHost));
+        let props = &tool.parameters()["properties"];
+        assert_eq!(props["ahead_by_k"]["minimum"], json!(0));
+        assert_eq!(props["ahead_by_k"]["maximum"], json!(MAX_AHEAD_BY_K));
+        assert_eq!(props["max_rounds"]["minimum"], json!(0));
+        assert_eq!(props["max_rounds"]["maximum"], json!(MAX_LOOP_ROUNDS));
+    }
+
+    #[tokio::test]
+    async fn pipeline_forwards_clamped_ahead_by_k_to_host() {
+        // A large value is clamped before it reaches the host, so the
+        // model-visible forwarded value is the bound, not the raw input.
+        let tool = SpawnTool::new(test_host(EchoHost));
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("pipeline"));
+        params.insert("steps".to_string(), json!([{"prompt": "one"}]));
+        params.insert("ahead_by_k".to_string(), json!(1_000_000u64));
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+        assert_eq!(
+            result,
+            format!(
+                "pipeline [{0}] ahead {1}",
+                r#"{"prompt":"one"}"#, MAX_AHEAD_BY_K
+            )
+        );
     }
 }
