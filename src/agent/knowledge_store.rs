@@ -82,7 +82,7 @@ impl KnowledgeStore {
         #[cfg(feature = "semantic")]
         Self::register_vec_extension();
 
-        let conn = Connection::open(db_path).context("Failed to open knowledge database")?;
+        let mut conn = Connection::open(db_path).context("Failed to open knowledge database")?;
 
         // Enable WAL mode and mmap for performance
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -139,7 +139,7 @@ impl KnowledgeStore {
         // Migrate chunks_fts to the porter tokenizer if it predates this change,
         // so knowledge.db matches sessions.db (both porter unicode61) and a query
         // stems consistently across stores. External-content FTS — no data lost.
-        Self::migrate_fts_tokenizer(&conn)?;
+        Self::migrate_fts_tokenizer(&mut conn)?;
 
         Ok(Self {
             conn,
@@ -175,7 +175,17 @@ impl KnowledgeStore {
     /// already porter (or when the table doesn't exist yet — the schema init's
     /// CREATE handles new DBs). External-content FTS, so the rebuild repopulates
     /// from `chunks` with no text loss.
-    fn migrate_fts_tokenizer(conn: &Connection) -> Result<()> {
+    ///
+    /// The DROP + CREATE + rebuild run inside a single transaction so that a
+    /// transient failure of the `rebuild` step (e.g. `SQLITE_FULL`/IOERR) rolls
+    /// the schema changes back, leaving the legacy table in place and letting
+    /// the next `open()` retry. Without the wrapping transaction the autocommit
+    /// `execute_batch` would commit the empty porter table before the rebuild
+    /// fails, and the schema-sticky idempotency gate below would then suppress
+    /// every future rebuild — permanently breaking search for existing chunks.
+    /// The gate also self-heals any DB already left in that broken state: when
+    /// chunks exist but the FTS index is empty, rebuild regardless of the schema.
+    fn migrate_fts_tokenizer(conn: &mut Connection) -> Result<()> {
         let existing: Option<String> = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts'",
@@ -184,11 +194,20 @@ impl KnowledgeStore {
             )
             .optional()?;
         let needs_rebuild = match existing.as_deref() {
-            Some(sql) => !sql.to_ascii_lowercase().contains("porter"),
+            // Legacy bare-unicode61 table — upgrade to porter unicode61.
+            Some(sql) if !sql.to_ascii_lowercase().contains("porter") => true,
+            // Already porter-stamped, but a prior (pre-atomicity-fix) migration
+            // may have committed the porter table then failed its rebuild,
+            // stranding every existing chunk outside the index. Rebuild to
+            // restore searchability. (`count(*) FROM chunks_fts` reads from the
+            // content table, not the index, so the `_docsize` shadow table —
+            // one row per indexed document — is the reliable emptiness signal.)
+            Some(_) => Self::fts_index_empty_with_chunks(conn)?,
             None => false,
         };
         if needs_rebuild {
-            conn.execute_batch(
+            let tx = conn.transaction()?;
+            tx.execute_batch(
                 r#"
                 DROP TABLE chunks_fts;
                 CREATE VIRTUAL TABLE chunks_fts USING fts5(
@@ -201,8 +220,27 @@ impl KnowledgeStore {
                 "#,
             )
             .context("Failed to migrate chunks_fts to porter tokenizer")?;
+            tx.commit()?;
         }
         Ok(())
+    }
+
+    /// True when `chunks` has rows that the `chunks_fts` index does not cover —
+    /// the signature of a previously-failed tokenizer rebuild. FTS5 external-
+    /// content tables return the content-table rowcount for `count(*)`, so the
+    /// `chunks_fts_docsize` shadow table (one row per indexed document) is used
+    /// as the authoritative index-population count.
+    fn fts_index_empty_with_chunks(conn: &Connection) -> Result<bool> {
+        let chunk_rows: i64 =
+            conn.query_row("SELECT count(*) FROM chunks", [], |row| row.get(0))?;
+        if chunk_rows == 0 {
+            return Ok(false);
+        }
+        let indexed: i64 =
+            conn.query_row("SELECT count(*) FROM chunks_fts_docsize", [], |row| {
+                row.get(0)
+            })?;
+        Ok(indexed == 0)
     }
 
     /// Open the knowledge database at the default location (~/.nanobot/knowledge.db).
@@ -1072,5 +1110,251 @@ mod tests {
 
         let results = store.vector_search("test", 5).unwrap();
         assert!(results.is_empty());
+    }
+
+    // Regression for the non-atomic FTS tokenizer migration: a transient failure
+    // of the `INSERT INTO chunks_fts(...) VALUES('rebuild')` step must roll back
+    // the already-committed DROP/CREATE (under the old autocommit `execute_batch`
+    // they committed independently, leaving a porter-stamped empty index forever).
+    #[test]
+    fn test_failed_rebuild_rolls_back_legacy_table_and_allows_retry() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // 1. Populate with many large chunks under the default porter tokenizer.
+        {
+            let store = KnowledgeStore::open(&db_path).unwrap();
+            let big = format!("{} ", "daemon searchable running token content".repeat(60));
+            for i in 0..40 {
+                store
+                    .ingest(&format!("doc{i}"), None, &big, 200, 20)
+                    .unwrap();
+            }
+            assert!(!store.search("daemon", 10).unwrap().is_empty());
+        }
+
+        // 2. Regress chunks_fts to the legacy bare-unicode61 tokenizer but leave
+        //    its index EMPTY (no 'rebuild'): dropping this tiny table frees
+        //    almost no pages, so the porter rebuild below MUST grow the file.
+        let mut conn = Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "DROP TABLE chunks_fts;\
+             CREATE VIRTUAL TABLE chunks_fts USING fts5(content, content='chunks', content_rowid='id');\
+             VACUUM;",
+        )
+        .unwrap();
+        let schema: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!schema.to_ascii_lowercase().contains("porter"));
+        let chunks: i64 = conn
+            .query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert!(chunks > 0);
+        let docsize: i64 = conn
+            .query_row("SELECT count(*) FROM chunks_fts_docsize", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            docsize, 0,
+            "regressed legacy table must start with an empty index"
+        );
+
+        // 3. Fault injection: cap the file at its current page count so the
+        //    rebuild's index growth hits SQLITE_FULL mid-transaction.
+        let pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap();
+        conn.pragma_update(None, "max_page_count", pages).unwrap();
+        let migrate_res = KnowledgeStore::migrate_fts_tokenizer(&mut conn);
+        assert!(
+            migrate_res.is_err(),
+            "rebuild must fail under the page-count cap, got: {migrate_res:?}"
+        );
+
+        // 4. The wrapping transaction must have rolled back: the legacy table
+        //    (no 'porter') survives and chunks are intact, so a later open()
+        //    retries the migration instead of being suppressed by a porter-
+        //    stamped empty index.
+        let schema_after: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            !schema_after.to_ascii_lowercase().contains("porter"),
+            "rollback must restore the legacy (non-porter) table, got: {schema_after}"
+        );
+        let chunks_after: i64 = conn
+            .query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(chunks_after, chunks, "chunks content must survive rollback");
+        let docsize_after: i64 = conn
+            .query_row("SELECT count(*) FROM chunks_fts_docsize", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            docsize_after, 0,
+            "empty legacy index must remain after rollback"
+        );
+
+        // 5. Lift the cap; the retry through the public open() succeeds and
+        //    restores full-text search for the pre-existing chunks.
+        conn.pragma_update(None, "max_page_count", 1_000_000i64)
+            .unwrap();
+        drop(conn);
+        let store = KnowledgeStore::open(&db_path).unwrap();
+        let hits = store.search("daemon", 20).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "retry must repopulate the index and restore search for existing chunks"
+        );
+    }
+
+    // Self-heal for DBs already corrupted by the pre-fix bug: a porter-stamped
+    // chunks_fts whose index is empty while chunks has rows must be detected and
+    // rebuilt by the data-aware (not schema-sticky) idempotency gate on open().
+    #[test]
+    fn test_auto_heals_porter_stamped_empty_index_on_open() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // 1. Healthy store with indexed chunks.
+        {
+            let store = KnowledgeStore::open(&db_path).unwrap();
+            store
+                .ingest(
+                    "doc",
+                    None,
+                    "the daemon was running all night long",
+                    4096,
+                    256,
+                )
+                .unwrap();
+            assert!(!store.search("daemon", 10).unwrap().is_empty());
+        }
+
+        // 2. Reproduce the legacy bug's end state: DROP+CREATE porter committed
+        //    (schema stamped) but the rebuild never ran, so the index is empty
+        //    while chunks still has rows.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "DROP TABLE chunks_fts;\
+                 CREATE VIRTUAL TABLE chunks_fts USING fts5(content, content='chunks', content_rowid='id', tokenize='porter unicode61');",
+            )
+            .unwrap();
+            let schema: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(schema.contains("porter"));
+            let chunks: i64 = conn
+                .query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))
+                .unwrap();
+            assert!(chunks > 0);
+            let docsize: i64 = conn
+                .query_row("SELECT count(*) FROM chunks_fts_docsize", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(docsize, 0, "corrupted end state must have an empty index");
+            // Pre-fix this state returned zero search hits — confirm the index
+            // is genuinely unsearchable before the heal.
+            let hits: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM chunks_fts WHERE chunks_fts MATCH 'daemon'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(hits, 0);
+        }
+
+        // 3. Reopen: the data-aware gate detects the empty index over non-empty
+        //    chunks and rebuilds it, restoring search for the pre-existing doc.
+        let store = KnowledgeStore::open(&db_path).unwrap();
+        let hits = store.search("daemon", 10).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "empty porter index over non-empty chunks must be auto-rebuilt on open"
+        );
+    }
+
+    // False-positive guard: a healthy, populated porter index must NOT be rebuilt
+    // on every open (the data-aware gate is a no-op when the index already covers
+    // the chunks); otherwise search would be needlessly rebuilt each open().
+    #[test]
+    fn test_populated_porter_index_is_not_rebuilt_on_open() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        let store = KnowledgeStore::open(&db_path).unwrap();
+        store
+            .ingest("doc", None, "the daemon was running all night", 4096, 256)
+            .unwrap();
+        assert!(!store.search("daemon", 10).unwrap().is_empty());
+        let docsize_before: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM chunks_fts_docsize", [], |r| r.get(0))
+            .unwrap();
+        let chunks_before: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(docsize_before, chunks_before);
+
+        drop(store);
+
+        // Reopen must be a no-op for migration: the indexed-doc count is unchanged
+        // (a rebuild would briefly drop it to 0 then repopulate, but at the post-
+        // open steady state it must equal the chunks count again — we assert the
+        // simplest invariant: still covered, still searchable).
+        let store = KnowledgeStore::open(&db_path).unwrap();
+        let docsize_after: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM chunks_fts_docsize", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            docsize_after, docsize_before,
+            "populated index must not be rebuilt"
+        );
+        assert!(!store.search("daemon", 10).unwrap().is_empty());
+    }
+
+    // Unit coverage for the emptiness signal itself, covering all three states
+    // the gate inspects: empty store, healthy populated index, and corrupted
+    // empty index over non-empty chunks.
+    #[test]
+    fn test_fts_index_empty_with_chunks_signal() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let store = KnowledgeStore::open(&db_path).unwrap();
+
+        // Empty store: no chunks -> not flagged (nothing to rebuild).
+        assert!(!KnowledgeStore::fts_index_empty_with_chunks(&store.conn).unwrap());
+
+        store
+            .ingest("doc", None, "the daemon was running", 4096, 256)
+            .unwrap();
+        // Healthy populated index -> not flagged.
+        assert!(!KnowledgeStore::fts_index_empty_with_chunks(&store.conn).unwrap());
+
+        // Corrupted: DROP+CREATE porter leaves an empty index over non-empty
+        // chunks -> flagged for rebuild.
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE chunks_fts;\
+                 CREATE VIRTUAL TABLE chunks_fts USING fts5(content, content='chunks', content_rowid='id', tokenize='porter unicode61');",
+            )
+            .unwrap();
+        assert!(KnowledgeStore::fts_index_empty_with_chunks(&store.conn).unwrap());
     }
 }
