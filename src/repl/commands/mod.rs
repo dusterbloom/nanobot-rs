@@ -395,6 +395,14 @@ impl ReplContext {
         let mut restarted = false;
         while let Ok(req) = self.restart_rx.try_recv() {
             if req.role == "main" {
+                // The request may be stale by drain time: the watchdog enqueues
+                // it on the unhealthy branch but owns only `restart_tx`, so it
+                // cannot drain the channel when the server recovers. Re-check
+                // `/health` before the stop→start cycle and skip the kill when
+                // the server is already healthy at drain time.
+                if server::check_local_health(&self.srv.local_port).await {
+                    continue;
+                }
                 let _ = self.display_tx.send(format!(
                     "\x1b[RAW]\n  \x1b[33m\u{25cf}\x1b[0m Auto-restarting main server...\n"
                 ));

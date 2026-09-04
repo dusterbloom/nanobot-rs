@@ -1345,4 +1345,139 @@ mod tests {
         assert_eq!(result.breakdown[1].role, "router");
         assert_eq!(result.breakdown[2].role, "specialist");
     }
+
+    // -- health watchdog characterization (facet 1: stale requests survive
+    //    recovery across a healthy transition) --
+
+    /// Mock `/health` endpoint whose 2xx/5xx response is gated by an
+    /// `AtomicBool`. Spawns one task per accepted connection so concurrent
+    /// watchdog polls don't block each other.
+    async fn spawn_mock_health(
+        healthy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = match listener.accept().await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                let h = healthy.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let body = if h.load(Ordering::Relaxed) {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+                    } else {
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"
+                    };
+                    let _ = stream.write_all(body.as_bytes()).await;
+                });
+            }
+        });
+        (port.to_string(), handle)
+    }
+
+    /// Try to receive a `RestartRequest` within 100 ms; returns `None` on
+    /// timeout (i.e. the channel is empty at the moment).
+    async fn try_recv_restart(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<RestartRequest>,
+    ) -> Option<Option<RestartRequest>> {
+        tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+            .await
+            .ok()
+    }
+
+    /// Facet 1: the watchdog owns only `restart_tx` and on the healthy branch
+    /// resets the failure counter but does NOT drain the channel, so a
+    /// `RestartRequest` queued during an unhealthy window survives across the
+    /// healthy transition. Also asserts the `seen_healthy` latch is write-once
+    /// (granted exactly once per session) — the by-design behavior that controls
+    /// the rate at which stale requests appear on later unhealthy windows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watchdog_seen_healthy_latch_is_write_once_and_restart_rx_survives_recovery() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        const POLL: u64 = 1;
+        const THRESH: u32 = 3;
+
+        let healthy = std::sync::Arc::new(AtomicBool::new(false));
+        let (port, srv) = spawn_mock_health(healthy.clone()).await;
+        let (alert_tx, _alert_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (restart_tx, mut restart_rx) = tokio::sync::mpsc::unbounded_channel::<RestartRequest>();
+        let inference_active = std::sync::Arc::new(AtomicBool::new(false));
+
+        let handle = start_health_watchdog_with_autorepair(
+            vec![("main".to_string(), port)],
+            alert_tx,
+            restart_tx,
+            inference_active,
+            POLL,
+            THRESH,
+            2,
+        );
+
+        // Phase 1: initial unhealthy, `seen_healthy=false` → grace gate skips
+        // counting → no RestartRequest queued. Assert the channel stays empty
+        // for 3.5 s (well past `THRESH × POLL`).
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        assert!(
+            try_recv_restart(&mut restart_rx).await.is_none(),
+            "Phase 1: seen_healthy gate must suppress restarts during initial load"
+        );
+
+        // Phase 2: first healthy → latches `seen_healthy=true`.
+        healthy.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(
+            try_recv_restart(&mut restart_rx).await.is_none(),
+            "Phase 2: a healthy transition must not queue a restart"
+        );
+
+        // Phase 3: unhealthy again ("a reload"), `seen_healthy` already true →
+        // failures count immediately → a RestartRequest is sent at
+        // failure==THRESH; the counter self-resets → a second request is sent
+        // THRESH polls later. Leave the channel undrained.
+        healthy.store(false, Ordering::Relaxed);
+        let first = tokio::time::timeout(Duration::from_secs(10), restart_rx.recv())
+            .await
+            .expect("Phase 3: first stale RestartRequest should be queued within THRESH polls")
+            .expect("channel unexpectedly closed");
+        assert_eq!(first.role, "main");
+        let second = tokio::time::timeout(Duration::from_secs(10), restart_rx.recv())
+            .await
+            .expect("Phase 3: second stale RestartRequest after counter self-reset")
+            .expect("channel unexpectedly closed");
+        assert_eq!(second.role, "main");
+
+        // Phase 4: recovery → healthy branch does NOT drain `restart_tx`
+        // (facet 1). Wait for the healthy transition, then assert the channel
+        // is empty (both stale requests were already received above and no
+        // further drain happens from the watchdog side).
+        healthy.store(true, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            try_recv_restart(&mut restart_rx).await.is_none(),
+            "Phase 4: healthy branch must not drain or emit on restart_tx"
+        );
+
+        // Phase 5: second unhealthy window, `seen_healthy` still true (the
+        // latch is write-once and never re-armed) → a RestartRequest is
+        // re-queued within THRESH polls. Direct contrast with Phase 1, showing
+        // the loading grace is granted exactly once.
+        healthy.store(false, Ordering::Relaxed);
+        let third = tokio::time::timeout(Duration::from_secs(10), restart_rx.recv())
+            .await
+            .expect("Phase 5: re-queued RestartRequest within THRESH polls (latch is write-once)")
+            .expect("channel unexpectedly closed");
+        assert_eq!(third.role, "main");
+
+        handle.abort();
+        srv.abort();
+    }
 }
