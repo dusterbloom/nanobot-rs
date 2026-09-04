@@ -406,7 +406,9 @@ fn parse_unified_patch(patch: &str) -> Result<Vec<PatchHunk>, String> {
     let mut current: Option<PatchHunk> = None;
 
     for raw in normalized.lines() {
-        if raw.starts_with("--- ") || raw.starts_with("+++ ") || raw.starts_with("diff ") {
+        if current.is_none()
+            && (raw.starts_with("--- ") || raw.starts_with("+++ ") || raw.starts_with("diff "))
+        {
             continue;
         }
         if raw.starts_with("@@") {
@@ -518,6 +520,14 @@ mod tests {
         let err = apply_unified_patch_to_content("one\ntwo\n", patch).unwrap_err();
         assert!(err.contains("stale patch hunk"), "{err}");
         assert!(err.contains("missing"), "{err}");
+    }
+
+    #[test]
+    fn patch_removes_double_dash_comment() {
+        let content = "-- comment\nkeep\n";
+        let patch = "@@ -1,2 +1,1 @@\n--- comment\n keep\n";
+        let (updated, _) = apply_unified_patch_to_content(content, patch).unwrap();
+        assert_eq!(updated, "keep\n");
     }
 
     #[tokio::test]
