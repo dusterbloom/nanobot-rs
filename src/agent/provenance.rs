@@ -635,26 +635,39 @@ pub fn verify_turn_claims(response: &str, entries: &[AuditEntry]) -> (Vec<Annota
 /// Returns the redacted text and the number of redactions made.
 /// Claims are processed from end to start to preserve byte offsets.
 pub fn redact_fabrications(text: &str, claims: &[AnnotatedClaim]) -> (String, usize) {
-    // Filter to Claimed status only.
-    let mut to_redact: Vec<&AnnotatedClaim> = claims
+    // Collect Claimed spans and merge any that overlap or abut into disjoint
+    // unions. The replacement loop below relies on every pending span being
+    // pairwise disjoint: a single replace_range shifts the buffer by
+    // `26 - span_len` bytes, which would otherwise invalidate the original
+    // byte offsets of an overlapping sibling and leak or drop fabricated
+    // content (introduced in dc34208).
+    let mut spans: Vec<(usize, usize)> = claims
         .iter()
         .filter(|c| c.status == ClaimStatus::Claimed)
+        .map(|c| c.span)
         .collect();
+    spans.sort_by_key(|s| (s.0, s.1));
 
-    if to_redact.is_empty() {
-        return (text.to_string(), 0);
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for s in spans {
+        match merged.last_mut() {
+            Some(last) if s.0 <= last.1 => last.1 = last.1.max(s.1),
+            _ => merged.push(s),
+        }
     }
 
-    // Sort by span start descending (process from end to preserve offsets).
-    to_redact.sort_by(|a, b| b.span.0.cmp(&a.span.0));
+    if merged.is_empty() {
+        return (text.to_string(), 0);
+    }
 
     let mut result = text.to_string();
     let mut count = 0usize;
 
-    for claim in &to_redact {
-        let (start, end) = claim.span;
-        if start <= result.len() && end <= result.len() && start <= end {
-            result.replace_range(start..end, "[unverified claim removed]");
+    // Process from end to start so each replacement leaves the offsets of the
+    // remaining (lower-indexed, disjoint) spans unchanged.
+    for (start, end) in merged.iter().rev() {
+        if *start <= result.len() && *end <= result.len() && *start <= *end {
+            result.replace_range(*start..*end, "[unverified claim removed]");
             count += 1;
         }
     }
@@ -1339,6 +1352,177 @@ mod tests {
         assert!(result.contains("BBB"));
         assert!(!result.contains("AAA"));
         assert!(!result.contains("CCC"));
+    }
+
+    #[test]
+    fn test_redact_fabrications_overlapping_short_inner_no_leak() {
+        // Leak variant from the bug report: a sentence-spanning Claimed
+        // action_claim (0, len) overlaps a shorter inner file_ref (2, 18)
+        // whose length is < the 26-byte placeholder. Without span merging,
+        // the inner replacement grows the buffer and the outer redaction then
+        // carves only its first `outer_end` bytes, leaking the trailing
+        // `26 - inner_len` bytes of the original unverified sentence.
+        let text = "I created `/a.txt` and saw the result of the long command here.";
+        let claims = vec![
+            AnnotatedClaim {
+                span: (0, text.len()),
+                claim_type: "action_claim".to_string(),
+                status: ClaimStatus::Claimed,
+                text: text.to_string(),
+            },
+            AnnotatedClaim {
+                span: (2, 18),
+                claim_type: "file_ref".to_string(),
+                status: ClaimStatus::Claimed,
+                text: "created `/a.txt`".to_string(),
+            },
+        ];
+        let (redacted, count) = redact_fabrications(text, &claims);
+        assert_eq!(count, 1);
+        assert_eq!(redacted, "[unverified claim removed]");
+        // The buggy code returned "[unverified claim removed]mand here.".
+        assert!(!redacted.contains("mand here"));
+        assert!(!redacted.contains("command here"));
+    }
+
+    #[test]
+    fn test_redact_fabrications_overlapping_long_inner_no_drop() {
+        // Drop variant: inner span length > 26 bytes. Without merging, the
+        // inner replacement shrinks the buffer so the outer redaction's stale
+        // `end` exceeds result.len(), the guard fails, and the outer
+        // (sentence-spanning) Claimed span is silently skipped — delivering
+        // the unverified sentence tail unredacted with an understated count.
+        let text =
+            "I created `/a/very/long/path/to/some/file/here.txt` and saw the result of the long command here.";
+        let inner_end = 51;
+        let claims = vec![
+            AnnotatedClaim {
+                span: (0, text.len()),
+                claim_type: "action_claim".to_string(),
+                status: ClaimStatus::Claimed,
+                text: text.to_string(),
+            },
+            AnnotatedClaim {
+                span: (2, inner_end),
+                claim_type: "file_ref".to_string(),
+                status: ClaimStatus::Claimed,
+                text: text[2..inner_end].to_string(),
+            },
+        ];
+        let (redacted, count) = redact_fabrications(text, &claims);
+        assert_eq!(count, 1);
+        assert_eq!(redacted, "[unverified claim removed]");
+        // The buggy code returned "I [unverified claim removed] and saw the ...".
+        assert!(!redacted.contains("and saw the result"));
+        assert!(!redacted.contains("long command here"));
+    }
+
+    #[test]
+    fn test_redact_fabrications_partial_overlap() {
+        // Two spans overlapping in the middle: union covers both, redact once.
+        let text = "AAAAABBBBCCCCDDDD";
+        let s1 = "AAAAABBBB";
+        let s2 = "BBBBCCCC";
+        let span1 = (text.find(s1).unwrap(), text.find(s1).unwrap() + s1.len());
+        let span2 = (text.find(s2).unwrap(), text.find(s2).unwrap() + s2.len());
+        assert_eq!(span1, (0, 9));
+        assert_eq!(span2, (5, 13));
+        let claims = vec![
+            AnnotatedClaim {
+                span: span1,
+                claim_type: "action_claim".to_string(),
+                status: ClaimStatus::Claimed,
+                text: s1.to_string(),
+            },
+            AnnotatedClaim {
+                span: span2,
+                claim_type: "file_ref".to_string(),
+                status: ClaimStatus::Claimed,
+                text: s2.to_string(),
+            },
+        ];
+        let (redacted, count) = redact_fabrications(text, &claims);
+        assert_eq!(count, 1);
+        assert_eq!(redacted, "[unverified claim removed]DDDD");
+        assert!(redacted.contains("DDDD"));
+        assert!(!redacted.contains("AAAA"));
+        assert!(!redacted.contains("BBBB"));
+        assert!(!redacted.contains("CCCC"));
+    }
+
+    #[test]
+    fn test_redact_fabrications_overlapping_via_verifier_payload() {
+        // End-to-end: claims produced by ClaimVerifier::verify (not hand
+        // -rolled) for a fabricated sentence whose leaked tail would carry
+        // payload. With no audit entries, the sentence-spanning action_claim
+        // and the inner file_ref (plus the inner outcome claim) are all
+        // Claimed and overlapping — the geometry from the bug report.
+        let entries: Vec<AuditEntry> = vec![];
+        let verifier = ClaimVerifier::new(&entries);
+        let text = "I created `/tmp/sk-abc` and the deploy succeeded with all passwords.";
+        let claims = verifier.verify(text);
+
+        // Geometry guard: verify actually emits an overlapping Claimed set,
+        // otherwise the regression would not exercise the bug.
+        let action = claims
+            .iter()
+            .find(|c| c.claim_type == "action_claim" && c.status == ClaimStatus::Claimed)
+            .expect("a Claimed action_claim must be emitted");
+        let file = claims
+            .iter()
+            .find(|c| c.claim_type == "file_ref" && c.status == ClaimStatus::Claimed)
+            .expect("a Claimed file_ref must be emitted");
+        assert!(
+            file.span.0 >= action.span.0 && file.span.1 <= action.span.1,
+            "file_ref span {:?} must sit inside the action_claim span {:?}",
+            file.span,
+            action.span
+        );
+
+        let (redacted, count) = redact_fabrications(text, &claims);
+        assert_eq!(count, 1);
+        assert_eq!(redacted, "[unverified claim removed]");
+        // None of the unverified payload may survive (neither leak nor drop).
+        assert!(!redacted.contains("passwords"));
+        assert!(!redacted.contains("sk-abc"));
+        assert!(!redacted.contains("deploy succeeded"));
+        assert!(!redacted.contains("all passwords"));
+    }
+
+    #[test]
+    fn test_redact_fabrications_disjoint_claims_no_regression() {
+        // Two separate fabricated sentences yield two disjoint Claimed
+        // action_claims; both must be redacted (count = 2) and the text
+        // between them preserved. Guards against an over-merging fix.
+        let entries: Vec<AuditEntry> = vec![];
+        let verifier = ClaimVerifier::new(&entries);
+        let text = "I deleted the backups. I created the report.";
+        let claims = verifier.verify(text);
+        let actions: Vec<&AnnotatedClaim> = claims
+            .iter()
+            .filter(|c| c.claim_type == "action_claim" && c.status == ClaimStatus::Claimed)
+            .collect();
+        assert_eq!(
+            actions.len(),
+            2,
+            "expected two disjoint Claimed action_claims"
+        );
+        let (a0, a1) = (actions[0].span, actions[1].span);
+        assert!(
+            a0.1 <= a1.0,
+            "action_claims must be disjoint (a0={:?}, a1={:?})",
+            a0,
+            a1
+        );
+
+        let (redacted, count) = redact_fabrications(text, &claims);
+        assert_eq!(count, 2);
+        assert_eq!(
+            redacted,
+            "[unverified claim removed] [unverified claim removed]"
+        );
+        assert!(!redacted.contains("deleted"));
+        assert!(!redacted.contains("created"));
     }
 
     // --- detect_phantom_claims ---
