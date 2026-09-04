@@ -1541,7 +1541,7 @@ impl VoicePipeline {
         let lang = detect_language(&text);
         debug!(
             "Transcribed: \"{}\" (lang: {})",
-            &text[..text.len().min(80)],
+            crate::utils::helpers::utf8_prefix(&text, 80),
             lang
         );
         Ok((text, lang))

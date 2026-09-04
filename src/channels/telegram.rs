@@ -42,6 +42,8 @@ use crate::config::schema::TelegramConfig;
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 
 #[cfg(feature = "voice")]
+use crate::utils::helpers::utf8_prefix;
+#[cfg(feature = "voice")]
 use crate::voice_pipeline::VoicePipeline;
 
 /// Send "typing..." indicator to a Telegram chat.
@@ -294,7 +296,7 @@ impl TelegramChannel {
                                 Ok((text, lang)) => {
                                     info!(
                                         "Transcribed Telegram voice: \"{}\" (lang: {})",
-                                        &text[..text.len().min(60)],
+                                        utf8_prefix(&text, 60),
                                         lang
                                     );
                                     content_parts.push(text);

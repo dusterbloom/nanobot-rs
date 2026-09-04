@@ -45,6 +45,7 @@ use tracing::{debug, error, info, warn};
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::Channel;
 use crate::config::schema::WhatsAppConfig;
+use crate::utils::helpers::utf8_prefix;
 
 #[cfg(feature = "voice")]
 use crate::voice_pipeline::VoicePipeline;
@@ -210,7 +211,7 @@ impl WhatsAppChannel {
                                 Ok((text, lang)) => {
                                     info!(
                                         "Transcribed WhatsApp voice: \"{}\" (lang: {})",
-                                        &text[..text.len().min(60)],
+                                        utf8_prefix(&text, 60),
                                         lang
                                     );
                                     is_voice_message = true;
@@ -368,7 +369,7 @@ impl Channel for WhatsAppChannel {
                                         Err(_) => {
                                             warn!(
                                                 "Invalid JSON from bridge: {}",
-                                                &text[..text.len().min(100)]
+                                                utf8_prefix(&text, 100)
                                             );
                                         }
                                     }

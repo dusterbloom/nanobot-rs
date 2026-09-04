@@ -101,6 +101,11 @@ pub fn floor_char_boundary(s: &str, idx: usize) -> usize {
     i
 }
 
+/// Return at most `max_bytes` without splitting a UTF-8 code point.
+pub fn utf8_prefix(s: &str, max_bytes: usize) -> &str {
+    &s[..floor_char_boundary(s, max_bytes)]
+}
+
 /// Truncate a string to max length, adding a suffix if truncated.
 pub fn truncate_string(s: &str, max_len: usize) -> String {
     let suffix = "...";
@@ -301,6 +306,13 @@ mod tests {
         assert_eq!(floor_char_boundary(s, 3), 1);
         assert_eq!(floor_char_boundary(s, 4), 1);
         assert_eq!(floor_char_boundary(s, 5), 5); // start of 'b'
+    }
+
+    #[test]
+    fn voice_preview_is_utf8_safe() {
+        let text = format!("a{}", "中".repeat(20));
+        assert!(!text.is_char_boundary(60));
+        assert_eq!(utf8_prefix(&text, 60), &text[..58]);
     }
 
     #[test]
