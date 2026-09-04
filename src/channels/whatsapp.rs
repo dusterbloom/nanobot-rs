@@ -208,9 +208,10 @@ impl WhatsAppChannel {
                         if let Some(ref pipeline) = voice_pipeline {
                             match pipeline.transcribe_file(vf).await {
                                 Ok((text, lang)) => {
+                                    let end = crate::utils::helpers::floor_char_boundary(&text, 60);
                                     info!(
                                         "Transcribed WhatsApp voice: \"{}\" (lang: {})",
-                                        &text[..text.len().min(60)],
+                                        &text[..end],
                                         lang
                                     );
                                     is_voice_message = true;
@@ -366,10 +367,10 @@ impl Channel for WhatsAppChannel {
                                             .await;
                                         }
                                         Err(_) => {
-                                            warn!(
-                                                "Invalid JSON from bridge: {}",
-                                                &text[..text.len().min(100)]
+                                            let end = crate::utils::helpers::floor_char_boundary(
+                                                &text, 100,
                                             );
+                                            warn!("Invalid JSON from bridge: {}", &text[..end]);
                                         }
                                     }
                                 }

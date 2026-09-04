@@ -292,9 +292,10 @@ impl TelegramChannel {
                         if let Some(ref pipeline) = voice_pipeline {
                             match pipeline.transcribe_file(&path).await {
                                 Ok((text, lang)) => {
+                                    let end = crate::utils::helpers::floor_char_boundary(&text, 60);
                                     info!(
                                         "Transcribed Telegram voice: \"{}\" (lang: {})",
-                                        &text[..text.len().min(60)],
+                                        &text[..end],
                                         lang
                                     );
                                     content_parts.push(text);

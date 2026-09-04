@@ -1539,11 +1539,8 @@ impl VoicePipeline {
         }
 
         let lang = detect_language(&text);
-        debug!(
-            "Transcribed: \"{}\" (lang: {})",
-            &text[..text.len().min(80)],
-            lang
-        );
+        let end = crate::utils::helpers::floor_char_boundary(&text, 80);
+        debug!("Transcribed: \"{}\" (lang: {})", &text[..end], lang);
         Ok((text, lang))
     }
 
