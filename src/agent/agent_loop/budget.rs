@@ -354,12 +354,18 @@ pub(super) fn history_window_near(
 /// margin errs conservative.
 const OVERFLOW_TRIM_MARGIN: f64 = 0.93;
 
-/// Trim target for server-oracle overflow recovery (see
-/// `attempt_overflow_recovery`), as a fraction of the SMALLEST possible
-/// prompt cap (window minus the BASE response budget). The server already
-/// proved the client estimate wrong for this content — the bias measured up
-/// to ~20% on entity-heavy content — so the recovery target sits far enough
-/// under every possible cap that even a badly biased estimate lands safely.
+/// Trim margin for server-oracle overflow recovery (see
+/// `attempt_overflow_recovery`), as a fraction of the prompt cap the failed
+/// request actually sent: the context window minus the call's
+/// `effective_max_tokens`. The server already proved the client estimate
+/// wrong for this content — the bias measured up to ~20% on entity-heavy
+/// content — so the recovery target sits far enough under the call's real
+/// cap that even a badly biased estimate lands safely. Computing this from
+/// the *base* `ctx.core.max_tokens` while the failed request was sent with
+/// the widened *effective* budget leaves the target above the server's true
+/// prompt cap (`window − effective`), which makes `apply_emergency_trim`'s
+/// no-shrink guard short-circuit and turns the overflow into a fatal
+/// `context_length_exceeded` 400 — see [`overflow_recovery_fallback_budget`].
 pub(super) const OVERFLOW_RECOVERY_MARGIN: f64 = 0.80;
 
 /// Headroom under the server-reported cap for the RATIO-based recovery
@@ -383,4 +389,148 @@ pub(super) const MAX_OVERFLOW_RECOVERIES: u32 = 3;
 /// overflowing kills the turn.
 pub(super) fn overflow_trim_threshold(prompt_cap: usize) -> usize {
     (prompt_cap as f64 * OVERFLOW_TRIM_MARGIN) as usize
+}
+
+/// `None`-arm fallback target for `attempt_overflow_recovery`: the context
+/// window minus the failed call's `effective_max_tokens`, scaled by
+/// [`OVERFLOW_RECOVERY_MARGIN`].
+///
+/// The failed request was sent with `max_tokens = effective_max_tokens`
+/// (possibly widened above the static base `ctx.core.max_tokens` by `/long`,
+/// a long-form prompt, a local Rich-artifact action, or a thinking budget),
+/// so the server enforced the real prompt cap `window − effective` — not
+/// `window − base`. Deriving the target from the base budget instead can
+/// leave it *above* that real cap, which makes `apply_emergency_trim`'s
+/// no-shrink guard (`rendered_before <= message_budget`) short-circuit and
+/// turns the overflow into a fatal `context_length_exceeded` 400 even though
+/// trimming further would fit. Mirrors how the preflight gate
+/// ([`overflow_trim_threshold`]) derives its cap from the same effective
+/// budget; when `effective_max_tokens == base` the result is identical to
+/// the old base-derived computation, so unwidened turns are unaffected.
+pub(super) fn overflow_recovery_fallback_budget(
+    max_context: usize,
+    effective_max_tokens: u32,
+) -> usize {
+    ((max_context.saturating_sub(effective_max_tokens as usize)) as f64 * OVERFLOW_RECOVERY_MARGIN)
+        as usize
+}
+
+#[cfg(test)]
+mod overflow_recovery_fallback_budget_tests {
+    use super::{
+        overflow_recovery_fallback_budget, overflow_trim_threshold, OVERFLOW_RECOVERY_MARGIN,
+    };
+
+    // Production defaults: base max_tokens B = 4096, adaptive_long_mode_min_tokens
+    // = 12288 (what /long and a local Rich-artifact action widen `effective` to),
+    // and the local default window is 32,768.
+    const BASE: u32 = 4096;
+    const EFFECTIVE_LONG: u32 = 12288;
+    const LOCAL_WINDOW: usize = 32_768;
+
+    #[test]
+    fn uses_effective_max_tokens_so_target_lands_under_the_real_cap() {
+        // The failed request sent max_tokens = EFFECTIVE_LONG, so the server's
+        // real prompt cap is window − effective, NOT window − base.
+        let real_cap = LOCAL_WINDOW.saturating_sub(EFFECTIVE_LONG as usize);
+        assert_eq!(real_cap, 20_480);
+
+        let target = overflow_recovery_fallback_budget(LOCAL_WINDOW, EFFECTIVE_LONG);
+        assert_eq!(
+            target,
+            ((LOCAL_WINDOW - EFFECTIVE_LONG as usize) as f64 * OVERFLOW_RECOVERY_MARGIN) as usize
+        );
+        assert_eq!(target, 16_384);
+        assert!(
+            target < real_cap,
+            "fixed target must sit under the server's real prompt cap: {target} >= {real_cap}"
+        );
+    }
+
+    #[test]
+    fn guard_no_longer_short_circuits_on_the_firing_window() {
+        // After the preflight gate trims, rendered_before sits at the preflight
+        // clamp = (window − effective) · OVERFLOW_TRIM_MARGIN. apply_emergency_trim
+        // short-circuits (refuses to trim) when rendered_before <= message_budget,
+        // which with the BUGGY base-derived target made recovery bail to a fatal
+        // 400 on the local / non-higgs firing window.
+        let clamp = overflow_trim_threshold(LOCAL_WINDOW.saturating_sub(EFFECTIVE_LONG as usize));
+        assert_eq!(clamp, 19_046);
+
+        // Fixed (effective-derived) target is below the clamp → trim proceeds.
+        let fixed = overflow_recovery_fallback_budget(LOCAL_WINDOW, EFFECTIVE_LONG);
+        assert!(
+            fixed < clamp,
+            "fixed target must sit below the preflight clamp so the no-shrink guard fires the \
+             trim: {fixed} >= {clamp}"
+        );
+
+        // Regression guard: the pre-fix base-derived target overshot BOTH the
+        // clamp and the real cap — exactly the bug.
+        let pre_fix = ((LOCAL_WINDOW.saturating_sub(BASE as usize)) as f64
+            * OVERFLOW_RECOVERY_MARGIN) as usize;
+        assert_eq!(pre_fix, 22_937);
+        assert!(
+            pre_fix > clamp,
+            "pre-fix target sat above the preflight clamp: the no-shrink guard short-circuited \
+             (rendered_before ({clamp}) <= {pre_fix})"
+        );
+        assert!(
+            pre_fix > LOCAL_WINDOW.saturating_sub(EFFECTIVE_LONG as usize),
+            "pre-fix target sat above the real cap: even a successful trim would 400 again"
+        );
+    }
+
+    #[test]
+    fn unchanged_when_effective_equals_base() {
+        // No widening (E == B): the fix is byte-identical to the old
+        // base-derived computation, so unwidened turns keep their behaviour.
+        let window = 32_768usize;
+        let budget: u32 = 2_048;
+        let fixed = overflow_recovery_fallback_budget(window, budget);
+        let old =
+            ((window.saturating_sub(budget as usize)) as f64 * OVERFLOW_RECOVERY_MARGIN) as usize;
+        assert_eq!(fixed, old);
+        assert_eq!(fixed, 24_576);
+    }
+
+    #[test]
+    fn target_always_sits_under_the_real_cap_and_preflight_clamp() {
+        // General invariant: as a fraction (0.80) of (window − effective), the
+        // target is always strictly under the real cap (window − effective)
+        // and under the preflight clamp (window − effective) · 0.93 whenever
+        // that cap is positive — so the trimmed retry fits and the no-shrink
+        // guard does not short-circuit.
+        for (window, effective) in [
+            (128_000usize, 12_288u32), // cloud default + /long (non-firing row)
+            (32_768, 12_288),          // local default + /long (firing row)
+            (32_768, 6_144),           // local default + long-form prompt
+            (65_536, 12_288),          // mid-size cloud + /long
+            (8_192, 4_096),            // tiny harness window
+        ] {
+            let real_cap = window.saturating_sub(effective as usize);
+            assert!(real_cap > 0, "test vector must leave room for a prompt");
+            let target = overflow_recovery_fallback_budget(window, effective);
+            assert!(
+                target < real_cap,
+                "({window}, {effective}): target {target} must sit under real cap {real_cap}"
+            );
+            let clamp = overflow_trim_threshold(real_cap);
+            assert!(
+                target < clamp,
+                "({window}, {effective}): target {target} must sit under preflight clamp {clamp} \
+                 so the no-shrink guard does not short-circuit"
+            );
+        }
+    }
+
+    #[test]
+    fn saturates_to_zero_when_effective_budget_meets_or_exceeds_window() {
+        // When the response budget consumes the whole window no prompt can be
+        // sent: saturating_sub clamps to zero, the target is zero, and the
+        // no-shrink guard (rendered_before <= 0) leaves the turn to the normal
+        // error path — no panic, no unsigned wraparound.
+        assert_eq!(overflow_recovery_fallback_budget(8_192, 8_192), 0);
+        assert_eq!(overflow_recovery_fallback_budget(8_192, 16_384), 0);
+    }
 }

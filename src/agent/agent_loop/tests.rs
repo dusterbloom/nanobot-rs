@@ -10480,3 +10480,175 @@ async fn idle_turn_e2e_injects_journaled_quiet_turn() {
     run_handle.abort();
     let _ = std::fs::remove_dir_all(&workspace);
 }
+
+// ---------------------------------------------------------------------------
+// Overflow recovery: non-higgs local backend, effective_max_tokens > base.
+// Regression test for the bug where attempt_overflow_recovery's None arm
+// used ctx.core.max_tokens (base) instead of the call's effective_max_tokens,
+// making the recovery target overshoot the server's real prompt cap
+// (window − effective) on local non-higgs backends under /long.
+// ---------------------------------------------------------------------------
+
+/// Mock non-higgs local backend: first `chat` call returns a `None`-shape
+/// context-overflow 400, the second returns a normal response.
+/// `supports_higgs_session_cache() == false` so recovery takes the `None` arm.
+struct NonHiggsOverflowProvider {
+    name: String,
+    call_count: std::sync::atomic::AtomicU32,
+    captured_max_tokens: std::sync::Mutex<Vec<u32>>,
+}
+
+impl NonHiggsOverflowProvider {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            call_count: std::sync::atomic::AtomicU32::new(0),
+            captured_max_tokens: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn captured_max_tokens(&self) -> Vec<u32> {
+        self.captured_max_tokens.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl LLMProvider for NonHiggsOverflowProvider {
+    async fn chat(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        self.captured_max_tokens.lock().unwrap().push(max_tokens);
+        let call = self
+            .call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if call == 0 {
+            // Non-higgs overflow: `is_context_overflow_error` recognizes this,
+            // `parse_overflow_counts` returns None → recovery takes the None arm.
+            Err(crate::errors::ProviderError::HttpStatus {
+                status: 400,
+                code: None,
+                message: "exceed_context_size_error".to_string(),
+            }
+            .into())
+        } else {
+            Ok(crate::providers::base::LLMResponse {
+                content: Some("recovered".to_string()),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: std::collections::HashMap::new(),
+            })
+        }
+    }
+
+    fn get_default_model(&self) -> &str {
+        &self.name
+    }
+
+    fn supports_higgs_session_cache(&self) -> bool {
+        false
+    }
+}
+
+#[tokio::test]
+async fn overflow_recovery_none_arm_uses_effective_max_tokens_on_local_non_higgs() {
+    // Reproduction: local non-higgs backend (LM Studio / Qwen), local default
+    // window 32,768, /long widens effective_max_tokens to 12,288. The None-arm
+    // recovery target must use the EFFECTIVE budget so it lands under the
+    // real cap (window − effective = 20,480) and the no-shrink guard does not
+    // short-circuit.
+    //
+    // Pre-seed ~25K tokens of conversation history (8 user/assistant pairs),
+    // then turn with /long overflows on the accumulated context. Recovery
+    // must trim old history and retry.
+    let provider = Arc::new(NonHiggsOverflowProvider::new("local-qwen-test"));
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "local-qwen-test",
+        32_768,
+        LcmSchemaConfig {
+            tau_soft: 999.0,
+            tau_hard: 999.0,
+            ..Default::default()
+        },
+    );
+    let session_key = format!("overflow-non-higgs-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let counters = agent_loop.shared.core_handle.counters.clone();
+    let session = core.sessions.get_or_resume(&session_key).await;
+
+    // Seed many small user/assistant pairs (~500 tokens each) so the trimmer
+    // can drop individual messages in fine-grained steps. Total ~25K tokens,
+    // above the preflight clamp (19046) so the preflight trims, leaving
+    // rendered_before near 17726 — in the firing window (16384, 25804].
+    for turn in 0..45u32 {
+        let user_text = (0..120)
+            .map(|i| {
+                format!(
+                    "Turn {turn} line {i} with varied unique content 0x{:x}.",
+                    i * 0x1234 + turn as usize * 0x9abc
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        core.sessions
+            .add_message(
+                &session.id,
+                &json!({
+                    "role": "user",
+                    "content": user_text,
+                    "_turn": turn,
+                }),
+            )
+            .await;
+        core.sessions
+            .add_message(
+                &session.id,
+                &json!({
+                    "role": "assistant",
+                    "content": format!("Acknowledged turn {turn}."),
+                    "_turn": turn,
+                }),
+            )
+            .await;
+    }
+
+    // Simulate /long for the overflow turn: effective_max_tokens = 12,288.
+    counters
+        .long_mode_turns
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+
+    let response = agent_loop
+        .process_direct("Continue the analysis.", &session_key, "test", "offline")
+        .await;
+
+    let captured = provider.captured_max_tokens();
+
+    // Post-fix: recovery trims old history and retries successfully.
+    assert!(
+        response.contains("recovered"),
+        "post-fix: overflow recovery must trim history and retry, got: {response}"
+    );
+
+    // The provider must have been called ≥2 times (overflow + retry).
+    assert!(
+        captured.len() >= 2,
+        "post-fix: expected ≥2 provider calls (overflow + retry), got {}",
+        captured.len()
+    );
+
+    // The overflow call must carry the widened effective budget (12,288),
+    // not the base 512 — this is the budget that made the server enforce the
+    // real prompt cap (W − E = 20,480) and reject the request.
+    assert_eq!(
+        captured[0], 12_288,
+        "overflow call: max_tokens must be the effective (widened) budget 12_288, got {}",
+        captured[0]
+    );
+}
