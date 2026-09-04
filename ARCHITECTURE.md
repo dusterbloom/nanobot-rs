@@ -441,7 +441,7 @@ Config {
 - One `CompactionSidecarManager` owns process state and reference-counted leases for LCM, learning, cron reflection, and exit reflection
 - Lease acquisition resolves the literal served model through `/v1/models`; acquisition is bounded at 75s and failures enter a 5–60s manager-owned health backoff
 - Each compaction call is bounded at 150s; hard pressure waits up to 155s for an in-flight soft job before proceeding
-- Soft failures preserve the active context; hard failures use LCM level-three deterministic compression without routing to the main model
+- Both soft and hard failures preserve the active context; huge blocks take deterministic level-three truncation in either mode without routing to the main model
 - Dropping the last lease stops only a Higgs process spawned by the manager; external sidecars remain running
 
 ### 12. Event Bus (`src/bus/events.rs`)
