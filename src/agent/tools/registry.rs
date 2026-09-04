@@ -1101,13 +1101,9 @@ impl ToolRegistry {
             .tools
             .values()
             .filter(|t| t.is_available())
+            .filter(|t| !exclude.iter().any(|name| t.name() == *name))
+            .filter(|t| !Self::RARELY_ADVERTISED_TOOLS.contains(&t.name()))
             .map(|t| Self::tool_hint(t.as_ref()))
-            .filter(|h| !exclude.iter().any(|e| h.starts_with(e)))
-            .filter(|h| {
-                !Self::RARELY_ADVERTISED_TOOLS
-                    .iter()
-                    .any(|r| h.starts_with(r))
-            })
             .collect();
         hints.sort();
 
@@ -2872,6 +2868,22 @@ mod tests {
         assert!(
             !desc.contains("unavailable_test"),
             "Unavailable tool must NOT be listed"
+        );
+    }
+
+    #[test]
+    fn proxy_exclusion_matches_exact_tool_name() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(MockTool::new("exec")));
+        registry.register(Box::new(MockTool::new("execute_code")));
+
+        let defs = registry.get_proxy_definition_excluding(&["exec"]);
+        let desc = defs[0]["function"]["description"].as_str().unwrap();
+
+        assert!(!desc.contains("exec("), "exact exclusion leaked: {desc}");
+        assert!(
+            desc.contains("execute_code("),
+            "prefix-sharing tool must remain advertised: {desc}"
         );
     }
 
