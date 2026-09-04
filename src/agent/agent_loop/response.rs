@@ -31,8 +31,8 @@ use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProv
 use crate::turn_stream::ControlMarker;
 
 use super::{
-    AgentLoopShared, IterationOutcome, IterationPhase, MessageLog, StepResult, ToolRouting,
-    TurnContext, TurnOutcome,
+    AgentLoopShared, IterationOutcome, IterationPhase, StepResult, ToolRouting, TurnContext,
+    TurnOutcome,
 };
 
 async fn recorded_auxiliary_chat(
@@ -469,13 +469,6 @@ fn tool_calls_to_maps(tool_calls: &[ToolCallRequest]) -> Vec<HashMap<String, Val
         .collect()
 }
 
-fn push_lease_renewal_checkpoint(messages: &mut MessageLog, content: &str) {
-    messages.push_draft(json!({
-        "role": "assistant",
-        "content": content
-    }));
-}
-
 // ---------------------------------------------------------------------------
 // Handler methods on AgentLoopShared
 // ---------------------------------------------------------------------------
@@ -593,7 +586,10 @@ impl AgentLoopShared {
                         // The model's checkpoint is part of the protocol history:
                         // keep it immediately before the synthetic renewal nudge
                         // so the next request can continue the stated plan.
-                        push_lease_renewal_checkpoint(&mut ctx.messages, &content);
+                        ctx.messages.push_draft(json!({
+                            "role": "assistant",
+                            "content": content
+                        }));
                         // Nudge the model so it knows tools are available
                         // again. Without this, a small local model may
                         // emit another text answer instead of tool calls
@@ -1707,49 +1703,147 @@ mod tests {
         assert_eq!(maps[0]["arguments"]["path"], "/tmp/x");
     }
 
-    #[test]
-    fn lease_renewal_persists_assistant_checkpoint() {
-        let mut messages = super::super::shared::MessageLog::committed(vec![json!({
-            "role": "user",
-            "content": "inspect the files"
-        })]);
-        for index in 0..12 {
-            let call_id = format!("read-{index}");
-            messages.push_draft(json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": call_id,
-                    "type": "function",
-                    "function": {
-                        "name": "read_file",
-                        "arguments": format!(r#"{{"path":"file-{index}"}}"#)
-                    }
-                }]
-            }));
-            messages.push_draft(json!({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": format!("contents-{index}")
-            }));
+    #[tokio::test]
+    async fn lease_renewal_persists_assistant_checkpoint() {
+        const CHECKPOINT: &str =
+            "findings: twelve files inspected\nnext: compare results\nwill: report differences";
+
+        struct LeaseRenewalProvider {
+            calls: std::sync::Mutex<Vec<Vec<Value>>>,
+            next: std::sync::atomic::AtomicUsize,
         }
 
-        let checkpoint =
-            "findings: twelve files inspected\nnext: compare results\nwill: report differences";
-        push_lease_renewal_checkpoint(&mut messages, checkpoint);
-        messages.push_draft(crate::agent::markers::scaffold_user(
-            "[Lease renewed — proceed with the plan from your checkpoint.]",
-        ));
+        #[async_trait::async_trait]
+        impl crate::providers::base::LLMProvider for LeaseRenewalProvider {
+            async fn chat(
+                &self,
+                messages: &[Value],
+                _tools: Option<&[Value]>,
+                _model: Option<&str>,
+                _max_tokens: u32,
+                _temperature: f64,
+                _thinking_budget: Option<u32>,
+                _top_p: Option<f64>,
+            ) -> anyhow::Result<LLMResponse> {
+                self.calls.lock().unwrap().push(messages.to_vec());
+                let index = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if index < 12 {
+                    return Ok(LLMResponse {
+                        content: Some(String::new()),
+                        tool_calls: vec![ToolCallRequest {
+                            id: format!("read-{index}"),
+                            name: "read_file".to_string(),
+                            arguments: [("path".to_string(), json!(format!("file-{index}.txt")))]
+                                .into_iter()
+                                .collect(),
+                        }],
+                        finish_reason: FinishReason::ToolCalls,
+                        usage: HashMap::new(),
+                    });
+                }
+                let content = if index == 12 {
+                    CHECKPOINT
+                } else {
+                    "final answer"
+                };
+                Ok(LLMResponse {
+                    content: Some(content.to_string()),
+                    tool_calls: Vec::new(),
+                    finish_reason: FinishReason::Stop,
+                    usage: HashMap::new(),
+                })
+            }
 
-        let wire = messages.to_vec();
-        let checkpoint_index = wire
-            .iter()
-            .position(|message| {
-                message.get("role").and_then(Value::as_str) == Some("assistant")
-                    && message.get("content").and_then(Value::as_str) == Some(checkpoint)
-            })
-            .expect("valid renewal checkpoint must remain on the next request");
-        let scaffold_index = wire
+            fn get_default_model(&self) -> &str {
+                "local-qwen-test"
+            }
+        }
+
+        let provider = std::sync::Arc::new(LeaseRenewalProvider {
+            calls: std::sync::Mutex::new(Vec::new()),
+            next: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let workspace = tempfile::tempdir().unwrap().keep();
+        for index in 0..12 {
+            std::fs::write(workspace.join(format!("file-{index}.txt")), "contents").unwrap();
+        }
+        let core = crate::agent::agent_core::build_swappable_core(
+            crate::agent::agent_core::SwappableCoreConfig {
+                provider: provider.clone(),
+                workspace: workspace.clone(),
+                model: "local-qwen-test".to_string(),
+                max_iterations: 20,
+                max_continuations: 2,
+                max_tokens: 512,
+                temperature: 0.3,
+                max_context_tokens: 32_768,
+                brave_api_key: None,
+                search_provider: "searxng".to_string(),
+                searxng_url: "http://localhost:8888".to_string(),
+                crw_url: String::new(),
+                search_max_results: 5,
+                exec_timeout: 30,
+                restrict_to_workspace: true,
+                memory_config: crate::config::schema::MemoryConfig::default(),
+                is_local: true,
+                lane: crate::agent::lane::Lane::default(),
+                tool_delegation: crate::config::schema::ToolDelegationConfig::default(),
+                provenance: crate::config::schema::ProvenanceConfig::default(),
+                max_tool_result_chars: 2_000,
+                delegation_provider: None,
+                specialist_provider: None,
+                trio_config: crate::config::schema::TrioConfig::default(),
+                model_capabilities_overrides: HashMap::new(),
+                reasoning_config: crate::config::schema::ReasoningConfig::default(),
+                tool_heartbeat_secs: 2,
+                health_check_timeout_secs: 2,
+                adaptive_tokens: crate::config::schema::AdaptiveTokenConfig::default(),
+                sessions_db_path: Some(workspace.join("sessions.sqlite")),
+                code_execution: crate::config::schema::CodeExecutionConfig::default(),
+                python_kernel: crate::config::schema::PythonKernelConfig::default(),
+                cua: crate::config::schema::CuaToolConfig::default(),
+            },
+        );
+        let counters =
+            std::sync::Arc::new(crate::agent::agent_core::RuntimeCounters::new_with_config(
+                32_768,
+                &crate::config::schema::CircuitBreakerConfig::default(),
+            ));
+        let core_handle = crate::agent::agent_core::AgentHandle::new(core, counters);
+        let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel();
+        let agent_loop = super::super::AgentLoop::new(
+            core_handle,
+            inbound_rx,
+            outbound_tx,
+            inbound_tx,
+            None,
+            1,
+            None,
+            None,
+            None,
+            crate::config::schema::ProprioceptionConfig::default(),
+            crate::config::schema::LcmSchemaConfig::default(),
+            None,
+        );
+
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agent_loop.process_direct(
+                "inspect twelve files, then report",
+                "lease-renewal-checkpoint",
+                "test",
+                "offline",
+            ),
+        )
+        .await
+        .expect("scripted turn must terminate");
+        assert_eq!(answer, "final answer");
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(calls.len(), 14, "12 reads + checkpoint + final answer");
+        let post_renewal = &calls[13];
+        let scaffold_index = post_renewal
             .iter()
             .position(|message| {
                 message
@@ -1757,12 +1851,20 @@ mod tests {
                     .and_then(Value::as_str)
                     .is_some_and(|content| content.contains("Lease renewed"))
             })
-            .expect("renewal scaffold must remain on the next request");
-
+            .expect("first post-renewal request must contain the renewal scaffold");
+        let checkpoint = scaffold_index
+            .checked_sub(1)
+            .and_then(|index| post_renewal.get(index))
+            .expect("checkpoint must immediately precede the renewal scaffold");
         assert_eq!(
-            checkpoint_index + 1,
-            scaffold_index,
-            "checkpoint assistant message must immediately precede the renewal scaffold"
+            checkpoint.get("role").and_then(Value::as_str),
+            Some("assistant")
         );
+        assert_eq!(
+            checkpoint.get("content").and_then(Value::as_str),
+            Some(CHECKPOINT)
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
     }
 }
