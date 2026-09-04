@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
-use super::filesystem::{expand_path, idle_write_denied_err, sha256_hex};
+use super::filesystem::{expand_path, idle_write_denied_err, normalize_lexical, sha256_hex};
 use crate::errors::ToolError;
 
 /// Tool to validate or apply unified diffs across one or more files.
@@ -107,10 +107,11 @@ impl Tool for ApplyPatchTool {
         )];
 
         for fp in file_patches {
-            let path = expand_path(&fp.path);
+            let mut path = expand_path(&fp.path);
             // Idle turns gate every patched path: hunks name targets the
             // registry-level param check can never see.
             if let Some(paths) = &self.idle_paths {
+                path = normalize_lexical(&path);
                 let workspace = crate::utils::helpers::get_workspace_path(None);
                 if !super::filesystem::idle_write_allowed(paths, &path, &workspace) {
                     return Err(idle_write_denied_err(&path));

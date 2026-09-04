@@ -22,7 +22,7 @@ pub use write::WriteFileTool;
 pub(crate) use write::MAX_WRITE_FILE_PIECE_CHARS;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -274,6 +274,7 @@ fn is_sha256_hex(value: &str) -> bool {
 /// allowlist and is denied. Deny-over-surprise is the correct direction for
 /// an unattended turn; memory maintenance goes through remember/recall.
 pub(crate) fn idle_write_allowed(entries: &[String], target: &Path, workspace: &Path) -> bool {
+    let target = normalize_lexical(target);
     let mut allowed = false;
     for entry in entries {
         let (raw, subtree) = match entry.strip_suffix("/**") {
@@ -285,9 +286,10 @@ pub(crate) fn idle_write_allowed(entries: &[String], target: &Path, workspace: &
         }
         let base = Path::new(raw);
         let matched = if base.is_absolute() {
-            subtree && target.starts_with(base) || (!subtree && target == base)
+            let base = normalize_lexical(base);
+            subtree && target.starts_with(&base) || (!subtree && target == base)
         } else {
-            let ws = workspace.join(base);
+            let ws = normalize_lexical(&workspace.join(base));
             subtree && target.starts_with(&ws) || (!subtree && target == ws)
         };
         if matched {
@@ -296,6 +298,29 @@ pub(crate) fn idle_write_allowed(entries: &[String], target: &Path, workspace: &
         }
     }
     allowed
+}
+
+/// Normalize `.` and `..` without touching the filesystem. Relative paths
+/// retain parents that cannot be cancelled; absolute paths stop at root.
+pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
+    let absolute = path.is_absolute();
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                _ if !absolute => normalized.push(component.as_os_str()),
+                _ => {}
+            },
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    normalized
 }
 
 /// Consistent denial message for idle-turn writes outside the allowlist.
@@ -383,8 +408,9 @@ impl Tool for EditFileTool {
     ) -> ToolResult {
         let path = require_param(&params, "path")?;
 
-        let file_path = expand_path(path);
+        let mut file_path = expand_path(path);
         if let Some(paths) = &self.idle_paths {
+            file_path = normalize_lexical(&file_path);
             let workspace = crate::utils::helpers::get_workspace_path(None);
             if !idle_write_allowed(paths, &file_path, &workspace) {
                 return Err(idle_write_denied_err(&file_path));
@@ -1898,6 +1924,17 @@ mod tests {
             !idle_write_allowed(&[], &ws.join("MEMORY.md"), ws),
             "empty allowlist denies"
         );
+    }
+
+    #[test]
+    fn idle_allowlist_rejects_parent_traversal() {
+        let workspace = Path::new("/workspace");
+        let target = workspace.join("skills/../../outside.txt");
+        assert!(!idle_write_allowed(
+            &["skills/**".into()],
+            &target,
+            workspace
+        ));
     }
 
     #[tokio::test]
