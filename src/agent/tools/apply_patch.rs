@@ -211,6 +211,7 @@ fn parse_file_patches(patch: &str) -> Result<Vec<FilePatch>, String> {
     let mut patches = Vec::new();
     let mut current_path: Option<String> = None;
     let mut current_lines: Vec<String> = Vec::new();
+    let mut in_hunk = false;
 
     for raw in normalized.lines() {
         if raw == "*** Begin Patch" || raw == "*** End Patch" {
@@ -218,11 +219,17 @@ fn parse_file_patches(patch: &str) -> Result<Vec<FilePatch>, String> {
         }
         if raw.starts_with("diff --git ") {
             push_file_patch(&mut patches, &mut current_path, &mut current_lines);
+            in_hunk = false;
         }
-        if let Some(path) = raw.strip_prefix("+++ ") {
-            if path.trim() != "/dev/null" {
-                current_path = Some(normalize_patch_path(path.trim()));
+        if !in_hunk {
+            if let Some(path) = raw.strip_prefix("+++ ") {
+                if path.trim() != "/dev/null" {
+                    current_path = Some(normalize_patch_path(path.trim()));
+                }
             }
+        }
+        if raw.starts_with("@@") {
+            in_hunk = true;
         }
         if current_path.is_some() {
             current_lines.push(raw.to_string());
@@ -528,6 +535,31 @@ mod tests {
         let patch = "@@ -1,2 +1,1 @@\n--- comment\n keep\n";
         let (updated, _) = apply_unified_patch_to_content(content, patch).unwrap();
         assert_eq!(updated, "keep\n");
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_tool_preserves_plus_prefixed_hunk_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("demo.txt");
+        tokio::fs::write(&path, "keep\n").await.unwrap();
+        let patch = format!(
+            "--- a/{0}\n+++ b/{0}\n@@ -1,1 +1,2 @@\n keep\n+++ comment\n",
+            path.display()
+        );
+        let mut params = HashMap::new();
+        params.insert("patch".to_string(), json!(patch));
+
+        let out = crate::agent::tools::base::render_result(
+            ApplyPatchTool::default()
+                .execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+
+        assert!(out.contains("Patch applied successfully"), "{out}");
+        assert_eq!(
+            tokio::fs::read_to_string(path).await.unwrap(),
+            "keep\n++ comment\n"
+        );
     }
 
     #[tokio::test]
