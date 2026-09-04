@@ -6099,6 +6099,75 @@ fn repl_context_for_clear_test(
 }
 
 #[tokio::test]
+async fn handle_restart_requests_skips_stale_restart_when_server_recovered() {
+    // Regression for the classic-REPL auto-repair drain loop: a RestartRequest
+    // queued by the watchdog during an unhealthy window is stale once the
+    // server self-recovers. The watchdog owns only `restart_tx` and cannot
+    // drain the channel on recovery, so the drain loop must re-check `/health`
+    // before each kill→start cycle and skip when the server is already healthy.
+    let provider = MockLLM::named("restart-skip-stale-test");
+    let (agent_loop, workspace) = build_local_inline_harness(provider);
+    let core_handle = agent_loop.shared.core_handle.clone();
+    let session_id = format!("restart-skip-stale-{}", uuid::Uuid::new_v4());
+    let mut ctx = repl_context_for_clear_test(agent_loop, core_handle, session_id, workspace);
+
+    // This is the runtime-discovery configuration that actually reaches the
+    // drain loop: Higgs backend under Higgs autostart authority. The pure config
+    // defaults leave `autonomous_restart_allowed` false and the watchdog off.
+    ctx.config.agents.defaults.local_autostart = crate::config::schema::LocalAutostart::Higgs;
+    ctx.config.agents.defaults.local_backend = "higgs".to_string();
+    ctx.config.agents.defaults.local_api_base = String::new();
+
+    // Mock `/health` listener representing the already-recovered server.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    ctx.srv.local_port = port.to_string();
+    let health_server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await;
+            });
+        }
+    });
+
+    // Queue two stale "main" requests, as the watchdog would during an
+    // unhealthy window that has since recovered. Neither may fire a restart.
+    for _ in 0..2 {
+        ctx.restart_tx
+            .send(crate::server::RestartRequest {
+                role: "main".to_string(),
+            })
+            .unwrap();
+    }
+
+    let restarted = ctx.handle_restart_requests().await;
+
+    assert!(
+        !restarted,
+        "a stale restart request must not restart an already-healthy server"
+    );
+    assert!(
+        ctx.display_rx.try_recv().is_err(),
+        "no auto-restart display message should be emitted for skipped stale requests"
+    );
+    assert!(
+        ctx.restart_rx.try_recv().is_err(),
+        "the restart channel must be fully drained after handling"
+    );
+
+    health_server.abort();
+}
+
+#[tokio::test]
 async fn interactive_clear_is_atomic_against_session_admission() {
     let provider = MockLLM::named("interactive-clear-admission-test");
     let (agent_loop, workspace) = build_local_inline_harness_with_memory(
