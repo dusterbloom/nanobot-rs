@@ -1101,13 +1101,9 @@ impl ToolRegistry {
             .tools
             .values()
             .filter(|t| t.is_available())
+            .filter(|t| !exclude.iter().any(|e| t.name() == *e))
+            .filter(|t| !Self::RARELY_ADVERTISED_TOOLS.iter().any(|r| t.name() == *r))
             .map(|t| Self::tool_hint(t.as_ref()))
-            .filter(|h| !exclude.iter().any(|e| h.starts_with(e)))
-            .filter(|h| {
-                !Self::RARELY_ADVERTISED_TOOLS
-                    .iter()
-                    .any(|r| h.starts_with(r))
-            })
             .collect();
         hints.sort();
 
@@ -2636,6 +2632,88 @@ mod tests {
             .collect();
 
         assert!(def_names2.contains(&"execute_code".to_string()));
+    }
+
+    /// Regression: `execute_code` must appear in the static "Full catalog:" line
+    /// of the `get_tools` proxy when code execution is enabled. The native-tool
+    /// exclude entry "exec" is a string prefix of the registered name
+    /// "execute_code"; matching by rendered-hint prefix silently dropped
+    /// `execute_code` from the per-turn catalog the model reads each turn.
+    #[test]
+    fn test_proxy_catalog_advertises_execute_code_when_enabled() {
+        let ws = tempfile::tempdir().unwrap();
+        let mut config = ToolConfig::new(ws.path());
+        config.code_execution.enabled = true;
+        let reg = ToolRegistry::with_standard_tools(&config);
+        assert!(reg.has("execute_code"));
+        let defs = reg.get_core_plus_proxy_definitions();
+        let proxy_desc = defs
+            .iter()
+            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("get_tools"))
+            .and_then(|d| d.pointer("/function/description").and_then(|v| v.as_str()))
+            .unwrap();
+        assert!(
+            proxy_desc.contains("execute_code"),
+            "execute_code must be advertised in the proxy catalog; got: {proxy_desc}"
+        );
+        let catalog_line = proxy_desc.split("Full catalog:").nth(1).unwrap_or("");
+        assert!(
+            !catalog_line.contains("exec("),
+            "exec must stay excluded (native core tool); got: {catalog_line}"
+        );
+        assert!(
+            proxy_desc.contains("apply_patch"),
+            "non-colliding long-tail tool must still be advertised: {proxy_desc}"
+        );
+    }
+
+    /// The native exclude set matches by exact tool name, not by a `starts_with`
+    /// prefix of the rendered hint. A native name that is a string prefix of
+    /// another tool's name ("exec" vs "execute_code") must not drop the longer
+    /// tool from the advertised catalog.
+    #[test]
+    fn test_proxy_definition_excluding_matches_name_not_prefix() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(MockTool::new("exec")));
+        reg.register(Box::new(MockTool::new("execute_code")));
+        let defs = reg.get_proxy_definition_excluding(&["exec"]);
+        let desc = defs
+            .iter()
+            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("get_tools"))
+            .and_then(|d| d.pointer("/function/description").and_then(|v| v.as_str()))
+            .unwrap();
+        assert!(
+            !desc.contains("exec("),
+            "excluded name 'exec' must not appear in catalog: {desc}"
+        );
+        assert!(
+            desc.contains("execute_code("),
+            "longer tool sharing the 'exec' prefix must survive: {desc}"
+        );
+    }
+
+    /// `RARELY_ADVERTISED_TOOLS` matches by exact name too, so a future tool
+    /// whose name extends a rarely-advertised entry (e.g. "browser_open" vs
+    /// "browser") is not silently de-listed.
+    #[test]
+    fn test_proxy_definition_rarely_advertised_matches_name_not_prefix() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(MockTool::new("browser")));
+        reg.register(Box::new(MockTool::new("browser_open")));
+        let defs = reg.get_proxy_definition();
+        let desc = defs
+            .iter()
+            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("get_tools"))
+            .and_then(|d| d.pointer("/function/description").and_then(|v| v.as_str()))
+            .unwrap();
+        assert!(
+            !desc.contains("browser("),
+            "rarely-advertised 'browser' must be de-listed: {desc}"
+        );
+        assert!(
+            desc.contains("browser_open("),
+            "longer tool sharing the 'browser' prefix must survive: {desc}"
+        );
     }
 
     #[test]
