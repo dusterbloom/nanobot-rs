@@ -31,8 +31,8 @@ use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProv
 use crate::turn_stream::ControlMarker;
 
 use super::{
-    AgentLoopShared, IterationOutcome, IterationPhase, StepResult, ToolRouting, TurnContext,
-    TurnOutcome,
+    AgentLoopShared, IterationOutcome, IterationPhase, MessageLog, StepResult, ToolRouting,
+    TurnContext, TurnOutcome,
 };
 
 async fn recorded_auxiliary_chat(
@@ -469,6 +469,13 @@ fn tool_calls_to_maps(tool_calls: &[ToolCallRequest]) -> Vec<HashMap<String, Val
         .collect()
 }
 
+fn push_lease_renewal_checkpoint(messages: &mut MessageLog, content: &str) {
+    messages.push_draft(json!({
+        "role": "assistant",
+        "content": content
+    }));
+}
+
 // ---------------------------------------------------------------------------
 // Handler methods on AgentLoopShared
 // ---------------------------------------------------------------------------
@@ -583,6 +590,10 @@ impl AgentLoopShared {
                             "tool_lease_renewed"
                         );
                         ctx.flow.retries.lease_renewal_rejections = 0;
+                        // The model's checkpoint is part of the protocol history:
+                        // keep it immediately before the synthetic renewal nudge
+                        // so the next request can continue the stated plan.
+                        push_lease_renewal_checkpoint(&mut ctx.messages, &content);
                         // Nudge the model so it knows tools are available
                         // again. Without this, a small local model may
                         // emit another text answer instead of tool calls
@@ -1694,5 +1705,64 @@ mod tests {
         assert_eq!(maps.len(), 1);
         assert_eq!(maps[0]["name"], "read_file");
         assert_eq!(maps[0]["arguments"]["path"], "/tmp/x");
+    }
+
+    #[test]
+    fn lease_renewal_persists_assistant_checkpoint() {
+        let mut messages = super::super::shared::MessageLog::committed(vec![json!({
+            "role": "user",
+            "content": "inspect the files"
+        })]);
+        for index in 0..12 {
+            let call_id = format!("read-{index}");
+            messages.push_draft(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": format!(r#"{{"path":"file-{index}"}}"#)
+                    }
+                }]
+            }));
+            messages.push_draft(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": format!("contents-{index}")
+            }));
+        }
+
+        let checkpoint =
+            "findings: twelve files inspected\nnext: compare results\nwill: report differences";
+        push_lease_renewal_checkpoint(&mut messages, checkpoint);
+        messages.push_draft(crate::agent::markers::scaffold_user(
+            "[Lease renewed — proceed with the plan from your checkpoint.]",
+        ));
+
+        let wire = messages.to_vec();
+        let checkpoint_index = wire
+            .iter()
+            .position(|message| {
+                message.get("role").and_then(Value::as_str) == Some("assistant")
+                    && message.get("content").and_then(Value::as_str) == Some(checkpoint)
+            })
+            .expect("valid renewal checkpoint must remain on the next request");
+        let scaffold_index = wire
+            .iter()
+            .position(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.contains("Lease renewed"))
+            })
+            .expect("renewal scaffold must remain on the next request");
+
+        assert_eq!(
+            checkpoint_index + 1,
+            scaffold_index,
+            "checkpoint assistant message must immediately precede the renewal scaffold"
+        );
     }
 }
