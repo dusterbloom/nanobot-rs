@@ -2162,6 +2162,191 @@ async fn plain_text_response_is_final_answer() {
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
+/// Mock LLM that returns a distinct read-only `list_dir` tool call on every
+/// invocation (`dir_0`, `dir_1`, …). Distinct arguments keep the tool-guard
+/// duplicate cache and the repeated-tool breaker from firing, so the only
+/// thing that can stop the loop is the per-step budget exhaustion — exactly
+/// the reported "read-only step burns its budget with no checkpoint" path.
+struct DistinctReadonlyLoopProvider {
+    name: String,
+    call_count: std::sync::atomic::AtomicU32,
+}
+
+impl DistinctReadonlyLoopProvider {
+    fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            call_count: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+    fn call_count(&self) -> u32 {
+        self.call_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl LLMProvider for DistinctReadonlyLoopProvider {
+    async fn chat(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        let n = self
+            .call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut arguments = std::collections::HashMap::new();
+        arguments.insert("path".to_string(), json!(format!("dir_{n}")));
+        Ok(crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: vec![crate::providers::base::ToolCallRequest {
+                id: format!("tc_loop_{n}"),
+                name: "list_dir".to_string(),
+                arguments,
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            usage: std::collections::HashMap::new(),
+        })
+    }
+
+    fn get_default_model(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Mock LLM that returns one bare-text answer per call, ignoring messages —
+/// used to drive the plan-guided happy path (one text answer per step).
+struct TextAnswerProvider {
+    name: String,
+    answers: parking_lot::Mutex<std::collections::VecDeque<String>>,
+    call_count: std::sync::atomic::AtomicU32,
+}
+
+impl TextAnswerProvider {
+    fn new(name: &str, answers: Vec<&str>) -> Self {
+        Self {
+            name: name.to_string(),
+            answers: parking_lot::Mutex::new(answers.into_iter().map(|s| s.to_string()).collect()),
+            call_count: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+    fn call_count(&self) -> u32 {
+        self.call_count.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[async_trait]
+impl LLMProvider for TextAnswerProvider {
+    async fn chat(
+        &self,
+        _messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        self.call_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let answer = self.answers.lock().pop_front().unwrap_or_default();
+        Ok(crate::providers::base::LLMResponse {
+            content: Some(answer),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: std::collections::HashMap::new(),
+        })
+    }
+
+    fn get_default_model(&self) -> &str {
+        &self.name
+    }
+}
+
+#[tokio::test]
+async fn plan_guided_budget_exhaustion_no_checkpoint_breaks_turn() {
+    // End-to-end regression for the stall/mislabel bug: a plan-guided turn
+    // whose first (read-only) step issues only read-only tool calls never
+    // saves an auto-checkpoint (auto-checkpoint arms only before
+    // exec/write_file/edit_file/apply_patch). When that step exhausts its
+    // per-step iteration budget, the turn must terminate with an error
+    // instead of re-injecting the dead objective until max_iterations (the
+    // stall path) or silently reclassifying the failed step as Completed on
+    // a bare-text answer (the mislabel path).
+    let main = Arc::new(DistinctReadonlyLoopProvider::new("local-main"));
+    let main_dyn: Arc<dyn LLMProvider> = main.clone();
+    // step_budget=2 exhausts quickly; max_iterations=10 leaves plenty of
+    // room to observe the break happening *before* the hard cap.
+    let (agent_loop, workspace) = build_local_inline_harness_with_reasoning(main_dyn, 10, 2);
+    let session_key = format!("test-budget-stall-{}", uuid::Uuid::new_v4());
+
+    let response = agent_loop
+        .process_direct(
+            "1. List the directory\n2. Summarize the contents",
+            &session_key,
+            "test",
+            "offline",
+        )
+        .await;
+
+    // The turn must report the budget-exhaustion failure, not a happy ending.
+    assert!(
+        response.contains("iteration budget") && response.contains("checkpoint"),
+        "expected the budget-exhaustion error message, got: {response}",
+    );
+    // The loop must break at budget exhaustion (step_budget=2 => ~2 LLM
+    // calls), NOT run to max_iterations (10) — proving the stall is gone.
+    assert!(
+        main.call_count() <= 3,
+        "expected the loop to break at budget exhaustion (~2 LLM calls), \
+         but the model was called {} times (stall regression?)",
+        main.call_count(),
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn plan_guided_happy_path_completes_after_each_step() {
+    // Regression guard for the happy path: a 2-step plan where the model
+    // answers each step with bare text must still complete both steps and
+    // return the model's final answer — the Failed-guard and the budget-
+    // exhaustion break must not interfere with normal step completion.
+    let main = Arc::new(TextAnswerProvider::new(
+        "local-main",
+        vec!["listed the directory", "here is the summary"],
+    ));
+    let main_dyn: Arc<dyn LLMProvider> = main.clone();
+    let (agent_loop, workspace) = build_local_inline_harness_with_reasoning(main_dyn, 10, 5);
+    let session_key = format!("test-budget-happy-{}", uuid::Uuid::new_v4());
+
+    let response = agent_loop
+        .process_direct(
+            "1. List the directory\n2. Summarize the contents",
+            &session_key,
+            "test",
+            "offline",
+        )
+        .await;
+
+    assert!(
+        response.contains("here is the summary"),
+        "expected the second step's final answer, got: {response}",
+    );
+    assert_eq!(
+        main.call_count(),
+        2,
+        "expected exactly 2 LLM calls (one per step), got {}",
+        main.call_count(),
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
 struct ResponseSequenceProvider {
     name: String,
     responses: parking_lot::Mutex<std::collections::VecDeque<crate::providers::base::LLMResponse>>,
@@ -2586,6 +2771,80 @@ fn build_local_inline_harness_with_iters(
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
+        adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
+    });
+
+    let counters = test_runtime_counters(4096);
+    let core_handle = AgentHandle::new(core, counters);
+
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+    let agent_loop = AgentLoop::new(
+        core_handle,
+        inbound_rx,
+        outbound_tx,
+        inbound_tx,
+        None,
+        1,
+        None,
+        None,
+        None,
+        crate::config::schema::ProprioceptionConfig::default(),
+        LcmSchemaConfig::default(),
+        None,
+    );
+    (agent_loop, workspace)
+}
+
+/// Variant of [`build_local_inline_harness_with_iters`] that enables the
+/// plan-guided reasoning engine with a given `step_budget`. Used to exercise
+/// the auto-decompose + step-budget path end-to-end against a mock model.
+fn build_local_inline_harness_with_reasoning(
+    main: Arc<dyn LLMProvider>,
+    max_iterations: u32,
+    step_budget: u32,
+) -> (AgentLoop, std::path::PathBuf) {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let core = build_swappable_core(SwappableCoreConfig {
+        provider: main,
+        workspace: workspace.clone(),
+        model: "local-qwen-test".to_string(),
+        max_iterations,
+        max_continuations: 2,
+        max_tokens: 512,
+        temperature: 0.3,
+        max_context_tokens: 4096,
+        brave_api_key: None,
+        search_provider: "searxng".to_string(),
+        searxng_url: "http://localhost:8888".to_string(),
+        crw_url: String::new(),
+        search_max_results: 5,
+        exec_timeout: 30,
+        restrict_to_workspace: true,
+        memory_config: MemoryConfig::default(),
+        is_local: true,
+        lane: Lane::default(),
+        tool_delegation: ToolDelegationConfig::default(),
+        provenance: ProvenanceConfig::default(),
+        max_tool_result_chars: 2000,
+        delegation_provider: None,
+        specialist_provider: None,
+        trio_config: TrioConfig::default(),
+        model_capabilities_overrides: std::collections::HashMap::new(),
+        reasoning_config: crate::config::schema::ReasoningConfig {
+            enabled: true,
+            auto_decompose: true,
+            step_budget,
+            ..Default::default()
+        },
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
         code_execution: CodeExecutionConfig::default(),
