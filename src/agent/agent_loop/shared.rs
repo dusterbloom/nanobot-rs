@@ -2097,10 +2097,9 @@ impl AgentLoopShared {
             .get(&ctx.session_key)
             .copied()
             .unwrap_or(0);
-        // `apply_budget`'s Emergency mode hardcodes a zero tool-def reserve
-        // (target `available_budget(0)`), which can sit ABOVE the budget this
-        // call needs — call the trimmer directly with an offset so the trim
-        // lands at `raw_target`.
+        // Call the trimmer directly with an offset so the trim lands at
+        // `raw_target` — a bare `available_budget(0)` would sit ABOVE the budget
+        // this call needs.
         let budget_overhead = ctx
             .core
             .token_budget
@@ -3035,10 +3034,9 @@ impl AgentLoopShared {
                     .get(&ctx.session_key)
                     .copied()
                     .unwrap_or(0);
-                // apply_budget's Emergency mode hardcodes a zero tool-def
-                // reserve (target available_budget(0) > hard_limit — a no-op
-                // here), so call the trimmer directly with an offset that
-                // lands the trim at hard_limit.
+                // Call the trimmer directly with an offset that lands the trim
+                // at `hard_limit` — a bare `available_budget(0)` would be a
+                // no-op here (it sits above `hard_limit`).
                 let budget_overhead = ctx
                     .core
                     .token_budget
