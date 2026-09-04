@@ -405,7 +405,9 @@ fn parse_unified_patch(patch: &str) -> Result<Vec<PatchHunk>, String> {
     let mut current: Option<PatchHunk> = None;
 
     for raw in normalized.lines() {
-        if raw.starts_with("--- ") || raw.starts_with("+++ ") || raw.starts_with("diff ") {
+        if current.is_none()
+            && (raw.starts_with("--- ") || raw.starts_with("+++ ") || raw.starts_with("diff "))
+        {
             continue;
         }
         if raw.starts_with("@@") {
@@ -542,5 +544,82 @@ mod tests {
                 .await,
         );
         assert!(out.contains("File changed before patch"), "{out}");
+    }
+
+    #[test]
+    fn test_apply_patch_removes_line_starting_with_double_dash_space() {
+        let content = "-- foo\nbar\n";
+        let patch = "@@ -1,2 +1,1 @@\n--- foo\n bar\n";
+        let (updated, hunks) = apply_unified_patch_to_content(content, patch).unwrap();
+        assert_eq!(hunks, 1);
+        assert_eq!(updated, "bar\n");
+    }
+
+    #[test]
+    fn test_parse_unified_patch_classifies_hunk_body_dash_prefix_records() {
+        let patch = "@@ -1,2 +1,1 @@\n--- foo\n bar\n";
+        let hunks = parse_unified_patch(patch).unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(
+            hunks[0].lines,
+            vec![
+                PatchLine::Remove("-- foo".to_string()),
+                PatchLine::Context("bar".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_unified_patch_classifies_hunk_body_plus_prefix_records() {
+        let patch = "@@ -1,2 +1,3 @@\n keep\n+++ new line\n end\n";
+        let hunks = parse_unified_patch(patch).unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(
+            hunks[0].lines,
+            vec![
+                PatchLine::Context("keep".to_string()),
+                PatchLine::Add("++ new line".to_string()),
+                PatchLine::Context("end".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parse_unified_patch_still_skips_file_headers_outside_hunk() {
+        let patch = "--- a/demo.txt\n+++ b/demo.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n";
+        let hunks = parse_unified_patch(patch).unwrap();
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(
+            hunks[0].lines,
+            vec![
+                PatchLine::Context("one".to_string()),
+                PatchLine::Remove("two".to_string()),
+                PatchLine::Add("TWO".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_apply_patch_tool_removes_double_dash_space_line_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("demo.txt");
+        tokio::fs::write(&path, "-- a comment\nline2\n")
+            .await
+            .unwrap();
+        let patch = format!(
+            "diff --git a/{0} b/{0}\n--- a/{0}\n+++ b/{0}\n@@ -1,2 +1,1 @@\n--- a comment\n line2\n",
+            path.display()
+        );
+        let mut params = HashMap::new();
+        params.insert("patch".to_string(), json!(patch));
+        let out = crate::agent::tools::base::render_result(
+            ApplyPatchTool::default()
+                .execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+        assert!(out.contains("2 -> 1 line(s)"), "{out}");
+        assert!(out.contains("Patch applied successfully"), "{out}");
+        let updated = tokio::fs::read_to_string(&path).await.unwrap();
+        assert_eq!(updated, "line2\n");
     }
 }
