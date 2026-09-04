@@ -356,19 +356,23 @@ fn collapse_repetitive_attempts(messages: &mut Vec<Value>, min_count: usize) -> 
         }
         let run_len = run_end - k;
         if run_len >= min_count {
-            // Replace all but last in the run (using original message indices)
+            // Replace all but last in the run (using original message indices).
+            // Keep `tool_calls` on the collapsed assistants: this pass only
+            // walks assistant messages, so a `role=tool` result interleaved
+            // after a collapsed assistant is never touched here. Removing the
+            // `tool_calls` would orphan that result (its `tool_call_id` would
+            // no longer match any assistant call) — and hygiene's
+            // `remove_orphaned_tool_results` runs BEFORE anti-drift in
+            // `retention::apply_shaping`, so orphans introduced here are not
+            // cleaned up before the wire render on this iteration. Keeping the
+            // calls preserves the protocol pairing invariant; only the verbose
+            // preamble text is replaced with a compact placeholder.
             for j in k..(run_end - 1) {
                 let msg_idx = assistant_fps[j].0;
                 messages[msg_idx]["content"] = Value::String(format!(
                     "[{} previous similar attempts removed]",
                     run_len - 1
                 ));
-                // Remove tool_calls to avoid orphans
-                if messages[msg_idx].get("tool_calls").is_some() {
-                    messages[msg_idx]
-                        .as_object_mut()
-                        .map(|o| o.remove("tool_calls"));
-                }
                 collapsed += 1;
             }
             k = run_end;
@@ -841,6 +845,95 @@ mod tests {
             "Expected 2 collapsed attempts in interleaved conversation, got {}",
             collapsed_count
         );
+
+        // The collapse must not orphan the interleaved tool results: collapsing
+        // strips only the verbose preamble, leaving each `tool_call_id` paired
+        // with its announcing assistant `tool_calls` entry.
+        let orphans = orphaned_tool_result_ids(&messages);
+        assert!(
+            orphans.is_empty(),
+            "interleaved tool results orphaned after collapse: {:?}",
+            orphans
+        );
+    }
+
+    /// Collect tool_call_ids announced by assistant messages *in order* so a
+    /// caller can verify every `role=tool` result still has a matching call.
+    fn announced_tool_call_ids(messages: &[Value]) -> HashSet<String> {
+        messages
+            .iter()
+            .filter(|m| msg_role(m) == "assistant")
+            .filter_map(|m| m.get("tool_calls").and_then(|v| v.as_array()))
+            .flatten()
+            .filter_map(|tc| tc.get("id").and_then(|i| i.as_str()).map(String::from))
+            .collect()
+    }
+
+    /// Every `role=tool` message must have its `tool_call_id` present in some
+    /// assistant `tool_calls` entry — otherwise it is an orphan result.
+    fn orphaned_tool_result_ids(messages: &[Value]) -> Vec<String> {
+        let known = announced_tool_call_ids(messages);
+        messages
+            .iter()
+            .filter(|m| msg_role(m) == "tool")
+            .filter_map(|m| {
+                m.get("tool_call_id")
+                    .and_then(|i| i.as_str())
+                    .filter(|id| !known.contains(*id))
+                    .map(String::from)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_collapse_repetitive_attempts_keeps_tool_result_pairing() {
+        // The collapse pass must not orphan `role=tool` results: it walks
+        // assistant messages only, so a `role=tool` result interleaved after a
+        // collapsed assistant is never touched. Stripping `tool_calls` from
+        // the assistant then leaves the result's `tool_call_id` unmatched.
+        // Hygiene (which removes orphans) runs BEFORE anti-drift, so orphans
+        // introduced here survive to the wire on this iteration.
+        let mut messages = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({"role": "assistant", "content": "Let me read the file.", "tool_calls": [{"id": "t1", "function": {"name": "read_file", "arguments": "{\"path\":\"/a\"}"}}]}),
+            json!({"role": "tool", "content": "Error: file not found", "tool_call_id": "t1"}),
+            json!({"role": "user", "content": "Try /tmp instead"}),
+            json!({"role": "assistant", "content": "Let me read the file.", "tool_calls": [{"id": "t2", "function": {"name": "read_file", "arguments": "{\"path\":\"/a\"}"}}]}),
+            json!({"role": "tool", "content": "Error: file not found", "tool_call_id": "t2"}),
+            json!({"role": "user", "content": "Try again"}),
+            json!({"role": "assistant", "content": "Let me read the file.", "tool_calls": [{"id": "t3", "function": {"name": "read_file", "arguments": "{\"path\":\"/a\"}"}}]}),
+            json!({"role": "tool", "content": "Error: file not found", "tool_call_id": "t3"}),
+            json!({"role": "user", "content": "Continue"}),
+        ];
+
+        let collapsed = collapse_repetitive_attempts(&mut messages, 3);
+        assert_eq!(
+            collapsed, 2,
+            "the first two of three identical attempts collapse"
+        );
+
+        // No `role=tool` result may be left without its announcing assistant call.
+        let orphans = orphaned_tool_result_ids(&messages);
+        assert!(
+            orphans.is_empty(),
+            "collapse orphaned tool results {:?} — every tool_call_id must keep its assistant tool_calls entry",
+            orphans
+        );
+
+        // The collapsed assistants must still carry their tool_calls so the
+        // pairing above holds; only their textual preamble is placeholdered.
+        for m in messages.iter().filter(|m| msg_role(m) == "assistant") {
+            if msg_content(m).contains("previous similar attempts removed") {
+                let has_calls = m
+                    .get("tool_calls")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|a| !a.is_empty());
+                assert!(
+                    has_calls,
+                    "collapsed assistant must keep tool_calls to avoid orphaning its tool result"
+                );
+            }
+        }
     }
 
     #[test]

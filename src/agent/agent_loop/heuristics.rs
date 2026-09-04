@@ -864,4 +864,84 @@ mod tests {
         assert_eq!(rounds, 0);
         assert!(!nudged);
     }
+
+    // -----------------------------------------------------------------------
+    // render_via_protocol — anti-drift collapse must not emit orphan tool
+    // results on the wire.
+    //
+    // `collapse_repetitive_attempts` runs inside `pre_completion_pipeline`
+    // AFTER `context_hygiene` (which removes orphans) in
+    // `retention::apply_shaping`, so any orphans it introduces are not
+    // cleaned up before the wire render on that iteration. This pins the
+    // production wire path: after anti-drift collapses a run of identical
+    // tool-call attempts, every `role=tool` message rendered by
+    // `render_via_protocol` (the actual wire function, no substitution) must
+    // still have a preceding assistant `tool_calls` entry announcing its id.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn anti_drift_collapse_does_not_orphan_tool_results_on_the_wire() {
+        use std::collections::HashSet;
+
+        use crate::agent::anti_drift::pre_completion_pipeline;
+        use crate::agent::protocol::LocalProtocol;
+        use crate::config::schema::AntiDriftConfig;
+
+        // Fixture: 3 identical read_file({"path":"/a"}) attempts (same tool,
+        // same args → identical collapse fingerprint), each followed by its
+        // tool result and a user retry. This is the shape that reaches collapse
+        // along the overflow-recovery window.
+        let mut messages = vec![
+            serde_json::json!({"role": "system", "content": "system"}),
+            serde_json::json!({"role": "assistant", "content": "Let me read the file.", "tool_calls": [{"id": "t1", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"/a\"}"}}]}),
+            serde_json::json!({"role": "tool", "name": "read_file", "content": "Error: file not found", "tool_call_id": "t1"}),
+            serde_json::json!({"role": "user", "content": "Try /tmp instead"}),
+            serde_json::json!({"role": "assistant", "content": "Let me read the file.", "tool_calls": [{"id": "t2", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"/a\"}"}}]}),
+            serde_json::json!({"role": "tool", "name": "read_file", "content": "Error: file not found", "tool_call_id": "t2"}),
+            serde_json::json!({"role": "user", "content": "Try again"}),
+            serde_json::json!({"role": "assistant", "content": "Let me read the file.", "tool_calls": [{"id": "t3", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\":\"/a\"}"}}]}),
+            serde_json::json!({"role": "tool", "name": "read_file", "content": "Error: file not found", "tool_call_id": "t3"}),
+            serde_json::json!({"role": "user", "content": "Continue"}),
+        ];
+
+        let config = AntiDriftConfig::default();
+        pre_completion_pipeline(&mut messages, 1, &config, false);
+
+        // Sanity: collapse fired on the first two of the run.
+        let collapsed = messages
+            .iter()
+            .filter(|m| {
+                m.get("content")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains("previous similar attempts removed"))
+            })
+            .count();
+        assert_eq!(collapsed, 2, "fixture must collapse Exactly two attempts");
+
+        // Render through the production wire function the same way step_call_llm
+        // does. Anti-drift is gated to the local native tool-calling path, so
+        // LocalProtocol::native() is the carrier that would emit role=tool.
+        let rendered = super::render_via_protocol(&LocalProtocol::native(), &messages);
+
+        let announced: HashSet<String> = rendered
+            .iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .filter_map(|m| m.get("tool_calls").and_then(|v| v.as_array()))
+            .flatten()
+            .filter_map(|tc| tc.get("id").and_then(|i| i.as_str()).map(String::from))
+            .collect();
+        let orphans: Vec<&str> = rendered
+            .iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("tool"))
+            .filter_map(|m| {
+                m.get("tool_call_id")
+                    .and_then(|i| i.as_str())
+                    .filter(|id| !announced.contains(*id))
+            })
+            .collect();
+        assert!(
+            orphans.is_empty(),
+            "orphaned tool results survived the production wire render: {:?}",
+            orphans
+        );
+    }
 }
