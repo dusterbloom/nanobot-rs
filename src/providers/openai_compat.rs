@@ -127,6 +127,12 @@ fn normalize_model_name(name: &str) -> String {
     name.to_string()
 }
 
+/// Remove Nanobot's internal locality tag before addressing a local model on
+/// the wire. Capacity discovery and generation must use the same identifier.
+fn strip_internal_local_model_prefix(model: &str) -> &str {
+    model.strip_prefix("local:").unwrap_or(model)
+}
+
 impl OpenAICompatProvider {
     /// Returns true when the provider supports Anthropic-style `cache_control`
     /// breakpoints. Currently: direct Anthropic API and OpenRouter.
@@ -217,6 +223,7 @@ impl OpenAICompatProvider {
         if !self.higgs_session_cache {
             return Ok(None);
         }
+        let model = strip_internal_local_model_prefix(model);
 
         let response = self
             .client
@@ -899,10 +906,9 @@ fn parse_higgs_capacity_error(
         (413, "higgs_capacity_exceeded", "compact_and_retry") => {
             let safe_prompt_tokens = error.get("safePromptTokens")?.as_u64()?;
             let safe_total_tokens = error.get("safeTotalTokens")?.as_u64()?;
-            if safe_prompt_tokens == 0
-                || safe_total_tokens == 0
-                || safe_prompt_tokens > safe_total_tokens
-            {
+            // Zero prompt room is valid when the chosen output reserve consumes
+            // the full safe total; Nanobot must still enter typed recovery.
+            if safe_total_tokens == 0 || safe_prompt_tokens > safe_total_tokens {
                 return None;
             }
             Some(ProviderError::HiggsCapacityExceeded {
@@ -1058,7 +1064,7 @@ impl OpenAICompatProvider {
         // Strip "local:" prefix (internal routing tag, not part of actual model name)
         // and "provider/" prefix for non-OpenRouter APIs (e.g. "anthropic/claude-opus-4-5"
         // becomes "claude-opus-4-5" when hitting api.anthropic.com directly).
-        let stripped = raw_model.strip_prefix("local:").unwrap_or(raw_model);
+        let stripped = strip_internal_local_model_prefix(raw_model);
         let (model, policy_model) = resolve_request_and_policy_model(&self.api_base, stripped);
 
         debug!(
@@ -4429,6 +4435,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn higgs_capacity_fetch_strips_internal_local_model_prefix() {
+        let body = r#"{"schemaVersion":1,"model":"escha","modelFingerprint":"sha256:abc","bootId":"boot-1","generation":7,"availability":"available","pressure":"normal","safeTotalTokens":8192,"recommendedOutputTokens":4096,"maxPromptTokens":4096,"retainedSessionTokens":4096,"retainedBytes":0,"prefixCacheBytes":0,"basis":"conservative"}"#;
+        let (base, server) = spawn_capacity_server("200 OK", Some("application/json"), body).await;
+        let provider = OpenAICompatProvider::new("local", Some(&base), Some("escha"))
+            .with_higgs_session_cache(true);
+
+        let result = provider
+            .fetch_higgs_capacity("local:escha")
+            .await
+            .expect("internal routing prefix must not reach Higgs")
+            .expect("Higgs capability enabled");
+        let HiggsCapacityFetch::Profile(profile) = result else {
+            panic!("new Higgs must return a live profile");
+        };
+        assert_eq!(profile.model(), "escha");
+
+        let request = server.await.expect("capacity server task");
+        let request_target = request
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .expect("request target");
+        assert!(request_target.contains("model=escha"), "{request_target}");
+        assert!(!request_target.contains("local"), "{request_target}");
+    }
+
+    #[tokio::test]
     async fn higgs_capacity_fetch_keeps_known_unloaded_profile() {
         let body = r#"{"schemaVersion":1,"model":"escha","modelFingerprint":"sha256:abc","bootId":"boot-1","generation":8,"availability":"unavailable","pressure":"critical","safeTotalTokens":0,"recommendedOutputTokens":0,"maxPromptTokens":0,"retainedSessionTokens":0,"retainedBytes":0,"prefixCacheBytes":0,"basis":"conservative"}"#;
         let (base, server) = spawn_capacity_server("200 OK", Some("application/json"), body).await;
@@ -4578,6 +4611,21 @@ mod tests {
             })
         ));
         server.await.unwrap();
+    }
+
+    #[test]
+    fn zero_safe_prompt_capacity_error_remains_typed() {
+        let body = r#"{"error":{"type":"higgs_capacity_exceeded","code":"compact_and_retry","safePromptTokens":0,"safeTotalTokens":4096,"bootId":"boot-1","generation":8}}"#;
+
+        assert!(matches!(
+            parse_higgs_capacity_error(413, body),
+            Some(crate::errors::ProviderError::HiggsCapacityExceeded {
+                safe_prompt_tokens: 0,
+                safe_total_tokens: 4_096,
+                generation: 8,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
