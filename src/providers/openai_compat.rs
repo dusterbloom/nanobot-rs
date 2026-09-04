@@ -2068,6 +2068,7 @@ async fn parse_sse_stream(
     let mut full_inline_thinking = String::new(); // inline <think> tags — fallback when content empty
     let mut split_state = ThinkSplitState::default();
     let mut finish_reason = FinishReason::Stop;
+    let mut finish_reason_seen = false;
     let mut usage: HashMap<String, i64> = HashMap::new();
     let mut partial_stream_bytes = match mode {
         SseParserMode::Standard => None,
@@ -2283,6 +2284,7 @@ async fn parse_sse_stream(
                 if let Some(choice) = choices.first() {
                     // Update finish_reason if present (wire boundary: parse once here).
                     if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                        finish_reason_seen = true;
                         finish_reason = FinishReason::parse_finish_reason(fr);
                     }
 
@@ -2382,7 +2384,7 @@ async fn parse_sse_stream(
     // Stream ended without [DONE] — SLM may have crashed or dropped connection.
     // Treat an abnormal termination during content generation as "length" so
     // the auto-continue mechanism can detect and recover from it.
-    if finish_reason == FinishReason::Stop {
+    if !finish_reason_seen && finish_reason == FinishReason::Stop {
         finish_reason = FinishReason::Length;
     }
     warn!(
@@ -5616,6 +5618,34 @@ mod tests {
             resp.finish_reason,
             FinishReason::Length,
             "stream ending without [DONE] must yield finish_reason=length"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_stream_no_done_keeps_explicit_stop() {
+        let chunks = sse_bytes(&[
+            "data: {\"choices\":[{\"delta\":{\"content\":\"complete\"},\"index\":0}]}",
+            "data: {\"choices\":[{\"finish_reason\":\"stop\",\"index\":0}]}",
+        ]);
+        let stream = futures_util::stream::iter(chunks);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        parse_sse_stream(stream, tx, SseParserMode::Standard)
+            .await
+            .unwrap();
+
+        let mut done_response = None;
+        while let Ok(chunk) = rx.try_recv() {
+            if let StreamChunk::Done(resp) = chunk {
+                done_response = Some(resp);
+            }
+        }
+
+        let resp = done_response.expect("should have received Done chunk");
+        assert_eq!(
+            resp.finish_reason,
+            FinishReason::Stop,
+            "an explicit finish_reason must survive EOF without [DONE]"
         );
     }
 
