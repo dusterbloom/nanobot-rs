@@ -10,8 +10,8 @@ use crate::agent::router::{
     extract_json_object, parse_lenient_router_decision, request_strict_router_decision,
 };
 use crate::config::schema::{
-    AdaptiveTokenConfig, CodeExecutionConfig, CuaToolConfig, MemoryConfig, ProvenanceConfig,
-    ProviderConfig, PythonKernelConfig, ToolDelegationConfig, TrioConfig,
+    AdaptiveTokenConfig, CodeExecutionConfig, Config, CuaToolConfig, MemoryConfig,
+    ProvenanceConfig, ProviderConfig, PythonKernelConfig, ToolDelegationConfig, TrioConfig,
 };
 use crate::providers::base::{FinishReason, LLMProvider};
 use crate::providers::openai_compat::OpenAICompatProvider;
@@ -166,9 +166,112 @@ fn build_test_core(
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(sessions_db),
     })
+}
+
+/// Build a SwappableCore for instruction-profiles wiring tests.
+///
+/// Mirrors `build_test_core` but exposes the `instructions_path` slot so tests
+/// can exercise the disk-load path that `build_swappable_core` owns. The caller
+/// owns `workspace` so it can place an `instructions.yaml` inside it. Builds a
+/// CLOUD core so the two committed consumers (`build_developer_context` and
+/// `collect_static_sections`, both cloud-path) are the ones exercised.
+fn build_core_with_instructions(
+    workspace: std::path::PathBuf,
+    instructions_path: Option<std::path::PathBuf>,
+) -> SwappableCore {
+    let sessions_db = workspace.join("sessions.db");
+    let main = MockLLM::named("main-provider");
+    build_swappable_core(SwappableCoreConfig {
+        provider: main,
+        workspace,
+        model: "qwen-2.5-coder".to_string(),
+        max_iterations: 10,
+        max_continuations: 2,
+        max_tokens: 4096,
+        temperature: 0.7,
+        max_context_tokens: 16384,
+        brave_api_key: None,
+        search_provider: "searxng".to_string(),
+        searxng_url: "http://localhost:8888".to_string(),
+        crw_url: String::new(),
+        search_max_results: 5,
+        exec_timeout: 30,
+        restrict_to_workspace: false,
+        memory_config: MemoryConfig::default(),
+        is_local: false,
+        lane: Lane::default(),
+        tool_delegation: ToolDelegationConfig::default(),
+        provenance: ProvenanceConfig::default(),
+        max_tool_result_chars: 2000,
+        delegation_provider: None,
+        specialist_provider: None,
+        trio_config: TrioConfig::default(),
+        model_capabilities_overrides: std::collections::HashMap::new(),
+        reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
+        instructions_path,
+        adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: Some(sessions_db),
+    })
+}
+
+#[test]
+fn build_swappable_core_loads_instruction_profiles_from_path() {
+    // End-to-end through the production builder path: a configured
+    // instructions_path must populate context.instruction_profiles and the
+    // rendered developer context must carry the resolved markers.
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let yaml_path = workspace.join("instructions.yaml");
+    std::fs::write(
+        &yaml_path,
+        "base:\n  - role: developer\n    content: \"Always respond in JSON.\"\n",
+    )
+    .unwrap();
+    let core = build_core_with_instructions(workspace, Some(yaml_path));
+
+    assert!(
+        core.context.instruction_profiles.is_some(),
+        "build_swappable_core must populate instruction_profiles when instructions_path is set"
+    );
+    let dev = core.context.build_developer_context(None, None);
+    assert!(
+        dev.contains("<!-- instruction-profile role=developer"),
+        "developer context should include the instruction-profile marker"
+    );
+    assert!(
+        dev.contains("Always respond in JSON"),
+        "injected instruction content should appear in the developer context"
+    );
+}
+
+#[test]
+fn core_config_from_forwards_instructions_path() {
+    // Layer 1: core_config_from must transfer agents.defaults.instructions_path
+    // into SwappableCoreConfig.instructions_path (tilde-free path forwarded verbatim).
+    let tmp = tempfile::tempdir().unwrap();
+    let yaml_path = tmp.path().join("instructions.yaml");
+    std::fs::write(&yaml_path, "base: []\n").unwrap();
+    let mut config = Config::default();
+    config.agents.defaults.instructions_path = Some(yaml_path.to_string_lossy().to_string());
+    let provider = MockLLM::named("test");
+    let cfg = crate::cli::core_builder::core_config_from(
+        &config,
+        provider,
+        "test-model".to_string(),
+        16384,
+        false,
+        None,
+        None,
+    );
+    assert_eq!(cfg.instructions_path, Some(yaml_path));
 }
 
 #[test]
@@ -549,6 +652,7 @@ fn test_delegation_model_falls_back_to_main_when_empty() {
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -619,6 +723,7 @@ fn test_delegation_with_is_local_true() {
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -691,6 +796,7 @@ fn test_delegation_with_is_local_false_cloud() {
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -780,6 +886,7 @@ fn test_local_reflection_and_delegation_providers_do_not_reroute_lcm() {
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -850,6 +957,7 @@ fn test_cloud_memory_and_delegation_do_not_reroute_lcm() {
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -963,6 +1071,7 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -1248,6 +1357,7 @@ fn build_trio_e2e_harness(
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -1711,6 +1821,7 @@ async fn test_trio_e2e_router_unreachable() {
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -1830,6 +1941,7 @@ async fn test_trio_e2e_specialist_unreachable() {
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2516,6 +2628,7 @@ fn build_trio_offline_harness_with_registry(
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2591,6 +2704,7 @@ fn build_local_inline_harness_with_iters(
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2703,6 +2817,7 @@ fn build_local_inline_harness_with_memory_and_reflection(
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -2778,6 +2893,7 @@ fn build_cloud_inline_harness_with_memory(
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -8918,6 +9034,7 @@ async fn test_trio_offline_e2e_health_gate() {
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(
             std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -9478,6 +9595,7 @@ mod runtime_mode_parity_tests {
             code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
             cua: CuaToolConfig::default(),
+            instructions_path: None,
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -9540,6 +9658,7 @@ mod runtime_mode_parity_tests {
             code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
             cua: CuaToolConfig::default(),
+            instructions_path: None,
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -9600,6 +9719,7 @@ mod runtime_mode_parity_tests {
             code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
             cua: CuaToolConfig::default(),
+            instructions_path: None,
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -9661,6 +9781,7 @@ mod runtime_mode_parity_tests {
             code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
             cua: CuaToolConfig::default(),
+            instructions_path: None,
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -9709,6 +9830,7 @@ mod runtime_mode_parity_tests {
             code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
             cua: CuaToolConfig::default(),
+            instructions_path: None,
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -9788,6 +9910,7 @@ mod runtime_mode_parity_tests {
             code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
             cua: CuaToolConfig::default(),
+            instructions_path: None,
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -9843,6 +9966,7 @@ mod runtime_mode_parity_tests {
             code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
             cua: CuaToolConfig::default(),
+            instructions_path: None,
             adaptive_tokens: AdaptiveTokenConfig::default(),
             sessions_db_path: Some(
                 std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
@@ -10385,6 +10509,7 @@ async fn idle_turn_e2e_injects_journaled_quiet_turn() {
         code_execution: CodeExecutionConfig::default(),
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
+        instructions_path: None,
         adaptive_tokens: AdaptiveTokenConfig::default(),
         sessions_db_path: Some(db_path.clone()),
     });

@@ -1382,6 +1382,11 @@ pub struct SwappableCoreConfig {
     pub python_kernel: crate::config::schema::PythonKernelConfig,
     /// Cua driver (local desktop computer-use) tool settings.
     pub cua: crate::config::schema::CuaToolConfig,
+    /// Path to a YAML instruction profiles file. When `Some`, profiles are
+    /// loaded at core-build time and applied to every LLM call based on the
+    /// active model name and task kind. `None` (default) disables injection.
+    /// The transferred path is already tilde-expanded by `core_config_from`.
+    pub instructions_path: Option<PathBuf>,
 }
 
 /// Build a `SwappableCore` from the given config.
@@ -1424,6 +1429,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         code_execution,
         python_kernel,
         cua,
+        instructions_path,
     } = cfg;
     let model_capabilities =
         crate::agent::model_capabilities::lookup(&model, &model_capabilities_overrides);
@@ -1469,6 +1475,14 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
     // what agents exist and when to delegate instead of doing everything itself.
     let profiles = agent_profiles::load_profiles(&workspace);
     context.agent_profiles = agent_profiles::profiles_summary(&profiles);
+    // Instruction profiles — model- and task-specific prompt engineering loaded
+    // from a YAML file configured via `agents.defaults.instructions_path`. A
+    // set-but-unreadable/unparseable path warns and falls back to `None` so a
+    // misconfigured profiles file never bricks the agent; an unset path stays
+    // `None` and the `if let Some` consumers simply skip injection.
+    if let Some(ref path) = instructions_path {
+        context.instruction_profiles = crate::agent::instructions::load_from_path(path);
+    }
     let db_path = sessions_db_path.unwrap_or_else(|| {
         dirs::home_dir()
             .unwrap_or_default()
