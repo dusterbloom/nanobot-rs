@@ -1493,8 +1493,16 @@ mod tests {
         let settings = resolve_spawn_settings(None, None, Some("haiku"), "served-local", true, 20);
         assert_eq!(settings.model, "served-local");
         assert_eq!(
-            resolve_loop_model(Some("haiku"), None, "served-local", true),
+            resolve_loop_model(None, Some("haiku"), "served-local", true),
             "served-local"
+        );
+
+        let full_id = "openrouter/Meta-Llama/Llama-3.1-8B";
+        let settings = resolve_spawn_settings(None, None, Some(full_id), "parent", false, 20);
+        assert_eq!(settings.model, full_id);
+        assert_eq!(
+            resolve_loop_model(None, Some(full_id), "parent", false),
+            full_id
         );
     }
 

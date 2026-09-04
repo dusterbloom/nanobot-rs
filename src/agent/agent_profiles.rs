@@ -215,7 +215,7 @@ pub fn resolve_model_alias(alias: &str) -> String {
         "sonnet" => "claude-sonnet-4-5-20250929".to_string(),
         "opus" => "claude-opus-4-6".to_string(),
         "local" => "local".to_string(),
-        other => other.to_string(),
+        _ => alias.to_string(),
     }
 }
 
@@ -340,6 +340,10 @@ Do stuff."#;
         assert_eq!(resolve_model_alias("Haiku"), "claude-haiku-4-5-20251001"); // case insensitive
         assert_eq!(resolve_model_alias("local"), "local");
         assert_eq!(resolve_model_alias("custom-model-v2"), "custom-model-v2");
+        assert_eq!(
+            resolve_model_alias("openrouter/Meta-Llama/Llama-3.1-8B"),
+            "openrouter/Meta-Llama/Llama-3.1-8B"
+        );
     }
 
     #[test]
