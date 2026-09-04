@@ -29,46 +29,6 @@ use crate::agent::memory::MemoryStore;
 use crate::agent::skills::SkillsLoader;
 use crate::agent::token_budget::TokenBudget;
 
-/// Sanitize a tool result before injecting into context.
-///
-/// - Detects binary content (null bytes in first 512 bytes)
-/// - Detects base64 blobs (>50% alphanumeric+/= chars and length > 1000)
-/// - Truncates to `max_chars` if too long
-/// - Returns the original string unchanged otherwise
-pub fn sanitize_tool_result(result: &str, max_chars: usize) -> String {
-    if result.is_empty() || max_chars == 0 {
-        return result.to_string();
-    }
-
-    // Binary detection: null bytes in first 512 bytes.
-    if crate::utils::helpers::is_binary(result.as_bytes()) {
-        return format!("[Binary content, {} bytes]", result.len());
-    }
-
-    // Base64 detection: >50% base64-alphabet chars and length > 1000.
-    if result.len() > 1000 {
-        let b64_chars = result
-            .bytes()
-            .filter(|b| b.is_ascii_alphanumeric() || *b == b'+' || *b == b'/' || *b == b'=')
-            .count();
-        if b64_chars * 2 > result.len() {
-            return format!("[Base64 data, {} chars]", result.len());
-        }
-    }
-
-    // Truncation.
-    if result.len() > max_chars {
-        let end = crate::utils::helpers::floor_char_boundary(result, max_chars);
-        return format!(
-            "{}\n... [truncated, {} chars total]",
-            &result[..end],
-            result.len()
-        );
-    }
-
-    result.to_string()
-}
-
 /// Well-known files that are loaded from the workspace root when present.
 ///
 /// `TOOLS.md` was removed: its content (tool tables, safety levels, exec
@@ -1099,43 +1059,6 @@ impl ContextBuilder {
         }
     }
 
-    /// Insert a per-turn context block as a `role:user` message immediately
-    /// before the final user message.
-    ///
-    /// This is the local "tail block" placement: query-relevant skills/memory
-    /// go AFTER history (so the bulk KV prefix stays cached across turns) but
-    /// BEFORE the user's question. Under `LocalProtocol` this `user` message
-    /// merges with the real user message, keeping the "ends with user"
-    /// invariant.
-    ///
-    /// No-op when `tail` is blank or the array does not end with a user message.
-    ///
-    /// Cache contract: the tail is tagged `_cache_replay: true` via
-    /// `markers::scaffold_user`, so it persists to session history and replays
-    /// byte-for-byte on reload. The prior "ephemeral tail" contract (caller
-    /// bumps `new_start` to skip persist) violated the warm-prefix invariant —
-    /// a tail sent live but absent on reload forces Higgs to re-prefill the
-    /// whole context. Callers must NOT bump `new_start` past this insertion.
-    pub fn insert_tail_before_user(&self, messages: &mut Vec<Value>, tail: &str) {
-        if tail.trim().is_empty() {
-            return;
-        }
-        let ends_with_user = messages
-            .last()
-            .map(|m| m["role"] == "user")
-            .unwrap_or(false);
-        if !ends_with_user {
-            return;
-        }
-        let pos = messages.len() - 1;
-        // Cache-replay tagged: this tail block was sent to the model live, so
-        // the next turn's reload MUST replay it byte-for-byte or the warm
-        // prompt prefix shrinks and the Higgs radix cache diverges. The prior
-        // "ephemeral tail" contract (caller bumps new_start to skip persist)
-        // violated the cache invariant — see logs from 2026-07-27/28.
-        messages.insert(pos, crate::agent::markers::scaffold_user(tail));
-    }
-
     /// Add a tool result to the message list and return the updated list.
     pub fn add_tool_result(
         messages: &mut Vec<Value>,
@@ -1170,25 +1093,6 @@ impl ContextBuilder {
             "ok": ok,
             "content": result,
         }));
-    }
-
-    /// Add a tool result wrapped with verbatim markers (provenance mode).
-    ///
-    /// When provenance is enabled, tool results are marked as immutable so the
-    /// LLM is instructed to quote rather than paraphrase.
-    pub fn add_tool_result_immutable(
-        messages: &mut Vec<Value>,
-        tool_call_id: &str,
-        tool_name: &str,
-        result: &str,
-    ) {
-        Self::add_tool_result_immutable_with_status(
-            messages,
-            tool_call_id,
-            tool_name,
-            result,
-            tool_result_ok(result),
-        );
     }
 
     /// Add an immutable tool result with structured status preserved.
@@ -1410,65 +1314,6 @@ Workspace: {workspace_path} — your internal state (memory, skills, config). NO
         blocks
     }
 
-    fn assemble_local_prompt_report(
-        &self,
-        prefix: &str,
-        static_blocks: &[PromptBlock],
-        runtime_blocks: &[PromptBlock],
-    ) -> PromptAssemblyReport {
-        let mut assembled = prefix.trim().to_string();
-        let max_tokens = if self.system_prompt_cap > 0 {
-            self.system_prompt_cap
-        } else {
-            usize::MAX
-        };
-        let mut blocks = vec![PromptBlockReport {
-            kind: PromptBlockKind::Prefix,
-            title: "Identity".to_string(),
-            tokens: TokenBudget::estimate_str_tokens(&assembled),
-            included: true,
-            allocated_tokens: 0,
-            source: String::new(),
-        }];
-
-        for (kind, block) in static_blocks
-            .iter()
-            .map(|b| (PromptBlockKind::Static, b))
-            .chain(runtime_blocks.iter().map(|b| (PromptBlockKind::Runtime, b)))
-        {
-            let rendered = block.render();
-            if rendered.is_empty() {
-                continue;
-            }
-            let block_tokens = TokenBudget::estimate_str_tokens(&rendered);
-            let candidate = format!("{}\n\n---\n\n{}", assembled, rendered);
-            let included = max_tokens == usize::MAX
-                || TokenBudget::estimate_str_tokens(&candidate) <= max_tokens;
-            if included {
-                assembled = candidate;
-            }
-            blocks.push(PromptBlockReport {
-                kind,
-                title: block.report_title(),
-                tokens: block_tokens,
-                included,
-                allocated_tokens: 0,
-                source: String::new(),
-            });
-        }
-
-        PromptAssemblyReport {
-            total_tokens: TokenBudget::estimate_str_tokens(&assembled),
-            cap_tokens: if max_tokens == usize::MAX {
-                None
-            } else {
-                Some(max_tokens)
-            },
-            prompt: assembled,
-            blocks,
-        }
-    }
-
     /// Load bootstrap files within budget using progressive line-level inclusion.
     ///
     /// If a file fits fully within the remaining budget it is included in full.
@@ -1549,20 +1394,6 @@ Workspace: {workspace_path} — your internal state (memory, skills, config). NO
         }
 
         included.join("\n\n")
-    }
-
-    fn _available_bootstrap_files(&self) -> Vec<String> {
-        BOOTSTRAP_FILES
-            .iter()
-            .filter_map(|filename| {
-                let path = self.workspace.join(filename);
-                if path.exists() {
-                    Some((*filename).to_string())
-                } else {
-                    None
-                }
-            })
-            .collect()
     }
 
     /// Build user message content with optional base64-encoded images.
@@ -1850,68 +1681,6 @@ mod tests {
             stable_1
                 .get(0..crate::utils::helpers::floor_char_boundary(&stable_1, preview_chars))
                 .unwrap_or("")
-        );
-    }
-
-    // ----- insert_tail_before_user -----
-
-    #[test]
-    fn test_insert_tail_before_user_with_history() {
-        let (_tmp, cb) = make_context();
-        let mut messages = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "old q"}),
-            json!({"role": "assistant", "content": "old a"}),
-            json!({"role": "user", "content": "current question"}),
-        ];
-        cb.insert_tail_before_user(&mut messages, "RELEVANT TAIL");
-
-        // Tail lands at len-2; the real user message stays last.
-        let n = messages.len();
-        assert_eq!(messages[n - 2]["content"], "RELEVANT TAIL");
-        assert_eq!(messages[n - 2]["role"], "user");
-        assert_eq!(messages[n - 2]["_synthetic"], true);
-        assert_eq!(messages[n - 1]["content"], "current question");
-        assert_eq!(messages.last().unwrap()["role"], "user");
-    }
-
-    #[test]
-    fn test_insert_tail_before_user_no_history() {
-        let (_tmp, cb) = make_context();
-        let mut messages = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "q"}),
-        ];
-        cb.insert_tail_before_user(&mut messages, "TAIL");
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[1]["content"], "TAIL");
-        assert_eq!(messages[2]["content"], "q");
-    }
-
-    #[test]
-    fn test_insert_tail_before_user_blank_is_noop() {
-        let (_tmp, cb) = make_context();
-        let mut messages = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "user", "content": "q"}),
-        ];
-        cb.insert_tail_before_user(&mut messages, "   ");
-        assert_eq!(messages.len(), 2, "blank tail must not insert anything");
-    }
-
-    #[test]
-    fn test_insert_tail_before_user_requires_trailing_user() {
-        let (_tmp, cb) = make_context();
-        // Does not end with a user message → no-op (protocol invariant guard).
-        let mut messages = vec![
-            json!({"role": "system", "content": "sys"}),
-            json!({"role": "assistant", "content": "a"}),
-        ];
-        cb.insert_tail_before_user(&mut messages, "TAIL");
-        assert_eq!(
-            messages.len(),
-            2,
-            "must not insert when array lacks trailing user"
         );
     }
 
@@ -2435,44 +2204,6 @@ mod tests {
         assert!(messages[0].get("tool_calls").is_none());
     }
 
-    // ----- add_tool_result_immutable -----
-
-    #[test]
-    fn test_add_tool_result_immutable_wraps_content() {
-        let mut messages: Vec<Value> = Vec::new();
-        ContextBuilder::add_tool_result_immutable(
-            &mut messages,
-            "call_1",
-            "read_file",
-            "file content",
-        );
-
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["role"], "tool");
-        assert_eq!(messages[0]["tool_call_id"], "call_1");
-        assert_eq!(messages[0]["name"], "read_file");
-        let content = messages[0]["content"].as_str().unwrap();
-        // Bare body — verbatim instruction lives in the system prompt, not per-result.
-        assert_eq!(content, "file content");
-    }
-
-    #[test]
-    fn test_add_tool_result_immutable_empty_result() {
-        let mut messages: Vec<Value> = Vec::new();
-        ContextBuilder::add_tool_result_immutable(&mut messages, "c1", "exec", "");
-        let content = messages[0]["content"].as_str().unwrap();
-        assert_eq!(content, "");
-    }
-
-    #[test]
-    fn test_add_tool_result_immutable_passes_content_through_verbatim() {
-        // Same as the non-immutable variant: pure passthrough, no capping.
-        let mut messages: Vec<Value> = Vec::new();
-        let body = "exact bytes that the caller already bounded";
-        ContextBuilder::add_tool_result_immutable(&mut messages, "c1", "read_file", body);
-        assert_eq!(messages[0]["content"].as_str().unwrap(), body);
-    }
-
     #[test]
     fn test_truncate_to_budget_tail_keeps_newest() {
         // Long text should keep the tail (newest facts), silently.
@@ -2535,42 +2266,6 @@ mod tests {
             !prompt.contains("Observations from Past Conversations"),
             "observations should no longer be injected into system prompt"
         );
-    }
-
-    // ----- sanitize_tool_result -----
-
-    #[test]
-    fn test_sanitize_passthrough() {
-        let result = sanitize_tool_result("normal text output", 30000);
-        assert_eq!(result, "normal text output");
-    }
-
-    #[test]
-    fn test_sanitize_binary_detection() {
-        let data = "some text\0with null bytes".to_string();
-        let result = sanitize_tool_result(&data, 30000);
-        assert!(result.starts_with("[Binary content,"));
-    }
-
-    #[test]
-    fn test_sanitize_base64_detection() {
-        // Create a string that's >50% base64 characters and >1000 chars
-        let b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=".repeat(20);
-        let result = sanitize_tool_result(&b64, 30000);
-        assert!(result.starts_with("[Base64 data,"), "got: {}", result);
-    }
-
-    #[test]
-    fn test_sanitize_truncation() {
-        let long = "x".repeat(1000);
-        let result = sanitize_tool_result(&long, 100);
-        assert!(result.len() < 200); // 100 + truncation message
-        assert!(result.contains("[truncated, 1000 chars total]"));
-    }
-
-    #[test]
-    fn test_sanitize_empty() {
-        assert_eq!(sanitize_tool_result("", 100), "");
     }
 
     // ----- _truncate_to_budget_head -----
