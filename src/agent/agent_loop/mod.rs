@@ -63,6 +63,16 @@ pub(crate) use shared::*;
 use heuristics::adaptive_max_tokens;
 use heuristics::{last_user_message, render_via_protocol, should_strip_tools_for_trio};
 
+/// True if this inbound message is an internal system event (e.g. a subagent
+/// completion announcement published back on the originating channel) that
+/// must be relayed to the user verbatim without invoking the LLM.
+fn is_system_message(msg: &InboundMessage) -> bool {
+    msg.metadata
+        .get("is_system")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 // ---------------------------------------------------------------------------
 // Tool proxy wrappers
 // ---------------------------------------------------------------------------
@@ -300,28 +310,39 @@ impl AgentLoop {
 
             // Coalesce rapid messages from the same session (Telegram, WhatsApp).
             // Waits up to 400ms for follow-up messages before processing.
-            // Idle turns never coalesce: their observation must not be glued
-            // onto a real user message arriving in the window.
+            // Idle turns and system messages (subagent announcements) never
+            // coalesce: an injected observation must not be glued onto a real
+            // user message, and an announcement must relay inline (fast)
+            // rather than wait out the window and risk merging with user text.
             let msg = if crate::bus::events::should_coalesce(&msg.channel)
                 && !msg.content.trim_start().starts_with('/')
                 && !crate::agent::idle::is_idle_message(&msg)
+                && !is_system_message(&msg)
             {
                 let session = msg.session_key();
                 let mut batch = vec![msg];
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
                 loop {
                     match tokio::time::timeout_at(deadline, self.bus_inbound_rx.recv()).await {
-                        Ok(Some(next)) if next.session_key() == session => {
+                        Ok(Some(next))
+                            if next.session_key() == session
+                                && !next.content.trim_start().starts_with('/')
+                                && !crate::agent::idle::is_idle_message(&next)
+                                && !is_system_message(&next) =>
+                        {
                             batch.push(next);
                         }
                         Ok(Some(other)) => {
-                            // Preserve the different-session message for the
-                            // next normal iteration. This is the in-process
-                            // equivalent of push-back without a second gateway
-                            // execution pipeline (see main b9d0055) — a side
-                            // path here would skip is_system + /-command
-                            // interception, letting a /clear from another
-                            // session reach the LLM as plain text.
+                            // Preserve for the next normal iteration: either a
+                            // different-session message, or a same-session
+                            // special-category message (system announcement,
+                            // /-command, idle turn) that must not be glued onto
+                            // this coalescing batch. Routing both through
+                            // pending_msg keeps them on the full is_system /
+                            // /-command / lock / permit dispatch path (see
+                            // main b9d0055) — a side path here would skip
+                            // interception, letting a /clear reach the LLM as
+                            // plain text.
                             pending_msg = Some(other);
                             break;
                         }
@@ -337,11 +358,7 @@ impl AgentLoop {
             };
 
             // System messages (subagent announces) are handled inline (fast).
-            let is_system = msg
-                .metadata
-                .get("is_system")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let is_system = is_system_message(&msg);
 
             if is_system {
                 debug!(

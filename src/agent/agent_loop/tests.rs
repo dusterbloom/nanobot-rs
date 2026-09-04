@@ -3162,6 +3162,216 @@ async fn cross_session_command_seen_during_coalescing_uses_gateway_dispatch() {
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
+/// Regression (mechanism, user-message-first): on a coalescing channel, a user
+/// message followed within the 400ms window by a same-session `is_system`
+/// announcement must NOT merge with it. The user message is processed as a real
+/// turn and the announcement is relayed inline as its own outbound.
+#[tokio::test]
+async fn system_announcement_after_user_message_does_not_coalesce() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-main",
+        vec![WireRecordingProvider::text_response("user-reply")],
+    ));
+    let (mut gateway_loop, inbound_tx, mut outbound_rx, workspace) =
+        build_gateway_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let idle_tracker = gateway_loop.shared.idle.tracker.clone();
+    let running = gateway_loop.running.clone();
+    let runner = tokio::spawn(async move { gateway_loop.run().await });
+
+    // 1. hello from alice opens the coalescing window (test channel coalesces).
+    inbound_tx
+        .send(InboundMessage::new("test", "user", "alice", "hello"))
+        .unwrap();
+    // 2. is_system announcement for the SAME session — same-session follow-up.
+    //    Shaped exactly like `SubagentManager::_announce_result`.
+    let mut announce = InboundMessage::new(
+        "test",
+        "subagent",
+        "alice",
+        "[Subagent quick task (t1)] Status: completed\nTask: quick task\n\nResult:\ndone",
+    );
+    announce
+        .metadata
+        .insert("is_system".to_string(), json!(true));
+    inbound_tx.send(announce).unwrap();
+    // 3. bob (different session) breaks the window so alice's turn dispatches.
+    inbound_tx
+        .send(InboundMessage::new("test", "user", "bob", "hi"))
+        .unwrap();
+
+    // Collect: the inline-relayed announcement + replies to alice and bob.
+    let mut announcement: Option<String> = None;
+    let mut got_alice_reply = false;
+    let mut got_bob_reply = false;
+    for _ in 0..10 {
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("outbound must arrive within 5s")
+            .expect("outbound channel must stay open");
+        if out.content.contains("Subagent") {
+            announcement = Some(out.content);
+        } else if out.chat_id == "alice" {
+            got_alice_reply = true;
+        } else if out.chat_id == "bob" {
+            got_bob_reply = true;
+        }
+        if announcement.is_some() && got_alice_reply && got_bob_reply {
+            break;
+        }
+    }
+    let announcement = announcement.expect("announcement outbound must arrive");
+
+    running.store(false, std::sync::atomic::Ordering::SeqCst);
+    drop(inbound_tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
+    let _ = std::fs::remove_dir_all(&workspace);
+
+    // (a) The announcement was NOT merged with the user's "hello".
+    assert!(
+        !announcement.contains("hello"),
+        "announcement must not contain the user's text; got: {announcement:?}"
+    );
+    // (b) Both alice's hello and bob's hi were processed as real turns.
+    assert!(got_alice_reply, "alice's hello must produce an LLM reply");
+    assert!(got_bob_reply, "bob's hi must produce an LLM reply");
+    assert_eq!(
+        provider.calls().len(),
+        2,
+        "provider should be called twice (alice + bob), not once"
+    );
+    // (c) `note_inbound` ran for both alice and bob (bob dispatched last).
+    assert!(
+        idle_tracker.designated(Some("test:alice")).is_some(),
+        "idle tracker must have a record for test:alice"
+    );
+    assert_eq!(
+        idle_tracker
+            .designated(None)
+            .map(|t| t.session_key())
+            .unwrap_or_default(),
+        "test:bob",
+        "idle tracker's most-recent session should be bob (dispatched after alice)"
+    );
+}
+
+/// Regression (first-message guard): a `is_system` announcement arriving on a
+/// coalescing channel BEFORE a same-session user message must NOT open the
+/// 400ms coalescing window. The announcement is relayed inline and the
+/// subsequent user message is processed as a real turn (not merged into the
+/// announcement).
+#[tokio::test]
+async fn system_announcement_before_user_message_does_not_open_coalescing_window() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-main",
+        vec![WireRecordingProvider::text_response("user-reply")],
+    ));
+    let (mut gateway_loop, inbound_tx, mut outbound_rx, workspace) =
+        build_gateway_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let idle_tracker = gateway_loop.shared.idle.tracker.clone();
+    let running = gateway_loop.running.clone();
+    let runner = tokio::spawn(async move { gateway_loop.run().await });
+
+    // 1. is_system announcement FIRST. Before the fix it opened the 400ms
+    //    coalescing window and then batched the same-session user message.
+    let mut announce = InboundMessage::new(
+        "test",
+        "subagent",
+        "alice",
+        "[Subagent quick task (t1)] Status: completed\nTask: quick task\n\nResult:\ndone",
+    );
+    announce
+        .metadata
+        .insert("is_system".to_string(), json!(true));
+    inbound_tx.send(announce).unwrap();
+    // 2. hello from alice (same session) — must be a real turn, not merged.
+    inbound_tx
+        .send(InboundMessage::new("test", "user", "alice", "hello"))
+        .unwrap();
+
+    let mut announcement: Option<String> = None;
+    let mut user_reply: Option<String> = None;
+    for _ in 0..6 {
+        let out = tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
+            .await
+            .expect("outbound must arrive within 5s")
+            .expect("outbound channel must stay open");
+        if out.content.contains("Subagent") {
+            announcement = Some(out.content);
+        } else if out.content == "user-reply" {
+            user_reply = Some(out.content);
+        }
+        if announcement.is_some() && user_reply.is_some() {
+            break;
+        }
+    }
+    let announcement = announcement.expect("announcement outbound must arrive");
+    let _user_reply = user_reply.expect("user's LLM reply must arrive");
+
+    running.store(false, std::sync::atomic::Ordering::SeqCst);
+    drop(inbound_tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
+    let _ = std::fs::remove_dir_all(&workspace);
+
+    assert!(
+        !announcement.contains("hello"),
+        "announcement must not contain the user's text; got: {announcement:?}"
+    );
+    assert_eq!(
+        provider.calls().len(),
+        1,
+        "provider should be called once for the user message (announcement is relayed without the LLM)"
+    );
+    assert_eq!(
+        idle_tracker
+            .designated(Some("test:alice"))
+            .map(|t| t.session_key())
+            .unwrap_or_default(),
+        "test:alice",
+        "idle tracker must record alice's hello"
+    );
+}
+
+/// Regression guard: the coalescing batch-loop guards added to exclude system
+/// / `/-command` / idle messages must not break legitimate rapid same-session
+/// user follow-ups. Two plain user messages from the same session within the
+/// window still coalesce into a single LLM turn.
+#[tokio::test]
+async fn rapid_same_session_user_messages_still_coalesce() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-main",
+        vec![WireRecordingProvider::text_response("coalesced reply")],
+    ));
+    let (mut gateway_loop, inbound_tx, mut outbound_rx, workspace) =
+        build_gateway_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let running = gateway_loop.running.clone();
+    let runner = tokio::spawn(async move { gateway_loop.run().await });
+
+    inbound_tx
+        .send(InboundMessage::new("test", "user", "alice", "hello"))
+        .unwrap();
+    inbound_tx
+        .send(InboundMessage::new("test", "user", "alice", "world"))
+        .unwrap();
+
+    let out = tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
+        .await
+        .expect("coalesced reply must arrive within 5s")
+        .expect("outbound channel must stay open");
+    assert_eq!(out.content, "coalesced reply");
+    assert_eq!(out.chat_id, "alice");
+
+    running.store(false, std::sync::atomic::Ordering::SeqCst);
+    drop(inbound_tx);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
+    let _ = std::fs::remove_dir_all(&workspace);
+
+    assert_eq!(
+        provider.calls().len(),
+        1,
+        "two rapid same-session user messages must coalesce into one provider call"
+    );
+}
+
 #[tokio::test]
 async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
     let provider = Arc::new(WireRecordingProvider::new(
