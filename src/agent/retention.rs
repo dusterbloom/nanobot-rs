@@ -15,9 +15,8 @@
 //!
 //! [`RetentionPolicy::apply_shaping`] wraps the `step_prepare` call site
 //! (hygiene, then local-only anti-drift). [`RetentionPolicy::apply_budget`]
-//! wraps the `step_pre_call` call site (token-budget trim, normal or
-//! emergency). Both read the same policy struct, built once from config in
-//! `agent_core::build_swappable_core`.
+//! wraps the `step_pre_call` call site (token-budget trim). Both read the
+//! same policy struct, built once from config in `agent_core::build_swappable_core`.
 
 use serde_json::Value;
 
@@ -40,22 +39,10 @@ pub struct RetentionPolicy {
 }
 
 /// Which budget-trim call site is invoking [`RetentionPolicy::apply_budget`].
-///
-/// The two pre-extraction call sites in `step_pre_call` pass different
-/// arguments to `trim_to_fit_with_age_preserving_prefix`: the normal trim
-/// uses the policy's age ceiling and the real turn number, while the
-/// emergency (context-overflow) trim deliberately ignores age — ties
-/// `tool_def_tokens`/`current_turn`/`max_age_turns` to 0 so it trims more
-/// aggressively than the normal path. This enum keeps that distinction
-/// explicit at the call site instead of a bare bool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetMode {
     /// Standard pre-call trim: age-aware eviction using this turn's number.
     Normal { turn_count: u64 },
-    /// Emergency pre-flight trim when the rendered prompt is about to exceed
-    /// the model's context window. Ignores age preference and tool-def
-    /// token reservation (matches the original call site's `(0, 0, 0)`).
-    Emergency,
 }
 
 impl RetentionPolicy {
@@ -113,13 +100,6 @@ impl RetentionPolicy {
                     self.max_message_age_turns,
                     frozen_prefix,
                 ),
-            BudgetMode::Emergency => token_budget.trim_to_fit_with_age_preserving_prefix(
-                messages,
-                0,
-                0,
-                0,
-                frozen_prefix,
-            ),
         }
     }
 }
@@ -238,25 +218,5 @@ mod tests {
             0,
         );
         assert!(TokenBudget::estimate_tokens(&trimmed) <= 1500);
-    }
-
-    #[test]
-    fn test_apply_budget_emergency_matches_zeroed_direct_call() {
-        let p = policy();
-        let token_budget = TokenBudget::new(2_000, 500);
-        let fat = "word ".repeat(1200);
-        let mut messages = vec![json!({"role": "system", "content": "sys"})];
-        for i in 0..5 {
-            messages.push(json!({"role": "user", "content": format!("q{i}")}));
-            messages.push(json!({"role": "assistant", "content": fat.clone()}));
-        }
-
-        let (via_policy, disp_policy) =
-            p.apply_budget(&token_budget, &messages, 0, BudgetMode::Emergency, 0);
-        let (direct, disp_direct) =
-            token_budget.trim_to_fit_with_age_preserving_prefix(&messages, 0, 0, 0, 0);
-
-        assert_eq!(via_policy, direct);
-        assert_eq!(disp_policy, disp_direct);
     }
 }
