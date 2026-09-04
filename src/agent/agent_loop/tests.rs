@@ -8215,6 +8215,57 @@ async fn empty_plan_step_does_not_poison_later_success() {
 }
 
 #[tokio::test]
+async fn plan_guided_failed_plan_step_stops_at_step_budget() {
+    let responses = (0..8)
+        .map(|index| crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: vec![crate::providers::base::ToolCallRequest {
+                id: format!("tc-plan-budget-{index}"),
+                name: "list_dir".to_string(),
+                arguments: HashMap::from([(
+                    "path".to_string(),
+                    json!(format!("{}.", "./".repeat(index))),
+                )]),
+            }],
+            finish_reason: FinishReason::ToolCalls,
+            usage: HashMap::new(),
+        })
+        .collect();
+    let provider = Arc::new(ResponseSequenceProvider::new("local-main", responses));
+    let reasoning = crate::config::schema::ReasoningConfig {
+        enabled: true,
+        auto_decompose: true,
+        step_budget: 2,
+        ..Default::default()
+    };
+    let (agent_loop, workspace) = build_local_harness_with_runtime_options(
+        provider.clone() as Arc<dyn LLMProvider>,
+        8,
+        reasoning,
+        ToolDelegationConfig::default(),
+        None,
+    );
+    let session_key = format!("failed-plan-step-{}", uuid::Uuid::new_v4());
+
+    let response = agent_loop
+        .process_direct(
+            "1. inspect the workspace\n2. report the result",
+            &session_key,
+            "test",
+            "offline",
+        )
+        .await;
+
+    assert!(response.contains("iteration budget"), "{response:?}");
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "the failed step must stop at its own budget, not max_iterations"
+    );
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
 async fn model_failure_journal_failure_prevents_retry() {
     let provider = Arc::new(RetryableFailureProvider {
         name: "local-main".to_string(),

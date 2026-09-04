@@ -200,11 +200,12 @@ impl ReasoningEngine {
     }
 
     pub fn mark_current_failed(&mut self, reason: &str) {
+        let Some(idx) = self.current_step.take() else {
+            return;
+        };
         if let Some(plan) = self.plan.as_mut() {
-            if let Some(idx) = self.current_step {
-                if let Some(step) = plan.node_weight_mut(idx) {
-                    step.status = StepStatus::Failed(reason.to_string());
-                }
+            if let Some(step) = plan.node_weight_mut(idx) {
+                step.status = StepStatus::Failed(reason.to_string());
             }
         }
     }
@@ -213,6 +214,9 @@ impl ReasoningEngine {
         if let Some(plan) = self.plan.as_mut() {
             if let Some(idx) = self.current_step {
                 if let Some(step) = plan.node_weight_mut(idx) {
+                    if matches!(step.status, StepStatus::Failed(_)) {
+                        return;
+                    }
                     step.status = StepStatus::Completed;
                     step.result = result;
                 }
@@ -502,6 +506,35 @@ mod tests {
         engine.consume_iteration();
         engine.consume_iteration();
         assert_eq!(engine.step_budget_remaining(), 0);
+    }
+
+    #[test]
+    fn failed_plan_step_mark_current_failed_clears_current_step() {
+        let plan = linear_plan();
+        let mut engine = ReasoningEngine::new_with_plan(plan, 2);
+
+        engine.mark_current_failed("iteration budget exhausted");
+
+        assert!(engine.step_instruction().is_none());
+        engine.mark_current_completed(Some("late answer".into()));
+        assert!(!engine.is_complete());
+    }
+
+    #[test]
+    fn failed_plan_step_mark_current_completed_preserves_failure() {
+        let plan = linear_plan();
+        let mut engine = ReasoningEngine::new_with_plan(plan, 2);
+        let failed_step = engine.current_step.expect("active plan step");
+        engine.mark_current_failed("iteration budget exhausted");
+        engine.current_step = Some(failed_step);
+
+        engine.mark_current_completed(Some("late answer".into()));
+
+        assert!(!engine.is_complete());
+        assert!(matches!(
+            engine.plan.as_ref().unwrap()[failed_step].status,
+            StepStatus::Failed(_)
+        ));
     }
 
     // --- Backtracking integration test ---

@@ -2154,6 +2154,12 @@ impl AgentLoopShared {
                                 }
                                 continue;
                             }
+                            drop(engine);
+                            // The step's own hard stop is terminal; do not let the
+                            // global limit fallback issue another provider call.
+                            ctx.turn_outcome = TurnOutcome::Error;
+                            ctx.final_content = "I couldn't complete the current plan step before its iteration budget was exhausted.".to_string();
+                            break 'agent;
                         }
                     }
                     continue;
