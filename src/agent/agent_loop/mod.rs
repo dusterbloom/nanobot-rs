@@ -91,6 +91,14 @@ pub struct AgentLoop {
     reflection_spawned: AtomicBool,
 }
 
+/// Internal event that is relayed verbatim instead of entering the LLM turn.
+fn is_system_message(msg: &InboundMessage) -> bool {
+    msg.metadata
+        .get("is_system")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 impl AgentLoop {
     /// Create a new `AgentLoop`.
     #[allow(clippy::too_many_arguments)]
@@ -306,9 +314,10 @@ impl AgentLoop {
 
             // Coalesce rapid messages from the same session (Telegram, WhatsApp).
             // Waits up to 400ms for follow-up messages before processing.
-            // Idle turns never coalesce: their observation must not be glued
-            // onto a real user message arriving in the window.
+            // System announcements, commands, and idle turns never coalesce:
+            // their behavior and metadata must remain isolated from user turns.
             let msg = if crate::bus::events::should_coalesce(&msg.channel)
+                && !is_system_message(&msg)
                 && !msg.content.trim_start().starts_with('/')
                 && !crate::agent::idle::is_idle_message(&msg)
             {
@@ -317,17 +326,20 @@ impl AgentLoop {
                 let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
                 loop {
                     match tokio::time::timeout_at(deadline, self.bus_inbound_rx.recv()).await {
-                        Ok(Some(next)) if next.session_key() == session => {
+                        Ok(Some(next))
+                            if next.session_key() == session
+                                && !is_system_message(&next)
+                                && !next.content.trim_start().starts_with('/')
+                                && !crate::agent::idle::is_idle_message(&next) =>
+                        {
                             batch.push(next);
                         }
                         Ok(Some(other)) => {
-                            // Preserve the different-session message for the
-                            // next normal iteration. This is the in-process
-                            // equivalent of push-back without a second gateway
-                            // execution pipeline (see main b9d0055) — a side
-                            // path here would skip is_system + /-command
-                            // interception, letting a /clear from another
-                            // session reach the LLM as plain text.
+                            // Preserve a different-session message or a
+                            // same-session special message for the next normal
+                            // iteration. This in-process push-back avoids a
+                            // second gateway path (see main b9d0055) that could
+                            // skip system and command interception.
                             pending_msg = Some(other);
                             break;
                         }
@@ -343,13 +355,7 @@ impl AgentLoop {
             };
 
             // System messages (subagent announces) are handled inline (fast).
-            let is_system = msg
-                .metadata
-                .get("is_system")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            if is_system {
+            if is_system_message(&msg) {
                 debug!(
                     "Processing system message: {}",
                     &msg.content[..msg.content.len().min(80)]

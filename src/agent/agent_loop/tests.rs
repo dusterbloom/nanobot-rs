@@ -3345,6 +3345,112 @@ async fn cross_session_command_seen_during_coalescing_uses_gateway_dispatch() {
 }
 
 #[tokio::test]
+async fn rapid_same_session_user_messages_still_coalesce() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-coalescing-test",
+        vec![WireRecordingProvider::text_response("user response")],
+    ));
+    let (mut gateway_loop, inbound_tx, mut outbound_rx, workspace) =
+        build_gateway_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let running = gateway_loop.running.clone();
+    let runner = tokio::spawn(async move { gateway_loop.run().await });
+
+    inbound_tx
+        .send(InboundMessage::new(
+            "test",
+            "user",
+            "coalesced-chat",
+            "first user marker",
+        ))
+        .unwrap();
+    inbound_tx
+        .send(InboundMessage::new(
+            "test",
+            "user",
+            "coalesced-chat",
+            "second user marker",
+        ))
+        .unwrap();
+
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
+        .await
+        .expect("the coalesced user turn must complete")
+        .expect("outbound channel must stay open");
+    assert_eq!(response.content, "user response");
+    let calls = provider.calls();
+    assert_eq!(calls.len(), 1, "rapid user messages must share one turn");
+    let wire = serde_json::to_string(&calls[0]).unwrap();
+    assert!(wire.contains("first user marker"));
+    assert!(wire.contains("second user marker"));
+
+    running.store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(std::time::Duration::from_secs(5), runner)
+        .await
+        .expect("gateway loop must stop")
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn system_announcement_after_user_message_does_not_coalesce() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-system-announcement-test",
+        vec![WireRecordingProvider::text_response("user response")],
+    ));
+    let (mut gateway_loop, inbound_tx, mut outbound_rx, workspace) =
+        build_gateway_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let running = gateway_loop.running.clone();
+    let runner = tokio::spawn(async move { gateway_loop.run().await });
+
+    inbound_tx
+        .send(InboundMessage::new(
+            "test",
+            "user",
+            "announcement-chat",
+            "user turn marker",
+        ))
+        .unwrap();
+    let mut announcement = InboundMessage::new(
+        "test",
+        "subagent",
+        "announcement-chat",
+        "system announcement marker",
+    );
+    announcement
+        .metadata
+        .insert("is_system".to_string(), json!(true));
+    inbound_tx.send(announcement).unwrap();
+
+    let mut responses = Vec::new();
+    for _ in 0..2 {
+        responses.push(
+            tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv())
+                .await
+                .expect("the user reply and system announcement must both be emitted")
+                .expect("outbound channel must stay open")
+                .content,
+        );
+    }
+    assert!(responses.iter().any(|content| content == "user response"));
+    assert!(responses
+        .iter()
+        .any(|content| content == "system announcement marker"));
+
+    let calls = provider.calls();
+    assert_eq!(calls.len(), 1, "the user turn must reach the provider once");
+    let wire = serde_json::to_string(&calls[0]).unwrap();
+    assert!(wire.contains("user turn marker"));
+    assert!(!wire.contains("system announcement marker"));
+
+    running.store(false, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::timeout(std::time::Duration::from_secs(5), runner)
+        .await
+        .expect("gateway loop must stop")
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
 async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
     let provider = Arc::new(WireRecordingProvider::new(
         "local-hard-lcm-test",
