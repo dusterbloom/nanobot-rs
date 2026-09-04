@@ -40,8 +40,11 @@ impl TaintState {
         let mut sensitive_tools = HashSet::new();
         sensitive_tools.insert("exec".to_string());
         sensitive_tools.insert("write_file".to_string());
-        sensitive_tools.insert("create_file".to_string());
-        sensitive_tools.insert("patch_file".to_string());
+        sensitive_tools.insert("edit_file".to_string());
+        sensitive_tools.insert("apply_patch".to_string());
+        sensitive_tools.insert("execute_code".to_string());
+        #[cfg(feature = "python-kernel")]
+        sensitive_tools.insert("python".to_string());
 
         Self {
             spans: Vec::new(),
@@ -211,8 +214,9 @@ mod tests {
 
         // write_file should trigger warning
         assert!(state.check_sensitive("write_file").is_some());
-        assert!(state.check_sensitive("create_file").is_some());
-        assert!(state.check_sensitive("patch_file").is_some());
+        assert!(state.check_sensitive("edit_file").is_some());
+        assert!(state.check_sensitive("apply_patch").is_some());
+        assert!(state.check_sensitive("execute_code").is_some());
 
         // But read_file should NOT trigger
         assert!(state.check_sensitive("read_file").is_none());
@@ -259,5 +263,88 @@ mod tests {
         let summary = state.taint_summary();
         assert!(summary.contains("web_fetch"));
         assert!(summary.contains("web_search"));
+    }
+
+    // --- Regression guard: the sensitive set must match the real registry ---
+
+    /// The hardcoded `sensitive_tools` set must cover every file-mutating and
+    /// code-executing tool that `register_standard_tools` actually registers,
+    /// and must not contain stale names that match no registered tool. This
+    /// test fails if the registry grows a new sensitive tool and `taint.rs`
+    /// is not updated, preventing the drift this bug was caused by.
+    #[test]
+    fn test_sensitive_set_covers_all_registered_sensitive_tools() {
+        use crate::agent::tools::registry::{ToolConfig, ToolRegistry};
+
+        let ws = tempfile::tempdir().unwrap();
+        let mut config = ToolConfig::new(ws.path());
+        config.code_execution.enabled = true;
+        #[cfg(feature = "python-kernel")]
+        {
+            config.python_kernel.enabled = true;
+        }
+        let reg = ToolRegistry::with_standard_tools(&config);
+
+        let mut state = TaintState::new();
+        state.mark_tainted("web_fetch", Some("https://attacker.example/payload".into()));
+
+        // The file-mutating class — exactly the set the registry's `read_only`
+        // guard groups (`write_file | edit_file | apply_patch`).
+        for file_tool in ["write_file", "edit_file", "apply_patch"] {
+            assert!(
+                reg.has(file_tool),
+                "expected '{file_tool}' to be registered by register_standard_tools"
+            );
+            assert!(
+                state.check_sensitive(file_tool).is_some(),
+                "taint layer must flag file-mutating tool '{file_tool}' while tainted — \
+                 check_sensitive returned None"
+            );
+        }
+
+        // Code-execution primitives.
+        for exec_tool in ["exec", "execute_code"] {
+            assert!(
+                reg.has(exec_tool),
+                "expected '{exec_tool}' to be registered"
+            );
+            assert!(
+                state.check_sensitive(exec_tool).is_some(),
+                "taint layer must flag code-executing tool '{exec_tool}' while tainted"
+            );
+        }
+
+        #[cfg(feature = "python-kernel")]
+        {
+            assert!(
+                reg.has("python"),
+                "expected 'python' to be registered when the python-kernel feature is on"
+            );
+            assert!(
+                state.check_sensitive("python").is_some(),
+                "taint layer must flag code-executing tool 'python' while tainted"
+            );
+        }
+
+        // Stale names that caused this bug: no registered tool is named
+        // `create_file` or `patch_file`, so flagging them would be a dead
+        // signal. They must NOT be in the sensitive set.
+        for dead in ["create_file", "patch_file"] {
+            assert!(
+                !reg.has(dead),
+                "'{dead}' should not be a registered tool name (sanity check)"
+            );
+            assert!(
+                state.check_sensitive(dead).is_none(),
+                "taint layer must not flag stale name '{dead}' that matches no registered tool"
+            );
+        }
+
+        // A representative read-only tool is registered but must NOT be flagged.
+        assert!(reg.has("read_file"));
+        assert!(
+            state.check_sensitive("read_file").is_none(),
+            "read-only tools must not be flagged as sensitive"
+        );
     }
 }
