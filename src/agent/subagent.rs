@@ -302,16 +302,6 @@ impl SubagentManager {
         self
     }
 
-    /// Set the cluster router for distributed inference routing.
-    #[cfg(feature = "cluster")]
-    pub fn with_cluster_router(
-        mut self,
-        router: std::sync::Arc<crate::cluster::router::ClusterRouter>,
-    ) -> Self {
-        self.cluster_router = Some(router);
-        self
-    }
-
     /// Set the parent's context token limit as fallback for subagents.
     pub fn with_local_context_limit(mut self, limit: usize) -> Self {
         self.local_context_limit = Some(limit);
@@ -343,11 +333,6 @@ impl SubagentManager {
             self.default_subagent_model = Some(model);
         }
         self
-    }
-
-    /// Get a reference to loaded profiles (for system prompt injection).
-    pub fn profiles(&self) -> &HashMap<String, AgentProfile> {
-        &self.profiles
     }
 
     /// Resolve a profile name to a profile, or an error message listing
