@@ -9,7 +9,7 @@
 //! These tools are available to delegation workers (tool_runner) and provide
 //! capabilities beyond the sync micro-tools in context_store.rs:
 //! - `verify`: Run a command and check output against expectations
-//! - `python_eval`: Sandboxed Python code execution
+//! - `python_eval`: Python code execution (timeout-only; not sandboxed)
 //! - `diff_apply`: Surgical file editing via unified diff
 
 use std::collections::HashMap;
@@ -71,7 +71,7 @@ pub fn worker_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "python_eval",
-                "description": "Execute a Python expression or short script. Returns stdout. Max 5 second timeout. No network access.",
+                "description": "Execute a Python expression or short script. Returns stdout. Max 5 second timeout.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -209,7 +209,9 @@ async fn execute_verify(args: &HashMap<String, Value>) -> String {
     }
 }
 
-/// Execute Python code in a sandboxed environment.
+/// Execute Python code via `python3 -c` with a 5-second timeout. No sandbox
+/// is applied: the subprocess inherits the host's network, filesystem, and
+/// environment access.
 async fn execute_python_eval(args: &HashMap<String, Value>) -> String {
     let code = require_str!(args, "code", ".");
 
@@ -764,6 +766,38 @@ mod tests {
         assert!(names.contains(&"python_eval"));
         assert!(names.contains(&"diff_apply"));
         assert!(names.contains(&"fmt_convert"));
+    }
+
+    #[test]
+    fn test_python_eval_description_no_false_safety_claims() {
+        // Regression guard: shipped python_eval description must not assert
+        // isolation ("No network access"/"Sandboxed") the implementation lacks.
+        let desc: String = worker_tool_definitions()
+            .into_iter()
+            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("python_eval"))
+            .and_then(|d| {
+                d.pointer("/function/description")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+            .expect("python_eval tool definition missing");
+
+        assert!(
+            !desc.contains("No network access"),
+            "description must not claim No network access (no sandbox exists): {desc}"
+        );
+        assert!(
+            !desc.to_lowercase().contains("sandbox"),
+            "description must not claim a sandbox (none exists): {desc}"
+        );
+        assert!(
+            desc.contains("Python"),
+            "description should mention Python: {desc}"
+        );
+        assert!(
+            desc.contains("timeout"),
+            "description should mention the timeout: {desc}"
+        );
     }
 
     // -- fmt_convert tests --
