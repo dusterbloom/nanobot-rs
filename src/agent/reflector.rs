@@ -23,6 +23,7 @@ use tracing::{debug, info, warn};
 
 use crate::agent::knowledge_graph::KnowledgeGraph;
 use crate::agent::memory::{memory_transaction_lock, MemoryStore};
+use crate::agent::token_budget::TokenBudget;
 use crate::agent::working_memory::{SessionStatus, WorkingMemoryStore};
 use crate::providers::base::LLMProvider;
 use crate::session::db::SessionDb;
@@ -89,6 +90,26 @@ pub struct Reflector {
     max_words: usize,
 }
 
+/// What a single reflection pass distilled, counted from the locked
+/// `list_completed()` snapshot the pass actually processed.
+///
+/// Callers that surface per-invocation counts to a user/observer (e.g. `/learn`)
+/// should read these fields rather than an unlocked pre-flight snapshot: a
+/// concurrent reflector can consume the completed rows between such a snapshot
+/// and this pass acquiring `memory_transaction_lock`, leaving this pass a
+/// legitimate no-op (`sessions_distilled == 0`). Using the pre-flight count in
+/// that window would credit this invocation for distillation it did not
+/// perform.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReflectionReport {
+    /// Number of completed sessions this pass distilled. `0` when this pass
+    /// found nothing to do (typically because a concurrent pass consumed the
+    /// completed rows first).
+    pub sessions_distilled: usize,
+    /// Total estimated tokens across the sessions this pass distilled.
+    pub tokens_distilled: usize,
+}
+
 impl Reflector {
     /// Create a new reflector.
     pub fn new(
@@ -138,7 +159,30 @@ impl Reflector {
     ///
     /// `MemoryStore::write_long_term` uses temp-file + rename. Only after that
     /// atomic replacement succeeds do we mark the source rows reflected.
+    ///
+    /// Returns `Ok(())` on success, including a legitimate no-op (a concurrent
+    /// pass already consumed the completed rows). Callers that surface
+    /// per-invocation counts to a user/observer should use
+    /// [`reflect_with_counts`](Self::reflect_with_counts) instead, so the
+    /// counts they print reflect what *this* call actually distilled rather
+    /// than an unlocked pre-flight snapshot.
     pub async fn reflect(&self) -> Result<()> {
+        self.reflect_with_counts().await.map(|_| ())
+    }
+
+    /// Distill completed sessions into `MEMORY.md` and report what *this* pass
+    /// actually processed.
+    ///
+    /// The returned [`ReflectionReport`] is counted from the same locked
+    /// `list_completed()` snapshot this pass distills, so a caller cannot
+    /// credit itself for rows a concurrent reflector consumed between its
+    /// unlocked pre-flight snapshot and this pass acquiring
+    /// `memory_transaction_lock`. `sessions_distilled` is `0` when this pass
+    /// found nothing to do.
+    ///
+    /// `MemoryStore::write_long_term` uses temp-file + rename. Only after that
+    /// atomic replacement succeeds do we mark the source rows reflected.
+    pub async fn reflect_with_counts(&self) -> Result<ReflectionReport> {
         // Reflection is a single read/derive/write/status transaction at the
         // process level. All triggers share this lock so a slower run cannot
         // overwrite facts produced by a newer run or reflect the same rows
@@ -150,8 +194,25 @@ impl Reflector {
         // Read current state.
         let current_memory = memory_store.read_long_term();
 
-        // Gather summaries from completed working sessions.
+        // Gather summaries from completed working sessions. This re-query
+        // runs under the lock, so it sees whatever a concurrent pass has
+        // already advanced — the basis for the counts reported below.
         let completed_sessions = wm.list_completed().await?;
+
+        if completed_sessions.is_empty() {
+            debug!("Reflector: no completed sessions to process");
+            return Ok(ReflectionReport::default());
+        }
+
+        // Counts come from the same locked snapshot the pass distills, so a
+        // caller cannot report a stale pre-flight count for work a concurrent
+        // reflector performed.
+        let sessions_distilled = completed_sessions.len();
+        let tokens_distilled: usize = completed_sessions
+            .iter()
+            .map(|s| TokenBudget::estimate_str_tokens(&s.content))
+            .sum();
+
         let summaries: Vec<String> = completed_sessions
             .iter()
             .map(|s| {
@@ -164,14 +225,9 @@ impl Reflector {
             })
             .collect();
 
-        if summaries.is_empty() {
-            debug!("Reflector: no completed sessions to process");
-            return Ok(());
-        }
-
         info!(
             "Reflector: processing {} completed sessions into MEMORY.md",
-            completed_sessions.len()
+            sessions_distilled
         );
 
         let summaries_text = summaries.join("\n\n");
@@ -242,10 +298,13 @@ impl Reflector {
         wm.mark_reflected_all(&reflected_ids).await?;
         info!(
             "Reflector: marked {} working sessions reflected",
-            completed_sessions.len()
+            sessions_distilled
         );
 
-        Ok(())
+        Ok(ReflectionReport {
+            sessions_distilled,
+            tokens_distilled,
+        })
     }
 }
 
@@ -324,6 +383,7 @@ fn parse_entities_into_graph(kg: &mut KnowledgeGraph, section: &str) -> (usize, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::token_budget::TokenBudget;
     use crate::providers::base::{FinishReason, LLMProvider, LLMResponse};
     use async_trait::async_trait;
     use serde_json::Value;
@@ -478,7 +538,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 1, 10).await;
         let provider = Arc::new(MockProvider::new("memory"));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 100_000, sessions, 10_000);
+        let reflector = Reflector::new(
+            provider,
+            "test".into(),
+            &workspace,
+            100_000,
+            sessions,
+            10_000,
+        );
         assert!(!reflector.should_reflect().await);
     }
 
@@ -512,7 +579,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 3, 100).await;
         let provider = Arc::new(MockProvider::new("Updated facts."));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions.clone(), 10_000);
+        let reflector = Reflector::new(
+            provider,
+            "test".into(),
+            &workspace,
+            0,
+            sessions.clone(),
+            10_000,
+        );
 
         reflector.reflect().await.unwrap();
 
@@ -544,7 +618,14 @@ mod tests {
             sessions.clone(),
             10_000,
         );
-        let second = Reflector::new(provider.clone(), "test".into(), &workspace, 0, sessions, 10_000);
+        let second = Reflector::new(
+            provider.clone(),
+            "test".into(),
+            &workspace,
+            0,
+            sessions,
+            10_000,
+        );
 
         let (first_result, second_result) = tokio::join!(first.reflect(), second.reflect());
         first_result.unwrap();
@@ -563,7 +644,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 2, 100).await;
         let provider = Arc::new(FailingProvider);
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions.clone(), 10_000);
+        let reflector = Reflector::new(
+            provider,
+            "test".into(),
+            &workspace,
+            0,
+            sessions.clone(),
+            10_000,
+        );
 
         let result = reflector.reflect().await;
         assert!(result.is_err());
@@ -576,6 +664,144 @@ mod tests {
             2,
             "completed sessions should be preserved on failure"
         );
+    }
+
+    // --- reflect_with_counts: per-invocation reporting for /learn ----------
+
+    /// `reflect_with_counts` reports exactly the sessions and tokens this pass
+    /// distilled, counted from the locked snapshot it processed. The reported
+    /// token total matches `WorkingMemoryStore::total_tokens_by_status` for
+    /// the same (now consumed) sessions, so /learn's printed figure can never
+    /// diverge from what was actually distilled.
+    #[tokio::test]
+    async fn reflect_with_counts_reports_distilled_sessions_under_lock() {
+        let tmp = TempDir::new().unwrap();
+        let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 3, 100).await;
+        let expected_tokens: usize = (0..3)
+            .map(|_| TokenBudget::estimate_str_tokens(&"x".repeat(100)))
+            .sum();
+        let provider = Arc::new(MockProvider::new("Updated facts."));
+        let reflector = Reflector::new(
+            provider,
+            "test".into(),
+            &workspace,
+            0,
+            sessions.clone(),
+            10_000,
+        );
+
+        let report = reflector.reflect_with_counts().await.unwrap();
+
+        assert_eq!(report.sessions_distilled, 3);
+        assert_eq!(report.tokens_distilled, expected_tokens);
+
+        // Workspace end state is still correct: rows advanced to Reflected.
+        let wm = WorkingMemoryStore::new(sessions);
+        assert!(wm.list_completed().await.unwrap().is_empty());
+        assert_eq!(wm.list_reflected().await.unwrap().len(), 3);
+    }
+
+    /// The TOCTOU the bug report describes: a concurrent reflector acquires
+    /// `memory_transaction_lock` first and distills the only completed session.
+    /// The losing pass blocks on the lock, re-queries `list_completed()` under
+    /// it, finds the set empty, and must no-op — reporting `sessions_distilled
+    /// == 0`, NOT the pre-flight count it would have seen unlocked. This is the
+    /// exact signal `/learn` consumes to avoid printing a stale count.
+    #[tokio::test]
+    async fn reflect_with_counts_reports_zero_for_no_op_when_concurrent_pass_consumed_rows() {
+        let tmp = TempDir::new().unwrap();
+        let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 1, 100).await;
+        let provider = Arc::new(CoordinatedProvider {
+            calls: AtomicUsize::new(0),
+            active: AtomicUsize::new(0),
+            max_active: AtomicUsize::new(0),
+        });
+        let first = Reflector::new(
+            provider.clone(),
+            "test".into(),
+            &workspace,
+            0,
+            sessions.clone(),
+            10_000,
+        );
+        let second = Reflector::new(
+            provider.clone(),
+            "test".into(),
+            &workspace,
+            0,
+            sessions,
+            10_000,
+        );
+
+        let (first_result, second_result) =
+            tokio::join!(first.reflect_with_counts(), second.reflect_with_counts());
+        let first_report = first_result.unwrap();
+        let second_report = second_result.unwrap();
+
+        // Exactly one pass distilled the single session; the other no-op'd.
+        assert_eq!(
+            first_report.sessions_distilled + second_report.sessions_distilled,
+            1,
+            "the single completed session must be distilled exactly once"
+        );
+        assert_eq!(
+            first_report.sessions_distilled * second_report.sessions_distilled,
+            0,
+            "the losing pass must report zero, not the pre-flight count"
+        );
+
+        // Identify the winner/loser independent of scheduling order.
+        let (winner, loser) = if first_report.sessions_distilled == 1 {
+            (first_report, second_report)
+        } else {
+            (second_report, first_report)
+        };
+        assert!(winner.tokens_distilled > 0);
+        assert_eq!(loser.sessions_distilled, 0);
+        assert_eq!(loser.tokens_distilled, 0);
+
+        // Only one LLM call: the losing pass found empty rows under the lock
+        // and took the no-op branch instead of re-distilling.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.max_active.load(Ordering::SeqCst), 1);
+    }
+
+    /// `reflect()` delegates to `reflect_with_counts()` and returns `Ok(())`
+    /// both when it distilled sessions and on a legitimate no-op — its four
+    /// existing callers must observe unchanged behavior.
+    #[tokio::test]
+    async fn reflect_delegates_to_reflect_with_counts_across_distill_and_noop() {
+        let tmp = TempDir::new().unwrap();
+        let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 2, 100).await;
+        let provider = Arc::new(MockProvider::new("Facts."));
+        let reflector = Reflector::new(
+            provider,
+            "test".into(),
+            &workspace,
+            0,
+            sessions.clone(),
+            10_000,
+        );
+
+        // Distill path -> Ok(()); rows consumed.
+        reflector.reflect().await.unwrap();
+        assert!(WorkingMemoryStore::new(sessions.clone())
+            .list_completed()
+            .await
+            .unwrap()
+            .is_empty());
+
+        // No-op path (rows already consumed) -> Ok(()), NOT an error, and the
+        // provider is never consulted for the empty pass.
+        let reflector_again = Reflector::new(
+            Arc::new(MockProvider::new("must not be called for the no-op pass")),
+            "test".into(),
+            &workspace,
+            0,
+            sessions,
+            10_000,
+        );
+        reflector_again.reflect().await.unwrap();
     }
 
     // --- Entity extraction parsing tests ---
