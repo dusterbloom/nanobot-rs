@@ -15,6 +15,9 @@ use crate::agent::host_bridge::{
 };
 use crate::errors::ToolError;
 
+const MAX_AHEAD_BY_K: usize = 3;
+const MAX_LOOP_ROUNDS: u32 = 10;
+
 /// Tool to spawn a subagent for background task execution.
 ///
 /// The subagent runs asynchronously and announces its result back
@@ -198,6 +201,7 @@ impl SpawnAction {
                     .get("ahead_by_k")
                     .and_then(|v| v.as_u64())
                     .map(|v| usize::try_from(v).unwrap_or(usize::MAX))
+                    .map(|v| v.min(MAX_AHEAD_BY_K))
                     .unwrap_or(0);
                 Ok(SpawnAction::Pipeline { steps, ahead_by_k })
             }
@@ -207,6 +211,7 @@ impl SpawnAction {
                     .get("max_rounds")
                     .and_then(|v| v.as_u64())
                     .map(|v| u32::try_from(v).unwrap_or(u32::MAX))
+                    .map(|v| v.min(MAX_LOOP_ROUNDS))
                     .unwrap_or(5),
                 tools: params.get("tools").and_then(|v| v.as_array()).map(|arr| {
                     arr.iter()
@@ -378,7 +383,8 @@ impl Tool for SpawnTool {
                 },
                 "ahead_by_k": {
                     "type": "integer",
-                    "description": "MAKER voting margin (pipeline). 0 = no voting (default)"
+                    "description": "MAKER voting margin (pipeline). 0 = no voting (default)",
+                    "maximum": MAX_AHEAD_BY_K
                 },
                 "task": {
                     "type": "string",
@@ -414,7 +420,8 @@ impl Tool for SpawnTool {
                 },
                 "max_rounds": {
                     "type": "integer",
-                    "description": "Max loop rounds (default: 5)"
+                    "description": "Max loop rounds (default: 5)",
+                    "maximum": MAX_LOOP_ROUNDS
                 },
                 "tools": {
                     "type": "array",
@@ -658,6 +665,44 @@ mod tests {
         // The model must learn where profiles are listed and what overrides them.
         assert!(desc.to_lowercase().contains("system prompt"));
         assert!(desc.contains("model"));
+    }
+
+    #[test]
+    fn spawn_cost_bounds_schema_advertises_pipeline_and_loop_maxima() {
+        let tool = SpawnTool::new(test_host(EchoHost));
+        let params = tool.parameters();
+        let properties = &params["properties"];
+
+        assert_eq!(properties["ahead_by_k"]["maximum"], json!(3));
+        assert_eq!(properties["max_rounds"]["maximum"], json!(10));
+    }
+
+    #[test]
+    fn spawn_cost_bounds_pipeline_margin_is_clamped() {
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("pipeline"));
+        params.insert("steps".to_string(), json!([{"prompt": "one"}]));
+        params.insert("ahead_by_k".to_string(), json!(u64::MAX));
+
+        let action = SpawnAction::parse(&params).ok().expect("valid pipeline");
+        let SpawnAction::Pipeline { ahead_by_k, .. } = action else {
+            panic!("expected pipeline action");
+        };
+        assert_eq!(ahead_by_k, 3);
+    }
+
+    #[test]
+    fn spawn_cost_bounds_loop_rounds_are_clamped() {
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("loop"));
+        params.insert("task".to_string(), json!("refine"));
+        params.insert("max_rounds".to_string(), json!(u64::MAX));
+
+        let action = SpawnAction::parse(&params).ok().expect("valid loop");
+        let SpawnAction::Loop { max_rounds, .. } = action else {
+            panic!("expected loop action");
+        };
+        assert_eq!(max_rounds, 10);
     }
 
     #[tokio::test]

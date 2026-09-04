@@ -352,7 +352,7 @@ async fn vote_on_step(
             .copied()
             .unwrap_or(0);
 
-        if max_count >= second_max + ahead_by_k {
+        if max_count >= second_max.saturating_add(ahead_by_k) {
             debug!(
                 "Vote converged after {} voters: '{}'",
                 voters_used, normalized
@@ -592,6 +592,14 @@ mod tests {
         let (answer, voters) = vote_on_step(&provider, "mock", "test", 1, 5).await;
         assert_eq!(answer.trim().to_lowercase(), "a");
         assert!(voters <= 3);
+    }
+
+    #[tokio::test]
+    async fn spawn_cost_bounds_vote_convergence_is_overflow_safe() {
+        let provider = MockPipelineProvider::new(vec!["A", "B", "A", "B"]);
+        let (_, voters) = vote_on_step(&provider, "mock", "test", usize::MAX, 4).await;
+
+        assert_eq!(voters, 4);
     }
 
     #[tokio::test]

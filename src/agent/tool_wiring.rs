@@ -233,7 +233,7 @@ impl PipelineHost for AgentHost {
             steps: pipeline_steps,
             ahead_by_k: req.ahead_by_k,
             max_voters: if req.ahead_by_k > 0 {
-                req.ahead_by_k * 2 + 1
+                req.ahead_by_k.saturating_mul(2).saturating_add(1)
             } else {
                 1
             },
