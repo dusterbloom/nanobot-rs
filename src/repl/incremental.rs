@@ -762,9 +762,23 @@ fn find_link(chars: &[char], start: usize) -> Option<(usize, usize, usize)> {
         return None;
     }
     let url_start = j + 2;
-    // Find closing )
+    // Find the ')' that closes the link destination. A URL may itself contain
+    // balanced '(...)' (e.g. Wikipedia disambiguation pages such as
+    // `Python_(programming_language)`), so we track paren depth rather than
+    // stopping at the first ')' (CommonMark inline-link destination behaviour).
     let mut k = url_start;
-    while k < chars.len() && chars[k] != ')' {
+    let mut depth = 1;
+    while k < chars.len() {
+        match chars[k] {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            _ => {}
+        }
         k += 1;
     }
     if k >= chars.len() {
@@ -862,6 +876,36 @@ mod tests {
         let plain = strip_ansi(&result);
         assert!(plain.contains("docs"));
         assert!(plain.contains("https://example.com"));
+    }
+
+    #[test]
+    fn test_render_link_preserves_inner_paren_in_url() {
+        // Regression: a URL that itself contains a balanced '(...)' — e.g. a
+        // Wikipedia disambiguation page — must not be split at the inner ')'.
+        // The plain (ANSI-stripped) text a user copies must contain the full,
+        // functional URL including the inner ')'.
+        let cases = [
+            (
+                "[py](https://en.wikipedia.org/wiki/Python_(programming_language))",
+                "py https://en.wikipedia.org/wiki/Python_(programming_language)",
+            ),
+            (
+                "[wiki](https://en.wikipedia.org/wiki/C_(programming_language)#History)",
+                "wiki https://en.wikipedia.org/wiki/C_(programming_language)#History",
+            ),
+            (
+                "[ref](https://example.com/foo(bar)baz)",
+                "ref https://example.com/foo(bar)baz",
+            ),
+        ];
+        for (input, expected_plain) in cases {
+            let result = render_inline_markdown(input);
+            let plain = strip_ansi(&result);
+            assert_eq!(
+                plain, expected_plain,
+                "plain text must preserve the inner ')' in the URL — input: {input}"
+            );
+        }
     }
 
     #[test]
