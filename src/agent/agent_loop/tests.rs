@@ -7520,6 +7520,89 @@ async fn test_read_after_write_same_turn_is_not_blocked_by_stale_receipt() {
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
+/// Regression (router circuit breaker): when every tool call in a round is
+/// blocked *without* a cached result (an errored tool whose `record_result_with_status(ok=false)`
+/// stored nothing), the only recovery signal the model is supposed to receive
+/// before the `>= 4` hard break is the `>= 2` "write your final answer" scaffold.
+/// Commit 3dd40b1 constructed that scaffold via `scaffold_user(...)` but dropped
+/// the return value instead of `ctx.messages.push_draft(...)`-ing it, so the
+/// `>= 2` branch was a silent no-op and the model fell through to the hard break.
+/// This pins both the defect (fails on the buggy code) and the one-line fix.
+#[tokio::test]
+async fn test_circuit_breaker_scaffold_is_injected_after_repeated_blocked_no_result() {
+    use serde_json::Value;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-qwen-test",
+        vec![WireRecordingProvider::text_response("unused")],
+    ));
+    let (agent_loop, _workspace) =
+        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let msg =
+        crate::bus::events::InboundMessage::new("test", "user", "offline", "retry failing tool");
+    let mut ctx = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+    ctx.messages = crate::agent::agent_loop::shared::MessageLog::committed(vec![]);
+    ctx.new_start = 0;
+
+    // exec is NOT a READ/WEB tool, so `uses_cached_result` is false; allow() blocks
+    // via max_same_call once seen[key] > limit. record_result_with_status(ok=false)
+    // stores nothing, so get_cached_result is None -> blocked_no_result.
+    let mut guard = crate::agent::tool_guard::ToolGuard::new(1); // max_same_call = 1
+    let mut args = HashMap::new();
+    args.insert("command".to_string(), Value::String("false".to_string()));
+    // Prime seen[key] = 1 with an *ok* allow (first call permitted), simulating an
+    // earlier errored execution that recorded no result.
+    let _ = guard.allow("exec", &args); // seen 0 -> 1, Ok
+    guard.record_result_with_status("exec", &args, "error: exit 1".into(), false); // not stored
+    ctx.flow.tool_guard = guard;
+
+    // Round 1: exec blocked (seen 1 -> 2 > limit=1), blocked_no_result=1,
+    // allowed empty -> consecutive_all_blocked = 1, no receipt pushed (guard false).
+    let r1 = crate::agent::router::route_tool_calls(
+        &mut ctx,
+        Some(""),
+        vec![crate::providers::base::ToolCallRequest {
+            id: "t1".into(),
+            name: "exec".into(),
+            arguments: args.clone(),
+        }],
+    )
+    .await;
+    assert!(matches!(r1, crate::agent::router::RouteResult::Continue));
+    assert_eq!(ctx.flow.consecutive_all_blocked, 1);
+
+    // Round 2: same -> consecutive_all_blocked = 2, `>= 2` branch fires.
+    let r2 = crate::agent::router::route_tool_calls(
+        &mut ctx,
+        Some(""),
+        vec![crate::providers::base::ToolCallRequest {
+            id: "t2".into(),
+            name: "exec".into(),
+            arguments: args.clone(),
+        }],
+    )
+    .await;
+    assert!(matches!(r2, crate::agent::router::RouteResult::Continue));
+    assert_eq!(ctx.flow.consecutive_all_blocked, 2);
+
+    let has_scaffold = ctx.messages.iter().any(|m| {
+        m.get("content")
+            .and_then(|c| c.as_str())
+            .map(|c| c.contains("Your last several tool calls were duplicates"))
+            .unwrap_or(false)
+    });
+    // BUG: this assert FAILED before the fix — the scaffold was constructed but dropped.
+    assert!(
+        has_scaffold,
+        ">= 2 branch must inject the write-your-final-answer scaffold"
+    );
+}
+
 /// Regression (prod, session cli:oneshot, bonsai-27b): a turn that runs a
 /// side-effect tool (exec) arms the response boundary, which injects a
 /// synthetic `scaffold_user` nudge into the conversation. That nudge is

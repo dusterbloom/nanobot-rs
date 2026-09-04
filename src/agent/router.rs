@@ -1828,12 +1828,13 @@ pub(crate) async fn route_tool_calls(
                 // already collected. The model gets one more LLM call with
                 // this instruction; if it still calls tools at >= 4, the
                 // hard break above fires.
-                crate::agent::markers::scaffold_user(
-                    "[system] Your last several tool calls were duplicates or blocked. \
+                ctx.messages
+                    .push_draft(crate::agent::markers::scaffold_user(
+                        "[system] Your last several tool calls were duplicates or blocked. \
                      You already have the data you need from your previous tool results. \
                      Do NOT call any more tools. Write your final answer now using the \
-                     information you gathered."
-                );
+                     information you gathered.",
+                    ));
                 ctx.persist_pending_protocol_messages().await;
                 return RouteResult::Continue;
             }
