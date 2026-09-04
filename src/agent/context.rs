@@ -794,6 +794,19 @@ impl ContextBuilder {
                             "Memory",
                             &format!("{}\n\n## Knowledge Graph\n{}", existing, kg_ctx),
                         );
+                    } else {
+                        sections.push(SectionEntry {
+                            section: PromptSection::MemoryBriefing,
+                            block: PromptBlock::new(
+                                "Memory",
+                                &format!("## Knowledge Graph\n{}", kg_ctx),
+                            ),
+                            allocated_tokens: 0,
+                            actual_tokens: 0,
+                            source: SectionSource::File("knowledge graph".to_string()),
+                            included: true,
+                            shrinkable: PromptSection::MemoryBriefing.shrinkable(),
+                        });
                     }
                 }
             }
@@ -3018,6 +3031,114 @@ model_profiles:
         assert!(
             !ctx.contains("Knowledge Graph"),
             "KG section should not appear without knowledge-graph feature"
+        );
+    }
+
+    // --- Knowledge-graph context on the cloud path (feature-gated) ---
+    //
+    // Regression: collect_static_sections dropped the KG context whenever
+    // MEMORY.md was empty, because the KG block only appended to an *existing*
+    // MemoryBriefing and had no fallback "create a new entry" branch. The
+    // production read path (KnowledgeGraph::open_default) resolves to the
+    // single global file ~/.nanobot/knowledge_graph.json, so HOME is redirected
+    // to a temp dir to seed an isolated store. This is the sole HOME-mutator
+    // that runs in the non-ignored suite (the only other one,
+    // tests/memory_pipeline_e2e.rs::reflector_distills_to_memory_and_graph, is
+    // #[ignore] and cfg-gated on the semantic feature), and a panic-safe RAII
+    // guard restores the original value on drop.
+    #[cfg(feature = "knowledge-graph")]
+    #[test]
+    fn cloud_path_drops_kg_when_memory_md_empty() {
+        // Panic-safe HOME guard: restore on drop even if an assertion panics,
+        // so a failure cannot leak the temp HOME into the rest of the suite.
+        struct HomeGuard {
+            saved: Option<std::ffi::OsString>,
+        }
+        impl HomeGuard {
+            fn set(new: &Path) -> Self {
+                let saved = std::env::var_os("HOME");
+                std::env::set_var("HOME", new);
+                Self { saved }
+            }
+        }
+        impl Drop for HomeGuard {
+            fn drop(&mut self) {
+                match self.saved.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+
+        let home = TempDir::new().unwrap();
+        let _guard = HomeGuard::set(home.path());
+
+        // Seed the global KG store (home/.nanobot/knowledge_graph.json).
+        let kg_path = home.path().join(".nanobot").join("knowledge_graph.json");
+        std::fs::create_dir_all(kg_path.parent().unwrap()).unwrap();
+        let mut kg = crate::agent::knowledge_graph::KnowledgeGraph::open(&kg_path).unwrap();
+        kg.upsert_entity("Acme", "organization", "A customer");
+        kg.save().unwrap();
+
+        // --- Bug regression: empty MEMORY.md + populated KG ---
+        // No memory/MEMORY.md in the workspace ⇒ read_long_term() == "" and no
+        // MemoryBriefing section exists before the KG block. The KG must still
+        // reach the developer message via a standalone MemoryBriefing entry
+        // (the previously-missing else branch).
+        let mut cb = ContextBuilder::new(home.path());
+        cb.model_name = "claude-opus-4-6".to_string(); // cloud model; is_local == false
+
+        let messages = cb.build_messages(&[], "hi", None, None, None, None, false, None);
+        let developer = messages
+            .iter()
+            .find(|m| m["role"] == "developer")
+            .map(|m| m["content"].as_str().unwrap_or(""))
+            .unwrap_or("");
+        let system_content = messages
+            .iter()
+            .find(|m| m["role"] == "system")
+            .map(|m| m["content"].as_str().unwrap_or(""))
+            .unwrap_or("");
+
+        assert!(
+            developer.contains("Knowledge Graph"),
+            "KG section missing from developer message — bug present"
+        );
+        assert!(
+            developer.contains("Acme"),
+            "KG entity 'Acme' missing from developer message — bug present"
+        );
+        assert!(
+            !system_content.contains("Knowledge Graph"),
+            "KG must live in the developer message, not system"
+        );
+
+        // --- Sibling-branch guard: non-empty MEMORY.md + populated KG ---
+        // When a MemoryBriefing *does* exist, the KG must be appended to it so
+        // BOTH long-term memory and the KG section appear together (no
+        // regression in the append branch). KG follows HOME (still `home`);
+        // memory follows the workspace, so a second workspace is used here.
+        let ws = TempDir::new().unwrap();
+        let memory_dir = ws.path().join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::write(memory_dir.join("MEMORY.md"), "User prefers dark mode").unwrap();
+
+        let mut cb2 = ContextBuilder::new(ws.path());
+        cb2.model_name = "claude-opus-4-6".to_string();
+        let messages2 = cb2.build_messages(&[], "hi", None, None, None, None, false, None);
+        let developer2 = messages2
+            .iter()
+            .find(|m| m["role"] == "developer")
+            .map(|m| m["content"].as_str().unwrap_or(""))
+            .unwrap_or("");
+
+        assert!(
+            developer2.contains("User prefers dark mode"),
+            "long-term memory must still appear alongside the KG section"
+        );
+        assert!(
+            developer2.contains("Knowledge Graph") && developer2.contains("Acme"),
+            "KG must be appended to the existing MemoryBriefing"
         );
     }
 }
