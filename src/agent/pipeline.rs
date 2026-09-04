@@ -209,6 +209,13 @@ fn build_step_prompt(prompt: &str, context_so_far: &str) -> String {
     }
 }
 
+fn pipeline_targets_local(provider: &dyn LLMProvider, model: &str) -> bool {
+    !model.starts_with("mlx:")
+        && provider
+            .get_api_base()
+            .is_some_and(crate::providers::openai_compat::is_local_api_base)
+}
+
 /// Execute a tool-equipped pipeline step as a mini agent loop.
 ///
 /// Builds a ToolRegistry with the requested tools, then runs an
@@ -253,8 +260,8 @@ async fn execute_step_with_tools(
 
     let mut final_content = String::new();
 
-    // Detect local models for strict alternation repair.
-    let is_local = crate::agent::policy::is_local_model(model);
+    // Detect local endpoints for strict alternation repair.
+    let is_local = pipeline_targets_local(provider, model);
 
     for iteration in 0..max_iter {
         debug!(
@@ -448,6 +455,7 @@ mod tests {
     struct MockPipelineProvider {
         answers: Vec<String>,
         call_count: std::sync::atomic::AtomicUsize,
+        api_base: Option<String>,
     }
 
     impl MockPipelineProvider {
@@ -455,6 +463,15 @@ mod tests {
             Self {
                 answers: answers.into_iter().map(|s| s.to_string()).collect(),
                 call_count: std::sync::atomic::AtomicUsize::new(0),
+                api_base: None,
+            }
+        }
+
+        fn at(api_base: &str) -> Self {
+            Self {
+                answers: vec!["default".to_string()],
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+                api_base: Some(api_base.to_string()),
             }
         }
     }
@@ -489,6 +506,21 @@ mod tests {
         fn get_default_model(&self) -> &str {
             "mock"
         }
+
+        fn get_api_base(&self) -> Option<&str> {
+            self.api_base.as_deref()
+        }
+    }
+
+    #[test]
+    fn pipeline_targets_local_uses_endpoint_and_excludes_mlx() {
+        let lan_provider = MockPipelineProvider::at("http://192.168.1.22:1234/v1");
+        let cloud_provider = MockPipelineProvider::at("https://api.openai.com/v1");
+        let local_provider = MockPipelineProvider::at("http://127.0.0.1:1234/v1");
+
+        assert!(pipeline_targets_local(&lan_provider, "qwen/model"));
+        assert!(!pipeline_targets_local(&cloud_provider, "qwen/model"));
+        assert!(!pipeline_targets_local(&local_provider, "mlx:model"));
     }
 
     #[tokio::test]
