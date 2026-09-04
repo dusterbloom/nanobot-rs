@@ -22,7 +22,7 @@ pub use write::WriteFileTool;
 pub(crate) use write::MAX_WRITE_FILE_PIECE_CHARS;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -264,16 +264,63 @@ fn is_sha256_hex(value: &str) -> bool {
     trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Lexically normalize a path: drop `.` components and resolve `..` against
+/// the preceding normal components without ever escaping above the path's
+/// root — a `..` that would climb past `RootDir` / `Prefix` is dropped, and a
+/// leading `..` on a relative path is preserved (it cannot match an absolute
+/// allowlist entry anyway). This is a *lexical* operation: it touches no
+/// filesystem state and resolves no symlinks, so it is safe to run on
+/// not-yet-existing write targets.
+///
+/// `Path::starts_with` is a component-prefix comparison that treats `..` as
+/// an opaque component, so a target like `<ws>/skills/../../etc/passwd` still
+/// "starts with" `<ws>/skills`. Normalizing first strips the `..` semantics,
+/// so the confinement check in [`idle_write_allowed`] compares the path the
+/// OS will actually resolve rather than a traversal-laden string that only
+/// *lexically* begins with an allowlisted subtree.
+pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::ParentDir) | None => {
+                    normalized.push(Component::ParentDir.as_os_str());
+                }
+                // RootDir / Prefix: cannot climb above root — drop the `..`.
+                _ => {}
+            },
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        normalized.push(Component::CurDir.as_os_str());
+    }
+    normalized
+}
+
 /// Idle-turn write gate (v0.5 E1). Entry forms: workspace-relative subtree
 /// ("skills/**"), workspace-relative exact file ("MEMORY.md"), or absolute
 /// path, optionally with a "/**" subtree suffix. Only idle turns pass an
 /// allowlist at all — a human watches normal turns.
+///
+/// `target` is lexically normalized (see [`normalize_lexical`]) before the
+/// `starts_with` comparison so a `..`-laden path that only *lexically*
+/// begins with an allowlisted subtree — but resolves elsewhere on disk —
+/// is denied. Callers should also normalize the path they hand to the
+/// on-disk write so the confinement decision and the actual write target
+/// agree; normalizing here is defense-in-depth against any future caller
+/// that forgets.
 ///
 /// Note: relative paths resolve against cwd first (see [`expand_path`]), so
 /// an idle "MEMORY.md" with cwd outside the workspace resolves outside the
 /// allowlist and is denied. Deny-over-surprise is the correct direction for
 /// an unattended turn; memory maintenance goes through remember/recall.
 pub(crate) fn idle_write_allowed(entries: &[String], target: &Path, workspace: &Path) -> bool {
+    let target = normalize_lexical(target);
     let mut allowed = false;
     for entry in entries {
         let (raw, subtree) = match entry.strip_suffix("/**") {
@@ -383,9 +430,14 @@ impl Tool for EditFileTool {
     ) -> ToolResult {
         let path = require_param(&params, "path")?;
 
-        let file_path = expand_path(path);
+        let mut file_path = expand_path(path);
         if let Some(paths) = &self.idle_paths {
             let workspace = crate::utils::helpers::get_workspace_path(None);
+            // See WriteFileTool::execute_write: idle turns normalize the
+            // target lexically before the allowlist check and reuse the
+            // normalized path for the read/write so the on-disk operation
+            // cannot escape the boundary via OS-level `..` resolution.
+            file_path = normalize_lexical(&file_path);
             if !idle_write_allowed(paths, &file_path, &workspace) {
                 return Err(idle_write_denied_err(&file_path));
             }
@@ -1924,6 +1976,242 @@ mod tests {
             "denied write returned: {out}"
         );
         assert!(!outside.exists(), "denied write must not touch disk");
+    }
+
+    // -----------------------------------------------------------------------
+    // idle-turn path-traversal containment (`..` bypass of the allowlist)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_lexical_resolves_dotdot_and_dot_without_escaping_root() {
+        // Absolute: "." dropped, ".." pops a normal.
+        assert_eq!(
+            normalize_lexical(Path::new("/a/b/../c/./d")),
+            Path::new("/a/c/d")
+        );
+        // ".." past root stays at root — never climbs above RootDir.
+        assert_eq!(normalize_lexical(Path::new("/a/../../..")), Path::new("/"));
+        // "/.." (the starts_with footgun root) collapses to "/".
+        assert_eq!(normalize_lexical(Path::new("/..")), Path::new("/"));
+        // A trailing ".." that would pop the only normal falls back to ".".
+        assert_eq!(normalize_lexical(Path::new("a/..")), Path::new("."));
+        // Relative leading ".." is preserved (it cannot match an absolute
+        // allowlist base anyway, so keeping it is safe and semantic).
+        assert_eq!(
+            normalize_lexical(Path::new("../../foo")),
+            Path::new("../../foo")
+        );
+        assert_eq!(normalize_lexical(Path::new("a/b/../c")), Path::new("a/c"));
+        // "." and empty become ".".
+        assert_eq!(normalize_lexical(Path::new(".")), Path::new("."));
+        assert_eq!(normalize_lexical(Path::new("")), Path::new("."));
+        // Idempotent: normalizing twice never differs.
+        let tricky = Path::new("/ws/skills/../../etc/passwd");
+        assert_eq!(
+            normalize_lexical(&normalize_lexical(tricky)),
+            normalize_lexical(tricky)
+        );
+    }
+
+    #[test]
+    fn idle_allowlist_denies_traversal_even_when_lexically_prefixed() {
+        let ws = Path::new("/ws");
+
+        // Default-config arm: workspace-relative "skills/**". A target that
+        // lexically begins with <ws>/skills but resolves via ".." to /etc/passwd
+        // must be denied. Without normalization, Path::starts_with returns true
+        // here (the original bug) because the component sequence still begins
+        // with [RootDir, "ws", "skills"].
+        let rel_entries = vec!["skills/**".to_string()];
+        let rel_traversal = ws.join("skills").join("../../../../etc/passwd");
+        assert!(
+            !idle_write_allowed(&rel_entries, &rel_traversal, ws),
+            "relative-allowlist must deny traversal that escapes the subtree"
+        );
+        // The already-resolved outside path is also denied — and the
+        // un-resolved traversal form must match that decision (the fix).
+        assert!(!idle_write_allowed(
+            &rel_entries,
+            &Path::new("/etc/passwd"),
+            ws
+        ));
+        // Non-traversal inside the subtree is still allowed (no regression).
+        assert!(idle_write_allowed(
+            &rel_entries,
+            &ws.join("skills/foo/SKILL.md"),
+            ws
+        ));
+
+        // Absolute-allowlist arm: "/opt/app/skills/**".
+        let abs_entries = vec!["/opt/app/skills/**".to_string()];
+        let abs_traversal = Path::new("/opt/app/skills/../../../../etc/passwd");
+        assert!(
+            !idle_write_allowed(&abs_entries, abs_traversal, Path::new("/ws")),
+            "absolute-allowlist must deny traversal that escapes the subtree"
+        );
+        assert!(idle_write_allowed(
+            &abs_entries,
+            &Path::new("/opt/app/skills/x"),
+            Path::new("/ws")
+        ));
+
+        // Exact-file arm (default "MEMORY.md"): a `..` that lexically begins
+        // with <ws>/MEMORY.md but resolves outside the exact target must be
+        // denied — both the subtree form and the exact-match form are
+        // confined by the same normalization.
+        let exact_entries = vec!["MEMORY.md".to_string()];
+        assert!(idle_write_allowed(
+            &exact_entries,
+            &ws.join("MEMORY.md"),
+            ws
+        ));
+        assert!(!idle_write_allowed(
+            &exact_entries,
+            &ws.join("MEMORY.md").join("..").join("authorized_keys"),
+            ws
+        ));
+        assert!(!idle_write_allowed(
+            &exact_entries,
+            &ws.join("MEMORY.md.bak"),
+            ws
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_tool_idle_denies_traversal_relative_entry() {
+        // Reproduces the reported default-config escape: an idle write_file
+        // whose path lexically begins with <workspace>/skills (so the old
+        // starts_with gate passed) but resolves via ".." to a tempdir outside
+        // the workspace.
+        let tool = crate::agent::tools::filesystem::write::WriteFileTool::new(Some(vec![
+            "skills/**".to_string(),
+        ]));
+        let ws = crate::utils::helpers::get_workspace_path(None);
+        let escape = TempDir::new().unwrap();
+        let escape_file = escape.path().join("escaped.txt");
+
+        let mut malicious = ws.join("skills");
+        for _ in 0..ws.components().count() {
+            malicious.push("..");
+        }
+        malicious.push(escape_file.strip_prefix("/").unwrap());
+
+        let params = make_params(&[("path", malicious.to_str().unwrap()), ("content", "pwned")]);
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+        assert!(
+            result.starts_with("Error: idle turns may only write"),
+            "idle allowlist must deny the traversal path, got: {result}"
+        );
+        assert!(
+            !escape_file.exists(),
+            "traversal path must not write outside the workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_tool_idle_denies_traversal_absolute_entry() {
+        // Same bypass against an absolute idle.writePaths entry (<base>/**).
+        let sandbox = TempDir::new().unwrap();
+        let base = sandbox.path().join("app").join("skills");
+        std::fs::create_dir_all(&base).unwrap();
+        let tool = crate::agent::tools::filesystem::write::WriteFileTool::new(Some(vec![format!(
+            "{}/**",
+            base.display()
+        )]));
+        let escape = TempDir::new().unwrap();
+        let escape_file = escape.path().join("escaped.txt");
+
+        let mut malicious = base.clone();
+        for _ in 0..base.components().count() {
+            malicious.push("..");
+        }
+        malicious.push(escape_file.strip_prefix("/").unwrap());
+
+        let params = make_params(&[("path", malicious.to_str().unwrap()), ("content", "pwned")]);
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+        assert!(
+            result.starts_with("Error: idle turns may only write"),
+            "idle allowlist must deny the absolute-entry traversal, got: {result}"
+        );
+        assert!(
+            !escape_file.exists(),
+            "traversal must not write outside the allowlisted subtree"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_tool_idle_allows_normalized_dotdot_inside_subtree() {
+        // Non-regression: a legitimate ".." that stays inside the allowlisted
+        // subtree is still allowed, and the file lands at the normalized path
+        // (no stray intermediate dirs from a traversal-laden target string).
+        let sandbox = TempDir::new().unwrap();
+        let base = sandbox.path().join("skills");
+        std::fs::create_dir_all(&base).unwrap();
+        let tool = crate::agent::tools::filesystem::write::WriteFileTool::new(Some(vec![format!(
+            "{}/**",
+            base.display()
+        )]));
+        let target = base.join("nested").join("..").join("real.txt");
+
+        let params = make_params(&[("path", target.to_str().unwrap()), ("content", "ok")]);
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+        assert!(
+            result.starts_with("Successfully wrote"),
+            "legitimate inside-subtree '..' must still be allowed, got: {result}"
+        );
+        let written = base.join("real.txt");
+        assert!(written.exists(), "file must land at the normalized path");
+        assert_eq!(std::fs::read_to_string(&written).unwrap(), "ok");
+        assert!(
+            !base.join("nested").exists(),
+            "the '..'-laden target string must not create a stray intermediate dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_tool_idle_denies_traversal() {
+        // edit_file shares the idle_write_allowed gate; the bypass must not
+        // transfer. The idle check runs before the file-existence check, so a
+        // traversal target is denied without the file needing to exist.
+        let sandbox = TempDir::new().unwrap();
+        let base = sandbox.path().join("skills");
+        std::fs::create_dir_all(&base).unwrap();
+        let tool = EditFileTool::new(Some(vec![format!("{}/**", base.display())]));
+        let escape = TempDir::new().unwrap();
+        let escape_file = escape.path().join("escaped.txt");
+
+        let mut malicious = base.clone();
+        for _ in 0..base.components().count() {
+            malicious.push("..");
+        }
+        malicious.push(escape_file.strip_prefix("/").unwrap());
+
+        let params = make_params(&[
+            ("path", malicious.to_str().unwrap()),
+            ("old_text", "a"),
+            ("new_text", "b"),
+        ]);
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+        assert!(
+            result.starts_with("Error: idle turns may only write"),
+            "edit_file idle allowlist must deny traversal, got: {result}"
+        );
+        assert!(
+            !escape_file.exists(),
+            "edit_file must not write via traversal"
+        );
     }
 
     // -----------------------------------------------------------------------

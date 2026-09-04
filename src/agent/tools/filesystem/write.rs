@@ -15,7 +15,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
 use super::super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
-use super::{expand_path, idle_write_allowed, idle_write_denied_err, require_param};
+use super::{
+    expand_path, idle_write_allowed, idle_write_denied_err, normalize_lexical, require_param,
+};
 use crate::errors::ToolError;
 
 pub(crate) const MAX_WRITE_FILE_PIECE_CHARS: usize = 4096;
@@ -161,9 +163,17 @@ impl WriteFileTool {
         }
         let piece_chars = content.chars().count();
 
-        let target_path = expand_write_path(path);
+        let mut target_path = expand_write_path(path);
         if let Some(paths) = &self.idle_paths {
             let workspace = crate::utils::helpers::get_workspace_path(None);
+            // Idle turns are unattended — the allowlist is the sole security
+            // boundary. Normalize `..`/`.` lexically BEFORE the check so the
+            // comparison sees the path the OS will actually resolve, and use
+            // the normalized path for the on-disk write too, so a `..`-laden
+            // path that only lexically begins with an allowlisted subtree
+            // cannot be published outside the boundary via create_dir_all +
+            // rename. Normal turns (human-watched) are untouched.
+            target_path = normalize_lexical(&target_path);
             if !idle_write_allowed(paths, &target_path, &workspace) {
                 return Err(idle_write_denied_err(&target_path));
             }

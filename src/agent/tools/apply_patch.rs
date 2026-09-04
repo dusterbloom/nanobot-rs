@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
-use super::filesystem::{expand_path, idle_write_denied_err, sha256_hex};
+use super::filesystem::{expand_path, idle_write_denied_err, normalize_lexical, sha256_hex};
 use crate::errors::ToolError;
 
 /// Tool to validate or apply unified diffs across one or more files.
@@ -107,11 +107,15 @@ impl Tool for ApplyPatchTool {
         )];
 
         for fp in file_patches {
-            let path = expand_path(&fp.path);
+            let mut path = expand_path(&fp.path);
             // Idle turns gate every patched path: hunks name targets the
-            // registry-level param check can never see.
+            // registry-level param check can never see. Normalize `..`/`.`
+            // lexically before the allowlist check and reuse the normalized
+            // path for the read/write so the on-disk operation cannot escape
+            // the boundary via OS-level `..` resolution.
             if let Some(paths) = &self.idle_paths {
                 let workspace = crate::utils::helpers::get_workspace_path(None);
+                path = normalize_lexical(&path);
                 if !super::filesystem::idle_write_allowed(paths, &path, &workspace) {
                     return Err(idle_write_denied_err(&path));
                 }
@@ -542,5 +546,44 @@ mod tests {
                 .await,
         );
         assert!(out.contains("File changed before patch"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn apply_patch_tool_idle_denies_traversal() {
+        // apply_patch shares the idle_write_allowed gate; the bypass must not
+        // transfer. A patch whose `+++` target lexically begins with an
+        // allowlisted absolute subtree but resolves via ".." outside it must be
+        // denied before any file is read or written.
+        let sandbox = tempfile::tempdir().unwrap();
+        let base = sandbox.path().join("skills");
+        std::fs::create_dir_all(&base).unwrap();
+        let tool = ApplyPatchTool::new(Some(vec![format!("{}/**", base.display())]));
+        let escape = tempfile::tempdir().unwrap();
+        let escape_file = escape.path().join("escaped.txt");
+
+        let mut malicious = base.clone();
+        for _ in 0..base.components().count() {
+            malicious.push("..");
+        }
+        malicious.push(escape_file.strip_prefix("/").unwrap());
+
+        let patch = format!(
+            "--- a/x\n+++ {malicious}\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+            malicious = malicious.to_str().unwrap(),
+        );
+        let mut params = HashMap::new();
+        params.insert("patch".to_string(), json!(patch));
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+        assert!(
+            out.starts_with("Error: idle turns may only write"),
+            "apply_patch idle allowlist must deny traversal, got: {out}"
+        );
+        assert!(
+            !escape_file.exists(),
+            "apply_patch must not write via traversal"
+        );
     }
 }
