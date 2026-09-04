@@ -233,7 +233,11 @@ impl PipelineHost for AgentHost {
             steps: pipeline_steps,
             ahead_by_k: req.ahead_by_k,
             max_voters: if req.ahead_by_k > 0 {
-                req.ahead_by_k * 2 + 1
+                // Saturating arithmetic prevents overflow/wraparound even if a
+                // future change lets an unbounded `ahead_by_k` reach this
+                // consumer (defense-in-depth; the parse already clamps to
+                // `MAX_AHEAD_BY_K`, so this stays a small number in practice).
+                req.ahead_by_k.saturating_mul(2).saturating_add(1)
             } else {
                 1
             },
@@ -667,5 +671,112 @@ mod agent_host_tests {
             .as_str()
             .unwrap()
             .contains("No subagents currently running."));
+    }
+
+    // Cost-bound tests for `ahead_by_k` (cost/DoS fix). `ahead_by_k` is a cost
+    // multiplier — `max_voters = 2·ahead_by_k + 1` LLM calls per text-only
+    // pipeline step — that used to have no upper bound. A `u64::MAX` value
+    // passed through `SpawnAction::parse` unchanged on 64-bit, then either
+    // overflowed the `* 2 + 1` derivation (panic, debug) or wrapped to
+    // `usize::MAX` and hung the voter loop (release). After the fix the parse
+    // clamps it to `MAX_AHEAD_BY_K` so the pipeline completes in a bounded
+    // number of calls. `make_host` uses `NeverCompletesProvider`, whose every
+    // call returns the same error string, so voting converges in exactly
+    // `MAX_AHEAD_BY_K` calls — bounded and fast.
+
+    /// Full production chain `SpawnAction::parse → HostRequest::from →
+    /// HostDispatcher::dispatch → AgentHost::run_pipeline` with `u64::MAX`.
+    /// Must complete without panic and without hanging the worker.
+    #[tokio::test]
+    async fn pipeline_with_u64max_ahead_by_k_completes_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Arc::new(make_host(dir.path()));
+        let dispatcher = HostDispatcher::new(host.clone(), host.clone(), host.clone(), host);
+
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), serde_json::json!("pipeline"));
+        params.insert("steps".to_string(), serde_json::json!([{"prompt": "one"}]));
+        params.insert("ahead_by_k".to_string(), serde_json::json!(u64::MAX));
+
+        let action = crate::agent::tools::spawn::SpawnAction::parse(&params)
+            .unwrap_or_else(|_| panic!("parse should succeed"));
+        // The parse boundary clamps the multiplier before it reaches the host.
+        let crate::agent::tools::spawn::SpawnAction::Pipeline { ahead_by_k, .. } = &action else {
+            panic!("expected Pipeline action");
+        };
+        assert_eq!(*ahead_by_k, crate::agent::tools::spawn::MAX_AHEAD_BY_K);
+
+        let req: HostRequest = action.into();
+        // Bound wall-clock so a regression (clamp removed) fails cleanly
+        // instead of hanging: debug overflows and panics; release wraps and
+        // the voter loop runs ~`usize::MAX` times under a consistent answer.
+        let reply =
+            tokio::time::timeout(std::time::Duration::from_secs(15), dispatcher.dispatch(req))
+                .await
+                .expect("pipeline did not complete within timeout (cost bound regressed?)");
+
+        let HostReply::Ok { data } = reply else {
+            panic!("expected ok reply");
+        };
+        let text = data["text"].as_str().expect("reply has text");
+        assert!(
+            text.contains("Pipeline"),
+            "unexpected pipeline text: {text}"
+        );
+        assert!(
+            text.contains("completed"),
+            "unexpected pipeline text: {text}"
+        );
+        assert!(
+            !text.contains("panicked"),
+            "overflow panic leaked into reply: {text}"
+        );
+    }
+
+    /// Drives the actual `ToolRegistry::execute` path (registered `SpawnTool`,
+    /// real registry `catch_unwind`). Before the fix the overflow panic
+    /// surfaced as the model-facing failure `"Tool 'spawn' panicked during
+    /// execution"`; after the fix the parse clamps and the pipeline completes.
+    #[tokio::test]
+    async fn registry_spawn_pipeline_with_huge_ahead_by_k_succeeds_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = Arc::new(make_host(dir.path()));
+        let dispatcher: Arc<dyn HostBridge> = Arc::new(HostDispatcher::new(
+            host.clone(),
+            host.clone(),
+            host.clone(),
+            host,
+        ));
+
+        let spawn_tool = Arc::new(SpawnTool::new(dispatcher.clone()));
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(ArcToolProxy(spawn_tool)));
+        reg = reg.with_host(Some(dispatcher));
+
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), serde_json::json!("pipeline"));
+        params.insert("steps".to_string(), serde_json::json!([{"prompt": "one"}]));
+        params.insert("ahead_by_k".to_string(), serde_json::json!(u64::MAX));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            reg.execute("spawn", params),
+        )
+        .await
+        .expect("spawn pipeline did not complete within timeout (cost bound regressed?)");
+
+        assert!(
+            result.ok(),
+            "pipeline should complete, not surface a caught panic; got: {:?}",
+            result
+        );
+        assert_eq!(result.error(), None);
+        assert!(result.data().contains("Pipeline"));
+        assert!(result.data().contains("completed"));
+        assert!(
+            !result.data().contains("panicked"),
+            "overflow panic leaked through the registry: {}",
+            result.data()
+        );
     }
 }
