@@ -30,25 +30,25 @@
 - Consumes: `feature/adaptive-capacity-nanobot` at design commit `752ebf4`
 - Produces: a known-good baseline and recorded pre-existing failures
 
-- [ ] **Step 1: Confirm branch and preserve user edits**
+- [x] **Step 1: Confirm branch and preserve user edits**
 
 Run: `git status --short --branch`
 
 Expected: branch is `feature/adaptive-capacity-nanobot`; only `AGENTS.md` and `CLAUDE.md` are unstaged before this plan is added.
 
-- [ ] **Step 2: Build the baseline**
+- [x] **Step 2: Build the baseline**
 
 Run: `cargo build --release`
 
 Expected: exit 0.
 
-- [ ] **Step 3: Run the baseline suite**
+- [x] **Step 3: Run the baseline suite**
 
 Run: `cargo test --release`
 
 Expected: exit 0. If it fails, record the exact failing tests and stop before production edits unless the failures are already proven baseline failures.
 
-- [ ] **Step 4: Record baseline state**
+- [x] **Step 4: Record baseline state**
 
 Run: `git status --short`
 
