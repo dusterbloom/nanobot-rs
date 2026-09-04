@@ -398,40 +398,6 @@ pub(super) fn adaptive_max_tokens_for_artifact_action(
     effective
 }
 
-/// Proactive recall: search the knowledge store for context relevant to the user's message.
-/// Returns a formatted string of relevant snippets, or None if nothing useful was found.
-/// Silently returns None on any error (knowledge store missing, etc.).
-#[allow(dead_code)]
-pub(super) fn proactive_recall(user_message: &str) -> Option<String> {
-    // Skip very short messages (greetings, single words).
-    if user_message.len() < 15 {
-        return None;
-    }
-
-    let store = crate::agent::knowledge_store::KnowledgeStore::open_default().ok()?;
-    let hits = store.search(user_message, 3).ok()?;
-
-    if hits.is_empty() {
-        return None;
-    }
-
-    let mut output = String::new();
-    for hit in &hits {
-        // Truncate long snippets.
-        let snippet: String = if hit.snippet.len() > 300 {
-            hit.snippet.chars().take(300).collect::<String>() + "..."
-        } else {
-            hit.snippet.clone()
-        };
-        output.push_str(&format!(
-            "**{}** (chunk {}): {}\n",
-            hit.source_name, hit.chunk_idx, snippet
-        ));
-    }
-
-    Some(output.trim_end().to_string())
-}
-
 // ============================================================================
 // Heuristic helpers
 // ============================================================================
