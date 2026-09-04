@@ -1537,7 +1537,6 @@ pub enum CompactionFailureMode {
 // Three-Level Escalation (Algorithm 3)
 // ---------------------------------------------------------------------------
 
-
 /// Extract one mechanical headline line per message in the eviction span.
 /// No LLM calls — deterministic, zero-latency. Returns (text, manifest).
 /// The manifest is default (no structured extraction) — open_loops and
@@ -1926,12 +1925,80 @@ fn parse_message_ids(v: &Value) -> Vec<usize> {
     }
 }
 
+/// Given `bytes` right after a left digit run (offset `le`), look for the
+/// `<ws>-<ws><digits>` tail of a `<digits><ws>-<ws><digits>` pattern and return
+/// `(right_start, right_end)` byte offsets of the right digit run when the full
+/// tail is present. `None` for anything that is not a digit-flanked dash, so
+/// the caller can emit the left run verbatim and let the main loop reprocess
+/// the leftover chars. ASCII-only: dash-flanking whitespace from the model is
+/// always ASCII, and ASCII byte values never occur inside a multibyte UTF-8
+/// sequence, so the byte-level scan stays UTF-8-safe.
+const fn try_range_tail(bytes: &[u8], le: usize) -> Option<(usize, usize)> {
+    let mut i = le;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b'-' {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+        return None;
+    }
+    let rs = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    Some((rs, i))
+}
+
+/// Collapse whitespace around a dash that sits between two digit runs so a
+/// spaced range (`"5 - 8"`, `"5- 8"`, `"5 -8"`) collapses to the tight `"5-8"`
+/// form that the splitter already round-trips. Only the narrow
+/// `<digits><ws>-<ws><digits>` pattern is rewritten — space-separated lists
+/// (`"5 6 7 8"`), commas, brackets, and prose pass through untouched, because
+/// a blanket space strip would merge `"5 6 7 8"` into the garbage id `5678`.
+fn collapse_spaced_dash_range(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            let Some(ch) = input[i..].chars().next() else {
+                break;
+            };
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        let ls = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let le = i;
+        // The left digit run is emitted either way; a matching dash tail just
+        // appends `-` plus the right run and advances past it. No match leaves
+        // `i` at `le` so the loop reprocesses the leftover chars verbatim.
+        out.push_str(&input[ls..le]);
+        if let Some((rs, re_)) = try_range_tail(bytes, le) {
+            out.push('-');
+            out.push_str(&input[rs..re_]);
+            i = re_;
+        }
+    }
+    out
+}
+
 /// Parse integer IDs and `a-b` ranges out of a free-form string.
 fn parse_id_runs(s: &str) -> Vec<usize> {
+    let normalized = collapse_spaced_dash_range(s);
     let mut ids = Vec::new();
     // Tokens are runs of digits and '-'; everything else (commas, brackets,
     // spaces, prose) is a separator.
-    for tok in s.split(|c: char| !c.is_ascii_digit() && c != '-') {
+    for tok in normalized.split(|c: char| !c.is_ascii_digit() && c != '-') {
         let tok = tok.trim_matches('-');
         if tok.is_empty() {
             continue;
@@ -5307,6 +5374,26 @@ mod tests {
         assert!(parse_message_ids(&json!("none")).is_empty());
         // Runaway range is rejected, not expanded to millions.
         assert!(parse_message_ids(&json!("0-999999")).is_empty());
+        // Spaced-dash range (regression): the splitter used to drop the
+        // interior and return only the endpoints, silently losing `n-2`
+        // messages. Every interior id must now be recovered.
+        assert_eq!(parse_message_ids(&json!("5 - 8")), vec![5, 6, 7, 8]);
+        // Spaced range at a realistic size (39 messages) — the case where the
+        // silent drop bit hardest (`n-2` = 37 lost).
+        assert_eq!(
+            parse_message_ids(&json!("120 - 158")),
+            (120..=158).collect::<Vec<_>>()
+        );
+        // Mixed spaced-dash ranges and singles collapse independently.
+        assert_eq!(
+            parse_message_ids(&json!("5 - 8, 12, 14 - 20")),
+            vec![5, 6, 7, 8, 12, 14, 15, 16, 17, 18, 19, 20]
+        );
+        // Space-separated list must NOT collapse into a single id (a blanket
+        // space-strip would turn this into `[5678]`).
+        assert_eq!(parse_message_ids(&json!("5 6 7 8")), vec![5, 6, 7, 8]);
+        // Spaced runaway range is still rejected by the 10k cap.
+        assert!(parse_message_ids(&json!("0 - 999999")).is_empty());
     }
 
     // -----------------------------------------------------------------------
