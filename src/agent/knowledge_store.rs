@@ -82,7 +82,7 @@ impl KnowledgeStore {
         #[cfg(feature = "semantic")]
         Self::register_vec_extension();
 
-        let conn = Connection::open(db_path).context("Failed to open knowledge database")?;
+        let mut conn = Connection::open(db_path).context("Failed to open knowledge database")?;
 
         // Enable WAL mode and mmap for performance
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -136,10 +136,9 @@ impl KnowledgeStore {
         #[cfg(feature = "semantic")]
         Self::init_vec_schema(&conn)?;
 
-        // Migrate chunks_fts to the porter tokenizer if it predates this change,
-        // so knowledge.db matches sessions.db (both porter unicode61) and a query
-        // stems consistently across stores. External-content FTS — no data lost.
-        Self::migrate_fts_tokenizer(&conn)?;
+        // Keep chunks_fts on the porter tokenizer and repair an interrupted
+        // external-content migration before the store serves searches.
+        Self::migrate_fts_tokenizer(&mut conn)?;
 
         Ok(Self {
             conn,
@@ -172,10 +171,10 @@ impl KnowledgeStore {
 
     /// Migrate `chunks_fts` to the `porter unicode61` tokenizer if it was
     /// created under the bare `unicode61` default. Idempotent: no-op when
-    /// already porter (or when the table doesn't exist yet — the schema init's
-    /// CREATE handles new DBs). External-content FTS, so the rebuild repopulates
-    /// from `chunks` with no text loss.
-    fn migrate_fts_tokenizer(conn: &Connection) -> Result<()> {
+    /// already porter and populated (or when the table doesn't exist yet — the
+    /// schema init's CREATE handles new DBs). External-content FTS, so the
+    /// rebuild repopulates from `chunks` with no text loss.
+    fn migrate_fts_tokenizer(conn: &mut Connection) -> Result<()> {
         let existing: Option<String> = conn
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks_fts'",
@@ -183,13 +182,21 @@ impl KnowledgeStore {
                 |row| row.get::<_, String>(0),
             )
             .optional()?;
+        let index_is_stranded: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM chunks) \
+                    AND NOT EXISTS(SELECT 1 FROM chunks_fts_docsize)",
+            [],
+            |row| row.get(0),
+        )?;
         let needs_rebuild = match existing.as_deref() {
-            Some(sql) => !sql.to_ascii_lowercase().contains("porter"),
+            Some(sql) => !sql.to_ascii_lowercase().contains("porter") || index_is_stranded,
             None => false,
         };
         if needs_rebuild {
-            conn.execute_batch(
-                r#"
+            let transaction = conn.transaction()?;
+            transaction
+                .execute_batch(
+                    r#"
                 DROP TABLE chunks_fts;
                 CREATE VIRTUAL TABLE chunks_fts USING fts5(
                     content,
@@ -199,8 +206,9 @@ impl KnowledgeStore {
                 );
                 INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild');
                 "#,
-            )
-            .context("Failed to migrate chunks_fts to porter tokenizer")?;
+                )
+                .context("Failed to migrate chunks_fts to porter tokenizer")?;
+            transaction.commit()?;
         }
         Ok(())
     }
@@ -703,6 +711,40 @@ mod tests {
         assert!(
             !hits.is_empty(),
             "reopened legacy db must stem run -> running after migration"
+        );
+    }
+
+    #[test]
+    fn heals_empty_porter_index_on_open() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        {
+            let store = KnowledgeStore::open(&db_path).unwrap();
+            store
+                .ingest("doc", None, "The daemon stayed awake.", 4096, 256)
+                .unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE chunks_fts;\
+                     CREATE VIRTUAL TABLE chunks_fts USING fts5(\
+                         content, content='chunks', content_rowid='id',\
+                         tokenize='porter unicode61'\
+                     );",
+                )
+                .unwrap();
+        }
+
+        let store = KnowledgeStore::open(&db_path).unwrap();
+        let hits = store.search("daemon", 10).unwrap();
+        assert_eq!(hits.len(), 1, "reopen must rebuild a stranded porter index");
+        assert_eq!(hits[0].source_name, "doc");
+        assert_eq!(
+            store
+                .get_chunk("doc", hits[0].chunk_idx as usize)
+                .unwrap()
+                .as_deref(),
+            Some("The daemon stayed awake.")
         );
     }
 
