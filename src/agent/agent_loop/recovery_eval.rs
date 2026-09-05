@@ -781,12 +781,7 @@ async fn run_turn(
     }
     let instruction = if state.lock().stream.is_some() {
         let policy = std::env::var("ENDURANCE_POLICY").unwrap_or("optional".into());
-        let suffix = match policy.as_str() {
-            "optional" => "Context policy: optional. Context-management tools remain discretionary.",
-            "decision" => "Context policy: decision. After each submit_result and before finishing the turn, you must call context_status and decide how to preserve correctness on the next update. Choose continue, retrieve, or checkpoint/reset yourself; no threshold or preferred choice is prescribed. Execute any retrieval or checkpoint/reset you choose. If continuing, finish with 'Context decision: continue' and a brief operational reason. If resetting, put the decision reason in new_context. This mandatory inspection replaces the earlier optional-inspection wording. Do not resubmit the completed snapshot.",
-            _ => panic!("unsupported ENDURANCE_POLICY"),
-        };
-        format!("{}\n{suffix}", endurance_eval::ENDURANCE_GUIDE)
+        endurance_eval::endurance_instruction(&policy)
     } else {
         GUIDE.to_string()
     };

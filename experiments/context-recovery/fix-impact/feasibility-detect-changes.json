@@ -1,0 +1,148 @@
+{
+  "summary": {
+    "changed_count": 16,
+    "affected_count": 2,
+    "changed_files": 6,
+    "risk_level": "medium"
+  },
+  "changed_symbols": [
+    {
+      "id": "Section:AGENTS.md:L109:GitNexus — Code Intelligence",
+      "name": "GitNexus — Code Intelligence",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L115:Always Do",
+      "name": "Always Do",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L125:Never Do",
+      "name": "Never Do",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L132:Resources",
+      "name": "Resources",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L141:CLI",
+      "name": "CLI",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L159:GitNexus — Code Intelligence",
+      "name": "GitNexus — Code Intelligence",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L165:Always Do",
+      "name": "Always Do",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L175:Never Do",
+      "name": "Never Do",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L182:Resources",
+      "name": "Resources",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L191:CLI",
+      "name": "CLI",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:PLAN.md:L1:Current Plan — v0.5 \"Persistent Local Agent\"",
+      "name": "Current Plan — v0.5 \"Persistent Local Agent\"",
+      "type": "Section",
+      "filePath": "PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:PLAN.md:L3:Active follow-up",
+      "name": "Active follow-up",
+      "type": "Section",
+      "filePath": "PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:experiments/context-recovery/endurance.py:summarize",
+      "name": "summarize",
+      "type": "Function",
+      "filePath": "experiments/context-recovery/endurance.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:endurance_stream_checks",
+      "name": "endurance_stream_checks",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:endurance_eval_live",
+      "name": "endurance_eval_live",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:run_turn",
+      "name": "run_turn",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    }
+  ],
+  "affected_processes": [
+    {
+      "id": "proc_771_endurance_eval_live",
+      "name": "Endurance_eval_live → New",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "endurance_eval_live",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_773_endurance_eval_live",
+      "name": "Endurance_eval_live → Now",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "endurance_eval_live",
+          "step": 1
+        }
+      ]
+    }
+  ]
+}

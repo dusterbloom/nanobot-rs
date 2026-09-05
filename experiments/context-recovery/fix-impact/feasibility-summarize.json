@@ -1,0 +1,39 @@
+{
+  "target": {
+    "id": "Function:experiments/context-recovery/endurance.py:summarize",
+    "name": "summarize",
+    "type": "Function",
+    "filePath": "experiments/context-recovery/endurance.py"
+  },
+  "direction": "upstream",
+  "impactedCount": 1,
+  "risk": "LOW",
+  "epistemic": "exact",
+  "summary": {
+    "direct": 1,
+    "processes_affected": 0,
+    "modules_affected": 0
+  },
+  "byDepthCounts": {
+    "1": 1
+  },
+  "affected_processes": [],
+  "affected_modules": [],
+  "byDepth": {
+    "1": [
+      {
+        "depth": 1,
+        "id": "File:experiments/context-recovery/endurance.py",
+        "name": "endurance.py",
+        "filePath": "experiments/context-recovery/endurance.py",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      }
+    ]
+  },
+  "staleness": {
+    "commitsBehind": 4,
+    "hint": "⚠️ Index is 4 commits behind HEAD. Run analyze tool to update."
+  }
+}

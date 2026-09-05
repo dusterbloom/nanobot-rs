@@ -10,6 +10,7 @@ import subprocess
 import time
 import urllib.request
 from run import start_higgs
+from memory_probe import memory_sample
 
 
 def summarize(directory):
@@ -40,7 +41,7 @@ def summarize(directory):
                 request = json.loads(artifacts[sid, e['request_digest']])
                 output_reservations.add(request.get('max_tokens', 0))
                 system = request['messages'][0]['content']
-                if 'autonomous context-management experiment' not in system or 'There will be no reset reminders' not in system:
+                if not (('Context policy: scheduled.' in system and 'prescribed checkpoint/reset feasibility control' in system) or ('autonomous context-management experiment' in system and 'There will be no reset reminders' in system)):
                     wire_errors.append('missing autonomy guide')
                 if rid not in request_ids:
                     (directory / f'wire-{len(request_ids)}.json').write_text(json.dumps(request, indent=2))
@@ -133,6 +134,12 @@ def summarize(directory):
                   minimum_server_prompt_capacity=min((m['maxPromptTokens'] for m in envelopes), default=None),
                   maximum_mlx_active_bytes=max((c['mlxActiveBytes'] for c in capacities), default=None),
                   observed_downshifts=max((c.get('downshifts',0) for c in capacities), default=0))
+    memory = [s['memory'] for s in telemetry if 'memory' in s]
+    result.update(memory_samples=len(memory), memory_errors=sum('memory_error' in s for s in telemetry),
+                  maximum_physical_footprint_bytes=max((m['physical_footprint_bytes'] for m in memory), default=None),
+                  maximum_resident_bytes=max((m['resident_bytes'] for m in memory), default=None),
+                  minimum_free_page_bytes=min((m['system_vm_counters']['Pages free'] * m['system_page_size'] for m in memory), default=None),
+                  maximum_compressor_resident_bytes=max((m['system_vm_counters']['Pages occupied by compressor'] * m['system_page_size'] for m in memory), default=None))
     policy = result.get('policy')
     if policy:
         for wire in directory.glob('wire-*.json'):
@@ -155,7 +162,7 @@ if __name__ == '__main__':
     parser.add_argument('--ceiling', type=int, default=16384)
     parser.add_argument('--minutes', type=int, default=45)
     parser.add_argument('--arms', default='A,B')
-    parser.add_argument('--policy', choices=['optional', 'decision'], default='optional')
+    parser.add_argument('--policy', choices=['optional', 'decision', 'scheduled'], default='optional')
     args = parser.parse_args()
     requested_long_form_min_tokens = os.environ.get('ENDURANCE_LONG_FORM_MIN_TOKENS')
     if requested_long_form_min_tokens is not None:
@@ -197,7 +204,9 @@ if __name__ == '__main__':
                   'nanobot_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()}
     provenance['sha256'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in [
         Path('target/release/deps/nanobot-67848bc0f9b02956'), Path('/private/tmp/higgs-recovery/higgs-hardened'),
-        Path('src/agent/agent_loop/recovery_eval.rs'), Path('src/agent/agent_loop/endurance_eval.rs')]}
+        Path('src/agent/agent_loop/recovery_eval.rs'), Path('src/agent/agent_loop/endurance_eval.rs'),
+        Path('src/agent/token_budget.rs'), Path('/Users/peppi/.local/bin/nanobot'),
+        Path(__file__), Path(__file__).with_name('memory_probe.py')]}
     (root / 'provenance.json').write_text(json.dumps(provenance, indent=2))
     summaries = []
     for arm in arms:
@@ -207,6 +216,7 @@ if __name__ == '__main__':
         env = dict(os.environ, ENDURANCE_OUT=str(directory), ENDURANCE_ARM=arm, ENDURANCE_POLICY=args.policy,
                    ENDURANCE_UPDATES=str(args.updates), ENDURANCE_CEILING=str(args.ceiling), ENDURANCE_SECONDS=str(args.minutes * 60))
         print(f'START {arm}: boot={envelope["bootId"]}, updates={args.updates}', flush=True)
+        server_pid = int(subprocess.check_output(['lsof', '-tiTCP:9000', '-sTCP:LISTEN'], text=True).strip())
         started = time.monotonic()
         with (root / f'{arm}.log').open('w') as log, (root / f'{arm}-telemetry.jsonl').open('w') as telemetry:
             process = subprocess.Popen(['target/release/deps/nanobot-67848bc0f9b02956', 'endurance_eval_live', '--ignored', '--nocapture', '--test-threads=1'], env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -225,6 +235,10 @@ if __name__ == '__main__':
                         process.terminate()
                 except (OSError, ValueError, KeyError) as error:
                     sample['telemetry_error'] = str(error)
+                try:
+                    sample['memory'] = memory_sample(server_pid)
+                except (OSError, ValueError, subprocess.SubprocessError) as error:
+                    sample['memory_error'] = str(error)
                 telemetry.write(json.dumps(sample) + '\n')
                 telemetry.flush()
                 if time.monotonic() - started > args.minutes * 60 + 210:
