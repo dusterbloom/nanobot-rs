@@ -2565,38 +2565,7 @@ impl AgentLoopShared {
             ProviderError::HiggsCapacityUnavailable { retry_after_ms, .. } => {
                 // The user message is already durable (persisted before the
                 // first provider call); defer the turn as resumable work.
-                let delay_ms =
-                    crate::session::db::capacity_retry_delay_ms(Some(*retry_after_ms), 0);
-                if let Err(record_error) = ctx
-                    .core
-                    .sessions
-                    .record_turn_suspended(
-                        &ctx.session_id,
-                        &ctx.request_id,
-                        ctx.turn_count,
-                        *retry_after_ms,
-                    )
-                    .await
-                {
-                    warn!(error = %record_error, "turn_suspended_persist_failed");
-                }
-                let next_retry_at = RuntimeCounters::now_epoch_ms().saturating_add(delay_ms);
-                if let Err(record_error) = ctx
-                    .core
-                    .sessions
-                    .record_pending_capacity_turn(
-                        &ctx.session_id,
-                        &ctx.channel,
-                        &ctx.chat_id,
-                        "",
-                        &ctx.user_content,
-                        ctx.is_voice_message,
-                        next_retry_at,
-                    )
-                    .await
-                {
-                    warn!(error = %record_error, "pending_capacity_turn_persist_failed");
-                }
+                let delay_ms = self.suspend_capacity_turn(ctx, Some(*retry_after_ms)).await;
 
                 warn!(
                     session = %ctx.session_key,
@@ -2613,6 +2582,41 @@ impl AgentLoopShared {
             }
             _ => None,
         }
+    }
+
+    async fn suspend_capacity_turn(&self, ctx: &TurnContext, retry_after_ms: Option<u64>) -> u64 {
+        let delay_ms = crate::session::db::capacity_retry_delay_ms(retry_after_ms, 0);
+        if let Err(record_error) = ctx
+            .core
+            .sessions
+            .record_turn_suspended(
+                &ctx.session_id,
+                &ctx.request_id,
+                ctx.turn_count,
+                retry_after_ms.unwrap_or(delay_ms),
+            )
+            .await
+        {
+            warn!(error = %record_error, "turn_suspended_persist_failed");
+        }
+        let next_retry_at = RuntimeCounters::now_epoch_ms().saturating_add(delay_ms);
+        if let Err(record_error) = ctx
+            .core
+            .sessions
+            .record_pending_capacity_turn(
+                &ctx.session_id,
+                &ctx.channel,
+                &ctx.chat_id,
+                "",
+                &ctx.user_content,
+                ctx.is_voice_message,
+                next_retry_at,
+            )
+            .await
+        {
+            warn!(error = %record_error, "pending_capacity_turn_persist_failed");
+        }
+        delay_ms
     }
 
     /// Typed Higgs 413 recovery (Task 5). The rejection carries the
@@ -2669,6 +2673,7 @@ impl AgentLoopShared {
             ctx.capacity_recovery = TurnCapacityRecovery::Terminal {
                 generation: generation.saturating_add(1),
             };
+            self.suspend_capacity_turn(ctx, None).await;
             return CapacityExceededRecovery::TurnPending;
         }
 

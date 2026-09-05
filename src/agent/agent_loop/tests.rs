@@ -13992,6 +13992,10 @@ mod capacity_exceeded {
         event_kinds: Vec<&'static str>,
         outcome: String,
         reply: String,
+        suspended_events: usize,
+        pending_count: usize,
+        pending_content: Option<String>,
+        pending_session_id: Option<String>,
     }
 
     async fn drive_typed_turn(typed_failures: u32, prompt: &str) -> TurnRecord {
@@ -14086,11 +14090,25 @@ mod capacity_exceeded {
                 _ => None,
             })
             .expect("turn_finished");
+        let suspended_events = turn_events
+            .iter()
+            .filter(|event| event.payload.kind() == "turn_suspended")
+            .count();
+        let due = sessions
+            .due_pending_capacity_turns(
+                crate::agent::agent_core::RuntimeCounters::now_epoch_ms() + 30_000,
+            )
+            .await
+            .unwrap();
         TurnRecord {
             provider_calls: provider.requests.load(Ordering::SeqCst),
             event_kinds,
             outcome,
             reply,
+            suspended_events,
+            pending_count: due.len(),
+            pending_content: due.first().map(|turn| turn.content.clone()),
+            pending_session_id: due.first().map(|turn| turn.session_id.clone()),
         }
     }
 
@@ -14133,6 +14151,10 @@ mod capacity_exceeded {
             record.reply
         );
         assert_eq!(record.outcome, "capacity_unavailable");
+        assert_eq!(record.suspended_events, 1, "one suspended-turn event");
+        assert_eq!(record.pending_count, 1, "one resumable pending row");
+        assert_eq!(record.pending_content.as_deref(), Some("try twice"));
+        assert!(record.pending_session_id.is_some());
         let model_requests = record
             .event_kinds
             .iter()

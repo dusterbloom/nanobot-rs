@@ -117,7 +117,16 @@ fn digest_old_tool_results(msgs: &mut Vec<Value>) {
     }
 }
 
-/// Stage 2: Walk backward from the tail, keeping messages that fit within `budget`.
+/// Locate the newest metadata-tagged user turn, falling back to the final entry.
+fn protected_tail_start(msgs: &[Value]) -> usize {
+    msgs.iter()
+        .rposition(|message| message.get("_turn").and_then(Value::as_u64).is_some())
+        .filter(|index| *index > 0)
+        .unwrap_or_else(|| msgs.len().saturating_sub(1))
+}
+
+/// Stage 2: Walk backward from the protected current-turn suffix, keeping older
+/// messages that fit within `budget`.
 ///
 /// The system message (index 0) is always preserved. Tool results whose assistant
 /// message was skipped are also dropped to maintain protocol integrity.
@@ -129,11 +138,19 @@ fn keep_recent_within_budget(msgs: &mut Vec<Value>, budget: usize) {
     let system_tokens = TokenBudget::estimate_message_tokens(&system_msg);
     let remaining_budget = budget.saturating_sub(system_tokens);
 
-    let mut kept_tail: Vec<Value> = Vec::new();
-    let mut tail_tokens = 0;
+    // `_turn` marks the original user input. Preserve it and every protocol
+    // message produced after it as one indivisible current-turn suffix. If
+    // that suffix cannot fit by itself, returning an oversized request lets
+    // the caller's typed capacity/overflow path reject or retry it; trimming
+    // any part would silently ask the model to continue from stale state.
+    // Callers without turn metadata retain the historical last-entry rule.
+    let protected_start = protected_tail_start(msgs);
+    let protected_tail = msgs[protected_start..].to_vec();
+    let mut tail_tokens = TokenBudget::estimate_tokens(&protected_tail);
+    let mut kept_tail = protected_tail;
     let mut skipped_call_ids: HashSet<String> = HashSet::new();
 
-    for msg in msgs[1..].iter().rev() {
+    for msg in msgs[1..protected_start].iter().rev() {
         let msg_tokens = TokenBudget::estimate_message_tokens(msg);
         let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
 
@@ -173,7 +190,8 @@ fn keep_recent_within_budget(msgs: &mut Vec<Value>, budget: usize) {
     *msgs = std::iter::once(system_msg).chain(kept_tail).collect();
 }
 
-/// Stage 3 (hard reset): Keep only system prompt + truncation notice + last user message.
+/// Stage 3 (hard reset): Keep the system prompt, truncation notice, and complete
+/// current-turn suffix.
 ///
 /// Last resort when all softer strategies still exceed the budget.
 /// No-op when `msgs.len() <= 2` (nothing to collapse).
@@ -182,14 +200,15 @@ fn hard_reset(msgs: &mut Vec<Value>) {
         return;
     }
     let system_msg = msgs[0].clone();
-    let Some(last_msg) = msgs.last().cloned() else {
-        return; // len > 2 was checked above
-    };
+    let protected_tail = msgs[protected_tail_start(msgs)..].to_vec();
     let summary_msg = serde_json::json!({
         "role": "user",
         "content": "[Previous conversation truncated due to context limits. Please continue from the latest message.]"
     });
-    *msgs = vec![system_msg, summary_msg, last_msg];
+    *msgs = std::iter::once(system_msg)
+        .chain(std::iter::once(summary_msg))
+        .chain(protected_tail)
+        .collect();
 }
 
 /// Manages the token budget for LLM context windows.
@@ -810,6 +829,46 @@ mod tests {
         assert!(
             contents.contains(&"tiny"),
             "earlier small message should survive when oversized one is skipped"
+        );
+    }
+
+    #[test]
+    fn test_trim_preserves_exact_latest_user_when_pinned_summary_leaves_too_little_room() {
+        let budget = TokenBudget::new(160, 80);
+        let authoritative_update = format!(
+            "authoritative_update={{\"revision\":4,\"checksum\":\"{}\"}}",
+            "7aF03-bC9x-00Q".repeat(40)
+        );
+        let messages = vec![
+            json!({"role": "system", "content": "system"}),
+            json!({
+                "role": "user",
+                "content": "compacted history",
+                "_lcm_summary": true
+            }),
+            json!({"role": "assistant", "content": "previous answer"}),
+            json!({"role": "user", "content": authoritative_update, "_turn": 4}),
+            assistant_call("tc_current"),
+            json!({
+                "role": "tool",
+                "tool_call_id": "tc_current",
+                "content": "current result"
+            }),
+        ];
+
+        let trimmed = budget.trim_to_fit(&messages, 0);
+        let retained_update = trimmed
+            .iter()
+            .find(|message| message.get("_turn") == Some(&json!(4)));
+
+        assert_eq!(
+            retained_update.and_then(|message| message["content"].as_str()),
+            Some(authoritative_update.as_str()),
+            "an impossible budget may be rejected upstream, but must never erase or rewrite the current user input"
+        );
+        assert!(
+            TokenBudget::estimate_tokens(&trimmed) > budget.available_budget(0),
+            "the protected current-turn group must remain visibly oversized for typed capacity handling"
         );
     }
 
