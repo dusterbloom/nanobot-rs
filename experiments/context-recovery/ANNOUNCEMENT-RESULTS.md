@@ -135,3 +135,22 @@ Evidence: `autonomous-announcement-evidence.json`, `lcm-announcement-evidence.js
 raw replay/telemetry in `endurance-announcement-autonomous/` and
 `endurance-announcement-lcm/`. The remaining discriminator is longer completed
 coverage under measured capacity, plus completion handling after status inspection.
+
+## Overflow retry defect discovered by the audit
+
+The B replay exposed a separate deterministic defect: after the 10300 > 10240
+rejection, emergency trimming reversed the protected current-turn suffix. The
+original request ended user → notes call → receipt → submit call → success receipt;
+the retry contained that suffix in reverse order. Thus the success bytes survived
+but their causal order did not. This did not cause the earlier revision-3 duplicate.
+
+`keep_recent_within_budget` seeded a backward accumulator with a forward-ordered
+protected suffix, then reversed the entire accumulator. The correction seeds it in
+reverse order so the final reversal restores chronology. A regression exercises
+the public trimming path with older history, an oversized message and two current
+call/receipt pairs. Pre-fix endurance scores above remain pre-fix evidence.
+
+Overflow-order verification: the new regression failed on the old code with the
+exact reversed sequence, then passed with the correction. Full nanobot release
+suite: 3003 passed, 0 failed, 31 ignored; release build passed. Independent review
+confirmed the reverse-walk correction. Graph analysis was complete and LOW risk.

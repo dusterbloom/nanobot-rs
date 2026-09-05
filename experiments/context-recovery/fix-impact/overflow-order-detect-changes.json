@@ -1,0 +1,137 @@
+{
+  "summary": {
+    "changed_count": 18,
+    "affected_count": 0,
+    "changed_files": 6,
+    "risk_level": "low"
+  },
+  "changed_symbols": [
+    {
+      "id": "Section:AGENTS.md:L109:GitNexus — Code Intelligence",
+      "name": "GitNexus — Code Intelligence",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L115:Always Do",
+      "name": "Always Do",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L125:Never Do",
+      "name": "Never Do",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L132:Resources",
+      "name": "Resources",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L141:CLI",
+      "name": "CLI",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L159:GitNexus — Code Intelligence",
+      "name": "GitNexus — Code Intelligence",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L165:Always Do",
+      "name": "Always Do",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L175:Never Do",
+      "name": "Never Do",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L182:Resources",
+      "name": "Resources",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L191:CLI",
+      "name": "CLI",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:PLAN.md:L1:Current Plan — v0.5 \"Persistent Local Agent\"",
+      "name": "Current Plan — v0.5 \"Persistent Local Agent\"",
+      "type": "Section",
+      "filePath": "PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:PLAN.md:L3:Active follow-up",
+      "name": "Active follow-up",
+      "type": "Section",
+      "filePath": "PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/ANNOUNCEMENT-PLAN.md:L1:Context announcement recovery",
+      "name": "Context announcement recovery",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/ANNOUNCEMENT-PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/token_budget.rs:keep_recent_within_budget",
+      "name": "keep_recent_within_budget",
+      "type": "Function",
+      "filePath": "src/agent/token_budget.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:src/agent/token_budget.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "src/agent/token_budget.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/token_budget.rs:tests.test_available_budget",
+      "name": "test_available_budget",
+      "type": "Function",
+      "filePath": "src/agent/token_budget.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/token_budget.rs:tests.test_estimate_tool_def_tokens",
+      "name": "test_estimate_tool_def_tokens",
+      "type": "Function",
+      "filePath": "src/agent/token_budget.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/token_budget.rs:tests.test_age_based_eviction_drops_old_messages",
+      "name": "test_age_based_eviction_drops_old_messages",
+      "type": "Function",
+      "filePath": "src/agent/token_budget.rs",
+      "change_type": "touched"
+    }
+  ],
+  "affected_processes": []
+}

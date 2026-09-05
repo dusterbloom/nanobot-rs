@@ -147,7 +147,9 @@ fn keep_recent_within_budget(msgs: &mut Vec<Value>, budget: usize) {
     let protected_start = protected_tail_start(msgs);
     let protected_tail = msgs[protected_start..].to_vec();
     let mut tail_tokens = TokenBudget::estimate_tokens(&protected_tail);
-    let mut kept_tail = protected_tail;
+    // The accumulator is reverse chronological until the final reverse below.
+    // Seed the protected suffix in that same order, or receipts precede calls.
+    let mut kept_tail: Vec<_> = protected_tail.into_iter().rev().collect();
     let mut skipped_call_ids: HashSet<String> = HashSet::new();
 
     for msg in msgs[1..protected_start].iter().rev() {
@@ -870,6 +872,29 @@ mod tests {
             TokenBudget::estimate_tokens(&trimmed) > budget.available_budget(0),
             "the protected current-turn group must remain visibly oversized for typed capacity handling"
         );
+    }
+
+    #[test]
+    fn test_trim_stage2_preserves_current_turn_call_receipt_order() {
+        let current = vec![
+            json!({"role": "user", "content": "revision 5", "_turn": 6}),
+            assistant_call("notes_current"),
+            json!({"role": "tool", "tool_call_id": "notes_current", "content": "saved"}),
+            assistant_call("submit_current"),
+            json!({"role": "tool", "tool_call_id": "submit_current", "content": "recorded_revision:5, turn_complete:true"}),
+        ];
+        let system = json!({"role": "system", "content": "system"});
+        let older = json!({"role": "user", "content": "older context"});
+        let mut messages = vec![
+            system.clone(),
+            older.clone(),
+            json!({"role": "assistant", "content": "x".repeat(20000)}),
+        ];
+        messages.extend(current.clone());
+        let expected: Vec<_> = [system, older].into_iter().chain(current).collect();
+        let budget = TokenBudget::new(TokenBudget::estimate_tokens(&expected) + 32, 0);
+        assert_eq!(budget.trim_to_fit(&messages, 0), expected,
+            "overflow trimming must retain user → call → receipt causal order, including a completed submission");
     }
 
     #[test]
