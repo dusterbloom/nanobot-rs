@@ -1,0 +1,14 @@
+{
+  "title": "nanobot",
+  "intro": "One agent loop connects conversations to models, tools, and durable context.",
+  "note": "Arrows show coordination and data flow. Tool receipts return to the loop; replies travel back through the originating channel. Notes/reset remains experimental.",
+  "nodes": [
+    {"id":"input","label":"Conversations","description":"CLI and channel entrypoints","path":"src/main.rs","column":0,"row":0},
+    {"id":"loop","label":"Agent loop","description":"Context, requests, tools, replies","path":"src/agent/agent_loop/shared.rs","column":1,"row":0},
+    {"id":"provider","label":"Provider","description":"Protocol and transport","path":"src/providers/openai_compat.rs","column":2,"row":0},
+    {"id":"history","label":"Durable context","description":"SQLite history and LCM summaries","path":"src/session/mod.rs","column":0,"row":1},
+    {"id":"tools","label":"Tools","description":"Workspace-aware execution","path":"src/agent/tools/base.rs","column":1,"row":1},
+    {"id":"models","label":"Runtime mode","description":"Local Higgs or cloud inference","path":"src/agent/runtime_mode.rs","column":2,"row":1}
+  ],
+  "edges": [["input","loop"],["loop","provider"],["provider","models"],["loop","tools"],["history","loop"]]
+}
