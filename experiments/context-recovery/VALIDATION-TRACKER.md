@@ -20,7 +20,7 @@ Updated: 2026-09-05. Keep precision, reset timing and recovery correctness separ
 ## Runtime restored
 
 Both matched arms are terminal. Installed Higgs is serving in `recovery-higgs:0.0`,
-PID 65802, boot `2b8511ce-e335-4d43-8a5d-f8fa3daae2fa`; installed executable and Metal
+PID 69407, boot `dd9cdc15-7655-4b4b-9b48-e753664d4c04`; installed executable and Metal
 mappings/hashes verified. Default auto resolves to throughput, native FP32 cache
 40960 bytes/token, scratch_matmul prefill, chunk 1024. Exact READY smoke passed.
 Full runtime evidence is in `BINARY-PROVENANCE-AFTER.json`.
@@ -30,8 +30,8 @@ Full runtime evidence is in `BINARY-PROVENANCE-AFTER.json`.
 - Nanobot `721bc3b`: explicit announcement detection, persisted execution instruction, restricted/validated recovery calls, stateless forced requests, truthful streamed failure replacement, durable fixture checkpoint sequencing.
 - Higgs `dd6730133`: required/named tool-choice grammar using the existing FSM/parser; thinking disabled for forced calls. Local `nightly` includes the commit.
 - Installed Higgs SHA-256: `fd9747c68f4f85770eb47d30cf7c077b9a014e559a71dc03e2b46380dcfa86fc`.
-- Installed nanobot SHA-256: `f557bebfe98891c759d6e758114907efa7e24f41841371b425268aec62c62f0e`.
-- Release suites: nanobot 3002 passed/31 ignored across targets; Higgs 1528 passed/35 ignored. Both release builds passed.
+- Installed nanobot `7b8b24a`, SHA-256: `e26c4082bff1dea1540a593cc176e4fd092b3f12e7fb9504a1b9717fc42755a0`.
+- Release suites after overflow fix: nanobot 3003 passed/31 ignored across targets; Higgs 1528 passed/35 ignored. Both release builds passed.
 - Matched CLI sample: identical final replies/token counts; warm mean 1236.5ms before, 1228.5ms after. Too small to claim a speed improvement; no meaningful regression observed.
 - Full graph analysis and independent review completed. Main retry/chat routes have CRITICAL graph impact; two review findings were fixed and rechecked. User instruction files restored byte-identically after indexing.
 
@@ -58,3 +58,10 @@ HTTP retained-cache validation remain separate precision gates.
 
 Public Higgs follow-up push remains blocked by automatic approval review pending
 explicit public-destination authorization. Local binaries/branches include the work.
+
+## Endurance audit follow-up
+
+The pre-fix B overflow retry reversed the current user/call/receipt suffix.
+Commit `7b8b24a` fixes the backward accumulator; public-path regression RED→GREEN,
+3003 release tests passed and corrected executable installed. Earlier endurance
+results are preserved and have not been rerun on this correction.

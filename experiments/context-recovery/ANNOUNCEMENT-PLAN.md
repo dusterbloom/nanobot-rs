@@ -33,4 +33,4 @@ frozen handoff and matched endurance checks are recorded in ANNOUNCEMENT-RESULTS
 
 - [x] Confirm actual replay array reversal and analyze keep_recent_within_budget impact (LOW; direct caller trim_to_fit_with_age, 20 upstream hits).
 - [x] Reproduce chronological current-turn failure, fix reverse walk, run release validation.
-- [ ] Install corrected binary and update provenance; preserve pre-fix endurance scores.
+- [x] Install corrected binary and update provenance; preserve pre-fix endurance scores.

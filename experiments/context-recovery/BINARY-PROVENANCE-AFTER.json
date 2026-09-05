@@ -3,10 +3,10 @@
   "sha256": {
     "/Users/peppi/.local/bin/higgs": "fd9747c68f4f85770eb47d30cf7c077b9a014e559a71dc03e2b46380dcfa86fc",
     "/Users/peppi/.local/bin/mlx.metallib": "d4ec42fe79abd9d24922c84a6a160b98e9bba7ebed68dbed844981b1190eafb5",
-    "/Users/peppi/.local/bin/nanobot": "f557bebfe98891c759d6e758114907efa7e24f41841371b425268aec62c62f0e",
+    "/Users/peppi/.local/bin/nanobot": "e26c4082bff1dea1540a593cc176e4fd092b3f12e7fb9504a1b9717fc42755a0",
     "/private/tmp/higgs-recovery/higgs-hardened": "fd9747c68f4f85770eb47d30cf7c077b9a014e559a71dc03e2b46380dcfa86fc"
   },
-  "nanobot_commit": "721bc3b",
+  "nanobot_commit": "7b8b24a",
   "higgs_remote_nightly": "last verified 890039d7f; public follow-ups await explicit destination approval",
   "previous_restored_service": {
     "pid": 41674,
@@ -26,17 +26,11 @@
   },
   "restored_service": {
     "status": "running; READY smoke passed",
-    "pid": 65802,
+    "pid": 69407,
     "tmux": "recovery-higgs:0.0",
     "mappings": [
-      "n/Users/peppi/Dev/higgs",
       "n/Users/peppi/.local/bin/higgs",
-      "n/System/Library/Extensions/AGXMetalG16G_B0.bundle/Contents/Resources/ds.binary.metallib.g16g-b0",
-      "n/private/tmp/higgs-final-default.log",
-      "n/private/tmp/higgs-final-default.log",
-      "n/Users/peppi/.local/bin/mlx.metallib",
-      "n/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2/.higgs-prefix-cache.bin",
-      "n/Users/peppi/.config/higgs/logs/metrics.jsonl"
+      "n/Users/peppi/.local/bin/mlx.metallib"
     ],
     "requested_profile": "auto",
     "effective_profile": "throughput",
@@ -45,9 +39,9 @@
     "persistent_cache_bytes_per_token": 40960,
     "log": "/private/tmp/higgs-final-default.log",
     "smoke": {
-      "id": "chatcmpl-7242c741-5a9b-49d4-a1c3-ceca6d45afac",
+      "id": "chatcmpl-ed6ff0da-71d6-47bc-a73b-cf8b5ef0a164",
       "object": "chat.completion",
-      "created": 1788643403,
+      "created": 1788644069,
       "model": "escha-35b-a3b",
       "choices": [
         {
@@ -69,7 +63,7 @@
       "schemaVersion": 1,
       "model": "escha-35b-a3b",
       "modelFingerprint": "sha256:adf23a8e2f3b720f38311bd469a5df275b2d41fb6bfeb0e0cb337244b3dbfa2a",
-      "bootId": "2b8511ce-e335-4d43-8a5d-f8fa3daae2fa",
+      "bootId": "dd9cdc15-7655-4b4b-9b48-e753664d4c04",
       "generation": 3,
       "availability": "available",
       "pressure": "normal",
@@ -80,7 +74,8 @@
       "retainedBytes": 805306368,
       "prefixCacheBytes": 134217728,
       "basis": "conservative"
-    }
+    },
+    "boot_id": "dd9cdc15-7655-4b4b-9b48-e753664d4c04"
   },
-  "validated_harness_sha256": "0f0b2eeff0d2397613e895f95a8d434cba22bf742640d8f0dbb6c2c3afedada3"
+  "validated_harness_sha256": "f4d029efd6065780071ba1a486b30322cad7e8b62528968008d0eb070fdb2eda"
 }

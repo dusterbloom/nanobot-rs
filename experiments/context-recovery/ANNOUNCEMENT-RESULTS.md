@@ -154,3 +154,10 @@ Overflow-order verification: the new regression failed on the old code with the
 exact reversed sequence, then passed with the correction. Full nanobot release
 suite: 3003 passed, 0 failed, 31 ignored; release build passed. Independent review
 confirmed the reverse-walk correction. Graph analysis was complete and LOW risk.
+
+Correction installed as nanobot `7b8b24a`; final binary/runtime hashes are in
+`BINARY-PROVENANCE-AFTER.json`. The matched ordinary CLI check returned identical
+replies/token counts, warm means 1221ms before and 1220ms after. One initial
+after-build model load was rejected by critical-pressure policy; a single fresh
+retry passed without relaxing policy. No endurance rerun on this final correction
+is claimed. Installed Higgs defaults were restored and READY smoke passed.

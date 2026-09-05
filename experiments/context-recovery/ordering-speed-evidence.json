@@ -1,0 +1,129 @@
+{
+  "before": {
+    "requests": [
+      {
+        "timestamp": "2026-09-05T23:31:10.644818+02:00",
+        "request_id": "c1e84b6d",
+        "logical_session": "20260905_213101_5c1488",
+        "cache_route": "active",
+        "role": "main",
+        "model": "local:escha-35b-a3b",
+        "provider_base": "http://127.0.0.1:9000/v1",
+        "elapsed_ms": 9570,
+        "ttft_ms": 9387,
+        "prompt_tokens": 1966,
+        "completion_tokens": 11,
+        "cache_creation_tokens": 1966,
+        "status": "ok",
+        "tool_calls_requested": 0,
+        "tool_calls_executed": 0
+      },
+      {
+        "timestamp": "2026-09-05T23:31:12.039613+02:00",
+        "request_id": "8be13401",
+        "logical_session": "20260905_213101_5c1488",
+        "cache_route": "active",
+        "role": "main",
+        "model": "local:escha-35b-a3b",
+        "provider_base": "http://127.0.0.1:9000/v1",
+        "elapsed_ms": 1231,
+        "ttft_ms": 969,
+        "prompt_tokens": 2001,
+        "completion_tokens": 13,
+        "cache_read_tokens": 1976,
+        "cache_creation_tokens": 25,
+        "status": "ok",
+        "tool_calls_requested": 0,
+        "tool_calls_executed": 0
+      },
+      {
+        "timestamp": "2026-09-05T23:31:13.416990+02:00",
+        "request_id": "30c9ccfa",
+        "logical_session": "20260905_213101_5c1488",
+        "cache_route": "active",
+        "role": "main",
+        "model": "local:escha-35b-a3b",
+        "provider_base": "http://127.0.0.1:9000/v1",
+        "elapsed_ms": 1211,
+        "ttft_ms": 1036,
+        "prompt_tokens": 2038,
+        "completion_tokens": 11,
+        "cache_read_tokens": 2017,
+        "cache_creation_tokens": 21,
+        "status": "ok",
+        "tool_calls_requested": 0,
+        "tool_calls_executed": 0
+      }
+    ],
+    "warm_mean_ms": 1221.0,
+    "replies": [
+      "The number 1 is the first positive integer.",
+      "The number 2 is the smallest and only even prime.",
+      "The number 3 is the first odd prime."
+    ]
+  },
+  "after": {
+    "requests": [
+      {
+        "timestamp": "2026-09-05T23:33:20.840569+02:00",
+        "request_id": "ae61283b",
+        "logical_session": "20260905_213311_7af2e0",
+        "cache_route": "active",
+        "role": "main",
+        "model": "local:escha-35b-a3b",
+        "provider_base": "http://127.0.0.1:9000/v1",
+        "elapsed_ms": 9766,
+        "ttft_ms": 9585,
+        "prompt_tokens": 1966,
+        "completion_tokens": 11,
+        "cache_creation_tokens": 1966,
+        "status": "ok",
+        "tool_calls_requested": 0,
+        "tool_calls_executed": 0
+      },
+      {
+        "timestamp": "2026-09-05T23:33:22.232291+02:00",
+        "request_id": "b49c23f9",
+        "logical_session": "20260905_213311_7af2e0",
+        "cache_route": "active",
+        "role": "main",
+        "model": "local:escha-35b-a3b",
+        "provider_base": "http://127.0.0.1:9000/v1",
+        "elapsed_ms": 1231,
+        "ttft_ms": 965,
+        "prompt_tokens": 2001,
+        "completion_tokens": 13,
+        "cache_read_tokens": 1976,
+        "cache_creation_tokens": 25,
+        "status": "ok",
+        "tool_calls_requested": 0,
+        "tool_calls_executed": 0
+      },
+      {
+        "timestamp": "2026-09-05T23:33:23.601310+02:00",
+        "request_id": "b8ab82b5",
+        "logical_session": "20260905_213311_7af2e0",
+        "cache_route": "active",
+        "role": "main",
+        "model": "local:escha-35b-a3b",
+        "provider_base": "http://127.0.0.1:9000/v1",
+        "elapsed_ms": 1209,
+        "ttft_ms": 1029,
+        "prompt_tokens": 2038,
+        "completion_tokens": 11,
+        "cache_read_tokens": 2017,
+        "cache_creation_tokens": 21,
+        "status": "ok",
+        "tool_calls_requested": 0,
+        "tool_calls_executed": 0
+      }
+    ],
+    "warm_mean_ms": 1220.0,
+    "replies": [
+      "The number 1 is the first positive integer.",
+      "The number 2 is the smallest and only even prime.",
+      "The number 3 is the first odd prime."
+    ]
+  },
+  "initial_after_attempt": "Model load rejected by capacity policy: critical memory pressure at model allocation boundary; one fresh retry succeeded without policy change."
+}
