@@ -1,0 +1,141 @@
+{
+  "provenance": {
+    "updates": 20,
+    "context_ceiling": 12288,
+    "minutes_per_arm": 45,
+    "arms": "B",
+    "policy": "decision",
+    "higgs_config": "[server]\nhost = \"127.0.0.1\"\nport = 9000\napi_key = \"higgs\"\nmax_tokens = 8192\n\n[local]\nallow_runtime_model_load = true\nraise_wired_limit = true\n\n[[models]]\npath = \"/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2\"\nname = \"escha-35b-a3b\"\ngeneration_defaults = { max_tokens = 8192, temperature = 0.0, top_p = 0.95, top_k = 20, min_p = 0.05, speculation = \"auto\", enable_thinking = false }\nkv_max_sessions = 1\ndisk_cache_enabled = true\nkv_max_session_tokens = 16384\n# Native FP32 KV + GDN needs 736,952,320 bytes at 16,384 slots.\n# Keep the byte ceiling above that geometry so the 16K experiment tests\n# context decisions rather than an unintended 11,264-token retention cliff.\nkv_max_retained_bytes = 805306368\nkv_cache_bytes = 134217728\n",
+    "endurance_long_form_min_tokens": 2048,
+    "endurance_reset_handoff_requested": "1",
+    "endurance_reset_handoff_enabled": true,
+    "arm_servers": {
+      "B": {
+        "config": "/Users/peppi/Dev/nanobot-rs/experiments/context-recovery/endurance-reset-handoff/server-B/higgs-endurance.toml",
+        "capacity_profile_dir": "/Users/peppi/Dev/nanobot-rs/experiments/context-recovery/endurance-reset-handoff/server-B/capacity"
+      }
+    },
+    "nanobot_head": "5e9915aa8ab57fbe36cf07f132946a0b9c6d2039",
+    "sha256": {
+      "target/release/deps/nanobot-67848bc0f9b02956": "d4342dce6c5add9be48de01f7ee829296b4c6f8a04acd4775c30709aebe65099",
+      "/private/tmp/higgs-recovery/higgs-hardened": "e7a811f1dec325741d4a5d69fa91fcdd93a9f9b0d4040a325f7056d72feec7c7",
+      "src/agent/agent_loop/recovery_eval.rs": "ec7d6a7314ff424e088526f888740f701ac1489e54b13aebfcc72a8271ac729f",
+      "src/agent/agent_loop/endurance_eval.rs": "902e814eed457d8f52b614b6d82a7a8b33c93f4b1e42f60a6487ed2790481b82"
+    }
+  },
+  "summary": {
+    "arm": "B",
+    "completed_updates": 5,
+    "context_ceiling": 12288,
+    "correct_updates": 5,
+    "deadline_cancelled": false,
+    "endurance_long_form_min_tokens": 2048,
+    "endurance_reset_handoff_enabled": true,
+    "endurance_reset_handoff_requested": "1",
+    "forbidden_actions": 0,
+    "pass": false,
+    "policy": "decision",
+    "requested_updates": 20,
+    "reset_handoff_count": 0,
+    "seconds": 277.981396708,
+    "source_estimated_tokens": 34028,
+    "submission_violations": 0,
+    "turns": [
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3812,
+        "outcome": "Finished",
+        "response": "Context decision: continue. The session has ample remaining capacity (~5700 tokens) and no pending actions or state changes require a reset. I will wait for the next project update.",
+        "seconds": 51.277840833,
+        "session_id": "20260905_194716_e47b40"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 5824,
+        "outcome": "Finished",
+        "response": "Context decision: continue. Remaining capacity is still healthy (~3700 tokens) and no pending actions require a reset. I will wait for the next update.",
+        "seconds": 32.347211083,
+        "session_id": "20260905_194716_e47b40"
+      },
+      {
+        "completed_compactions": 1,
+        "initial_estimated_tokens": 7833,
+        "outcome": "Finished",
+        "response": "Context decision: checkpoint/reset. The estimated remaining capacity is 0 tokens, meaning the current context window is nearly full and there is no room for the next update (~2400 tokens). I will initiate a new_context to preserve correctness on the next revision while retaining the recorded snapshot and diagnostic evidence.",
+        "seconds": 67.021926916,
+        "session_id": "20260905_194716_e47b40"
+      },
+      {
+        "completed_compactions": 1,
+        "initial_estimated_tokens": 4294,
+        "outcome": "Finished",
+        "response": "Context decision: continue. The checkpoint/reset was already performed before this update, and the current context window has sufficient capacity for the next revision (~2400 tokens). I will wait for the next project update.",
+        "seconds": 33.645723084,
+        "session_id": "20260905_194716_e47b40"
+      },
+      {
+        "completed_compactions": 2,
+        "initial_estimated_tokens": 6213,
+        "outcome": "Finished",
+        "response": "Context decision: checkpoint/reset. The estimated remaining capacity is 0 tokens, meaning the current context window is nearly full and there is no room to safely process further updates or perform a reliable next inspection. I will checkpoint the current snapshot (revision 4) with its diagnostic code and evidence pointers, then reset to preserve correctness on the next update.",
+        "seconds": 93.162008334,
+        "session_id": "20260905_194716_e47b40"
+      },
+      {
+        "completed_compactions": 2,
+        "initial_estimated_tokens": 4510,
+        "outcome": "CapacityUnavailable",
+        "response": "[Capacity Unavailable] The live capacity window shrank; this turn is saved as pending work.",
+        "seconds": 0.275552583,
+        "session_id": "20260905_194716_e47b40"
+      }
+    ],
+    "voluntary_resets": 0,
+    "artifact_pass": false,
+    "pending_capacity_turns": 1,
+    "control_tool_calls": {
+      "context_status": 4,
+      "notes": 0,
+      "new_context": 0,
+      "history": 0,
+      "recall": 0,
+      "lcm_expand": 0
+    },
+    "submissions_with_post_submit_inspection": 4,
+    "source_tokens_scope": "entire planned stream; not necessarily all delivered",
+    "actual_output_reservations": [
+      2048
+    ],
+    "submission_attempts": 5,
+    "forbidden_attempts": 0,
+    "llm_compaction_requests": 0,
+    "completed_compactions": 2,
+    "tool_errors": 0,
+    "model_requests": 18,
+    "logical_input_tokens": 75495,
+    "output_tokens": 899,
+    "wire_errors": [],
+    "reset_events": [],
+    "repeated_boundary_coverage": false,
+    "first_wrong_revision": null,
+    "peak_actual_prompt_tokens": 8959,
+    "delivered_update_bytes": 0,
+    "delivered_tool_bytes": 1162,
+    "delivered_tool_estimated_window_equivalents": 0.023640950520833332,
+    "delivered_update_estimated_window_equivalents": 0.0,
+    "snapshots_per_minute": 1.0792089094909074,
+    "source_window_equivalents": 2.7692057291666665,
+    "resets_below_quarter_estimated_budget": 0,
+    "telemetry_errors": 0,
+    "observed_boot_ids": [
+      "2d10018c-e6cb-4c79-8cea-5ea68891bf0c"
+    ],
+    "minimum_server_prompt_capacity": 2048,
+    "maximum_mlx_active_bytes": 14604351300,
+    "observed_downshifts": 4,
+    "valid_measurement": true,
+    "process_exit": 0,
+    "watchdog_terminated": false,
+    "unexpected_server_restart": false
+  }
+}

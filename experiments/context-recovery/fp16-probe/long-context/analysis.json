@@ -1,0 +1,183 @@
+{
+  "frontiers": [
+    {
+      "frontier": 4096,
+      "fp32_decode_mean": 17.93661315337006,
+      "fp16_decode_mean": 17.529812236020764,
+      "decode_change_percent": -2.2679918102201158,
+      "fp32_repeat_identical": true,
+      "fp16_repeat_identical": true,
+      "cross_precision_identical": false,
+      "fp32_prefill_mean_ms": 31175.915936999998,
+      "fp16_prefill_mean_ms": 25694.461729000002
+    },
+    {
+      "frontier": 8192,
+      "fp32_decode_mean": 16.11815480388826,
+      "fp16_decode_mean": 16.425865224366582,
+      "decode_change_percent": 1.9090921028013241,
+      "fp32_repeat_identical": true,
+      "fp16_repeat_identical": true,
+      "cross_precision_identical": false,
+      "fp32_prefill_mean_ms": 32142.360729,
+      "fp16_prefill_mean_ms": 27370.886167
+    },
+    {
+      "frontier": 16384,
+      "fp32_decode_mean": 8.638113575043288,
+      "fp16_decode_mean": 14.483191100055492,
+      "decode_change_percent": 67.66613421128713,
+      "fp32_repeat_identical": true,
+      "fp16_repeat_identical": true,
+      "cross_precision_identical": false,
+      "fp32_prefill_mean_ms": 90668.0638335,
+      "fp16_prefill_mean_ms": 67516.477063
+    }
+  ],
+  "runs": [
+    {
+      "label": "off1",
+      "peak_footprint_bytes": 25606891048,
+      "rows": [
+        {
+          "run": 1,
+          "frontier": 4096,
+          "incremental_prefill_ms": 31125.180041,
+          "prefill_tokps": 131.59763235439914,
+          "probe_decode_tokps": 18.158808699070654,
+          "probe_output_digest_fnv1a64": 1705211898746830551,
+          "kv_bytes": 233635840,
+          "kv_bytes_per_token": 57040.0
+        },
+        {
+          "run": 1,
+          "frontier": 8192,
+          "incremental_prefill_ms": 31475.178499999998,
+          "prefill_tokps": 130.13428978647414,
+          "probe_decode_tokps": 16.45732423476091,
+          "probe_output_digest_fnv1a64": 6923773007897092056,
+          "kv_bytes": 401408000,
+          "kv_bytes_per_token": 49000.0
+        },
+        {
+          "run": 1,
+          "frontier": 16384,
+          "incremental_prefill_ms": 85031.80012500001,
+          "prefill_tokps": 96.34042779239586,
+          "probe_decode_tokps": 5.565281316537616,
+          "probe_output_digest_fnv1a64": 7486364475534840855,
+          "kv_bytes": 736952320,
+          "kv_bytes_per_token": 44980.0
+        }
+      ]
+    },
+    {
+      "label": "on1",
+      "peak_footprint_bytes": 25423504936,
+      "rows": [
+        {
+          "run": 1,
+          "frontier": 4096,
+          "incremental_prefill_ms": 25675.958916,
+          "prefill_tokps": 159.52666123980958,
+          "probe_decode_tokps": 16.669901369146004,
+          "probe_output_digest_fnv1a64": 10851595830657402645,
+          "kv_bytes": 149749760,
+          "kv_bytes_per_token": 36560.0
+        },
+        {
+          "run": 1,
+          "frontier": 8192,
+          "incremental_prefill_ms": 27971.072834000002,
+          "prefill_tokps": 146.43700026482867,
+          "probe_decode_tokps": 18.042132535696283,
+          "probe_output_digest_fnv1a64": 15224158028682043229,
+          "kv_bytes": 233635840,
+          "kv_bytes_per_token": 28520.0
+        },
+        {
+          "run": 1,
+          "frontier": 16384,
+          "incremental_prefill_ms": 60654.920334,
+          "prefill_tokps": 135.0591172965071,
+          "probe_decode_tokps": 16.502273765790815,
+          "probe_output_digest_fnv1a64": 16845166657154058046,
+          "kv_bytes": 401408000,
+          "kv_bytes_per_token": 24500.0
+        }
+      ]
+    },
+    {
+      "label": "on2",
+      "peak_footprint_bytes": 25423177280,
+      "rows": [
+        {
+          "run": 1,
+          "frontier": 4096,
+          "incremental_prefill_ms": 25712.964542,
+          "prefill_tokps": 159.29707340083337,
+          "probe_decode_tokps": 18.389723102895523,
+          "probe_output_digest_fnv1a64": 10851595830657402645,
+          "kv_bytes": 149749760,
+          "kv_bytes_per_token": 36560.0
+        },
+        {
+          "run": 1,
+          "frontier": 8192,
+          "incremental_prefill_ms": 26770.6995,
+          "prefill_tokps": 153.00309952677927,
+          "probe_decode_tokps": 14.80959791303688,
+          "probe_output_digest_fnv1a64": 15224158028682043229,
+          "kv_bytes": 233635840,
+          "kv_bytes_per_token": 28520.0
+        },
+        {
+          "run": 1,
+          "frontier": 16384,
+          "incremental_prefill_ms": 74378.033792,
+          "prefill_tokps": 110.14004514974313,
+          "probe_decode_tokps": 12.46410843432017,
+          "probe_output_digest_fnv1a64": 16845166657154058046,
+          "kv_bytes": 401408000,
+          "kv_bytes_per_token": 24500.0
+        }
+      ]
+    },
+    {
+      "label": "off2",
+      "peak_footprint_bytes": 25612871088,
+      "rows": [
+        {
+          "run": 1,
+          "frontier": 4096,
+          "incremental_prefill_ms": 31226.651833,
+          "prefill_tokps": 131.17000253198424,
+          "probe_decode_tokps": 17.714417607669464,
+          "probe_output_digest_fnv1a64": 1705211898746830551,
+          "kv_bytes": 233635840,
+          "kv_bytes_per_token": 57040.0
+        },
+        {
+          "run": 1,
+          "frontier": 8192,
+          "incremental_prefill_ms": 32809.542958,
+          "prefill_tokps": 124.84172684890345,
+          "probe_decode_tokps": 15.77898537301561,
+          "probe_output_digest_fnv1a64": 6923773007897092056,
+          "kv_bytes": 401408000,
+          "kv_bytes_per_token": 49000.0
+        },
+        {
+          "run": 1,
+          "frontier": 16384,
+          "incremental_prefill_ms": 96304.327542,
+          "prefill_tokps": 85.06367480139795,
+          "probe_decode_tokps": 11.710945833548962,
+          "probe_output_digest_fnv1a64": 7486364475534840855,
+          "kv_bytes": 736952320,
+          "kv_bytes_per_token": 44980.0
+        }
+      ]
+    }
+  ]
+}

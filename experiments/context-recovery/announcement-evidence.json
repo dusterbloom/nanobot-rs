@@ -1,0 +1,58 @@
+{
+  "announcement_persisted": true,
+  "boundary_outcome": "Finished",
+  "boundary_pass": true,
+  "boundary_response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+  "boundary_session_id": "20260905_205428_199e38",
+  "boundary_tool_sequence": [
+    "notes",
+    "new_context"
+  ],
+  "checkpoint": "Task: Targeted obligation replay (Revision 4)\nProject: QUARTZ\nBranch: hotfix/q1\nOwner: Neri-1\nChecksum: 7aF03-bC9x-00Q\nReceipt: rcpt_Q8n3_L04\nPayment Status: settled\nExport Status: pending\nNext Action: review_diff\nExecute: false\nDiagnostic Code: D-b3c501b29525acfb\nStatus: Checkpoint saved. Context reset required due to capacity limits.\nEvidence Pointers:\n- Submission snapshot confirmed in prior context.\n- No external actions repeated.\n- Ready for next update upon context recovery.",
+  "checkpoint_preserves_snapshot": true,
+  "checkpoint_unchanged": true,
+  "current_task": "Targeted obligation replay. Revision 4 was submitted successfully with snapshot: project=QUARTZ, branch=hotfix/q1, owner=Neri-1, checksum=7aF03-bC9x-00Q, receipt=rcpt_Q8n3_L04, payment_status=settled, export_status=pending, next_action=review_diff, execute=false, diagnostic_code=D-b3c501b29525acfb. Complete the announced checkpoint/reset without repeating the submission or any external action.",
+  "expected": {
+    "branch": "hotfix/q1",
+    "checksum": "7aF03-bC9x-00Q",
+    "diagnostic_code": "D-b3c501b29525acfb",
+    "execute": false,
+    "export_status": "pending",
+    "next_action": "review_diff",
+    "owner": "Neri-1",
+    "payment_status": "settled",
+    "project": "QUARTZ",
+    "receipt": "rcpt_Q8n3_L04"
+  },
+  "fresh_recovery": {
+    "completed_compactions": 0,
+    "initial_estimated_tokens": 634,
+    "outcome": "Finished",
+    "response": "The task has been completed successfully. The durable checkpoint was read, and the result was submitted exactly once with all required fields:\n- **project**: QUARTZ\n- **branch**: hotfix/q1\n- **owner**: Neri-1\n- **checksum**: 7aF03-bC9x-00Q\n- **receipt**: rcpt_Q8n3_L04\n- **payment_status**: settled\n- **export_status**: pending\n- **next_action**: review_diff\n- **execute**: false\n- **diagnostic_code**: D-b3c501b29525acfb",
+    "seconds": 34.547632209,
+    "session_id": "20260905_205500_674720"
+  },
+  "fresh_recovery_pass": true,
+  "fresh_result": {
+    "branch": "hotfix/q1",
+    "checksum": "7aF03-bC9x-00Q",
+    "diagnostic_code": "D-b3c501b29525acfb",
+    "execute": false,
+    "export_status": "pending",
+    "next_action": "review_diff",
+    "owner": "Neri-1",
+    "payment_status": "settled",
+    "project": "QUARTZ",
+    "receipt": "rcpt_Q8n3_L04"
+  },
+  "instruction_persisted": true,
+  "pass": true,
+  "recorded_announcement": "Context decision: checkpoint/reset. The estimated remaining capacity is 0 tokens, meaning the current context window is nearly full and there is no room to safely process further updates or perform a reliable next inspection. I will checkpoint the current snapshot (revision 4) with its diagnostic code and evidence pointers, then reset to preserve correctness on the next update.",
+  "recovered_first_calls": [
+    "notes"
+  ],
+  "replay_request_is_stateless": true,
+  "requested_higgs_session_cache_policy": "require_continuation",
+  "requested_higgs_session_id": 991,
+  "rollover": true
+}

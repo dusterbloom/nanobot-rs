@@ -243,3 +243,5 @@ After the candidate tests, the unchanged recovery `cache.rs` and
 baseline sources rather than reuse the candidate model library.
 
 Repository evidence: this directory preserves reports, patches, token IDs and raw JSON/logs. Full binaries and logits are also copied to the git-ignored sibling `../endurance-fp16-artifacts/`; their original `/private/tmp` paths above describe the actual commands run.
+
+Follow-up: [longer-context validation](LONG-CONTEXT.md) extends to4K/8K/16K. It found repeatable cross-precision output differences, so the short129-token match above must not be generalized to long-context parity. That report also distinguishes the Rust binding revision from the built MLX core revision.

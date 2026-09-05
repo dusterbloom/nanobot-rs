@@ -1,0 +1,1214 @@
+{
+  "summary": {
+    "changed_count": 38,
+    "affected_count": 70,
+    "changed_files": 3,
+    "risk_level": "critical"
+  },
+  "changed_symbols": [
+    {
+      "id": "Impl:crates/higgs-engine/src/constrained.rs:ConstrainedGenerator",
+      "name": "ConstrainedGenerator",
+      "type": "Impl",
+      "filePath": "crates/higgs-engine/src/constrained.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/constrained.rs:ConstrainedGenerator.for_json_object#1",
+      "name": "for_json_object",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/constrained.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/constrained.rs:ConstrainedGenerator.from_regex#2",
+      "name": "from_regex",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/constrained.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/constrained.rs:ConstrainedGenerator.allowed_token_ids#0",
+      "name": "allowed_token_ids",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/constrained.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:crates/higgs-engine/src/constrained.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "crates/higgs-engine/src/constrained.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/constrained.rs:tests.apply_mask_uses_logit_vocab_dimension",
+      "name": "apply_mask_uses_logit_vocab_dimension",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/constrained.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/constrained.rs:tests.apply_mask_no_allowed_tokens_returns_unchanged",
+      "name": "apply_mask_no_allowed_tokens_returns_unchanged",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/constrained.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/constrained.rs:tests.apply_mask_allowed_token_beyond_vocab_is_ignored",
+      "name": "apply_mask_allowed_token_beyond_vocab_is_ignored",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/constrained.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:continuation_policy",
+      "name": "continuation_policy",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:map_session_engine_error",
+      "name": "map_session_engine_error",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:streaming_error_json",
+      "name": "streaming_error_json",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:chat_completions",
+      "name": "chat_completions",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:chat_completions_non_streaming",
+      "name": "chat_completions_non_streaming",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:chat_completions_stream",
+      "name": "chat_completions_stream",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:drop_requested_retained_sessions",
+      "name": "drop_requested_retained_sessions",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:retained_session_drop_ids",
+      "name": "retained_session_drop_ids",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:current_unix_timestamp",
+      "name": "current_unix_timestamp",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:crates/higgs/src/routes/chat.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:tests.streaming_required_worker_rejection_returns_http_409_before_sse",
+      "name": "streaming_required_worker_rejection_returns_http_409_before_sse",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:tests.streaming_required_materialization_failure_errors_before_sse",
+      "name": "streaming_required_materialization_failure_errors_before_sse",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:tests.blocking_required_post_admission_miss_returns_http_409",
+      "name": "blocking_required_post_admission_miss_returns_http_409",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:tests.capacity_interrupted_stream_emits_exact_terminal_event_then_done",
+      "name": "capacity_interrupted_stream_emits_exact_terminal_event_then_done",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:tests.required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409",
+      "name": "required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409.request@1993:8",
+      "name": "request",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:tests.axum_session_prefill_mode_is_authoritative_before_mutation",
+      "name": "axum_session_prefill_mode_is_authoritative_before_mutation",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/types/openai.rs:ChatCompletionRequest",
+      "name": "ChatCompletionRequest",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/types/openai.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/types/openai.rs:ChatCompletionRequest.response_format",
+      "name": "response_format",
+      "type": "Property",
+      "filePath": "crates/higgs/src/types/openai.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/types/openai.rs:StreamOptions",
+      "name": "StreamOptions",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/types/openai.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/types/openai.rs:StreamOptions.include_usage",
+      "name": "include_usage",
+      "type": "Property",
+      "filePath": "crates/higgs/src/types/openai.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/types/openai.rs:ReasoningConfig",
+      "name": "ReasoningConfig",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/types/openai.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/types/openai.rs:ReasoningConfig.effort",
+      "name": "effort",
+      "type": "Property",
+      "filePath": "crates/higgs/src/types/openai.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/types/openai.rs:ResponseFormat",
+      "name": "ResponseFormat",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/types/openai.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/types/openai.rs:ResponseFormat.r#type",
+      "name": "r#type",
+      "type": "Property",
+      "filePath": "crates/higgs/src/types/openai.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/types/openai.rs:ResponseFormat.json_schema",
+      "name": "json_schema",
+      "type": "Property",
+      "filePath": "crates/higgs/src/types/openai.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:crates/higgs/src/types/openai.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "crates/higgs/src/types/openai.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/types/openai.rs:tests.test_chat_request_full_deserialization",
+      "name": "test_chat_request_full_deserialization",
+      "type": "Function",
+      "filePath": "crates/higgs/src/types/openai.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/types/openai.rs:tests.test_chat_request_reasoning_deserialization",
+      "name": "test_chat_request_reasoning_deserialization",
+      "type": "Function",
+      "filePath": "crates/higgs/src/types/openai.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/types/openai.rs:tests.test_chat_request_drop_session_id_deserialization",
+      "name": "test_chat_request_drop_session_id_deserialization",
+      "type": "Function",
+      "filePath": "crates/higgs/src/types/openai.rs",
+      "change_type": "touched"
+    }
+  ],
+  "affected_processes": [
+    {
+      "id": "proc_56_blocking_required_po",
+      "name": "Blocking_required_post_admission_miss_returns_http_409 → Get_i32",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "blocking_required_post_admission_miss_returns_http_409",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_100_blocking_required_po",
+      "name": "Blocking_required_post_admission_miss_returns_http_409 → Get_f32",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "blocking_required_post_admission_miss_returns_http_409",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_101_blocking_required_po",
+      "name": "Blocking_required_post_admission_miss_returns_http_409 → SigLipVisionConfig",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "blocking_required_post_admission_miss_returns_http_409",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_260_axum_session_prefill",
+      "name": "Axum_session_prefill_mode_is_authoritative_before_mutation → Non_empty",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "axum_session_prefill_mode_is_authoritative_before_mutation",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_264_axum_session_prefill",
+      "name": "Axum_session_prefill_mode_is_authoritative_before_mutation → Env",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "axum_session_prefill_mode_is_authoritative_before_mutation",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_265_axum_session_prefill",
+      "name": "Axum_session_prefill_mode_is_authoritative_before_mutation → Is_hf_model_id",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "axum_session_prefill_mode_is_authoritative_before_mutation",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_266_axum_session_prefill",
+      "name": "Axum_session_prefill_mode_is_authoritative_before_mutation → Resolve_hf_snapshot",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "axum_session_prefill_mode_is_authoritative_before_mutation",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_285_axum_session_prefill",
+      "name": "Axum_session_prefill_mode_is_authoritative_before_mutation → Default_retention_enabled",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "axum_session_prefill_mode_is_authoritative_before_mutation",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_286_axum_session_prefill",
+      "name": "Axum_session_prefill_mode_is_authoritative_before_mutation → Default_retention_minutes",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "axum_session_prefill_mode_is_authoritative_before_mutation",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_287_capacity_interrupted",
+      "name": "Capacity_interrupted_stream_emits_exact_terminal_event_then_done → Get_i32",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "capacity_interrupted_stream_emits_exact_terminal_event_then_done",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_321_axum_session_prefill",
+      "name": "Axum_session_prefill_mode_is_authoritative_before_mutation → Cli_kv_cache_mode",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "axum_session_prefill_mode_is_authoritative_before_mutation",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_322_axum_session_prefill",
+      "name": "Axum_session_prefill_mode_is_authoritative_before_mutation → Default_kv_bits",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "axum_session_prefill_mode_is_authoritative_before_mutation",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_323_axum_session_prefill",
+      "name": "Axum_session_prefill_mode_is_authoritative_before_mutation → ModelConfig",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "axum_session_prefill_mode_is_authoritative_before_mutation",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_324_axum_session_prefill",
+      "name": "Axum_session_prefill_mode_is_authoritative_before_mutation → Validate_pflash_settings",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "axum_session_prefill_mode_is_authoritative_before_mutation",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_325_capacity_interrupted",
+      "name": "Capacity_interrupted_stream_emits_exact_terminal_event_then_done → Get_f32",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "capacity_interrupted_stream_emits_exact_terminal_event_then_done",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_326_capacity_interrupted",
+      "name": "Capacity_interrupted_stream_emits_exact_terminal_event_then_done → SigLipVisionConfig",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "capacity_interrupted_stream_emits_exact_terminal_event_then_done",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_391_chat_completions",
+      "name": "Chat_completions → Image_marker_text",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        },
+        {
+          "symbol": "chat_completions",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_392_chat_completions",
+      "name": "Chat_completions → Is_vlm",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        },
+        {
+          "symbol": "chat_completions",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_393_chat_completions",
+      "name": "Chat_completions → Model_name",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        },
+        {
+          "symbol": "chat_completions",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_394_axum_session_prefill",
+      "name": "Axum_session_prefill_mode_is_authoritative_before_mutation → Write",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "axum_session_prefill_mode_is_authoritative_before_mutation",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_429_blocking_required_po",
+      "name": "Blocking_required_post_admission_miss_returns_http_409 → Default_retention_enabled",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "blocking_required_post_admission_miss_returns_http_409",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_430_blocking_required_po",
+      "name": "Blocking_required_post_admission_miss_returns_http_409 → Default_retention_minutes",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "blocking_required_post_admission_miss_returns_http_409",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_485_chat_completions",
+      "name": "Chat_completions → Enable_thinking",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        },
+        {
+          "symbol": "chat_completions",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_501_blocking_required_po",
+      "name": "Blocking_required_post_admission_miss_returns_http_409 → Image_marker_text",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "blocking_required_post_admission_miss_returns_http_409",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_502_blocking_required_po",
+      "name": "Blocking_required_post_admission_miss_returns_http_409 → Is_vlm",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "blocking_required_post_admission_miss_returns_http_409",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_503_blocking_required_po",
+      "name": "Blocking_required_post_admission_miss_returns_http_409 → Model_name",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "blocking_required_post_admission_miss_returns_http_409",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_504_blocking_required_po",
+      "name": "Blocking_required_post_admission_miss_returns_http_409 → Write",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "blocking_required_post_admission_miss_returns_http_409",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_539_capacity_interrupted",
+      "name": "Capacity_interrupted_stream_emits_exact_terminal_event_then_done → Default_retention_enabled",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "capacity_interrupted_stream_emits_exact_terminal_event_then_done",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_558_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → Cli_kv_cache_mode",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_559_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → Default_kv_bits",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_560_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → ModelConfig",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_561_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → Validate_pflash_settings",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_581_blocking_required_po",
+      "name": "Blocking_required_post_admission_miss_returns_http_409 → Enable_thinking",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "blocking_required_post_admission_miss_returns_http_409",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_588_capacity_interrupted",
+      "name": "Capacity_interrupted_stream_emits_exact_terminal_event_then_done → Image_marker_text",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "capacity_interrupted_stream_emits_exact_terminal_event_then_done",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_589_capacity_interrupted",
+      "name": "Capacity_interrupted_stream_emits_exact_terminal_event_then_done → Is_vlm",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "capacity_interrupted_stream_emits_exact_terminal_event_then_done",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_590_capacity_interrupted",
+      "name": "Capacity_interrupted_stream_emits_exact_terminal_event_then_done → Model_name",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "capacity_interrupted_stream_emits_exact_terminal_event_then_done",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_591_capacity_interrupted",
+      "name": "Capacity_interrupted_stream_emits_exact_terminal_event_then_done → Write",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "capacity_interrupted_stream_emits_exact_terminal_event_then_done",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_625_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → Default_retention_minutes",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_626_streaming_required_m",
+      "name": "Streaming_required_materialization_failure_errors_before_sse → Get_i32",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_materialization_failure_errors_before_sse",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_642_streaming_required_m",
+      "name": "Streaming_required_materialization_failure_errors_before_sse → Get_f32",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_materialization_failure_errors_before_sse",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_643_streaming_required_m",
+      "name": "Streaming_required_materialization_failure_errors_before_sse → SigLipVisionConfig",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_materialization_failure_errors_before_sse",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_656_capacity_interrupted",
+      "name": "Capacity_interrupted_stream_emits_exact_terminal_event_then_done → Enable_thinking",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "capacity_interrupted_stream_emits_exact_terminal_event_then_done",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_661_prompt_limit_rejects",
+      "name": "Prompt_limit_rejects_before_blocking_and_streaming_session_mutations → Image_marker_text",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_662_prompt_limit_rejects",
+      "name": "Prompt_limit_rejects_before_blocking_and_streaming_session_mutations → Is_vlm",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_663_prompt_limit_rejects",
+      "name": "Prompt_limit_rejects_before_blocking_and_streaming_session_mutations → Model_name",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_694_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → Default_retention_enabled",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_695_streaming_required_m",
+      "name": "Streaming_required_materialization_failure_errors_before_sse → Default_retention_minutes",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_materialization_failure_errors_before_sse",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_696_streaming_required_w",
+      "name": "Streaming_required_worker_rejection_returns_http_409_before_sse → Get_i32",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_worker_rejection_returns_http_409_before_sse",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_706_axum_session_prefill",
+      "name": "Axum_session_prefill_mode_is_authoritative_before_mutation → New",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "axum_session_prefill_mode_is_authoritative_before_mutation",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_711_streaming_required_w",
+      "name": "Streaming_required_worker_rejection_returns_http_409_before_sse → Get_f32",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_worker_rejection_returns_http_409_before_sse",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_712_streaming_required_w",
+      "name": "Streaming_required_worker_rejection_returns_http_409_before_sse → SigLipVisionConfig",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_worker_rejection_returns_http_409_before_sse",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_724_prompt_limit_rejects",
+      "name": "Prompt_limit_rejects_before_blocking_and_streaming_session_mutations → Enable_thinking",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_728_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → Image_marker_text",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_729_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → Is_vlm",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_730_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → Model_name",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_731_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → Write",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_759_streaming_required_m",
+      "name": "Streaming_required_materialization_failure_errors_before_sse → Default_retention_enabled",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_materialization_failure_errors_before_sse",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_776_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → Enable_thinking",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_780_streaming_required_m",
+      "name": "Streaming_required_materialization_failure_errors_before_sse → Image_marker_text",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_materialization_failure_errors_before_sse",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_781_streaming_required_m",
+      "name": "Streaming_required_materialization_failure_errors_before_sse → Is_vlm",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_materialization_failure_errors_before_sse",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_782_streaming_required_m",
+      "name": "Streaming_required_materialization_failure_errors_before_sse → Model_name",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_materialization_failure_errors_before_sse",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_783_streaming_required_m",
+      "name": "Streaming_required_materialization_failure_errors_before_sse → Write",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_materialization_failure_errors_before_sse",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_811_streaming_required_w",
+      "name": "Streaming_required_worker_rejection_returns_http_409_before_sse → Default_retention_enabled",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_worker_rejection_returns_http_409_before_sse",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_826_streaming_required_m",
+      "name": "Streaming_required_materialization_failure_errors_before_sse → Enable_thinking",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_materialization_failure_errors_before_sse",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_829_streaming_required_w",
+      "name": "Streaming_required_worker_rejection_returns_http_409_before_sse → Image_marker_text",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_worker_rejection_returns_http_409_before_sse",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_830_streaming_required_w",
+      "name": "Streaming_required_worker_rejection_returns_http_409_before_sse → Is_vlm",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_worker_rejection_returns_http_409_before_sse",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_831_streaming_required_w",
+      "name": "Streaming_required_worker_rejection_returns_http_409_before_sse → Model_name",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_worker_rejection_returns_http_409_before_sse",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_832_streaming_required_w",
+      "name": "Streaming_required_worker_rejection_returns_http_409_before_sse → Write",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_worker_rejection_returns_http_409_before_sse",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_862_capacity_interrupted",
+      "name": "Capacity_interrupted_stream_emits_exact_terminal_event_then_done → New",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "capacity_interrupted_stream_emits_exact_terminal_event_then_done",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_873_streaming_required_w",
+      "name": "Streaming_required_worker_rejection_returns_http_409_before_sse → Enable_thinking",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "streaming_required_worker_rejection_returns_http_409_before_sse",
+          "step": 1
+        },
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    }
+  ]
+}

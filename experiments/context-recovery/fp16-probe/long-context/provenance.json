@@ -1,0 +1,48 @@
+{
+  "binary_sha256": "db8dfb78ba8382d16fc96b8a2430fc00f8967ff1cf21b1c5840504cc3e2db9c1",
+  "command": [
+    "/usr/bin/time",
+    "-l",
+    "/private/tmp/higgs-fp16-artifacts/bench_frontier-fp16-attn",
+    "--model-dir",
+    "/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2",
+    "--frontiers",
+    "4096,8192,16384",
+    "--probe-tokens",
+    "128",
+    "--runs",
+    "1",
+    "--prefill-chunk-size",
+    "1024",
+    "--format",
+    "json"
+  ],
+  "order": [
+    "off1",
+    "on1",
+    "on2",
+    "off2"
+  ],
+  "results": [
+    {
+      "label": "off1",
+      "exit": 0,
+      "seconds": 201.00860404968262
+    },
+    {
+      "label": "on1",
+      "exit": 0,
+      "seconds": 145.0276939868927
+    },
+    {
+      "label": "on2",
+      "exit": 0,
+      "seconds": 160.65622305870056
+    },
+    {
+      "label": "off2",
+      "exit": 0,
+      "seconds": 202.32570791244507
+    }
+  ]
+}

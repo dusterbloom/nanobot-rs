@@ -1,0 +1,70 @@
+   Compiling nanobot v0.1.0 (/Users/peppi/Dev/nanobot-rs)
+error[E0425]: cannot find value `RESET_HANDOFF_INSTRUCTION` in this scope
+   --> src/agent/agent_loop/endurance_eval.rs:196:28
+    |
+196 |     let mut pending = Some(RESET_HANDOFF_INSTRUCTION);
+    |                            ^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find value `RESET_HANDOFF_INSTRUCTION` in this scope
+   --> src/agent/agent_loop/endurance_eval.rs:200:35
+    |
+200 | ...p_prefix(RESET_HANDOFF_INSTRUCTION), Some(original.as_str()));
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+warning: variable does not need to be mutable
+   --> src/agent/tools/cua.rs:286:13
+    |
+286 |         let mut out = raw_out;
+    |             ----^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+error[E0425]: cannot find function `prepend_pending_reset_handoff` in this scope
+   --> src/agent/agent_loop/endurance_eval.rs:198:28
+    |
+198 | ...ied) = prepend_pending_reset_handoff(original.clone(), &mut pending);
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `prepend_pending_reset_handoff` in this scope
+   --> src/agent/agent_loop/endurance_eval.rs:202:29
+    |
+202 | ...ied) = prepend_pending_reset_handoff(original.clone(), &mut pending);
+    |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `endurance_reset_handoff` in this scope
+   --> src/agent/agent_loop/endurance_eval.rs:209:14
+    |
+209 |     assert!(!endurance_reset_handoff(None));
+    |              ^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `endurance_reset_handoff` in this scope
+   --> src/agent/agent_loop/endurance_eval.rs:210:14
+    |
+210 |     assert!(!endurance_reset_handoff(Some("0")));
+    |              ^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `endurance_reset_handoff` in this scope
+   --> src/agent/agent_loop/endurance_eval.rs:211:13
+    |
+211 |     assert!(endurance_reset_handoff(Some("1")));
+    |             ^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `endurance_reset_handoff` in this scope
+   --> src/agent/agent_loop/endurance_eval.rs:217:5
+    |
+217 |     endurance_reset_handoff(Some("2"));
+    |     ^^^^^^^^^^^^^^^^^^^^^^^ not found in this scope
+
+warning: variable does not need to be mutable
+    --> src/agent/agent_core.rs:2964:13
+     |
+2964 |         let mut live = vec![
+     |             ----^^^^
+     |             |
+     |             help: remove this `mut`
+
+For more information about this error, try `rustc --explain E0425`.
+warning: `nanobot` (lib test) generated 2 warnings
+error: could not compile `nanobot` (lib test) due to 8 previous errors; 2 warnings emitted

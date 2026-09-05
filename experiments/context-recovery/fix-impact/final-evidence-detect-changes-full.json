@@ -1,8 +1,8 @@
 {
   "summary": {
-    "changed_count": 20,
+    "changed_count": 39,
     "affected_count": 0,
-    "changed_files": 38,
+    "changed_files": 49,
     "risk_level": "low"
   },
   "changed_symbols": [
@@ -91,59 +91,192 @@
       "change_type": "touched"
     },
     {
-      "id": "Section:experiments/context-recovery/HIGGS-FIX-PLAN.md:L1:Higgs allocation and runtime-default repair plan",
-      "name": "Higgs allocation and runtime-default repair plan",
+      "id": "Section:experiments/context-recovery/ANNOUNCEMENT-PLAN.md:L1:Context announcement recovery",
+      "name": "Context announcement recovery",
       "type": "Section",
-      "filePath": "experiments/context-recovery/HIGGS-FIX-PLAN.md",
+      "filePath": "experiments/context-recovery/ANNOUNCEMENT-PLAN.md",
       "change_type": "touched"
     },
     {
-      "id": "Section:experiments/context-recovery/HIGGS-FIX-PLAN.md:L27:End-to-end regression discovered after installation",
-      "name": "End-to-end regression discovered after installation",
+      "id": "Section:experiments/context-recovery/ANNOUNCEMENT-RESULTS.md:L1:Explicit context-decision recovery",
+      "name": "Explicit context-decision recovery",
       "type": "Section",
-      "filePath": "experiments/context-recovery/HIGGS-FIX-PLAN.md",
+      "filePath": "experiments/context-recovery/ANNOUNCEMENT-RESULTS.md",
       "change_type": "touched"
     },
     {
-      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L1:Higgs allocation repair — verification record",
-      "name": "Higgs allocation repair — verification record",
+      "id": "Section:experiments/context-recovery/ANNOUNCEMENT-RESULTS.md:L33:Evidence",
+      "name": "Evidence",
       "type": "Section",
-      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "filePath": "experiments/context-recovery/ANNOUNCEMENT-RESULTS.md",
       "change_type": "touched"
     },
     {
-      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L8:Changes",
-      "name": "Changes",
+      "id": "Section:experiments/context-recovery/CONTEXT-VALIDATION-RESULTS.md:L1:Context-recovery validation: response budget and handoff",
+      "name": "Context-recovery validation: response budget and handoff",
       "type": "Section",
-      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "filePath": "experiments/context-recovery/CONTEXT-VALIDATION-RESULTS.md",
       "change_type": "touched"
     },
     {
-      "id": "Section:experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md:L1:Higgs Escha W2 kernel-default audit",
-      "name": "Higgs Escha W2 kernel-default audit",
+      "id": "Section:experiments/context-recovery/CONTEXT-VALIDATION-RESULTS.md:L26:Autonomous run with handoff enabled: not exercised",
+      "name": "Autonomous run with handoff enabled: not exercised",
       "type": "Section",
-      "filePath": "experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md",
+      "filePath": "experiments/context-recovery/CONTEXT-VALIDATION-RESULTS.md",
       "change_type": "touched"
     },
     {
-      "id": "Section:experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md:L8:Decision",
-      "name": "Decision",
+      "id": "Section:experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md:L1:LCM vs. notes/reset choice audit",
+      "name": "LCM vs. notes/reset choice audit",
       "type": "Section",
-      "filePath": "experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md",
+      "filePath": "experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md",
       "change_type": "touched"
     },
     {
-      "id": "Section:experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md:L1:Startup capacity diagnosis",
-      "name": "Startup capacity diagnosis",
+      "id": "Section:experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md:L7:Run identity and outcome",
+      "name": "Run identity and outcome",
       "type": "Section",
-      "filePath": "experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md",
+      "filePath": "experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md",
       "change_type": "touched"
     },
     {
-      "id": "Section:experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md:L89:Profile-key label",
-      "name": "Profile-key label",
+      "id": "Section:experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md:L15:Post-submission context decisions",
+      "name": "Post-submission context decisions",
       "type": "Section",
-      "filePath": "experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md",
+      "filePath": "experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md:L29:Why no notes or voluntary reset occurred",
+      "name": "Why no notes or voluntary reset occurred",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md:L35:Automatic compaction and terminal suspension",
+      "name": "Automatic compaction and terminal suspension",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md:L53:What the compaction metrics count",
+      "name": "What the compaction metrics count",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md:L64:Follow-up with a 2,048-token long-form reserve",
+      "name": "Follow-up with a 2,048-token long-form reserve",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md:L86:Next discriminator",
+      "name": "Next discriminator",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md:L96:Interpreting the choice (hypotheses, not observed intent)",
+      "name": "Interpreting the choice (hypotheses, not observed intent)",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/LCM-NOTES-CHOICE-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/VALIDATION-TRACKER.md:L1:Escha precision and context-recovery validation",
+      "name": "Escha precision and context-recovery validation",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/VALIDATION-TRACKER.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/VALIDATION-TRACKER.md:L5:Current status",
+      "name": "Current status",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/VALIDATION-TRACKER.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/VALIDATION-TRACKER.md:L15:Active work and ownership",
+      "name": "Active work and ownership",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/VALIDATION-TRACKER.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/VALIDATION-TRACKER.md:L36:What the controls establish",
+      "name": "What the controls establish",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/VALIDATION-TRACKER.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/VALIDATION-TRACKER.md:L50:Completed verification",
+      "name": "Completed verification",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/VALIDATION-TRACKER.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/fp16-probe/LONG-CONTEXT.md:L1:Longer-context FP16 attention validation",
+      "name": "Longer-context FP16 attention validation",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/fp16-probe/LONG-CONTEXT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/fp16-probe/LONG-CONTEXT.md:L28:Source-supported kernel interpretation",
+      "name": "Source-supported kernel interpretation",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/fp16-probe/LONG-CONTEXT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/fp16-probe/README.md:L1:Native Escha FP16 KV and attention feasibility probes",
+      "name": "Native Escha FP16 KV and attention feasibility probes",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/fp16-probe/README.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/fp16-probe/README.md:L224:Overall decision",
+      "name": "Overall decision",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/fp16-probe/README.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Variable:experiments/context-recovery/fp16-probe/long-context/run.py:root",
+      "name": "root",
+      "type": "Variable",
+      "filePath": "experiments/context-recovery/fp16-probe/long-context/run.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Variable:experiments/context-recovery/fp16-probe/long-context/run.py:binary",
+      "name": "binary",
+      "type": "Variable",
+      "filePath": "experiments/context-recovery/fp16-probe/long-context/run.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Variable:experiments/context-recovery/fp16-probe/long-context/run.py:command",
+      "name": "command",
+      "type": "Variable",
+      "filePath": "experiments/context-recovery/fp16-probe/long-context/run.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Variable:experiments/context-recovery/fp16-probe/long-context/run.py:provenance",
+      "name": "provenance",
+      "type": "Variable",
+      "filePath": "experiments/context-recovery/fp16-probe/long-context/run.py",
       "change_type": "touched"
     }
   ],

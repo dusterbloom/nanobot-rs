@@ -1,0 +1,68 @@
+{
+  "before": {
+    "requests": 3,
+    "elapsed_ms": [
+      9881,
+      1263,
+      1210
+    ],
+    "ttft_ms": [
+      9698,
+      1000,
+      1033
+    ],
+    "prompt_tokens": [
+      1966,
+      2001,
+      2038
+    ],
+    "completion_tokens": [
+      11,
+      13,
+      11
+    ],
+    "all_ok": true,
+    "warm_mean_elapsed_ms": 1236.5,
+    "warm_mean_ttft_ms": 1016.5
+  },
+  "after": {
+    "requests": 3,
+    "elapsed_ms": [
+      9965,
+      1255,
+      1202
+    ],
+    "ttft_ms": [
+      9778,
+      992,
+      1023
+    ],
+    "prompt_tokens": [
+      1966,
+      2001,
+      2038
+    ],
+    "completion_tokens": [
+      11,
+      13,
+      11
+    ],
+    "all_ok": true,
+    "warm_mean_elapsed_ms": 1228.5,
+    "warm_mean_ttft_ms": 1007.5
+  },
+  "warm_elapsed_change_percent": -0.6469874646178764,
+  "final_replies": {
+    "before": [
+      "The number 1 is the first positive integer.",
+      "The number 2 is the smallest and only even prime.",
+      "The number 3 is the first odd prime."
+    ],
+    "after": [
+      "The number 1 is the first positive integer.",
+      "The number 2 is the smallest and only even prime.",
+      "The number 3 is the first odd prime."
+    ]
+  },
+  "identical_final_replies": true
+}

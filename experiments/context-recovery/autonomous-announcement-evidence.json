@@ -1,0 +1,149 @@
+{
+  "arm": "B",
+  "completed_updates": 6,
+  "context_ceiling": 12288,
+  "correct_updates": 6,
+  "deadline_cancelled": false,
+  "endurance_long_form_min_tokens": 2048,
+  "endurance_reset_handoff_enabled": true,
+  "endurance_reset_handoff_requested": "1",
+  "forbidden_actions": 0,
+  "pass": false,
+  "policy": "decision",
+  "requested_updates": 20,
+  "reset_handoff_count": 1,
+  "seconds": 295.792030625,
+  "source_estimated_tokens": 34028,
+  "submission_violations": 1,
+  "turns": [
+    {
+      "completed_compactions": 0,
+      "initial_estimated_tokens": 3812,
+      "outcome": "Finished",
+      "response": "Context decision: continue. The session has ample remaining capacity (~5700 tokens) and no pending actions or state changes require a reset. I will wait for the next project update.",
+      "seconds": 32.945664792,
+      "session_id": "20260905_211002_e40938"
+    },
+    {
+      "completed_compactions": 0,
+      "initial_estimated_tokens": 5824,
+      "outcome": "Finished",
+      "response": "Context decision: continue. Remaining capacity is still healthy (~3700 tokens) and no pending actions require a reset. I will wait for the next update.",
+      "seconds": 19.464389,
+      "session_id": "20260905_211002_e40938"
+    },
+    {
+      "completed_compactions": 0,
+      "initial_estimated_tokens": 7833,
+      "outcome": "Finished",
+      "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+      "seconds": 30.20509625,
+      "session_id": "20260905_211002_e40938"
+    },
+    {
+      "completed_compactions": 0,
+      "initial_estimated_tokens": 3775,
+      "outcome": "Finished",
+      "response": "The first submit_result already recorded revision 3 successfully. The second call was a duplicate which is not allowed \u2014 the task says \"submit exactly once\" and \"wait for a new user update before another submission.\" I should finish the turn now without resubmitting.\nContext decision: continue \u2014 sufficient remaining capacity (~5500 tokens) to handle the next update; no reset needed.",
+      "seconds": 51.640087125,
+      "session_id": "20260905_211124_9b1888"
+    },
+    {
+      "completed_compactions": 0,
+      "initial_estimated_tokens": 6204,
+      "outcome": "Finished",
+      "response": "Context decision: continue \u2014 ~3010 tokens remaining, sufficient for the next update. No reset needed yet.",
+      "seconds": 34.823354583,
+      "session_id": "20260905_211124_9b1888"
+    },
+    {
+      "completed_compactions": 1,
+      "initial_estimated_tokens": 8495,
+      "outcome": "CapacityUnavailable",
+      "response": "[Capacity Unavailable] The live capacity window shrank; this turn is saved as pending work.",
+      "seconds": 126.602298292,
+      "session_id": "20260905_211124_9b1888"
+    }
+  ],
+  "voluntary_resets": 1,
+  "artifact_pass": false,
+  "pending_capacity_turns": 1,
+  "control_tool_calls": {
+    "context_status": 5,
+    "notes": 5,
+    "new_context": 1,
+    "history": 4,
+    "recall": 0,
+    "lcm_expand": 0
+  },
+  "submissions_with_post_submit_inspection": 5,
+  "source_tokens_scope": "entire planned stream; not necessarily all delivered",
+  "forced_recovery_requests": 0,
+  "actual_output_reservations": [
+    2048
+  ],
+  "submission_attempts": 7,
+  "forbidden_attempts": 0,
+  "llm_compaction_requests": 0,
+  "completed_compactions": 1,
+  "tool_errors": 1,
+  "model_requests": 30,
+  "logical_input_tokens": 178683,
+  "output_tokens": 2490,
+  "wire_errors": [],
+  "reset_events": [
+    {
+      "batch": [
+        {
+          "kind": "tool_post_execute",
+          "message_id": 21,
+          "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+          "tool_call_id": "call_0_e31a7490-112f-422d-8c79-b05e271bc202"
+        },
+        {
+          "duration_ms": 0,
+          "kind": "tool_execute",
+          "ok": true,
+          "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+          "tool_call_id": "call_0_e31a7490-112f-422d-8c79-b05e271bc202"
+        },
+        {
+          "arguments_digest": "6955b2c4a2c052d4f8290afe5fccc362a4599c246aaa5ffe32d8c9b18e54f9ef",
+          "decision": {
+            "status": "ready"
+          },
+          "kind": "tool_pre_execute",
+          "tool_call_id": "call_0_e31a7490-112f-422d-8c79-b05e271bc202",
+          "tool_name": "new_context"
+        }
+      ],
+      "estimated_tokens": 8257,
+      "last_actual_prompt_tokens": 9399,
+      "prompt_budget": 9657,
+      "request_id": "715c1e93",
+      "revision": 3,
+      "session_id": "20260905_211002_e40938"
+    }
+  ],
+  "repeated_boundary_coverage": false,
+  "first_wrong_revision": null,
+  "peak_actual_prompt_tokens": 9940,
+  "delivered_update_bytes": 0,
+  "delivered_tool_bytes": 10964,
+  "delivered_tool_estimated_window_equivalents": 0.22306315104166666,
+  "delivered_update_estimated_window_equivalents": 0.0,
+  "snapshots_per_minute": 1.2170713296072597,
+  "source_window_equivalents": 2.7692057291666665,
+  "resets_below_quarter_estimated_budget": 0,
+  "telemetry_errors": 0,
+  "observed_boot_ids": [
+    "e2624ead-2f3e-4c39-b04f-7ddd1c502f19"
+  ],
+  "minimum_server_prompt_capacity": 4096,
+  "maximum_mlx_active_bytes": 14834099796,
+  "observed_downshifts": 1,
+  "valid_measurement": true,
+  "process_exit": 0,
+  "watchdog_terminated": false,
+  "unexpected_server_restart": false
+}

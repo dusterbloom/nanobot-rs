@@ -1,0 +1,70 @@
+{
+  "initial": [
+    {
+      "case": "blocking",
+      "seconds": 7.717851125009474,
+      "pass": true,
+      "calls": [
+        {
+          "name": "notes",
+          "arguments": "{\"op\":\"write\",\"content\":\"revision=4; receipt=rcpt_Q8n3_L04\"}"
+        }
+      ],
+      "content": ""
+    },
+    {
+      "case": "stream",
+      "seconds": 3.5245155000011437,
+      "pass": true,
+      "calls": [
+        {
+          "name": "notes",
+          "arguments": "{\"op\":\"write\",\"content\":\"revision=4; receipt=rcpt_Q8n3_L04\"}"
+        }
+      ],
+      "content": ""
+    }
+  ],
+  "adversarial": [
+    {
+      "case": "auto",
+      "seconds": 6.1379288750031264,
+      "pass": true,
+      "calls": [],
+      "content": "UNCONSTRAINED_SENTINEL"
+    },
+    {
+      "case": "blocking",
+      "seconds": 3.712860833009472,
+      "pass": true,
+      "calls": [
+        {
+          "name": "notes",
+          "arguments": "{\"op\":\"write\",\"content\":\"revision=4; receipt=rcpt_Q8n3_L04\"}"
+        }
+      ],
+      "content": ""
+    },
+    {
+      "case": "stream",
+      "seconds": 3.3263851670053555,
+      "pass": true,
+      "calls": [
+        {
+          "name": "notes",
+          "arguments": "{\"op\":\"write\",\"content\":\"revision=4; receipt=rcpt_Q8n3_L04\"}"
+        }
+      ],
+      "content": ""
+    }
+  ],
+  "provenance": {
+    "sha256": {
+      "/Users/peppi/Dev/nanobot-rs/target/release/deps/nanobot-67848bc0f9b02956": "0f0b2eeff0d2397613e895f95a8d434cba22bf742640d8f0dbb6c2c3afedada3",
+      "/private/tmp/higgs-recovery/higgs-hardened": "fd9747c68f4f85770eb47d30cf7c077b9a014e559a71dc03e2b46380dcfa86fc",
+      "/Users/peppi/Dev/nanobot-rs/src/agent/agent_loop/shared.rs": "81ed45c46e7079f11a1ce564307c98fd3cb4217c4e564d9621d98a265cbcaa62",
+      "/Users/peppi/Dev/nanobot-rs/src/agent/agent_loop/recovery_eval.rs": "333b5edba4571c2da057ccafb67711a44fd81b2372581c261406522cf7d99507"
+    },
+    "scope": "grammar wire plus targeted announcement obligation and fresh-context recovery; not autonomous timing"
+  }
+}

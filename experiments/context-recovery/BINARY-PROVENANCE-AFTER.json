@@ -1,14 +1,14 @@
 {
-  "higgs_commit": "78da18f13",
+  "higgs_commit": "dd6730133",
   "sha256": {
-    "/Users/peppi/.local/bin/higgs": "e7a811f1dec325741d4a5d69fa91fcdd93a9f9b0d4040a325f7056d72feec7c7",
+    "/Users/peppi/.local/bin/higgs": "fd9747c68f4f85770eb47d30cf7c077b9a014e559a71dc03e2b46380dcfa86fc",
     "/Users/peppi/.local/bin/mlx.metallib": "d4ec42fe79abd9d24922c84a6a160b98e9bba7ebed68dbed844981b1190eafb5",
-    "/Users/peppi/.local/bin/nanobot": "8503b96521535dc1749a816fce3b3f7f3e50495d78a9dea3f7918692affd6cdb",
-    "/private/tmp/higgs-recovery/higgs-hardened": "e7a811f1dec325741d4a5d69fa91fcdd93a9f9b0d4040a325f7056d72feec7c7"
+    "/Users/peppi/.local/bin/nanobot": "f557bebfe98891c759d6e758114907efa7e24f41841371b425268aec62c62f0e",
+    "/private/tmp/higgs-recovery/higgs-hardened": "fd9747c68f4f85770eb47d30cf7c077b9a014e559a71dc03e2b46380dcfa86fc"
   },
-  "nanobot_commit": "5d4a680",
-  "higgs_remote_nightly": "890039d7f (78da18f13 push awaiting explicit public-destination approval)",
-  "restored_service": {
+  "nanobot_commit": "721bc3b",
+  "higgs_remote_nightly": "last verified 890039d7f; public follow-ups await explicit destination approval",
+  "previous_restored_service": {
     "pid": 41674,
     "boot_id": "29551c1f-4b1c-4166-8b85-40dd60433b99",
     "tmux": "recovery-higgs:0.0",
@@ -23,5 +23,64 @@
     "execution_mode": "simple:eschamoe-native",
     "persistent_cache_bytes_per_token": 40960,
     "log": "/private/tmp/higgs-final-default.log"
-  }
+  },
+  "restored_service": {
+    "status": "running; READY smoke passed",
+    "pid": 65802,
+    "tmux": "recovery-higgs:0.0",
+    "mappings": [
+      "n/Users/peppi/Dev/higgs",
+      "n/Users/peppi/.local/bin/higgs",
+      "n/System/Library/Extensions/AGXMetalG16G_B0.bundle/Contents/Resources/ds.binary.metallib.g16g-b0",
+      "n/private/tmp/higgs-final-default.log",
+      "n/private/tmp/higgs-final-default.log",
+      "n/Users/peppi/.local/bin/mlx.metallib",
+      "n/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2/.higgs-prefix-cache.bin",
+      "n/Users/peppi/.config/higgs/logs/metrics.jsonl"
+    ],
+    "requested_profile": "auto",
+    "effective_profile": "throughput",
+    "prefill_kernel": "scratch_matmul",
+    "execution_mode": "simple:eschamoe-native",
+    "persistent_cache_bytes_per_token": 40960,
+    "log": "/private/tmp/higgs-final-default.log",
+    "smoke": {
+      "id": "chatcmpl-7242c741-5a9b-49d4-a1c3-ceca6d45afac",
+      "object": "chat.completion",
+      "created": 1788643403,
+      "model": "escha-35b-a3b",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "READY"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 15,
+        "completion_tokens": 2,
+        "total_tokens": 17
+      }
+    },
+    "capacity": {
+      "schemaVersion": 1,
+      "model": "escha-35b-a3b",
+      "modelFingerprint": "sha256:adf23a8e2f3b720f38311bd469a5df275b2d41fb6bfeb0e0cb337244b3dbfa2a",
+      "bootId": "2b8511ce-e335-4d43-8a5d-f8fa3daae2fa",
+      "generation": 3,
+      "availability": "available",
+      "pressure": "normal",
+      "safeTotalTokens": 18432,
+      "recommendedOutputTokens": 4096,
+      "maxPromptTokens": 14336,
+      "retainedSessionTokens": 14336,
+      "retainedBytes": 805306368,
+      "prefixCacheBytes": 134217728,
+      "basis": "conservative"
+    }
+  },
+  "validated_harness_sha256": "0f0b2eeff0d2397613e895f95a8d434cba22bf742640d8f0dbb6c2c3afedada3"
 }

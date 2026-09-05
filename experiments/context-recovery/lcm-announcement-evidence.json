@@ -1,0 +1,116 @@
+{
+  "arm": "A",
+  "completed_updates": 6,
+  "context_ceiling": 12288,
+  "correct_updates": 6,
+  "deadline_cancelled": false,
+  "endurance_long_form_min_tokens": 2048,
+  "endurance_reset_handoff_enabled": true,
+  "endurance_reset_handoff_requested": "1",
+  "forbidden_actions": 0,
+  "pass": false,
+  "policy": "decision",
+  "requested_updates": 20,
+  "reset_handoff_count": 0,
+  "seconds": 193.614076417,
+  "source_estimated_tokens": 34028,
+  "submission_violations": 0,
+  "turns": [
+    {
+      "completed_compactions": 0,
+      "initial_estimated_tokens": 3605,
+      "outcome": "Finished",
+      "response": "Context decision: continue. The snapshot for revision 0 has been submitted with diagnostic code D-47762e2e62293c57 extracted from the verified diagnostic line. Context usage is well within budget (~3727 tokens estimated, ~5939 remaining), so no reset or retrieval is needed at this time. I will wait for the next project update.",
+      "seconds": 36.8753635,
+      "session_id": "20260905_211719_34a630"
+    },
+    {
+      "completed_compactions": 0,
+      "initial_estimated_tokens": 5653,
+      "outcome": "Finished",
+      "response": "Context decision: continue. Revision 1 snapshot submitted with diagnostic code D-5e886b6860b8b7a4. The authoritative update changed branch to `hotfix/q1` and owner to `Neri-1`; all other fields from revision 0 are preserved. Context usage is ~5781 tokens with ~3885 remaining \u2014 still within budget, so no reset needed. Awaiting the next update.",
+      "seconds": 23.291199291,
+      "session_id": "20260905_211719_34a630"
+    },
+    {
+      "completed_compactions": 0,
+      "initial_estimated_tokens": 7718,
+      "outcome": "Finished",
+      "response": "Context decision: checkpoint/reset. Revision 2 snapshot submitted with diagnostic code D-39bec4e4e0de2f7f. The authoritative update changed `export_status` to \"failed\" and `next_action` to \"request_permission\"; all other fields preserved from revision 1. Context usage is now ~7846 tokens with only ~1820 remaining \u2014 approaching budget limits, so a reset is warranted before the next update. I will checkpoint by preserving the current project state (branch hotfix/q1, owner Neri-1, checksum 5Cd7-k9X2-e10F, receipt rcpt_Q8n3_L04, payment settled) and reset to free context for incoming updates.",
+      "seconds": 26.7944365,
+      "session_id": "20260905_211719_34a630"
+    },
+    {
+      "completed_compactions": 1,
+      "initial_estimated_tokens": 9830,
+      "outcome": "Finished",
+      "response": "Context decision: checkpoint/reset. Estimated remaining tokens (~220) are critically low for the next update; a fresh window is required to preserve correctness and avoid truncation.",
+      "seconds": 70.593165375,
+      "session_id": "20260905_211719_34a630"
+    },
+    {
+      "completed_compactions": 1,
+      "initial_estimated_tokens": 3894,
+      "outcome": "Finished",
+      "response": "Context decision: continue. Estimated remaining tokens (~2575) are sufficient for the next update, and no state changes require preservation beyond what\u2019s already captured in the submitted snapshot.",
+      "seconds": 18.971839625,
+      "session_id": "20260905_211719_34a630"
+    },
+    {
+      "completed_compactions": 1,
+      "initial_estimated_tokens": 5880,
+      "outcome": "CapacityUnavailable",
+      "response": "[Capacity Unavailable] The live capacity window shrank; this turn is saved as pending work.",
+      "seconds": 16.992287875,
+      "session_id": "20260905_211719_34a630"
+    }
+  ],
+  "voluntary_resets": 0,
+  "artifact_pass": false,
+  "pending_capacity_turns": 1,
+  "control_tool_calls": {
+    "context_status": 6,
+    "notes": 0,
+    "new_context": 0,
+    "history": 0,
+    "recall": 0,
+    "lcm_expand": 0
+  },
+  "submissions_with_post_submit_inspection": 6,
+  "source_tokens_scope": "entire planned stream; not necessarily all delivered",
+  "forced_recovery_requests": 0,
+  "actual_output_reservations": [
+    2048
+  ],
+  "submission_attempts": 6,
+  "forbidden_attempts": 0,
+  "llm_compaction_requests": 0,
+  "completed_compactions": 1,
+  "tool_errors": 0,
+  "model_requests": 20,
+  "logical_input_tokens": 106713,
+  "output_tokens": 1268,
+  "wire_errors": [],
+  "reset_events": [],
+  "repeated_boundary_coverage": false,
+  "first_wrong_revision": null,
+  "peak_actual_prompt_tokens": 9168,
+  "delivered_update_bytes": 0,
+  "delivered_tool_bytes": 1660,
+  "delivered_tool_estimated_window_equivalents": 0.033772786458333336,
+  "delivered_update_estimated_window_equivalents": 0.0,
+  "snapshots_per_minute": 1.85936893981119,
+  "source_window_equivalents": 2.7692057291666665,
+  "resets_below_quarter_estimated_budget": 0,
+  "telemetry_errors": 0,
+  "observed_boot_ids": [
+    "9f668904-48f7-4b87-979a-b8d5437d1602"
+  ],
+  "minimum_server_prompt_capacity": 5120,
+  "maximum_mlx_active_bytes": 14707950536,
+  "observed_downshifts": 1,
+  "valid_measurement": true,
+  "process_exit": 0,
+  "watchdog_terminated": false,
+  "unexpected_server_restart": false
+}

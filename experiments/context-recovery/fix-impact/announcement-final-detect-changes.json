@@ -1,0 +1,772 @@
+{
+  "summary": {
+    "changed_count": 52,
+    "affected_count": 26,
+    "changed_files": 9,
+    "risk_level": "critical"
+  },
+  "changed_symbols": [
+    {
+      "id": "Section:AGENTS.md:L109:GitNexus — Code Intelligence",
+      "name": "GitNexus — Code Intelligence",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L115:Always Do",
+      "name": "Always Do",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L125:Never Do",
+      "name": "Never Do",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L132:Resources",
+      "name": "Resources",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L141:CLI",
+      "name": "CLI",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L159:GitNexus — Code Intelligence",
+      "name": "GitNexus — Code Intelligence",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L165:Always Do",
+      "name": "Always Do",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L175:Never Do",
+      "name": "Never Do",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L182:Resources",
+      "name": "Resources",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L191:CLI",
+      "name": "CLI",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:PLAN.md:L1:Current Plan — v0.5 \"Persistent Local Agent\"",
+      "name": "Current Plan — v0.5 \"Persistent Local Agent\"",
+      "type": "Section",
+      "filePath": "PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:PLAN.md:L3:Active follow-up",
+      "name": "Active follow-up",
+      "type": "Section",
+      "filePath": "PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:experiments/context-recovery/endurance.py:summarize",
+      "name": "summarize",
+      "type": "Function",
+      "filePath": "experiments/context-recovery/endurance.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/fp16-probe/README.md:L1:Native Escha FP16 KV and attention feasibility probes",
+      "name": "Native Escha FP16 KV and attention feasibility probes",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/fp16-probe/README.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/fp16-probe/README.md:L224:Overall decision",
+      "name": "Overall decision",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/fp16-probe/README.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Const:src/agent/agent_loop/endurance_eval.rs:RESET_HANDOFF_INSTRUCTION",
+      "name": "RESET_HANDOFF_INSTRUCTION",
+      "type": "Const",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Const:src/agent/agent_loop/endurance_eval.rs:RECORDED_REVISION_TWO_CHECKPOINT",
+      "name": "RECORDED_REVISION_TWO_CHECKPOINT",
+      "type": "Const",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:endurance_long_form_min_tokens",
+      "name": "endurance_long_form_min_tokens",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:endurance_reset_handoff",
+      "name": "endurance_reset_handoff",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:prepend_pending_reset_handoff",
+      "name": "prepend_pending_reset_handoff",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:recorded_revision_two_checkpoint",
+      "name": "recorded_revision_two_checkpoint",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:endurance_long_form_min_tokens_defaults_and_accepts_positive_override",
+      "name": "endurance_long_form_min_tokens_defaults_and_accepts_positive_override",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:endurance_long_form_min_tokens_rejects_zero",
+      "name": "endurance_long_form_min_tokens_rejects_zero",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:reset_handoff_prefixes_one_normal_update_and_preserves_original_bytes",
+      "name": "reset_handoff_prefixes_one_normal_update_and_preserves_original_bytes",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:reset_handoff_setting_defaults_off_and_accepts_zero_or_one",
+      "name": "reset_handoff_setting_defaults_off_and_accepts_zero_or_one",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:reset_handoff_setting_rejects_other_values",
+      "name": "reset_handoff_setting_rejects_other_values",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:recorded_replay_checkpoint_is_exact_revision_two_state",
+      "name": "recorded_replay_checkpoint_is_exact_revision_two_state",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:endurance_reset_handoff_replay_live",
+      "name": "endurance_reset_handoff_replay_live",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:endurance_eval_live",
+      "name": "endurance_eval_live",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:eval_tool_test_state",
+      "name": "eval_tool_test_state",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:eval_notes_must_commit_before_one_reset_request",
+      "name": "eval_notes_must_commit_before_one_reset_request",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:failed_eval_note_commit_does_not_enable_reset",
+      "name": "failed_eval_note_commit_does_not_enable_reset",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:streamed_reset_recovery_failure_retracts_and_replaces_announcement",
+      "name": "streamed_reset_recovery_failure_retracts_and_replaces_announcement",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:src/agent/agent_loop/recovery_eval.rs:EvalTool",
+      "name": "EvalTool",
+      "type": "Struct",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:EvalTool.checkpoint_written",
+      "name": "checkpoint_written",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:EvalTool.execute#2",
+      "name": "execute",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:make_agent",
+      "name": "make_agent",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:make_agent_configured",
+      "name": "make_agent_configured",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:run_turn",
+      "name": "run_turn",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:context_reset_announcement_recovery_live",
+      "name": "context_reset_announcement_recovery_live",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/shared.rs:announces_context_reset",
+      "name": "announces_context_reset",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/shared.rs:context_reset_recovery_tools",
+      "name": "context_reset_recovery_tools",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/shared.rs:reset_recovery_calls_valid",
+      "name": "reset_recovery_calls_valid",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/shared.rs:stateless_forced_recovery_messages",
+      "name": "stateless_forced_recovery_messages",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/shared.rs:reset_recovery_failure",
+      "name": "reset_recovery_failure",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Impl:src/agent/agent_loop/shared.rs:AgentLoopShared",
+      "name": "AgentLoopShared",
+      "type": "Impl",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/shared.rs:AgentLoopShared.maybe_recover_botched_tool_call#5",
+      "name": "maybe_recover_botched_tool_call",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:src/agent/agent_loop/shared.rs:forced_recovery_tests",
+      "name": "forced_recovery_tests",
+      "type": "Module",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/shared.rs:forced_recovery_tests.context_reset_announcement_is_explicit_and_restricts_retry_tools",
+      "name": "context_reset_announcement_is_explicit_and_restricts_retry_tools",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/shared.rs:forced_recovery_tests.reset_recovery_rejects_unrelated_or_incomplete_calls",
+      "name": "reset_recovery_rejects_unrelated_or_incomplete_calls",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/shared.rs:reset_recovery_rejects_unrelated_or_incomplete_calls.call@7439:8",
+      "name": "call",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/shared.rs:forced_recovery_tests.forced_recovery_does_not_require_retained_cache",
+      "name": "forced_recovery_does_not_require_retained_cache",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    }
+  ],
+  "affected_processes": [
+    {
+      "id": "proc_12_recovery_eval_live",
+      "name": "Recovery_eval_live → Has_size_marker",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_13_recovery_eval_live",
+      "name": "Recovery_eval_live → Is_qwen35_family",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_14_recovery_eval_live",
+      "name": "Recovery_eval_live → Is_qwen36_family",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_15_recovery_eval_live",
+      "name": "Recovery_eval_live → ModelCapabilities",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_43_recovery_eval_live",
+      "name": "Recovery_eval_live → Apply_override",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_68_recovery_eval_live",
+      "name": "Recovery_eval_live → Is_local",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_69_recovery_eval_live",
+      "name": "Recovery_eval_live → Reserve_cap",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_70_recovery_eval_live",
+      "name": "Recovery_eval_live → Get_default_model",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_107_recovery_eval_live",
+      "name": "Recovery_eval_live → SwappableCoreConfig",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_108_recovery_eval_live",
+      "name": "Recovery_eval_live → MemoryConfig",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_186_context_reset_announ",
+      "name": "Context_reset_announcement_recovery_live → EvalState",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "context_reset_announcement_recovery_live",
+          "step": 1
+        },
+        {
+          "symbol": "eval_tool_test_state",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_187_eval_notes_must_comm",
+      "name": "Eval_notes_must_commit_before_one_reset_request → Invalid",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "execute",
+          "step": 2
+        },
+        {
+          "symbol": "eval_notes_must_commit_before_one_reset_request",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_188_eval_notes_must_comm",
+      "name": "Eval_notes_must_commit_before_one_reset_request → Page",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "execute",
+          "step": 2
+        },
+        {
+          "symbol": "eval_notes_must_commit_before_one_reset_request",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_294_context_reset_announ",
+      "name": "Context_reset_announcement_recovery_live → Has_size_marker",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "context_reset_announcement_recovery_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_295_context_reset_announ",
+      "name": "Context_reset_announcement_recovery_live → Is_qwen35_family",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "context_reset_announcement_recovery_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_296_context_reset_announ",
+      "name": "Context_reset_announcement_recovery_live → Is_qwen36_family",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "context_reset_announcement_recovery_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_297_context_reset_announ",
+      "name": "Context_reset_announcement_recovery_live → ModelCapabilities",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "context_reset_announcement_recovery_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_298_context_reset_announ",
+      "name": "Context_reset_announcement_recovery_live → Name",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "context_reset_announcement_recovery_live",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_320_context_reset_announ",
+      "name": "Context_reset_announcement_recovery_live → Apply_override",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "context_reset_announcement_recovery_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_334_context_reset_announ",
+      "name": "Context_reset_announcement_recovery_live → Is_local",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "context_reset_announcement_recovery_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_335_context_reset_announ",
+      "name": "Context_reset_announcement_recovery_live → Reserve_cap",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "context_reset_announcement_recovery_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_336_context_reset_announ",
+      "name": "Context_reset_announcement_recovery_live → Get_default_model",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "context_reset_announcement_recovery_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_517_maybe_recover_botche",
+      "name": "Maybe_recover_botched_tool_call → Name",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "maybe_recover_botched_tool_call",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_771_endurance_eval_live",
+      "name": "Endurance_eval_live → New",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "endurance_eval_live",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_773_endurance_eval_live",
+      "name": "Endurance_eval_live → Now",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "endurance_eval_live",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_774_endurance_reset_hand",
+      "name": "Endurance_reset_handoff_replay_live → Now",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "endurance_reset_handoff_replay_live",
+          "step": 1
+        }
+      ]
+    }
+  ]
+}

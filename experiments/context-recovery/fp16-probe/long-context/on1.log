@@ -1,0 +1,19 @@
+[persisted] target/bench-results/bench_frontier/890039d__Qwen3.6-35B-A3B-Escha-W2__20260905T185309Z-892.json
+      145.00 real        20.93 user        25.29 sys
+          9434218496  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              640784  page reclaims
+                  22  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                1938  voluntary context switches
+              397789  involuntary context switches
+        182312415963  instructions retired
+         91891715882  cycles elapsed
+         25423504936  peak memory footprint
