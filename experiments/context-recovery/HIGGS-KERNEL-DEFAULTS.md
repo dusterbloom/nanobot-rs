@@ -1,8 +1,11 @@
 # Higgs Escha W2 kernel-default audit
 
-Date: 2026-09-05  
-Source: `higgs` commit `327e5021ef957a7d6968f6780a7644f00b410a9e` plus the local candidate described below  
-Model: `EschaLabs/Qwen3.6-35B-A3B-Escha-W2`  
+Date: 2026-09-05
+
+Source: `higgs` commit `327e5021ef957a7d6968f6780a7644f00b410a9e` plus the local candidate described below
+
+Model: `EschaLabs/Qwen3.6-35B-A3B-Escha-W2`
+
 Host: Apple M4, 32 GiB, Darwin 27, release profile
 
 ## Decision

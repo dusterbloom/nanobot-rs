@@ -1,6 +1,12 @@
 # Higgs allocation repair — verification record
 
-Status: release validation complete; fixes installed and pushed to fork nightly; live/endurance verification in progress.
+Status (2026-09-05): Higgs core fixes `890039d7f` are installed and pushed. Local nightly additionally includes cache-label correction `78da18f13`; its public push awaits explicit destination approval after automatic review rejected it. Installed Higgs SHA-256 starts `e7a811f1`; installed nanobot includes both replay/pending repairs (`5d4a680`, SHA-256 starts `8503b965`). Full release validation passed. Experiment harness/evidence are committed as `6e6642d`.
+
+The quick FP16 experiments passed bounded numerical checks. FP16 KV alone regressed speed because FP32 queries promote KV inside MLX attention. FP16 Q/K/V attention instead showed a warm-repeat decode improvement of 9.8–19.4%, with identical 129-token greedy continuation and a 1.6% lower process peak. This isolated candidate is not installed; long-context quality and HTTP retained-cache behavior remain unvalidated.
+
+The final frozen-input, per-arm-profile-isolated endurance run finished: A 4/4 correct submitted updates, B 5/5; both then suspended with durable pending input. Neither completed 20 updates or three recovery boundaries. See `ENDURANCE-FINAL-ISOLATED.md`. Prior runs below are historical diagnostics, not a passing strategy comparison. Shared persisted learning plus pressure classification and upward hysteresis explained earlier startup variation; see `STARTUP-CAPACITY-DIAGNOSIS.md`.
+
+## Historical verification record
 
 Source: isolated `fix/capacity-runtime-integration`, based on `327e5021e`.
 Local nightly has already fast-forwarded to the 30 existing hardening commits at that base.
@@ -102,3 +108,15 @@ The frozen final run again failed the 12K startup prerequisite (fresh safe total
 Native cache metadata correction committed locally to nightly as `78da18f13` after 770 server tests and release build passed. Installed/worktree baseline SHA-256 `e7a811f1dec325741d4a5d69fa91fcdd93a9f9b0d4040a325f7056d72feec7c7`. This describes observed FP32 storage; it does not establish that Escha inherently requires FP32. Public push was rejected twice by automatic approval review despite verifying public fork/admin access; explicit destination approval requested. Remote remains890039d7f until approved.
 
 User requested a fast FP16 feasibility experiment. An isolated candidate will store only dense KV in FP16 and restore views to activation dtype before attention; weights and GDN state remain unchanged. No candidate precision change is installed. Shared build/GPU window handed to kernel_defaults; frozen per-arm-isolated endurance waits for this experiment.
+
+FP16 feasibility interim evidence: direct mixed-dtype SDPA is accepted, but MLX internally promotes K/V to FP32 for FP32 queries. At 1,024/2,048 tokens, actual retained bytes fall by20,971,520/41,943,040 exactly; both greedy digests match. Peak process footprint is essentially unchanged. Initial apparent speedup reversed against a later warmed FP32 control; a final ON repeat and tiny logit check are pending before timing conclusions. This remains an isolated experiment, not an installed precision change.
+
+## Completed FP16 feasibility probe
+
+Both variants passed real-model short-fixture checks with exact 129-token greedy agreement. KV-only FP16 retained 20,480 rather than 40,960 variable bytes/token, but averaged 15.5–18.6% slower decode because MLX promoted K/V for FP32 queries. True FP16 Q/K/V attention restored the output to the original activation dtype and avoided that promotion: the repeat ON run decoded 19.4% faster at 1K and 9.8% faster at 2K than its same-binary OFF control. Prefill was 0.2%/9.6% faster in that repeat; the first ON run had a substantial 1K first-use penalty. Peak process footprint fell from 19.514 to 19.197 GB (1.62%), not by half. Maximum short-fixture logit drift was 0.003558.
+
+These are bounded feasibility results from one ON/OFF/ON sequence, not a production speed guarantee. Packed W2 weights, GDN/recurrent state and the surrounding residual stream were unchanged. DenseMTP, batching, long-context quality and full HTTP cache restoration remain unvalidated. Installed binaries are unchanged. Full commands, hashes, numerical evidence and candidate patches: [fp16-probe/README.md](fp16-probe/README.md).
+
+## Restored service
+
+After all experiments, tmux `recovery-higgs:0.0` runs installed `/Users/peppi/.local/bin/higgs` (PID41674, boot `29551c1f-4b1c-4166-8b85-40dd60433b99`). `lsof` confirms installed executable and adjacent `mlx.metallib`; all recorded hashes still match. Process environment contains no Higgs kernel/precision overrides. Startup resolves auto→throughput, scratch prefill, native Escha, 1,024-token chunks and 40,960 baseline KV bytes/token. The metrics endpoint is live.

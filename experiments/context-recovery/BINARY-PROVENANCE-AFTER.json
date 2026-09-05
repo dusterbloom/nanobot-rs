@@ -7,5 +7,21 @@
     "/private/tmp/higgs-recovery/higgs-hardened": "e7a811f1dec325741d4a5d69fa91fcdd93a9f9b0d4040a325f7056d72feec7c7"
   },
   "nanobot_commit": "5d4a680",
-  "higgs_remote_nightly": "890039d7f (78da18f13 push awaiting explicit public-destination approval)"
+  "higgs_remote_nightly": "890039d7f (78da18f13 push awaiting explicit public-destination approval)",
+  "restored_service": {
+    "pid": 41674,
+    "boot_id": "29551c1f-4b1c-4166-8b85-40dd60433b99",
+    "tmux": "recovery-higgs:0.0",
+    "executable": [
+      "/Users/peppi/Dev/higgs",
+      "/Users/peppi/.local/bin/higgs",
+      "/Users/peppi/.local/bin/mlx.metallib"
+    ],
+    "requested_profile": "auto",
+    "effective_profile": "throughput",
+    "prefill_kernel": "scratch_matmul",
+    "execution_mode": "simple:eschamoe-native",
+    "persistent_cache_bytes_per_token": 40960,
+    "log": "/private/tmp/higgs-final-default.log"
+  }
 }

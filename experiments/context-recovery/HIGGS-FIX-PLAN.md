@@ -13,8 +13,8 @@ Constraints: release builds/tests only; persistent jobs in tmux; impact checks b
 - [x] Wire serialized prefill/decode observations and completion into capacity learning, preserving cancellation ownership and dirty-request exclusion.
 - [x] Export raw pressure, cumulative VM activity, measurement freshness and allocator cached bytes alongside existing effective pressure.
 - [x] Verify prefill/decode ENV selections: real-model QGEMM was 34.48% slower, so preserve scratch default; native QMV decode and established safe defaults remain. Numerical/regression tests pass; raw benchmark artifacts saved.
-- [ ] Run release regression/build checks and real request/long-session validation, recording hashes, source revision, kernel choices and synchronized telemetry.
-- [ ] Review graph changes, integrate all hardened commits plus fixes into nightly, build/install matching executable and Metal library, restart tmux service and verify active process provenance.
+- [x] Run release regression/build checks and real request/long-session validation, recording hashes, source revision, kernel choices and synchronized telemetry. Endurance outcome is capacity suspension, not a 20-update pass.
+- [x] Review graph changes, integrate all hardened commits plus fixes into local nightly, build/install matching executable and Metal library, restart tmux service and verify active process provenance. Public metadata follow-up remains separately approval-blocked.
 
 Ownership: parent handles estimator, allocator snapshots, integration/provenance and live validation; kernel_defaults handles Escha kernel selection; live_learning handles engine receipts/registry/retention diagnostics; pressure_telemetry handles pressure observation and diagnostic types. Shared-file changes are coordinated explicitly.
 
@@ -31,3 +31,14 @@ Installed and pushed nightly `890039d7f`; complete release suites and real-model
 - [x] Fix repeated CapacityExceeded recovery reporting saved pending work without writing a pending record; share the existing persistence path, add a regression proving durable pending bytes, release-validate and include in nanobot installation.
 
 Nanobot core repairs committed `5d4a680`, full library2,951pass/buildpass, installed exact release hash8503b965…. Post-fix live endurance remains in progress; do not mark overall endurance complete from unit tests.
+
+## Current follow-up checklist (2026-09-05)
+
+- [x] Release suites/builds, core graph review, local nightly integration and installed executable/Metal-library identity verified.
+- [x] Push core Higgs fixes `890039d7f` to fork/nightly.
+- [x] Install cache-label follow-up `78da18f13`; no precision change.
+- [ ] Push `78da18f13` after explicit public-destination approval (automatic review blocked it).
+- [x] Commit corrected endurance driver and frozen fixture (`6e6642d`); isolate learning profiles per arm.
+- [x] Run bounded FP16 KV-only and true FP16 attention probes; preserve baseline installation.
+- [x] Finish frozen/profile-isolated endurance and record coverage honestly: A 4/4 correct, B 5/5; capacity suspension prevents the planned 20 updates / three boundaries.
+- [x] Restore installed no-override Higgs service after live trials and verify running provenance: PID 41674, boot `29551c1f-4b1c-4166-8b85-40dd60433b99`, executable/Metal mappings and hashes match, no Higgs overrides.

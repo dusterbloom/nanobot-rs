@@ -88,10 +88,12 @@ profile persistence within an arm while preventing evidence from crossing arms.
 
 ## Profile-key label
 
-The key says `kvRepresentation: "fp16"` because it describes the configured KV
+The diagnosed pre-correction key said `kvRepresentation: "fp16"` because it described the configured KV
 mode. Native Escha execution actually promotes K/V storage and is charged at
 40,960 bytes per token. This label is semantically stale, but it did not cause
 this reuse: `executionMode`, the resolved runtime settings fingerprint, and the
 Higgs executable build identity also participate in exact profile compatibility.
 It remains a naming and future key-collision risk if runtime KV behavior changes
 without changing any of those identity fields.
+
+Local nightly `78da18f13` corrects the native Escha key label to `fp32`, matching actual baseline storage. A release regression verifies that metadata. The isolated FP16 experiments do not change the installed baseline or this diagnosis.

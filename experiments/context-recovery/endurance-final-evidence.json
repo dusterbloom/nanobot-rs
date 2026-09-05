@@ -1,0 +1,245 @@
+{
+  "provenance": {
+    "updates": 20,
+    "context_ceiling": 12288,
+    "minutes_per_arm": 45,
+    "arms": "A,B",
+    "policy": "decision",
+    "higgs_config": "[server]\nhost = \"127.0.0.1\"\nport = 9000\napi_key = \"higgs\"\nmax_tokens = 8192\n\n[local]\nallow_runtime_model_load = true\nraise_wired_limit = true\n\n[[models]]\npath = \"/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2\"\nname = \"escha-35b-a3b\"\ngeneration_defaults = { max_tokens = 8192, temperature = 0.0, top_p = 0.95, top_k = 20, min_p = 0.05, speculation = \"auto\", enable_thinking = false }\nkv_max_sessions = 1\ndisk_cache_enabled = true\nkv_max_session_tokens = 16384\n# Native FP32 KV + GDN needs 736,952,320 bytes at 16,384 slots.\n# Keep the byte ceiling above that geometry so the 16K experiment tests\n# context decisions rather than an unintended 11,264-token retention cliff.\nkv_max_retained_bytes = 805306368\nkv_cache_bytes = 134217728\n",
+    "arm_servers": {
+      "A": {
+        "config": "/Users/peppi/Dev/nanobot-rs/experiments/context-recovery/endurance-final-isolated/server-A/higgs-endurance.toml",
+        "capacity_profile_dir": "/Users/peppi/Dev/nanobot-rs/experiments/context-recovery/endurance-final-isolated/server-A/capacity"
+      },
+      "B": {
+        "config": "/Users/peppi/Dev/nanobot-rs/experiments/context-recovery/endurance-final-isolated/server-B/higgs-endurance.toml",
+        "capacity_profile_dir": "/Users/peppi/Dev/nanobot-rs/experiments/context-recovery/endurance-final-isolated/server-B/capacity"
+      }
+    },
+    "nanobot_head": "6e6642d29415b1feec76b13cdc38bd0ba871d749",
+    "sha256": {
+      "target/release/deps/nanobot-67848bc0f9b02956": "c2fac6cbe316eae4b631e37b00295a189266f03a2258477a2486995a59fe0ae2",
+      "/private/tmp/higgs-recovery/higgs-hardened": "e7a811f1dec325741d4a5d69fa91fcdd93a9f9b0d4040a325f7056d72feec7c7",
+      "src/agent/agent_loop/recovery_eval.rs": "5b7e979e5923b20ecca4f97345289e2e07272c32c5e42b6492b7fba96a478daa",
+      "src/agent/agent_loop/endurance_eval.rs": "300903ca1a8bc567d77c02007d565e5bc71409247b116fe13016e6d49a2c570d"
+    }
+  },
+  "summaries": [
+    {
+      "arm": "A",
+      "completed_updates": 4,
+      "context_ceiling": 12288,
+      "correct_updates": 4,
+      "deadline_cancelled": false,
+      "forbidden_actions": 0,
+      "pass": false,
+      "policy": "decision",
+      "requested_updates": 20,
+      "seconds": 167.214278375,
+      "source_estimated_tokens": 34028,
+      "submission_violations": 0,
+      "turns": [
+        {
+          "completed_compactions": 0,
+          "initial_estimated_tokens": 3605,
+          "outcome": "Finished",
+          "response": "Context decision: continue. The snapshot for revision 0 has been submitted with diagnostic code D-47762e2e62293c57 extracted from the verified diagnostic line. Remaining estimated capacity (~1843 tokens) is sufficient to await the next update without needing retrieval or checkpoint/reset at this time.",
+          "seconds": 49.615470417,
+          "session_id": "20260905_175524_e34878"
+        },
+        {
+          "completed_compactions": 0,
+          "initial_estimated_tokens": 5641,
+          "outcome": "Finished",
+          "response": "Context decision: continue. Revision 1 snapshot submitted with diagnostic code D-5e886b6860b8b7a4. Only `branch` and `owner` changed from revision 0; all other fields preserved. Remaining estimated capacity (~3897 tokens) is sufficient for the next update.",
+          "seconds": 31.636439625,
+          "session_id": "20260905_175524_e34878"
+        },
+        {
+          "completed_compactions": 1,
+          "initial_estimated_tokens": 7681,
+          "outcome": "Finished",
+          "response": "Context decision: continue. The snapshot for revision 2 has been submitted with diagnostic code D-39bec4e4e0de2f7f extracted from the verified diagnostic line; only `branch`, `owner`, and `diagnostic_code` changed from revision 1, so no reset is needed.",
+          "seconds": 55.7257,
+          "session_id": "20260905_175524_e34878"
+        },
+        {
+          "completed_compactions": 1,
+          "initial_estimated_tokens": 4107,
+          "outcome": "Finished",
+          "response": "Context decision: continue. The snapshot for revision 3 has been submitted with diagnostic code D-4056fe02915122b9 extracted from the verified diagnostic line; only `checksum` and `diagnostic_code` changed from revision 2, so no reset is needed.",
+          "seconds": 29.866154542,
+          "session_id": "20260905_175524_e34878"
+        },
+        {
+          "completed_compactions": 1,
+          "initial_estimated_tokens": 6111,
+          "outcome": "CapacityUnavailable",
+          "response": "[Capacity Unavailable] The live capacity window shrank; this turn is saved as pending work.",
+          "seconds": 0.186335625,
+          "session_id": "20260905_175524_e34878"
+        }
+      ],
+      "voluntary_resets": 0,
+      "artifact_pass": false,
+      "pending_capacity_turns": 1,
+      "control_tool_calls": {
+        "context_status": 4,
+        "notes": 0,
+        "new_context": 0,
+        "history": 0,
+        "recall": 0,
+        "lcm_expand": 0
+      },
+      "submissions_with_post_submit_inspection": 4,
+      "source_tokens_scope": "entire planned stream; not necessarily all delivered",
+      "actual_output_reservations": [
+        2048,
+        6144
+      ],
+      "submission_attempts": 4,
+      "forbidden_attempts": 0,
+      "compaction_attempts": 0,
+      "completed_compactions": 1,
+      "tool_errors": 0,
+      "model_requests": 15,
+      "logical_input_tokens": 66048,
+      "output_tokens": 859,
+      "wire_errors": [],
+      "reset_events": [],
+      "repeated_boundary_coverage": false,
+      "first_wrong_revision": null,
+      "peak_actual_prompt_tokens": 8849,
+      "delivered_update_bytes": 0,
+      "delivered_tool_bytes": 1107,
+      "delivered_tool_estimated_window_equivalents": 0.02252197265625,
+      "delivered_update_estimated_window_equivalents": 0.0,
+      "snapshots_per_minute": 1.4352841296349614,
+      "source_window_equivalents": 2.7692057291666665,
+      "resets_below_quarter_estimated_budget": 0,
+      "telemetry_errors": 0,
+      "observed_boot_ids": [
+        "d69edcf5-c859-41b2-9534-1e5cd40ada7d"
+      ],
+      "minimum_server_prompt_capacity": 5120,
+      "maximum_mlx_active_bytes": 14510782276,
+      "observed_downshifts": 1,
+      "valid_measurement": true,
+      "process_exit": 0,
+      "watchdog_terminated": false,
+      "unexpected_server_restart": false
+    },
+    {
+      "arm": "B",
+      "completed_updates": 5,
+      "context_ceiling": 12288,
+      "correct_updates": 5,
+      "deadline_cancelled": false,
+      "forbidden_actions": 0,
+      "pass": false,
+      "policy": "decision",
+      "requested_updates": 20,
+      "seconds": 236.707741041,
+      "source_estimated_tokens": 34028,
+      "submission_violations": 0,
+      "turns": [
+        {
+          "completed_compactions": 0,
+          "initial_estimated_tokens": 3812,
+          "outcome": "Finished",
+          "response": "Context decision: continue. The current snapshot has been recorded and context usage is well within budget (~1627 tokens remaining). No checkpoint or reset needed at this time.",
+          "seconds": 48.238221666,
+          "session_id": "20260905_175833_a69870"
+        },
+        {
+          "completed_compactions": 0,
+          "initial_estimated_tokens": 5821,
+          "outcome": "Finished",
+          "response": "Context decision: continue. The snapshot for revision 1 has been recorded and context usage remains well within budget (~3708 tokens remaining). No checkpoint or reset needed at this time.",
+          "seconds": 28.632481542,
+          "session_id": "20260905_175833_a69870"
+        },
+        {
+          "completed_compactions": 0,
+          "initial_estimated_tokens": 7835,
+          "outcome": "Finished",
+          "response": "Context decision: continue. The snapshot for revision 2 has been recorded and context usage remains within budget (~1694 tokens remaining). No checkpoint or reset needed at this time.",
+          "seconds": 29.563872083,
+          "session_id": "20260905_175833_a69870"
+        },
+        {
+          "completed_compactions": 1,
+          "initial_estimated_tokens": 9836,
+          "outcome": "Finished",
+          "response": "Context decision: continue. The remaining token budget is low but sufficient for the next update; I will monitor capacity and checkpoint/reset if needed before hitting limits.",
+          "seconds": 102.831607875,
+          "session_id": "20260905_175833_a69870"
+        },
+        {
+          "completed_compactions": 1,
+          "initial_estimated_tokens": 4098,
+          "outcome": "Finished",
+          "response": "Context decision: continue. The remaining token budget is healthy (~2362 tokens), so I can safely process the next update without checkpointing or resetting.",
+          "seconds": 27.075109333,
+          "session_id": "20260905_175833_a69870"
+        },
+        {
+          "completed_compactions": 1,
+          "initial_estimated_tokens": 6079,
+          "outcome": "CapacityUnavailable",
+          "response": "[Capacity Unavailable] The live capacity window shrank; this turn is saved as pending work.",
+          "seconds": 0.175619,
+          "session_id": "20260905_175833_a69870"
+        }
+      ],
+      "voluntary_resets": 0,
+      "artifact_pass": false,
+      "pending_capacity_turns": 1,
+      "control_tool_calls": {
+        "context_status": 5,
+        "notes": 0,
+        "new_context": 0,
+        "history": 0,
+        "recall": 0,
+        "lcm_expand": 0
+      },
+      "submissions_with_post_submit_inspection": 5,
+      "source_tokens_scope": "entire planned stream; not necessarily all delivered",
+      "actual_output_reservations": [
+        2048,
+        6144
+      ],
+      "submission_attempts": 5,
+      "forbidden_attempts": 0,
+      "compaction_attempts": 0,
+      "completed_compactions": 1,
+      "tool_errors": 0,
+      "model_requests": 18,
+      "logical_input_tokens": 94793,
+      "output_tokens": 842,
+      "wire_errors": [],
+      "reset_events": [],
+      "repeated_boundary_coverage": false,
+      "first_wrong_revision": null,
+      "peak_actual_prompt_tokens": 9200,
+      "delivered_update_bytes": 0,
+      "delivered_tool_bytes": 1384,
+      "delivered_tool_estimated_window_equivalents": 0.028157552083333332,
+      "delivered_update_estimated_window_equivalents": 0.0,
+      "snapshots_per_minute": 1.267385674336849,
+      "source_window_equivalents": 2.7692057291666665,
+      "resets_below_quarter_estimated_budget": 0,
+      "telemetry_errors": 0,
+      "observed_boot_ids": [
+        "46996241-0abd-46a7-869a-446a66c883de"
+      ],
+      "minimum_server_prompt_capacity": 5120,
+      "maximum_mlx_active_bytes": 14903002020,
+      "observed_downshifts": 2,
+      "valid_measurement": true,
+      "process_exit": 0,
+      "watchdog_terminated": false,
+      "unexpected_server_restart": false
+    }
+  ]
+}

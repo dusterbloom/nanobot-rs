@@ -1,0 +1,22 @@
+[persisted] target/bench-results/bench_frontier/890039d__Qwen3.6-35B-A3B-Escha-W2__20260905T173244Z-011.json
+       30.35 real         4.02 user        12.44 sys
+          7887978496  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              639933  page reclaims
+                 398  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 964  voluntary context switches
+              150887  involuntary context switches
+         54638978859  instructions retired
+         32620669474  cycles elapsed
+         19432957720  peak memory footprint
+547131b279c8dc348f2a6ffb32a7b8eb72efa4b2921657eab1fe7b78c7429664  /private/tmp/higgs-fp16-artifacts/bench_frontier-fp16
+eb9ea6166cdc47df183db73cb4821bbeac35dc25001485c7b655c903dfe933c4  -
+__FP16_BENCH_EXIT__ 0

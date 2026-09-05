@@ -1,0 +1,151 @@
+{
+  "summary": {
+    "changed_count": 20,
+    "affected_count": 0,
+    "changed_files": 38,
+    "risk_level": "low"
+  },
+  "changed_symbols": [
+    {
+      "id": "Section:AGENTS.md:L109:GitNexus — Code Intelligence",
+      "name": "GitNexus — Code Intelligence",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L115:Always Do",
+      "name": "Always Do",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L125:Never Do",
+      "name": "Never Do",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L132:Resources",
+      "name": "Resources",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L141:CLI",
+      "name": "CLI",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L159:GitNexus — Code Intelligence",
+      "name": "GitNexus — Code Intelligence",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L165:Always Do",
+      "name": "Always Do",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L175:Never Do",
+      "name": "Never Do",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L182:Resources",
+      "name": "Resources",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L191:CLI",
+      "name": "CLI",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:PLAN.md:L1:Current Plan — v0.5 \"Persistent Local Agent\"",
+      "name": "Current Plan — v0.5 \"Persistent Local Agent\"",
+      "type": "Section",
+      "filePath": "PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:PLAN.md:L3:Active follow-up",
+      "name": "Active follow-up",
+      "type": "Section",
+      "filePath": "PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-PLAN.md:L1:Higgs allocation and runtime-default repair plan",
+      "name": "Higgs allocation and runtime-default repair plan",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-PLAN.md:L27:End-to-end regression discovered after installation",
+      "name": "End-to-end regression discovered after installation",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L1:Higgs allocation repair — verification record",
+      "name": "Higgs allocation repair — verification record",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L8:Changes",
+      "name": "Changes",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md:L1:Higgs Escha W2 kernel-default audit",
+      "name": "Higgs Escha W2 kernel-default audit",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md:L8:Decision",
+      "name": "Decision",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md:L1:Startup capacity diagnosis",
+      "name": "Startup capacity diagnosis",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md:L89:Profile-key label",
+      "name": "Profile-key label",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md",
+      "change_type": "touched"
+    }
+  ],
+  "affected_processes": []
+}

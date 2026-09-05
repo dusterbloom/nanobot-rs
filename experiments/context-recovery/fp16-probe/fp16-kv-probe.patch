@@ -1,0 +1,138 @@
+diff --git a/crates/higgs-models/src/cache.rs b/crates/higgs-models/src/cache.rs
+index f65028bdf..2c1e2f18b 100644
+--- a/crates/higgs-models/src/cache.rs
++++ b/crates/higgs-models/src/cache.rs
+@@ -31,6 +31,12 @@ pub enum KvCacheView {
+ 
+ static TURBOQUANT_ACTIVATE_AT: OnceLock<i32> = OnceLock::new();
+ static TURBOQUANT_INACTIVE_LOGGED: AtomicBool = AtomicBool::new(false);
++static FP16_KV_PROBE_ENABLED: OnceLock<bool> = OnceLock::new();
++
++fn fp16_kv_probe_enabled() -> bool {
++    *FP16_KV_PROBE_ENABLED
++        .get_or_init(|| std::env::var("HIGGS_FP16_KV_PROBE").is_ok_and(|value| value == "1"))
++}
+ 
+ /// KV token count at which TurboQuant quantization activates for decode.
+ ///
+@@ -1055,6 +1061,20 @@ impl SteppingKeyValueCache {
+         let prev = self.offset;
+         let k_shape = keys.shape();
+         let v_shape = values.shape();
++        // Diagnostic-only FP16-KV feasibility probe: only newly-created dense
++        // caches change storage dtype, while restored caches retain their
++        // serialized dtype. MLX 0.31 accepts native Escha's FP32 queries with
++        // FP16 K/V, but promotes K/V to FP32 inside SDPA. The matched real-model
++        // benchmark must therefore account for that transient conversion.
++        let probe_dtype = fp16_kv_probe_enabled().then_some(Dtype::Float16);
++        let key_storage_dtype = self
++            .keys
++            .as_ref()
++            .map_or_else(|| probe_dtype.unwrap_or(keys.dtype()), Array::dtype);
++        let value_storage_dtype = self
++            .values
++            .as_ref()
++            .map_or_else(|| probe_dtype.unwrap_or(values.dtype()), Array::dtype);
+         let dim = |s: &[i32], i: usize, label: &'static str| -> Result<i32, Exception> {
+             s.get(i).copied().ok_or_else(|| {
+                 Exception::custom(format!("update_dense: missing dim {i} ({label})"))
+@@ -1088,19 +1108,26 @@ impl SteppingKeyValueCache {
+                         Exception::custom("trimmed dense key cache has no token axis")
+                     })?;
+                     let new_slots = target_capacity - retained_capacity;
+-                    let new_k =
+-                        ops::zeros_dtype(&[b, n_kv_heads, new_slots, k_head_dim], keys.dtype())?;
+-                    let new_v =
+-                        ops::zeros_dtype(&[b, n_kv_heads, new_slots, v_head_dim], values.dtype())?;
++                    let new_k = ops::zeros_dtype(
++                        &[b, n_kv_heads, new_slots, k_head_dim],
++                        key_storage_dtype,
++                    )?;
++                    let new_v = ops::zeros_dtype(
++                        &[b, n_kv_heads, new_slots, v_head_dim],
++                        value_storage_dtype,
++                    )?;
+                     let cat_k = concatenate_axis(&[trimmed_k, new_k], 2)?;
+                     let cat_v = concatenate_axis(&[trimmed_v, new_v], 2)?;
+                     (cat_k, cat_v)
+                 }
+                 _ => (
+-                    ops::zeros_dtype(&[b, n_kv_heads, target_capacity, k_head_dim], keys.dtype())?,
++                    ops::zeros_dtype(
++                        &[b, n_kv_heads, target_capacity, k_head_dim],
++                        key_storage_dtype,
++                    )?,
+                     ops::zeros_dtype(
+                         &[b, n_kv_heads, target_capacity, v_head_dim],
+-                        values.dtype(),
++                        value_storage_dtype,
+                     )?,
+                 ),
+             };
+@@ -1117,8 +1144,10 @@ impl SteppingKeyValueCache {
+             .as_ref()
+             .ok_or_else(|| Exception::custom("Values cannot be None after grow"))?;
+ 
+-        let updated_k = slice_update_axis2(k, keys, prev, new_tokens)?;
+-        let updated_v = slice_update_axis2(v, values, prev, new_tokens)?;
++        let stored_keys = keys.as_dtype(key_storage_dtype)?;
++        let stored_values = values.as_dtype(value_storage_dtype)?;
++        let updated_k = slice_update_axis2(k, &stored_keys, prev, new_tokens)?;
++        let updated_v = slice_update_axis2(v, &stored_values, prev, new_tokens)?;
+         self.keys = Some(updated_k);
+         self.values = Some(updated_v);
+ 
+@@ -2345,6 +2374,53 @@ mod tests {
+         assert_eq!(dense_growth_capacity(0, 983, 256).unwrap(), 1_024);
+     }
+ 
++    #[test]
++    fn fp16_probe_stores_and_returns_fp16() {
++        assert!(
++            fp16_kv_probe_enabled(),
++            "run this diagnostic with HIGGS_FP16_KV_PROBE=1"
++        );
++        let _exec = crate::mlx_exec::acquire();
++        let mut cache = SteppingKeyValueCache::new();
++        let values = (0..3 * 4)
++            .map(|index| (index as f32 * 0.031_25).sin())
++            .collect::<Vec<_>>();
++        let appended = Array::from_slice(&values, &[1, 1, 3, 4]);
++
++        let view = cache
++            .update_and_view(appended.clone(), appended.clone())
++            .unwrap();
++        let (view_keys, view_values) = view.into_dense().unwrap();
++        assert_eq!(cache.keys().unwrap().dtype(), Dtype::Float16);
++        assert_eq!(cache.values().unwrap().dtype(), Dtype::Float16);
++        assert_eq!(view_keys.dtype(), Dtype::Float16);
++        assert_eq!(view_values.dtype(), Dtype::Float16);
++        assert_eq!(cache.estimated_bytes(), 2 * 256 * 4 * 2);
++
++        let continued = Array::from_slice(&[0.5_f32, -0.5, 0.25, -0.25], &[1, 1, 1, 4]);
++        let view = cache
++            .update_and_view(continued.clone(), continued.clone())
++            .unwrap();
++        let (view_keys, view_values) = view.into_dense().unwrap();
++        mlx_rs::transforms::eval([&view_keys, &view_values]).unwrap();
++        assert_eq!(cache.offset(), 4);
++        assert_eq!(view_keys.shape(), &[1, 1, 4, 4]);
++        assert_eq!(view_values.shape(), &[1, 1, 4, 4]);
++        assert_eq!(view_keys.dtype(), Dtype::Float16);
++        assert_eq!(view_values.dtype(), Dtype::Float16);
++        let expected = appended
++            .as_dtype(Dtype::Float16)
++            .unwrap()
++            .as_dtype(Dtype::Float32)
++            .unwrap();
++        let stored_prefix = slice_axis2(&view_keys, 0, 3)
++            .unwrap()
++            .as_dtype(Dtype::Float32)
++            .unwrap();
++        mlx_rs::transforms::eval([&expected, &stored_prefix]).unwrap();
++        assert_eq!(stored_prefix.as_slice::<f32>(), expected.as_slice::<f32>());
++    }
++
+     #[test]
+     fn compact_retained_dense_cache_regrows_to_absolute_step_boundary() {
+         let _exec = crate::mlx_exec::acquire();

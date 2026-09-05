@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "bench_name": "bench_frontier",
+    "bench_version": "1.0.1",
+    "higgs_version": null,
+    "git_commit": "890039d7f294d4a861f381bff03f4ab0396d7ed9",
+    "git_commit_short": "890039d",
+    "git_dirty": true,
+    "started_at": "2026-09-05T17:38:42.045617Z",
+    "duration_ms": 29795,
+    "host": {
+      "hostname": "redacted",
+      "os": "Darwin 27.0 (27.0.0)",
+      "cpu": "Apple M4",
+      "ram_gb": 32.0,
+      "gpu": "Apple Silicon (MLX)"
+    },
+    "mlx_version": null,
+    "model": {
+      "key": "Qwen3.6-35B-A3B-Escha-W2",
+      "path": "Qwen3.6-35B-A3B-Escha-W2",
+      "quantization": "local",
+      "approx_size_gb": 0.0
+    },
+    "args": [
+      "<local-path:bench_frontier-fp16>",
+      "--model-dir",
+      "<local-path:Qwen3.6-35B-A3B-Escha-W2>",
+      "--frontiers",
+      "1024,2048",
+      "--probe-tokens",
+      "32",
+      "--runs",
+      "1",
+      "--prefill-chunk-size",
+      "1024",
+      "--format",
+      "json"
+    ]
+  },
+  "params": {
+    "model_dir": "Qwen3.6-35B-A3B-Escha-W2",
+    "frontiers": [
+      1024,
+      2048
+    ],
+    "probe_tokens": 32,
+    "runs": 1,
+    "prefill_chunk_size": 1024,
+    "q2_simd_override": null,
+    "escha_trellis_gemm_override": null,
+    "verify_kv_analytic": false,
+    "expect_kv_bytes_per_token": null
+  },
+  "results": {
+    "rows": [
+      {
+        "run": 1,
+        "frontier": 1024,
+        "incremental_prefill_ms": 10044.116709,
+        "prefill_tokps": 101.95022914085096,
+        "probe_decode_tokps": 14.98169786976891,
+        "probe_output_digest_fnv1a64": 12792644362472167692,
+        "kv_bytes": 86835200,
+        "kv_bytes_per_token": 84800.0
+      },
+      {
+        "run": 1,
+        "frontier": 2048,
+        "incremental_prefill_ms": 7341.395666,
+        "prefill_tokps": 139.4830147545953,
+        "probe_decode_tokps": 15.366623143218149,
+        "probe_output_digest_fnv1a64": 7617371700643931454,
+        "kv_bytes": 107806720,
+        "kv_bytes_per_token": 52640.0
+      }
+    ],
+    "analytic_verified": null
+  }
+}
