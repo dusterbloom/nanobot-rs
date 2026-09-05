@@ -230,6 +230,173 @@ fn recovery_eval_boundary_checks() {
     assert!(!complete_batch(&[]));
 }
 
+fn eval_tool_test_state(dir: &Path) -> Arc<parking_lot::Mutex<EvalState>> {
+    Arc::new(parking_lot::Mutex::new(EvalState {
+        dir: dir.into(),
+        rows: vec![],
+        live: String::new(),
+        used: 0,
+        prompt_budget: 0,
+        last_actual_prompt: 0,
+        stream: None,
+        rollover: false,
+        actions: 0,
+        submissions: 0,
+    }))
+}
+
+#[tokio::test]
+async fn eval_notes_must_commit_before_one_reset_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = eval_tool_test_state(dir.path());
+    let checkpoint_written = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let notes = EvalTool {
+        mode: EvalMode::Endurance,
+        name: "notes",
+        state: state.clone(),
+        checkpoint_written: checkpoint_written.clone(),
+    };
+    let reset = EvalTool {
+        mode: EvalMode::Endurance,
+        name: "new_context",
+        state: state.clone(),
+        checkpoint_written,
+    };
+    let ctx = ToolContext::sandbox();
+
+    let empty = notes
+        .execute(
+            HashMap::from([
+                ("op".into(), json!("write")),
+                ("content".into(), json!("  \n")),
+            ]),
+            &ctx,
+        )
+        .await;
+    assert!(matches!(
+        empty,
+        Err(crate::errors::ToolError::InvalidArgs { .. })
+    ));
+    assert!(matches!(
+        reset.execute(HashMap::new(), &ctx).await,
+        Err(crate::errors::ToolError::InvalidArgs { .. })
+    ));
+    assert!(!state.lock().rollover);
+
+    notes
+        .execute(
+            HashMap::from([
+                ("op".into(), json!("write")),
+                ("content".into(), json!("durable checkpoint")),
+            ]),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("checkpoint.md")).unwrap(),
+        "durable checkpoint"
+    );
+    assert!(!dir.path().join("checkpoint.md.tmp").exists());
+    let first = reset.execute(HashMap::new(), &ctx).await.unwrap();
+    let repeated = reset.execute(HashMap::new(), &ctx).await.unwrap();
+    assert!(first.text.contains("requested_after_successful_tool_batch"));
+    assert!(repeated.text.contains("already_requested"));
+    assert!(state.lock().rollover);
+}
+
+#[tokio::test]
+async fn failed_eval_note_commit_does_not_enable_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = eval_tool_test_state(dir.path());
+    let checkpoint_written = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let notes = EvalTool {
+        mode: EvalMode::Endurance,
+        name: "notes",
+        state: state.clone(),
+        checkpoint_written: checkpoint_written.clone(),
+    };
+    let reset = EvalTool {
+        mode: EvalMode::Endurance,
+        name: "new_context",
+        state: state.clone(),
+        checkpoint_written,
+    };
+    let ctx = ToolContext::sandbox();
+
+    notes
+        .execute(
+            HashMap::from([
+                ("op".into(), json!("write")),
+                ("content".into(), json!("first durable checkpoint")),
+            ]),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    reset.execute(HashMap::new(), &ctx).await.unwrap();
+    assert!(state.lock().rollover);
+    std::fs::remove_file(dir.path().join("checkpoint.md")).unwrap();
+    std::fs::create_dir(dir.path().join("checkpoint.md")).unwrap();
+    assert!(matches!(
+        notes
+            .execute(
+                HashMap::from([
+                    ("op".into(), json!("write")),
+                    ("content".into(), json!("cannot rename over directory")),
+                ]),
+                &ctx,
+            )
+            .await,
+        Err(crate::errors::ToolError::Execution { .. })
+    ));
+    assert!(matches!(
+        reset.execute(HashMap::new(), &ctx).await,
+        Err(crate::errors::ToolError::InvalidArgs { .. })
+    ));
+    assert!(!state.lock().rollover);
+}
+
+#[tokio::test]
+async fn streamed_reset_recovery_failure_retracts_and_replaces_announcement() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = make_agent_configured(dir.path(), 12288, 12, Some(2048));
+    let message = crate::bus::events::InboundMessage::new(
+        "cli",
+        "user",
+        "reset-recovery-failure",
+        "Preserve the current task before resetting.",
+    );
+    let mut ctx = agent
+        .shared
+        .prepare_context(&message, None, None, None, None)
+        .await;
+    let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+    ctx.text_delta_tx = Some(delta_tx);
+    ctx.flow.content_was_streamed = true;
+    let failed = reset_recovery_failure(
+        &mut ctx,
+        LLMResponse {
+            content: Some("Context decision: checkpoint/reset.".into()),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Stop,
+            usage: HashMap::new(),
+        },
+        "the constrained retry returned an invalid call",
+    );
+
+    assert!(!ctx.flow.content_was_streamed);
+    assert_eq!(
+        delta_rx.try_recv().unwrap(),
+        crate::turn_stream::ControlMarker::RetractReply.encode()
+    );
+    assert!(delta_rx.try_recv().is_err());
+    assert!(failed
+        .content
+        .as_deref()
+        .is_some_and(|text| text.contains("was not executed")));
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EvalMode {
     Recovery,
@@ -240,6 +407,7 @@ struct EvalTool {
     mode: EvalMode,
     name: &'static str,
     state: Arc<parking_lot::Mutex<EvalState>>,
+    checkpoint_written: Arc<std::sync::atomic::AtomicBool>,
 }
 #[async_trait]
 impl Tool for EvalTool {
@@ -294,8 +462,20 @@ impl Tool for EvalTool {
             }
             "inspect_state" => json!({"observed":s.live}),
             "new_context" => {
-                s.rollover = true;
-                json!({"status":"requested_after_successful_tool_batch"})
+                if !self
+                    .checkpoint_written
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(invalid(
+                        "write a nonempty durable checkpoint with notes before requesting new_context",
+                    ));
+                }
+                if s.rollover {
+                    json!({"status":"already_requested_after_successful_tool_batch"})
+                } else {
+                    s.rollover = true;
+                    json!({"status":"requested_after_successful_tool_batch"})
+                }
             }
             "perform_action" => {
                 s.actions += 1;
@@ -304,14 +484,42 @@ impl Tool for EvalTool {
                 ));
             }
             "notes" if op == "write" => {
+                // A later failed replacement revokes this run's reset authority even
+                // when an older checkpoint remains readable on disk.
+                self.checkpoint_written
+                    .store(false, std::sync::atomic::Ordering::Release);
+                s.rollover = false;
                 let content = p
                     .get("content")
                     .and_then(Value::as_str)
                     .ok_or_else(|| invalid("content required"))?;
+                if content.trim().is_empty() {
+                    return Err(invalid("checkpoint content must not be empty"));
+                }
                 if content.chars().count() > 8000 {
                     return Err(invalid("checkpoint maximum 8000 characters"));
                 }
-                std::fs::write(s.dir.join("checkpoint.md"), content).unwrap();
+                let path = s.dir.join("checkpoint.md");
+                let temp = s.dir.join("checkpoint.md.tmp");
+                let committed = (|| -> std::io::Result<()> {
+                    let mut file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .truncate(true)
+                        .write(true)
+                        .open(&temp)?;
+                    file.write_all(content.as_bytes())?;
+                    file.sync_all()?;
+                    std::fs::rename(&temp, &path)?;
+                    std::fs::File::open(&s.dir)?.sync_all()
+                })();
+                if let Err(error) = committed {
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(crate::errors::ToolError::Execution {
+                        message: format!("Failed to save checkpoint: {error}"),
+                    });
+                }
+                self.checkpoint_written
+                    .store(true, std::sync::atomic::Ordering::Release);
                 json!({"saved":true})
             }
             "notes" if op == "read" => {
@@ -369,11 +577,20 @@ impl Tool for EvalTool {
 }
 
 fn make_agent(dir: &Path) -> AgentLoop {
-    make_agent_configured(dir, CEILING, 12)
+    make_agent_configured(dir, CEILING, 12, None)
 }
 
-fn make_agent_configured(dir: &Path, ceiling: usize, iterations: u32) -> AgentLoop {
+fn make_agent_configured(
+    dir: &Path,
+    ceiling: usize,
+    iterations: u32,
+    adaptive_long_form_min_tokens: Option<u32>,
+) -> AgentLoop {
     let endpoint = std::env::var("HIGGS_EVAL_URL").unwrap_or("http://127.0.0.1:9000/v1".into());
+    let mut adaptive_tokens = AdaptiveTokenConfig::default();
+    if let Some(min_tokens) = adaptive_long_form_min_tokens {
+        adaptive_tokens.adaptive_long_form_min_tokens = min_tokens;
+    }
     let provider = Arc::new(
         OpenAICompatProvider::new("higgs", Some(&endpoint), Some(MODEL))
             .with_higgs_session_cache(true)
@@ -418,7 +635,7 @@ fn make_agent_configured(dir: &Path, ceiling: usize, iterations: u32) -> AgentLo
         },
         tool_heartbeat_secs: 2,
         health_check_timeout_secs: 2,
-        adaptive_tokens: AdaptiveTokenConfig::default(),
+        adaptive_tokens,
         sessions_db_path: Some(dir.join("sessions.db")),
         code_execution: CodeExecutionConfig {
             enabled: false,
@@ -503,6 +720,7 @@ async fn run_turn(
         .shared
         .prepare_context(&msg, None, None, cancel, None)
         .await;
+    let checkpoint_written = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // Production request/tool/persistence phases run with an isolated registry;
     // no shell, network, messaging, or production workspace tools are exposed.
     let mode = if state.lock().stream.is_some() {
@@ -516,6 +734,7 @@ async fn run_turn(
             mode,
             name,
             state: state.clone(),
+            checkpoint_written: checkpoint_written.clone(),
         }));
     }
     if state.lock().stream.is_some() {
@@ -532,6 +751,7 @@ async fn run_turn(
                 mode,
                 name,
                 state: state.clone(),
+                checkpoint_written: checkpoint_written.clone(),
             }));
         }
     }
@@ -556,6 +776,7 @@ async fn run_turn(
             mode,
             name: "context_status",
             state: state.clone(),
+            checkpoint_written,
         }));
     }
     let instruction = if state.lock().stream.is_some() {
@@ -623,6 +844,220 @@ async fn run_turn(
     // normal background work and lets the next foreground turn preempt it; a voluntary reset retires the old context
     // so its deferred soft compaction has no consumer. Hard preflight is unchanged.
     json!({"seconds":started.elapsed().as_secs_f64(),"initial_estimated_tokens":initial_tokens,"session_id":session_id,"outcome":outcome,"completed_compactions":counters.lcm_compaction_count.load(std::sync::atomic::Ordering::Relaxed),"response":response.map(|r|r.content)})
+}
+
+#[tokio::test]
+#[ignore = "requires live Higgs; executes a recorded reset announcement and fresh-note recovery"]
+async fn context_reset_announcement_recovery_live() {
+    const CURRENT_TASK: &str = "Targeted obligation replay. Revision 4 was submitted successfully with snapshot: project=QUARTZ, branch=hotfix/q1, owner=Neri-1, checksum=7aF03-bC9x-00Q, receipt=rcpt_Q8n3_L04, payment_status=settled, export_status=pending, next_action=review_diff, execute=false, diagnostic_code=D-b3c501b29525acfb. Complete the announced checkpoint/reset without repeating the submission or any external action.";
+    const ANNOUNCEMENT: &str = "Context decision: checkpoint/reset. The estimated remaining capacity is 0 tokens, meaning the current context window is nearly full and there is no room to safely process further updates or perform a reliable next inspection. I will checkpoint the current snapshot (revision 4) with its diagnostic code and evidence pointers, then reset to preserve correctness on the next update.";
+    let dir = PathBuf::from(
+        std::env::var("RECOVERY_ANNOUNCEMENT_OUT").expect("set isolated RECOVERY_ANNOUNCEMENT_OUT"),
+    );
+    assert!(!dir.exists(), "refuse to overwrite recovery artifacts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let state = eval_tool_test_state(&dir);
+    let agent = make_agent_configured(&dir, 12288, 32, Some(2048));
+    let mut message = crate::bus::events::InboundMessage::new(
+        "cli",
+        "user",
+        "endurance:announcement:rev4",
+        CURRENT_TASK,
+    );
+    message
+        .metadata
+        .insert("session_key".into(), json!("endurance:announcement:rev4"));
+    let mut ctx = agent
+        .shared
+        .prepare_context(&message, None, None, None, None)
+        .await;
+    let checkpoint_written = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut registry = ToolRegistry::new();
+    for name in ["notes", "new_context"] {
+        registry.register(Box::new(EvalTool {
+            mode: EvalMode::Recovery,
+            name,
+            state: state.clone(),
+            checkpoint_written: checkpoint_written.clone(),
+        }));
+    }
+    ctx.tools = registry;
+    ctx.persist_pending_protocol_messages().await.unwrap();
+    ACTIVE.lock().insert(ctx.request_id.clone(), state.clone());
+    let mut messages = ctx.messages.to_vec();
+    let marker_message = messages
+        .first_mut()
+        .and_then(Value::as_object_mut)
+        .expect("prepared context starts with an object message");
+    marker_message.insert(
+        crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD.into(),
+        json!(991_u64),
+    );
+    marker_message.insert(
+        crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD.into(),
+        json!("require_continuation"),
+    );
+    let definitions = ctx.tools.get_definitions();
+    let announcement = LLMResponse {
+        content: Some(ANNOUNCEMENT.into()),
+        tool_calls: vec![],
+        finish_reason: FinishReason::Stop,
+        usage: HashMap::new(),
+    };
+    let recovered = match agent
+        .shared
+        .maybe_recover_botched_tool_call(
+            &mut ctx,
+            announcement,
+            &messages,
+            Some(&definitions),
+            2048,
+        )
+        .await
+    {
+        ForcedToolRecoveryOutcome::Response(response) => response,
+        ForcedToolRecoveryOutcome::ProviderError { error, .. } => panic!("{error}"),
+        ForcedToolRecoveryOutcome::PersistenceError(error) => panic!("{error}"),
+    };
+    let recovered_calls: Vec<_> = recovered
+        .tool_calls
+        .iter()
+        .map(|call| call.name.clone())
+        .collect();
+    let mut entered_tool_loop = false;
+    if let StepResult::Next(IterationPhase::Executing { response, routing }) = agent
+        .shared
+        .step_process_response(&mut ctx, recovered)
+        .await
+    {
+        entered_tool_loop = true;
+        let _ = agent
+            .shared
+            .step_execute_tools(&mut ctx, response, routing)
+            .await;
+        if boundary_ready(&ctx).await {
+            ctx.turn_outcome = TurnOutcome::Finished;
+        } else {
+            agent.shared.run_agent_loop(&mut ctx).await;
+        }
+    }
+    ACTIVE.lock().remove(&ctx.request_id);
+    let session_id = ctx.session_id.clone();
+    let outcome = format!("{:?}", ctx.turn_outcome);
+    let response = agent.shared.finalize_response(ctx).await;
+    let persisted = agent
+        .shared
+        .core_handle
+        .swappable()
+        .sessions
+        .get_all_messages(&session_id)
+        .await;
+    let replay = agent
+        .shared
+        .core_handle
+        .swappable()
+        .sessions
+        .load_session_replay(&session_id)
+        .await
+        .unwrap();
+    let replay_request = replay
+        .model_calls
+        .iter()
+        .find(|call| call.purpose == crate::session::db::ModelCallPurpose::ForcedToolRecovery)
+        .map(|call| {
+            serde_json::from_slice::<crate::session::db::RecordedProviderRequest>(&call.request)
+                .unwrap()
+        });
+    let replay_request_is_stateless = replay_request.as_ref().is_some_and(|request| {
+        request.messages.iter().all(|message| {
+            message
+                .get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD)
+                .is_none()
+                && message
+                    .get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD)
+                    .is_none()
+        })
+    });
+    let announcement_persisted = persisted
+        .iter()
+        .any(|row| row["role"] == "assistant" && row["content"] == ANNOUNCEMENT);
+    let instruction_persisted = persisted.iter().any(|row| {
+        row["role"] == "user"
+            && row["content"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("Execute your announced checkpoint/reset"))
+    });
+    let checkpoint = std::fs::read_to_string(dir.join("checkpoint.md")).ok();
+    let checkpoint_preserves_snapshot = checkpoint.as_deref().is_some_and(|text| {
+        [
+            "QUARTZ",
+            "hotfix/q1",
+            "Neri-1",
+            "7aF03-bC9x-00Q",
+            "rcpt_Q8n3_L04",
+            "settled",
+            "pending",
+            "review_diff",
+            "false",
+            "D-b3c501b29525acfb",
+        ]
+        .into_iter()
+        .all(|field| text.contains(field))
+    });
+    let actions_text = std::fs::read_to_string(dir.join("actions.jsonl")).unwrap_or_default();
+    let actions: Vec<Value> = actions_text
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let tool_sequence: Vec<_> = actions
+        .iter()
+        .filter_map(|row| row["tool"].as_str())
+        .collect();
+    let rollover = state.lock().rollover;
+    let boundary_pass = entered_tool_loop
+        && checkpoint_preserves_snapshot
+        && tool_sequence == ["notes", "new_context"]
+        && announcement_persisted
+        && instruction_persisted
+        && replay_request_is_stateless
+        && rollover
+        && outcome == "Finished";
+    state.lock().rollover = false;
+    let fresh_recovery = run_turn(
+        &agent,
+        "endurance:announcement:recovered",
+        "A fresh context window has started. Read the durable checkpoint with notes(op=read), then submit_result exactly once with result containing project, branch, owner, checksum, receipt, payment_status, export_status, next_action, execute, diagnostic_code. Do not write or replace notes and do not perform external actions.",
+        state.clone(),
+        RecoveryApproach::Notes,
+    )
+    .await;
+    let actual: Value = std::fs::read(dir.join("result.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or(Value::Null);
+    let expected = json!({"project":"QUARTZ","branch":"hotfix/q1","owner":"Neri-1","checksum":"7aF03-bC9x-00Q","receipt":"rcpt_Q8n3_L04","payment_status":"settled","export_status":"pending","next_action":"review_diff","execute":false,"diagnostic_code":"D-b3c501b29525acfb"});
+    let checkpoint_unchanged = checkpoint.as_deref().is_some_and(|saved| {
+        std::fs::read_to_string(dir.join("checkpoint.md"))
+            .ok()
+            .as_deref()
+            == Some(saved)
+    });
+    let fresh_session_id = fresh_recovery["session_id"].as_str();
+    let fresh_recovery_pass = fresh_session_id.is_some_and(|fresh| fresh != session_id)
+        && checkpoint_unchanged
+        && actual == expected
+        && state.lock().actions == 0
+        && state.lock().submissions == 1
+        && fresh_recovery["outcome"] == "Finished";
+    let pass = boundary_pass && fresh_recovery_pass;
+    let result = json!({"current_task":CURRENT_TASK,"recorded_announcement":ANNOUNCEMENT,"requested_higgs_session_id":991_u64,"requested_higgs_session_cache_policy":"require_continuation","replay_request_is_stateless":replay_request_is_stateless,"recovered_first_calls":recovered_calls,"boundary_tool_sequence":tool_sequence,"checkpoint":checkpoint,"checkpoint_preserves_snapshot":checkpoint_preserves_snapshot,"announcement_persisted":announcement_persisted,"instruction_persisted":instruction_persisted,"rollover":rollover,"boundary_session_id":session_id,"boundary_outcome":outcome,"boundary_response":response.map(|reply|reply.content),"boundary_pass":boundary_pass,"fresh_recovery":fresh_recovery,"fresh_result":actual,"expected":expected,"checkpoint_unchanged":checkpoint_unchanged,"fresh_recovery_pass":fresh_recovery_pass,"pass":pass});
+    std::fs::write(
+        dir.join("announcement-recovery.json"),
+        serde_json::to_vec_pretty(&result).unwrap(),
+    )
+    .unwrap();
+    eprintln!("ANNOUNCEMENT_RECOVERY_RESULT {result}");
+    assert!(pass, "recorded announcement recovery failed: {result}");
 }
 
 #[tokio::test]

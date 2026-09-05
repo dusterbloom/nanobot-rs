@@ -5028,11 +5028,20 @@ async fn retained_forced_recovery_error_retries_on_active_bounded_route() {
         );
         let calls = provider.foreground_calls();
         assert_eq!(calls.len(), 6);
-        for call in &calls[2..5] {
+        for call in &calls[2..4] {
             assert_eq!(
                 call.messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
                 json!(old_id)
             );
+        }
+        // Required-tool grammar decoding is stateless even while the ordinary
+        // calls around it retain the old route; call 5 is the fresh fallback.
+        for field in [
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD,
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD,
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD,
+        ] {
+            assert!(calls[4].messages[0].get(field).is_none());
         }
         assert_eq!(
             calls[5].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
@@ -5094,10 +5103,21 @@ async fn streamed_retained_recovery_failure_retracts_before_active_fallback() {
 
     let calls = provider.foreground_calls();
     assert_eq!(calls.len(), 6);
-    assert_eq!(
-        calls[4].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
-        json!(old_id)
-    );
+    for call in &calls[2..4] {
+        assert_eq!(
+            call.messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
+            json!(old_id)
+        );
+    }
+    // The constrained retry cannot resume a retained route; neighboring calls
+    // still prove the old route was active before the fresh fallback.
+    for field in [
+        crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD,
+        crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD,
+        crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD,
+    ] {
+        assert!(calls[4].messages[0].get(field).is_none());
+    }
     assert_eq!(
         calls[5].messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
         json!(fresh_id)

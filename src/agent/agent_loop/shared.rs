@@ -1702,6 +1702,105 @@ fn should_attempt_forced_recovery(
             || validation::has_raw_json_hallucinated_tool_call(content))
 }
 
+/// An explicit decision is an unexecuted intent, never a reset receipt. Only
+/// accept the decision at the start of the current response (not quoted history
+/// or examples), and only when both recovery tools are actually available.
+fn announces_context_reset(content: Option<&str>) -> bool {
+    content
+        .and_then(|text| {
+            text.trim_start()
+                .strip_prefix("Context decision: checkpoint/reset")
+        })
+        .is_some_and(|suffix| {
+            suffix.is_empty() || suffix.starts_with('.') || suffix.starts_with('\n')
+        })
+}
+
+fn context_reset_recovery_tools(
+    content: Option<&str>,
+    definitions: &[Value],
+) -> Option<Vec<Value>> {
+    if !announces_context_reset(content) {
+        return None;
+    }
+    let mut tools = ["notes", "new_context"]
+        .into_iter()
+        .map(|name| {
+            definitions
+                .iter()
+                .find(|d| d["function"]["name"] == name)
+                .cloned()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    // A recovery retry must save state, not merely read notes or re-submit a
+    // completed task. The reset tool remains responsible for save-before-reset.
+    let params = tools[0]["function"].get_mut("parameters")?;
+    if params["properties"]["op"].is_null() || params["properties"]["content"].is_null() {
+        return None;
+    }
+    params["properties"]["op"]
+        .as_object_mut()?
+        .insert("enum".into(), serde_json::json!(["write"]));
+    let required = params
+        .as_object_mut()?
+        .entry("required")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()?;
+    for field in ["op", "content"] {
+        if !required.iter().any(|value| value == field) {
+            required.push(serde_json::json!(field));
+        }
+    }
+    Some(tools)
+}
+
+fn reset_recovery_calls_valid(calls: &[crate::providers::base::ToolCallRequest]) -> bool {
+    !calls.is_empty()
+        && calls.iter().all(|call| match call.name.as_str() {
+            "new_context" => true,
+            "notes" => {
+                call.arguments.get("op").and_then(Value::as_str) == Some("write")
+                    && call
+                        .arguments
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.trim().is_empty())
+            }
+            _ => false,
+        })
+}
+
+fn stateless_forced_recovery_messages(messages: &[Value]) -> Vec<Value> {
+    use crate::providers::openai_compat::{
+        NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD, NANOBOT_HIGGS_SESSION_ID_FIELD,
+    };
+    let mut retry = messages.to_vec();
+    strip_higgs_session_lease_control(&mut retry);
+    // Constrained decoding cannot resume Higgs's retained route. Change only
+    // the wire copy: durable conversation/session identity remains intact.
+    for message in &mut retry {
+        if let Some(object) = message.as_object_mut() {
+            object.remove(NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD);
+            object.remove(NANOBOT_HIGGS_SESSION_ID_FIELD);
+        }
+    }
+    retry
+}
+
+fn reset_recovery_failure(
+    ctx: &mut TurnContext,
+    mut response: LLMResponse,
+    reason: &str,
+) -> LLMResponse {
+    if ctx.flow.content_was_streamed {
+        send_retract_reply_marker(&ctx.text_delta_tx);
+        ctx.flow.content_was_streamed = false;
+    }
+    response.content = Some(format!("Checkpoint/reset was not executed: {reason}"));
+    response.tool_calls.clear();
+    response
+}
+
 /// Resolve the effective request budget against the live Higgs snapshot
 /// (Task 3). Free function so the refresh contract is testable without a
 /// full loop: cloud bypass, fetch-once, boot-change epoch rotation, legacy
@@ -5409,26 +5508,63 @@ impl AgentLoopShared {
     /// so the normal validation-retry path still applies.
     async fn maybe_recover_botched_tool_call(
         &self,
-        ctx: &TurnContext,
+        ctx: &mut TurnContext,
         response: LLMResponse,
         messages_for_llm: &[Value],
         tool_defs_opt: Option<&[Value]>,
         max_tokens: u32,
     ) -> ForcedToolRecoveryOutcome {
-        if !should_attempt_forced_recovery(
-            response.has_tool_calls(),
-            ctx.core.mode().is_local(),
-            ctx.flow.retries.validation,
-            tool_defs_opt.is_some_and(|t| !t.is_empty()),
-            response.content.as_deref(),
-            ctx.protocol.is_textual_replay(),
-            ctx.flow.tool_guard.had_blocked_calls,
-        ) {
+        let reset_tools = if announces_context_reset(response.content.as_deref())
+            && !response.has_tool_calls()
+            && ctx.core.mode().is_local()
+            && ctx.flow.retries.validation == 0
+            && !ctx.flow.tool_guard.had_blocked_calls
+        {
+            context_reset_recovery_tools(
+                response.content.as_deref(),
+                &ctx.tools
+                    .definitions_for(&["notes".into(), "new_context".into()]),
+            )
+        } else {
+            None
+        };
+        if reset_tools.is_none()
+            && !should_attempt_forced_recovery(
+                response.has_tool_calls(),
+                ctx.core.mode().is_local(),
+                ctx.flow.retries.validation,
+                tool_defs_opt.is_some_and(|t| !t.is_empty()),
+                response.content.as_deref(),
+                ctx.protocol.is_textual_replay(),
+                ctx.flow.tool_guard.had_blocked_calls,
+            )
+        {
             return ForcedToolRecoveryOutcome::Response(response);
         }
 
+        let stateless_messages = stateless_forced_recovery_messages(messages_for_llm);
+        let messages_for_llm = stateless_messages.as_slice();
+        let mut reset_messages;
+        let (messages_for_llm, tool_defs_opt) = if let Some(ref tools) = reset_tools {
+            let announcement = serde_json::json!({"role":"assistant", "content":response.content});
+            let instruction = crate::agent::markers::scaffold_user(
+                "Execute your announced checkpoint/reset decision using the available tools. Save the current task state and evidence pointers with notes(op=write, content=...). After its successful receipt, call new_context. An announcement is not execution. Do not repeat completed submissions or external actions.");
+            // Keep the pending intent visible after the notes receipt and on
+            // replay; a request-only nudge disappears at the next iteration.
+            ctx.messages
+                .extend_draft([announcement.clone(), instruction.clone()]);
+            if let Err(error) = ctx.persist_pending_protocol_messages().await {
+                return ForcedToolRecoveryOutcome::PersistenceError(error);
+            }
+            reset_messages = messages_for_llm.to_vec();
+            reset_messages.extend([announcement, instruction]);
+            (reset_messages.as_slice(), Some(tools.as_slice()))
+        } else {
+            (messages_for_llm, tool_defs_opt)
+        };
         info!(
             model = %ctx.core.model,
+            context_reset = reset_tools.is_some(),
             "forced_tool_recovery: botched tool intent — re-issuing with tool_choice=required"
         );
         let request = RecordedProviderRequest {
@@ -5493,6 +5629,16 @@ impl AgentLoopShared {
                         "forced-tool recovery response could not be recorded: {error}"
                     ));
                 }
+                // Do not trust a backend to honor the narrowed grammar: only
+                // recovery calls may replace this announcement. No side effect
+                // is executed until the normal tool path validates it.
+                if reset_tools.is_some() && !reset_recovery_calls_valid(&recovered.tool_calls) {
+                    return ForcedToolRecoveryOutcome::Response(reset_recovery_failure(
+                        ctx,
+                        response,
+                        "the recovery request returned no valid recovery tool call.",
+                    ));
+                }
                 if !recovered.has_tool_calls() {
                     return ForcedToolRecoveryOutcome::Response(response);
                 }
@@ -5508,10 +5654,16 @@ impl AgentLoopShared {
                 {
                     return ForcedToolRecoveryOutcome::PersistenceError(record_error);
                 }
-                ForcedToolRecoveryOutcome::ProviderError {
-                    original: response,
-                    error,
-                }
+                let original = if reset_tools.is_some() {
+                    reset_recovery_failure(
+                        ctx,
+                        response,
+                        "the provider could not complete the recovery request.",
+                    )
+                } else {
+                    response
+                };
+                ForcedToolRecoveryOutcome::ProviderError { original, error }
             }
         }
     }
@@ -7235,6 +7387,105 @@ mod tests {
 #[cfg(test)]
 mod forced_recovery_tests {
     use super::{should_attempt_forced_recovery, ProviderRequestRetryPolicy};
+
+    #[test]
+    fn context_reset_announcement_is_explicit_and_restricts_retry_tools() {
+        use serde_json::json;
+        let defs = vec![
+            json!({"type":"function","function":{"name":"notes","parameters":{"type":"object","properties":{"op":{"type":"string","enum":["read","write"]},"content":{"type":"string"}},"required":["op"]}}}),
+            json!({"type":"function","function":{"name":"new_context","parameters":{"type":"object"}}}),
+            json!({"type":"function","function":{"name":"submit_result"}}),
+        ];
+        let tools = super::context_reset_recovery_tools(
+            Some(
+                "Context decision: checkpoint/reset. The estimated remaining capacity is 0 tokens.",
+            ),
+            &defs,
+        )
+        .expect("observed announcement must recover");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(
+            tools[0]["function"]["parameters"]["properties"]["op"]["enum"],
+            json!(["write"])
+        );
+        assert_eq!(
+            tools[0]["function"]["parameters"]["required"],
+            json!(["op", "content"])
+        );
+        assert_eq!(tools[1]["function"]["name"], "new_context");
+        for text in [
+            "Context decision: continue. The checkpoint/reset was already performed.",
+            "Example: Context decision: checkpoint/reset.",
+            "> Context decision: checkpoint/reset.",
+            "```\nContext decision: checkpoint/reset.\n```",
+            "Context decision: checkpoint/reset is one possible option.",
+            "I could save notes and reset.",
+        ] {
+            assert!(
+                super::context_reset_recovery_tools(Some(text), &defs).is_none(),
+                "{text}"
+            );
+        }
+        assert!(super::context_reset_recovery_tools(
+            Some("Context decision: checkpoint/reset."),
+            &defs[..1]
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn reset_recovery_rejects_unrelated_or_incomplete_calls() {
+        use crate::providers::base::ToolCallRequest;
+        use serde_json::json;
+        let call = |name: &str, arguments| ToolCallRequest {
+            id: "test".into(),
+            name: name.into(),
+            arguments: serde_json::from_value(arguments).unwrap(),
+        };
+        assert!(super::reset_recovery_calls_valid(&[call(
+            "notes",
+            json!({"op":"write","content":"revision 4; receipt preserved"})
+        )]));
+        assert!(super::reset_recovery_calls_valid(&[call(
+            "new_context",
+            json!({"reason":"checkpoint saved"})
+        )]));
+        for bad in [
+            call("submit_result", json!({})),
+            call("perform_action", json!({})),
+            call("notes", json!({"op":"read"})),
+            call("notes", json!({"op":"write","content":" "})),
+        ] {
+            assert!(!super::reset_recovery_calls_valid(&[bad]));
+        }
+        assert!(!super::reset_recovery_calls_valid(&[]));
+    }
+
+    #[test]
+    fn forced_recovery_does_not_require_retained_cache() {
+        use crate::providers::openai_compat::{
+            NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD, NANOBOT_HIGGS_SESSION_ID_FIELD,
+            NANOBOT_HIGGS_SESSION_LEASE_FIELD,
+        };
+        let source = vec![
+            serde_json::json!({"role":"user", "content":"preserve this update",
+            NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD:"require_continuation",
+            NANOBOT_HIGGS_SESSION_ID_FIELD:42,
+            NANOBOT_HIGGS_SESSION_LEASE_FIELD:{"session_id":42,"ttl_seconds":30}}),
+        ];
+        let retry = super::stateless_forced_recovery_messages(&source);
+        assert_eq!(retry[0]["content"], source[0]["content"]);
+        assert!(retry[0]
+            .get(NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD)
+            .is_none());
+        assert!(retry[0].get(NANOBOT_HIGGS_SESSION_ID_FIELD).is_none());
+        assert!(retry[0].get(NANOBOT_HIGGS_SESSION_LEASE_FIELD).is_none());
+        assert_eq!(
+            source[0][NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD],
+            "require_continuation"
+        );
+        assert_eq!(source[0][NANOBOT_HIGGS_SESSION_ID_FIELD], 42);
+    }
 
     // Real trigger strings (mirror src/agent/validation.rs tests).
     const CLAIMED: &str = "Let me check that file for you."; // prose only — NOT an error

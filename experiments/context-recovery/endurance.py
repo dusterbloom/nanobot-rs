@@ -20,6 +20,7 @@ def summarize(directory):
     artifacts = {(sid, digest): content for sid, digest, content in db.execute(
         'select session_id,digest,content from session_replay_artifacts')}
     compactions, tool_errors, requests = set(), 0, 0
+    forced_recovery_requests = 0
     input_tokens = output_tokens = prompt_peak = 0
     wire_errors = []
     request_ids = set()
@@ -32,6 +33,7 @@ def summarize(directory):
         e = json.loads(raw)
         if e['kind'] == 'model_request':
             requests += 1
+            forced_recovery_requests += e['purpose'] == 'forced_tool_recovery'
             if e['purpose'] == 'compaction':
                 compactions.add(rid)
             else:
@@ -49,7 +51,17 @@ def summarize(directory):
                     submit = next(d['function'] for d in definitions if d['function']['name'] == 'submit_result')
                     assert submit['parameters']['properties']['result']['properties']['payment_status']['enum'] == ['pending', 'settled', 'failed']
                     assert 'then finish the turn' in submit['description']
-                    assert any(d['function']['name'] == 'inspect_tool_result' for d in request['tools'])
+                    names = {d['function']['name'] for d in request['tools']}
+                    if e['purpose'] == 'forced_tool_recovery' and names == {'notes', 'new_context'}:
+                        # This retry intentionally excludes completed submissions
+                        # and unrelated tools; its actual wire must be constrained.
+                        assert request['tool_choice'] == 'required'
+                        notes = next(d['function'] for d in request['tools'] if d['function']['name'] == 'notes')
+                        assert notes['parameters']['properties']['op']['enum'] == ['write']
+                        assert {'op', 'content'} <= set(notes['parameters']['required'])
+                        assert all('_nanobot_higgs_session_cache_policy' not in m and '_nanobot_higgs_session_id' not in m for m in request['messages'])
+                    else:
+                        assert 'inspect_tool_result' in names
                     assert {'recall', 'lcm_expand'} <= {d['function']['name'] for d in definitions}
                 except (ValueError, KeyError, StopIteration, AssertionError):
                     wire_errors.append('missing or conflicting result schema')
@@ -101,7 +113,7 @@ def summarize(directory):
     result['control_tool_calls'] = {name: sum(n == name for n in tool_names.values()) for name in ('context_status', 'notes', 'new_context', 'history', 'recall', 'lcm_expand')}
     result['submissions_with_post_submit_inspection'] = len(inspected_requests)
     result['source_tokens_scope'] = 'entire planned stream; not necessarily all delivered'
-    result.update(actual_output_reservations=sorted(output_reservations), submission_attempts=submission_attempts, forbidden_attempts=forbidden_attempts, compaction_attempts=len(compactions), completed_compactions=completed_compactions, tool_errors=tool_errors, model_requests=requests,
+    result.update(forced_recovery_requests=forced_recovery_requests, actual_output_reservations=sorted(output_reservations), submission_attempts=submission_attempts, forbidden_attempts=forbidden_attempts, llm_compaction_requests=len(compactions), completed_compactions=completed_compactions, tool_errors=tool_errors, model_requests=requests,
                   logical_input_tokens=input_tokens, output_tokens=output_tokens,
                   wire_errors=wire_errors, reset_events=resets, repeated_boundary_coverage=boundaries >= 3,
                   first_wrong_revision=next((s['revision'] for s in scores if not s['pass']), None))
@@ -145,6 +157,18 @@ if __name__ == '__main__':
     parser.add_argument('--arms', default='A,B')
     parser.add_argument('--policy', choices=['optional', 'decision'], default='optional')
     args = parser.parse_args()
+    requested_long_form_min_tokens = os.environ.get('ENDURANCE_LONG_FORM_MIN_TOKENS')
+    if requested_long_form_min_tokens is not None:
+        try:
+            requested_long_form_min_tokens = int(requested_long_form_min_tokens)
+        except ValueError as error:
+            raise SystemExit('ENDURANCE_LONG_FORM_MIN_TOKENS must be a positive u32') from error
+        if not 1 <= requested_long_form_min_tokens <= 2**32 - 1:
+            raise SystemExit('ENDURANCE_LONG_FORM_MIN_TOKENS must be a positive u32')
+    requested_reset_handoff = os.environ.get('ENDURANCE_RESET_HANDOFF')
+    if requested_reset_handoff not in (None, '0', '1'):
+        raise SystemExit('ENDURANCE_RESET_HANDOFF must be 0 or 1')
+    reset_handoff_enabled = requested_reset_handoff == '1'
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=True)
     source_config = Path(os.environ.get(
@@ -166,6 +190,9 @@ if __name__ == '__main__':
         }
     provenance = {'updates': args.updates, 'context_ceiling': args.ceiling, 'minutes_per_arm': args.minutes,
                   'arms': args.arms, 'policy': args.policy, 'higgs_config': config_text,
+                  'endurance_long_form_min_tokens': requested_long_form_min_tokens,
+                  'endurance_reset_handoff_requested': requested_reset_handoff,
+                  'endurance_reset_handoff_enabled': reset_handoff_enabled,
                   'arm_servers': arm_servers,
                   'nanobot_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()}
     provenance['sha256'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in [
