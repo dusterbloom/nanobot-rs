@@ -9,6 +9,6 @@ Telemetry: server envelope/MLX counters plus proc_pid_rusage physical footprint/
 - [x] Inspect existing harness and graph; run_turn HIGH (four evaluation callers); endurance_eval_live UNKNOWN confirmed ignored test invoked by Python driver.
 - [x] Add scheduled policy with regression and unchanged autonomous prompts.
 - [x] Validate release harness and memory sampling.
-- [ ] Run 20-update control in tmux; audit exact correctness, reset/handoff count, tool receipts, headroom, peak footprint and capacity failures.
-- [ ] If control passes, compare corrected autonomous arms with same memory telemetry; otherwise report the exact limiting failure without claiming feasibility.
-- [ ] Restore installed Higgs defaults and record results/provenance.
+- [x] Run 20-update control in tmux; audit exact correctness, reset/handoff count, tool receipts, headroom, peak footprint and capacity failures.
+- [x] Exact recovery failed (13/20); recorded cause and withheld autonomous ranking. Execution schedule completed all 20 resets without capacity failure.
+- [x] Restore installed Higgs defaults and record results/provenance.

@@ -1,0 +1,50 @@
+{
+  "session_id": "20260905_223323_103388",
+  "revision": 8,
+  "correct_checksum": "7aF07-bC9x-00Q",
+  "submitted_checksum": "8bR29-mD7y-01P",
+  "requests": [
+    {
+      "event": 173,
+      "digest": "81d29835e688d97dd63d1ef54ff82a50eb2c8112831d53493559c2017ba70c80",
+      "purpose": "main",
+      "correct_checksum_in_request": false,
+      "wrong_checksum_in_request": false,
+      "messages": 2
+    },
+    {
+      "event": 178,
+      "digest": "0df6584053bf659af8eacca56b0b859d022d2d5aa4bd70a86ff032e07a5ff7c5",
+      "purpose": "main",
+      "correct_checksum_in_request": true,
+      "wrong_checksum_in_request": false,
+      "messages": 4
+    },
+    {
+      "event": 183,
+      "digest": "cebee345f13dcdcc70cc591c35fe3b637035358bbdeafaf87849515bc1dd09cd",
+      "purpose": "main",
+      "correct_checksum_in_request": true,
+      "wrong_checksum_in_request": true,
+      "messages": 6
+    },
+    {
+      "event": 188,
+      "digest": "97803091ac971f91f5a2b91bdc062bb4739addc474c371a8a9dfa741004faadf",
+      "purpose": "main",
+      "correct_checksum_in_request": true,
+      "wrong_checksum_in_request": true,
+      "messages": 8
+    }
+  ],
+  "source_db": "experiments/context-recovery/endurance-feasibility-scheduled/B/sessions.db",
+  "preceding_notes_receipt": [
+    {
+      "content": "{\"content\":\"QUARTZ revision 7 checkpoint: authoritative_update applied with checksum 7aF07-bC9x-00Q. diagnostic_code D-3b02ee9a28f763c3 extracted from Verified diagnostic code line. Snapshot submitted: branch=hotfix/q5, owner=Neri-5, payment_status=settled, project=QUARTZ, receipt=rcpt_Q8n3_L04, execute=false, export_status=failed, next_action=request_permission, revision=7. Historical note acknowledged as stale; not execution evidence.\"}",
+      "name": "notes",
+      "role": "tool",
+      "tool_call_id": "call_0_65ca0f20-2691-4061-8a66-ba25b6482017"
+    }
+  ],
+  "interpretation": "Correct checksum was delivered in the notes receipt before the first incorrect submission; no capacity rejection or compaction intervened."
+}

@@ -1,6 +1,6 @@
 # Escha precision and context-recovery validation
 
-Updated: 2026-09-05. Keep precision, reset timing and recovery correctness separate.
+Updated: 2026-09-06. Keep precision, reset timing and recovery correctness separate.
 
 ## Evidence so far
 
@@ -17,10 +17,12 @@ Updated: 2026-09-05. Keep precision, reset timing and recovery correctness separ
 | New autonomous notes/reset arm | 6/6 correct of 20 planned; 1 reset/handoff, 1 LCM boundary, 1 rejected duplicate, then capacity suspension; no forced retry | Correct recovery after autonomous reset; endurance goal not completed |
 | Matched LCM arm on new binaries | 6/6 correct of 20, 193.6s, 1 LCM boundary, zero duplicates, capacity suspension | Faster than B (295.8s) here; neither passed endurance |
 
+| Scheduled feasibility control | 20/20 submitted, 20 resets, 13/20 exact; no compaction, rejection or downshift | Execution feasible; exact recovery gate failed. See FEASIBILITY-RESULTS.md |
+
 ## Runtime restored
 
 Both matched arms are terminal. Installed Higgs is serving in `recovery-higgs:0.0`,
-PID 69407, boot `dd9cdc15-7655-4b4b-9b48-e753664d4c04`; installed executable and Metal
+PID 74177, boot `159acc9c-f810-44e2-a8f8-b42d473bcfb9`; installed executable and Metal
 mappings/hashes verified. Default auto resolves to throughput, native FP32 cache
 40960 bytes/token, scratch_matmul prefill, chunk 1024. Exact READY smoke passed.
 Full runtime evidence is in `BINARY-PROVENANCE-AFTER.json`.
@@ -65,3 +67,5 @@ The pre-fix B overflow retry reversed the current user/call/receipt suffix.
 Commit `7b8b24a` fixes the backward accumulator; public-path regression RED→GREEN,
 3003 release tests passed and corrected executable installed. Earlier endurance
 results are preserved and have not been rerun on this correction.
+
+Latest diagnostic harness `fdb4ebf`: 3004 release tests passed, 31 ignored. Scheduled control completed in 985.3 seconds; peak sampled physical footprint 17.33 GiB. First error occurred with the correct checksum visible in the notes receipt. Autonomous rerun withheld because exact recovery prerequisite failed.

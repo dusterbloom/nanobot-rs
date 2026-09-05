@@ -25,8 +25,8 @@
     "log": "/private/tmp/higgs-final-default.log"
   },
   "restored_service": {
-    "status": "running; READY smoke passed",
-    "pid": 69407,
+    "status": "running; READY smoke passed after scheduled feasibility control",
+    "pid": 74177,
     "tmux": "recovery-higgs:0.0",
     "mappings": [
       "n/Users/peppi/.local/bin/higgs",
@@ -39,9 +39,9 @@
     "persistent_cache_bytes_per_token": 40960,
     "log": "/private/tmp/higgs-final-default.log",
     "smoke": {
-      "id": "chatcmpl-ed6ff0da-71d6-47bc-a73b-cf8b5ef0a164",
+      "id": "chatcmpl-1ef0a25c-1e5f-4584-8034-e1fc3c865976",
       "object": "chat.completion",
-      "created": 1788644069,
+      "created": 1788648306,
       "model": "escha-35b-a3b",
       "choices": [
         {
@@ -63,7 +63,7 @@
       "schemaVersion": 1,
       "model": "escha-35b-a3b",
       "modelFingerprint": "sha256:adf23a8e2f3b720f38311bd469a5df275b2d41fb6bfeb0e0cb337244b3dbfa2a",
-      "bootId": "dd9cdc15-7655-4b4b-9b48-e753664d4c04",
+      "bootId": "159acc9c-f810-44e2-a8f8-b42d473bcfb9",
       "generation": 3,
       "availability": "available",
       "pressure": "normal",
@@ -75,7 +75,8 @@
       "prefixCacheBytes": 134217728,
       "basis": "conservative"
     },
-    "boot_id": "dd9cdc15-7655-4b4b-9b48-e753664d4c04"
+    "boot_id": "159acc9c-f810-44e2-a8f8-b42d473bcfb9"
   },
-  "validated_harness_sha256": "f4d029efd6065780071ba1a486b30322cad7e8b62528968008d0eb070fdb2eda"
+  "validated_harness_sha256": "0d906c2e648510c85bff9ec3139693937fc788cc97d0a470add278cb1c5caee6",
+  "validated_harness_commit": "fdb4ebf"
 }

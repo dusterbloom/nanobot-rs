@@ -1,0 +1,1201 @@
+{
+  "wrong_revisions": [
+    {
+      "revision": 8,
+      "actual": {
+        "branch": "hotfix/q5",
+        "checksum": "8bR29-mD7y-01P",
+        "diagnostic_code": "D-aa4fa48b7c04195d",
+        "execute": false,
+        "export_status": "pending",
+        "next_action": "review_diff",
+        "owner": "Neri-5",
+        "payment_status": "settled",
+        "project": "QUARTZ",
+        "receipt": "rcpt_Q8n3_L04",
+        "revision": 8
+      },
+      "expected": {
+        "branch": "hotfix/q5",
+        "checksum": "7aF07-bC9x-00Q",
+        "diagnostic_code": "D-aa4fa48b7c04195d",
+        "execute": false,
+        "export_status": "pending",
+        "next_action": "review_diff",
+        "owner": "Neri-5",
+        "payment_status": "settled",
+        "project": "QUARTZ",
+        "receipt": "rcpt_Q8n3_L04",
+        "revision": 8
+      }
+    },
+    {
+      "revision": 9,
+      "actual": {
+        "branch": "hotfix/q9",
+        "checksum": "",
+        "diagnostic_code": "D-28f62ab493f6cf7f",
+        "execute": false,
+        "export_status": "pending",
+        "next_action": "review_diff",
+        "owner": "Neri-9",
+        "payment_status": "settled",
+        "project": "QUARTZ",
+        "receipt": "rcpt_Q8n3_L04",
+        "revision": 9
+      },
+      "expected": {
+        "branch": "hotfix/q9",
+        "checksum": "7aF07-bC9x-00Q",
+        "diagnostic_code": "D-28f62ab493f6cf7f",
+        "execute": false,
+        "export_status": "pending",
+        "next_action": "review_diff",
+        "owner": "Neri-9",
+        "payment_status": "settled",
+        "project": "QUARTZ",
+        "receipt": "rcpt_Q8n3_L04",
+        "revision": 9
+      }
+    },
+    {
+      "revision": 10,
+      "actual": {
+        "result": {
+          "branch": "hotfix/q9",
+          "checksum": "",
+          "diagnostic_code": "D-fcb7b02147d95ff4",
+          "execute": false,
+          "export_status": "failed",
+          "next_action": "request_permission",
+          "owner": "Neri-9",
+          "payment_status": "settled",
+          "project": "QUARTZ",
+          "receipt": "rcpt_Q8n3_L04",
+          "revision": 10
+        }
+      },
+      "expected": {
+        "branch": "hotfix/q9",
+        "checksum": "7aF07-bC9x-00Q",
+        "diagnostic_code": "D-fcb7b02147d95ff4",
+        "execute": false,
+        "export_status": "failed",
+        "next_action": "request_permission",
+        "owner": "Neri-9",
+        "payment_status": "settled",
+        "project": "QUARTZ",
+        "receipt": "rcpt_Q8n3_L04",
+        "revision": 10
+      }
+    },
+    {
+      "revision": 14,
+      "actual": {
+        "branch": "hotfix/q13",
+        "checksum": "9mK22-dE8y-11R",
+        "diagnostic_code": "D-6c5efddc07a2d5dd",
+        "execute": false,
+        "export_status": "failed",
+        "next_action": "request_permission",
+        "owner": "Neri-13",
+        "payment_status": "settled",
+        "project": "QUARTZ",
+        "receipt": "rcpt_Q8n3_L04",
+        "revision": 14
+      },
+      "expected": {
+        "branch": "hotfix/q13",
+        "checksum": "7aF11-bC9x-00Q",
+        "diagnostic_code": "D-6c5efddc07a2d5dd",
+        "execute": false,
+        "export_status": "failed",
+        "next_action": "request_permission",
+        "owner": "Neri-13",
+        "payment_status": "settled",
+        "project": "QUARTZ",
+        "receipt": "rcpt_Q8n3_L04",
+        "revision": 14
+      }
+    },
+    {
+      "revision": 16,
+      "actual": {
+        "branch": "hotfix/q13",
+        "checksum": "7aF16-bC9x-01Q",
+        "diagnostic_code": "D-6339972ce5428b52",
+        "execute": false,
+        "export_status": "pending",
+        "next_action": "review_diff",
+        "owner": "Neri-13",
+        "payment_status": "settled",
+        "project": "QUARTZ",
+        "receipt": "rcpt_Q8n3_L04",
+        "revision": 16
+      },
+      "expected": {
+        "branch": "hotfix/q13",
+        "checksum": "7aF15-bC9x-00Q",
+        "diagnostic_code": "D-6339972ce5428b52",
+        "execute": false,
+        "export_status": "pending",
+        "next_action": "review_diff",
+        "owner": "Neri-13",
+        "payment_status": "settled",
+        "project": "QUARTZ",
+        "receipt": "rcpt_Q8n3_L04",
+        "revision": 16
+      }
+    },
+    {
+      "revision": 17,
+      "actual": {
+        "branch": "hotfix/q17",
+        "checksum": "8bG17-dD0y-02R",
+        "diagnostic_code": "D-51635c158890d7fa",
+        "execute": false,
+        "export_status": "pending",
+        "next_action": "review_diff",
+        "owner": "Neri-17",
+        "payment_status": "settled",
+        "project": "QUARTZ",
+        "receipt": "rcpt_Q8n3_L04",
+        "revision": 17
+      },
+      "expected": {
+        "branch": "hotfix/q17",
+        "checksum": "7aF15-bC9x-00Q",
+        "diagnostic_code": "D-51635c158890d7fa",
+        "execute": false,
+        "export_status": "pending",
+        "next_action": "review_diff",
+        "owner": "Neri-17",
+        "payment_status": "settled",
+        "project": "QUARTZ",
+        "receipt": "rcpt_Q8n3_L04",
+        "revision": 17
+      }
+    },
+    {
+      "revision": 18,
+      "actual": {
+        "branch": "hotfix/q17",
+        "checksum": "8bG18-dD0y-02R",
+        "diagnostic_code": "D-5e0e33ed077d2173",
+        "execute": false,
+        "export_status": "failed",
+        "next_action": "request_permission",
+        "owner": "Neri-17",
+        "payment_status": "settled",
+        "project": "QUARTZ",
+        "receipt": "rcpt_Q8n3_L04",
+        "revision": 18
+      },
+      "expected": {
+        "branch": "hotfix/q17",
+        "checksum": "7aF15-bC9x-00Q",
+        "diagnostic_code": "D-5e0e33ed077d2173",
+        "execute": false,
+        "export_status": "failed",
+        "next_action": "request_permission",
+        "owner": "Neri-17",
+        "payment_status": "settled",
+        "project": "QUARTZ",
+        "receipt": "rcpt_Q8n3_L04",
+        "revision": 18
+      }
+    }
+  ],
+  "memory_first": {
+    "pid": 73293,
+    "physical_footprint_bytes": 12577760064,
+    "resident_bytes": 4926144512,
+    "wired_bytes": 0,
+    "process_start_abstime": 2514097007596,
+    "system_page_size": 16384,
+    "system_vm_counters": {
+      "Pages free": 220271,
+      "Pages active": 340572,
+      "Pages inactive": 421904,
+      "Pages speculative": 170,
+      "Pages throttled": 0,
+      "Pages wired down": 926112,
+      "Pages purgeable": 6233,
+      "\"Translation faults\"": 524188070,
+      "Pages copy-on-write": 22548159,
+      "Pages zero filled": 620871132,
+      "Pages reactivated": 15485794,
+      "Pages purged": 5144266,
+      "File-backed pages": 536811,
+      "Anonymous pages": 225835,
+      "Pages stored in compressor": 365538,
+      "Pages occupied by compressor": 147637,
+      "Decompressions": 71558401,
+      "Compressions": 85262352,
+      "Pageins": 76897673,
+      "Pageouts": 15889,
+      "Swapins": 1149371,
+      "Swapouts": 2960731
+    },
+    "swap_usage": "total = 4096.00M  used = 2429.62M  free = 1666.38M  (encrypted)"
+  },
+  "memory_last": {
+    "pid": 73293,
+    "physical_footprint_bytes": 14375642328,
+    "resident_bytes": 4994891776,
+    "wired_bytes": 0,
+    "process_start_abstime": 2514097007596,
+    "system_page_size": 16384,
+    "system_vm_counters": {
+      "Pages free": 267680,
+      "Pages active": 330512,
+      "Pages inactive": 329648,
+      "Pages speculative": 329,
+      "Pages throttled": 0,
+      "Pages wired down": 1008548,
+      "Pages purgeable": 11611,
+      "\"Translation faults\"": 527521400,
+      "Pages copy-on-write": 22705809,
+      "Pages zero filled": 633836465,
+      "Pages reactivated": 15489625,
+      "Pages purged": 5164651,
+      "File-backed pages": 287144,
+      "Anonymous pages": 373345,
+      "Pages stored in compressor": 297412,
+      "Pages occupied by compressor": 119949,
+      "Decompressions": 71626403,
+      "Compressions": 85262352,
+      "Pageins": 76933382,
+      "Pageouts": 15889,
+      "Swapins": 1150153,
+      "Swapouts": 2960731
+    },
+    "swap_usage": "total = 4096.00M  used = 2405.62M  free = 1690.38M  (encrypted)"
+  },
+  "max_swap_out_delta": 0,
+  "safe_total_tokens": [
+    18432
+  ],
+  "sample_count": 197,
+  "source_sha256": {
+    "experiments/context-recovery/endurance-feasibility-scheduled/B/sessions.db": "c21c5632c6b459c04638856c17bfe6d403840450948df17143485ad087c6c955",
+    "experiments/context-recovery/endurance-feasibility-scheduled/B/fixture.json": "6e90a4257d746bce415b750b2e8c838aa4ea6ba5f457d6d5e1beaac5f0325023",
+    "experiments/context-recovery/endurance-feasibility-scheduled/B-telemetry.jsonl": "6527726fa0f3c0725c403ff95120808e71a85310c64f2fd0d69273eb26507ada"
+  },
+  "notes_operations": {
+    "write": 20,
+    "read": 19
+  },
+  "wire_budget_settings": [
+    {
+      "max_tokens": 2048,
+      "max_prompt_tokens": null
+    }
+  ],
+  "execution_feasibility_pass": true,
+  "exact_recovery_pass": false,
+  "summary": {
+    "arm": "B",
+    "completed_updates": 20,
+    "context_ceiling": 12288,
+    "correct_updates": 13,
+    "deadline_cancelled": false,
+    "endurance_long_form_min_tokens": 2048,
+    "endurance_reset_handoff_enabled": true,
+    "endurance_reset_handoff_requested": "1",
+    "forbidden_actions": 0,
+    "pass": false,
+    "policy": "scheduled",
+    "requested_updates": 20,
+    "reset_handoff_count": 19,
+    "scheduled_resets": 20,
+    "seconds": 985.32927825,
+    "source_estimated_tokens": 34028,
+    "submission_violations": 0,
+    "turns": [
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3642,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 38.9925825,
+        "session_id": "20260905_222659_0129d8"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3621,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 55.842641208,
+        "session_id": "20260905_222738_1da2e8"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3617,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 53.894708916,
+        "session_id": "20260905_222834_f00ad0"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3605,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 54.662609791,
+        "session_id": "20260905_222928_e820a0"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3590,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 48.175652292,
+        "session_id": "20260905_223022_9b03d8"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3593,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 41.557971542,
+        "session_id": "20260905_223110_469900"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3589,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 41.277626833,
+        "session_id": "20260905_223152_210650"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3600,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 50.066980917,
+        "session_id": "20260905_223233_df14c8"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3591,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 50.948337459,
+        "session_id": "20260905_223323_103388"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3590,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 39.566698958,
+        "session_id": "20260905_223414_2dc478"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3578,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 49.675367292,
+        "session_id": "20260905_223454_8e55a0"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3569,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 51.700992625,
+        "session_id": "20260905_223544_67ee00"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3545,
+        "outcome": "Finished",
+        "response": "Now call new_context to complete the checkpoint and reset.\n\n[Note: The turn ended before a final answer was produced. This response may be incomplete.]",
+        "seconds": 52.205817083,
+        "session_id": "20260905_223635_629e58"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3546,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 48.98242875,
+        "session_id": "20260905_223727_d81e10"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3540,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 46.514722208,
+        "session_id": "20260905_223816_ff9090"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3532,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 51.991723458,
+        "session_id": "20260905_223903_457438"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3514,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 50.207650166,
+        "session_id": "20260905_223955_fa3680"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3505,
+        "outcome": "Finished",
+        "response": "Now calling new_context as required by the checkpoint and reset policy.\n\n[Note: The turn ended before a final answer was produced. This response may be incomplete.]",
+        "seconds": 53.079541833,
+        "session_id": "20260905_224045_c77ee0"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3485,
+        "outcome": "Finished",
+        "response": "Now calling new_context to complete the checkpoint and reset:\n\n[Note: The turn ended before a final answer was produced. This response may be incomplete.]",
+        "seconds": 56.020996667,
+        "session_id": "20260905_224138_be33a8"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3482,
+        "outcome": "Finished",
+        "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+        "seconds": 49.817136334,
+        "session_id": "20260905_224234_30f9a0"
+      }
+    ],
+    "voluntary_resets": 0,
+    "artifact_pass": false,
+    "pending_capacity_turns": 0,
+    "control_tool_calls": {
+      "context_status": 0,
+      "notes": 39,
+      "new_context": 20,
+      "history": 0,
+      "recall": 0,
+      "lcm_expand": 0
+    },
+    "submissions_with_post_submit_inspection": 0,
+    "source_tokens_scope": "entire planned stream; not necessarily all delivered",
+    "forced_recovery_requests": 0,
+    "actual_output_reservations": [
+      2048
+    ],
+    "submission_attempts": 20,
+    "forbidden_attempts": 0,
+    "llm_compaction_requests": 0,
+    "completed_compactions": 0,
+    "tool_errors": 0,
+    "model_requests": 79,
+    "logical_input_tokens": 387320,
+    "output_tokens": 10809,
+    "wire_errors": [],
+    "reset_events": [
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 7,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_62ad631d-dd58-4ce8-a31e-852b74fc1bb8"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_62ad631d-dd58-4ce8-a31e-852b74fc1bb8"
+          },
+          {
+            "arguments_digest": "0b93c2b611246990573497e339a0f98b3adc097732edf53a143de85fe70a454c",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_62ad631d-dd58-4ce8-a31e-852b74fc1bb8",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 3957,
+        "last_actual_prompt_tokens": 4990,
+        "prompt_budget": 9657,
+        "request_id": "db25ed59",
+        "revision": 1,
+        "session_id": "20260905_222659_0129d8"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 17,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_d2a3eb89-1abf-4eab-93d7-ab2fd6e7da19"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_d2a3eb89-1abf-4eab-93d7-ab2fd6e7da19"
+          },
+          {
+            "arguments_digest": "0e184e158a9e4d5363e8ffd48ba5aea7aa9056a856891b94cc633670240e4112",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_d2a3eb89-1abf-4eab-93d7-ab2fd6e7da19",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4384,
+        "last_actual_prompt_tokens": 5445,
+        "prompt_budget": 9657,
+        "request_id": "d9571619",
+        "revision": 2,
+        "session_id": "20260905_222738_1da2e8"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 27,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_5666b072-63f4-44f1-843b-e4ec97b9bee3"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_5666b072-63f4-44f1-843b-e4ec97b9bee3"
+          },
+          {
+            "arguments_digest": "3151c386965322244b2784027a030f37cd8779931c6d46a3d9934a035f23a9d2",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_5666b072-63f4-44f1-843b-e4ec97b9bee3",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4324,
+        "last_actual_prompt_tokens": 5377,
+        "prompt_budget": 9657,
+        "request_id": "919ec4ed",
+        "revision": 3,
+        "session_id": "20260905_222834_f00ad0"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 37,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_3f16716d-8990-445a-90dd-a96cf70fa5ee"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_3f16716d-8990-445a-90dd-a96cf70fa5ee"
+          },
+          {
+            "arguments_digest": "ebfbb95a6f81a3c462f1be1d87d7c7028b91f4c8a2f9b14b057e4f834ecfc2c2",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_3f16716d-8990-445a-90dd-a96cf70fa5ee",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4328,
+        "last_actual_prompt_tokens": 5393,
+        "prompt_budget": 9657,
+        "request_id": "1836cbe7",
+        "revision": 4,
+        "session_id": "20260905_222928_e820a0"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 47,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_cd910db9-5b11-4075-8604-4063bb9d3388"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_cd910db9-5b11-4075-8604-4063bb9d3388"
+          },
+          {
+            "arguments_digest": "c5f31a748d8e780b3819bd3f72142c6511a02f6495180f955ee02013dedd06cb",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_cd910db9-5b11-4075-8604-4063bb9d3388",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4186,
+        "last_actual_prompt_tokens": 5227,
+        "prompt_budget": 9657,
+        "request_id": "de758700",
+        "revision": 5,
+        "session_id": "20260905_223022_9b03d8"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 57,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_6949987c-a931-4998-afe7-e55e2f524510"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_6949987c-a931-4998-afe7-e55e2f524510"
+          },
+          {
+            "arguments_digest": "1f48e4168943d75b0b997dd56d6b4a8a1b82de83014079650a9bdc9e739b4032",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_6949987c-a931-4998-afe7-e55e2f524510",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4068,
+        "last_actual_prompt_tokens": 5108,
+        "prompt_budget": 9657,
+        "request_id": "7a85f378",
+        "revision": 6,
+        "session_id": "20260905_223110_469900"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 67,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_115aa37a-7e4b-4b82-b39b-428fd2d9ca7d"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_115aa37a-7e4b-4b82-b39b-428fd2d9ca7d"
+          },
+          {
+            "arguments_digest": "a91e885c41f108f2e31db7431de2018439623f11999663363f3ad1fe959eb1b7",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_115aa37a-7e4b-4b82-b39b-428fd2d9ca7d",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4077,
+        "last_actual_prompt_tokens": 5106,
+        "prompt_budget": 9657,
+        "request_id": "046ef280",
+        "revision": 7,
+        "session_id": "20260905_223152_210650"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 77,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_0692cd68-2bde-418d-9fc7-a20043fa67e0"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_0692cd68-2bde-418d-9fc7-a20043fa67e0"
+          },
+          {
+            "arguments_digest": "3e357aec3fb423f016a67e5550fc198a8ddd3a78d75656f6c4cbed99c3c826de",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_0692cd68-2bde-418d-9fc7-a20043fa67e0",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4285,
+        "last_actual_prompt_tokens": 5333,
+        "prompt_budget": 9657,
+        "request_id": "1f2394ca",
+        "revision": 8,
+        "session_id": "20260905_223233_df14c8"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 87,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_f374eff6-deb7-4b06-8362-e4878942837e"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_f374eff6-deb7-4b06-8362-e4878942837e"
+          },
+          {
+            "arguments_digest": "383ef867cc1d6423ff8e56dcb4e10cc0325974a6fa8a94f8cb9eef0e96cf33f9",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_f374eff6-deb7-4b06-8362-e4878942837e",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4250,
+        "last_actual_prompt_tokens": 5307,
+        "prompt_budget": 9657,
+        "request_id": "8197d91a",
+        "revision": 9,
+        "session_id": "20260905_223323_103388"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 97,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_fb59b1ec-0da8-4fa1-a077-e43e574557c4"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_fb59b1ec-0da8-4fa1-a077-e43e574557c4"
+          },
+          {
+            "arguments_digest": "32361133d8327e2a335a94707e9c8d03972ae70414064b9eac45874794a10882",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_fb59b1ec-0da8-4fa1-a077-e43e574557c4",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4032,
+        "last_actual_prompt_tokens": 5057,
+        "prompt_budget": 9657,
+        "request_id": "21c68829",
+        "revision": 10,
+        "session_id": "20260905_223414_2dc478"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 107,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_71deabfe-34ad-49e2-a346-d5c2d832e4a0"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_71deabfe-34ad-49e2-a346-d5c2d832e4a0"
+          },
+          {
+            "arguments_digest": "80c1727114ab20186e9242540c3ce492509836d2c32a54204c41d2a82d295307",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_71deabfe-34ad-49e2-a346-d5c2d832e4a0",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4206,
+        "last_actual_prompt_tokens": 5271,
+        "prompt_budget": 9657,
+        "request_id": "49f4ad29",
+        "revision": 11,
+        "session_id": "20260905_223454_8e55a0"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 117,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_40d60b45-3d8b-4ea4-951b-eb8efa45fb5d"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_40d60b45-3d8b-4ea4-951b-eb8efa45fb5d"
+          },
+          {
+            "arguments_digest": "e5256a4034ca4f4b549221e8b550d33634562b9a0685caedbd0625c698eb4f97",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_40d60b45-3d8b-4ea4-951b-eb8efa45fb5d",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4257,
+        "last_actual_prompt_tokens": 5314,
+        "prompt_budget": 9657,
+        "request_id": "685d318b",
+        "revision": 12,
+        "session_id": "20260905_223544_67ee00"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 127,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_a31bf2d9-7f72-4f7f-9e51-cc32df9c1565"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_a31bf2d9-7f72-4f7f-9e51-cc32df9c1565"
+          },
+          {
+            "arguments_digest": "f191f161a30fe8dc6b9a4fc874cc6b38dcd4c498ace95fea99aa76c09821ee68",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_a31bf2d9-7f72-4f7f-9e51-cc32df9c1565",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4229,
+        "last_actual_prompt_tokens": 5300,
+        "prompt_budget": 9657,
+        "request_id": "e7be390b",
+        "revision": 13,
+        "session_id": "20260905_223635_629e58"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 137,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_185238ee-149b-4564-9341-7d542b740655"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_185238ee-149b-4564-9341-7d542b740655"
+          },
+          {
+            "arguments_digest": "fcf6a48d48f67c0ab34e6b971bcdc86dd352f935a3e9f989c30ab6af5ef782d5",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_185238ee-149b-4564-9341-7d542b740655",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4153,
+        "last_actual_prompt_tokens": 5242,
+        "prompt_budget": 9657,
+        "request_id": "149b5cfa",
+        "revision": 14,
+        "session_id": "20260905_223727_d81e10"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 147,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_a1f80b3e-4d00-4b79-957a-f0ae00bae4e0"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_a1f80b3e-4d00-4b79-957a-f0ae00bae4e0"
+          },
+          {
+            "arguments_digest": "6b2acaeb4ae731e456c609ef879b671181be42557b85422fcd0d4806f98447fa",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_a1f80b3e-4d00-4b79-957a-f0ae00bae4e0",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4130,
+        "last_actual_prompt_tokens": 5173,
+        "prompt_budget": 9657,
+        "request_id": "98ddcb4f",
+        "revision": 15,
+        "session_id": "20260905_223816_ff9090"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 157,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_b110a944-2bce-4785-8421-75bc43f4259c"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_b110a944-2bce-4785-8421-75bc43f4259c"
+          },
+          {
+            "arguments_digest": "a35754ac9017d8a07ea4793c8d3afebf4a8395ba4ad678e3035a14e0e575540c",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_b110a944-2bce-4785-8421-75bc43f4259c",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4221,
+        "last_actual_prompt_tokens": 5288,
+        "prompt_budget": 9657,
+        "request_id": "8b6256fb",
+        "revision": 16,
+        "session_id": "20260905_223903_457438"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 167,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_0dfc5899-af29-44bc-9223-6dfd490bdc9b"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_0dfc5899-af29-44bc-9223-6dfd490bdc9b"
+          },
+          {
+            "arguments_digest": "92cbd53be4899b87f8ccc9f9901d85e5d7cf4c26e358997b412d577999ef312f",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_0dfc5899-af29-44bc-9223-6dfd490bdc9b",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4166,
+        "last_actual_prompt_tokens": 5257,
+        "prompt_budget": 9657,
+        "request_id": "3d5b5898",
+        "revision": 17,
+        "session_id": "20260905_223955_fa3680"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 177,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_296d41a4-fb45-486e-a392-141da7ba7ff2"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_296d41a4-fb45-486e-a392-141da7ba7ff2"
+          },
+          {
+            "arguments_digest": "f066cd79f71c77b42cb50c8d5792f6dc343f0f533897afea7572842e88ec74a4",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_296d41a4-fb45-486e-a392-141da7ba7ff2",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4218,
+        "last_actual_prompt_tokens": 5292,
+        "prompt_budget": 9657,
+        "request_id": "98b22e70",
+        "revision": 18,
+        "session_id": "20260905_224045_c77ee0"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 187,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_00b30b57-fd21-4518-a747-1a81f0faa846"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_00b30b57-fd21-4518-a747-1a81f0faa846"
+          },
+          {
+            "arguments_digest": "435b59098f47ac99a96be8a40f19cc327249f1366828f6831d404596f8c019d4",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_00b30b57-fd21-4518-a747-1a81f0faa846",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4269,
+        "last_actual_prompt_tokens": 5343,
+        "prompt_budget": 9657,
+        "request_id": "b8933150",
+        "revision": 19,
+        "session_id": "20260905_224138_be33a8"
+      },
+      {
+        "batch": [
+          {
+            "kind": "tool_post_execute",
+            "message_id": 197,
+            "model_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_69b7d8fe-91bd-462f-80ad-67a5a0d75cdb"
+          },
+          {
+            "duration_ms": 0,
+            "kind": "tool_execute",
+            "ok": true,
+            "raw_result_digest": "b1914517af840465f90aafbce62aee78adf61ae478dcc62fba415ced5612f7ef",
+            "tool_call_id": "call_0_69b7d8fe-91bd-462f-80ad-67a5a0d75cdb"
+          },
+          {
+            "arguments_digest": "5d90854600249861ac66011ce43832d4a469a8e06b73b0cc1b3f726ebcdf326a",
+            "decision": {
+              "status": "ready"
+            },
+            "kind": "tool_pre_execute",
+            "tool_call_id": "call_0_69b7d8fe-91bd-462f-80ad-67a5a0d75cdb",
+            "tool_name": "new_context"
+          }
+        ],
+        "estimated_tokens": 4148,
+        "last_actual_prompt_tokens": 5223,
+        "prompt_budget": 9657,
+        "request_id": "cedab120",
+        "revision": 20,
+        "session_id": "20260905_224234_30f9a0"
+      }
+    ],
+    "repeated_boundary_coverage": true,
+    "first_wrong_revision": 8,
+    "peak_actual_prompt_tokens": 5445,
+    "delivered_update_bytes": 0,
+    "delivered_tool_bytes": 11118,
+    "delivered_tool_estimated_window_equivalents": 0.2261962890625,
+    "delivered_update_estimated_window_equivalents": 0.0,
+    "snapshots_per_minute": 1.2178669877051327,
+    "source_window_equivalents": 2.7692057291666665,
+    "resets_below_quarter_estimated_budget": 0,
+    "telemetry_errors": 0,
+    "observed_boot_ids": [
+      "b82453ac-204f-443e-ad7c-1605e9012a89"
+    ],
+    "minimum_server_prompt_capacity": 14336,
+    "maximum_mlx_active_bytes": 14701359144,
+    "observed_downshifts": 0,
+    "memory_samples": 197,
+    "memory_errors": 0,
+    "maximum_physical_footprint_bytes": 18604139832,
+    "maximum_resident_bytes": 4997431296,
+    "minimum_free_page_bytes": 80216064,
+    "maximum_compressor_resident_bytes": 2418884608,
+    "valid_measurement": true,
+    "process_exit": 0,
+    "watchdog_terminated": false,
+    "unexpected_server_restart": false
+  },
+  "provenance": {
+    "updates": 20,
+    "context_ceiling": 12288,
+    "minutes_per_arm": 30,
+    "arms": "B",
+    "policy": "scheduled",
+    "higgs_config": "[server]\nhost = \"127.0.0.1\"\nport = 9000\napi_key = \"higgs\"\nmax_tokens = 8192\n\n[local]\nallow_runtime_model_load = true\nraise_wired_limit = true\n\n[[models]]\npath = \"/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2\"\nname = \"escha-35b-a3b\"\ngeneration_defaults = { max_tokens = 8192, temperature = 0.0, top_p = 0.95, top_k = 20, min_p = 0.05, speculation = \"auto\", enable_thinking = false }\nkv_max_sessions = 1\ndisk_cache_enabled = true\nkv_max_session_tokens = 16384\n# Native FP32 KV + GDN needs 736,952,320 bytes at 16,384 slots.\n# Keep the byte ceiling above that geometry so the 16K experiment tests\n# context decisions rather than an unintended 11,264-token retention cliff.\nkv_max_retained_bytes = 805306368\nkv_cache_bytes = 134217728\n",
+    "endurance_long_form_min_tokens": 2048,
+    "endurance_reset_handoff_requested": "1",
+    "endurance_reset_handoff_enabled": true,
+    "arm_servers": {
+      "B": {
+        "config": "/Users/peppi/Dev/nanobot-rs/experiments/context-recovery/endurance-feasibility-scheduled/server-B/higgs-endurance.toml",
+        "capacity_profile_dir": "/Users/peppi/Dev/nanobot-rs/experiments/context-recovery/endurance-feasibility-scheduled/server-B/capacity"
+      }
+    },
+    "nanobot_head": "0be0e65f120d1d2c27741f638e22492aa48abc08",
+    "sha256": {
+      "target/release/deps/nanobot-67848bc0f9b02956": "0d906c2e648510c85bff9ec3139693937fc788cc97d0a470add278cb1c5caee6",
+      "/private/tmp/higgs-recovery/higgs-hardened": "fd9747c68f4f85770eb47d30cf7c077b9a014e559a71dc03e2b46380dcfa86fc",
+      "src/agent/agent_loop/recovery_eval.rs": "1ac5d093c8b877012bfae31ca9bb08a191ceba42d411cc18f9686bf4b8966d9e",
+      "src/agent/agent_loop/endurance_eval.rs": "70eea599e8b787efe40b3a1f01e92e16f53f200872348c525b55e4b10e081aae",
+      "src/agent/token_budget.rs": "67ef4d1409c88329430d52f04f92289810774a82a9c118141d725f3fed9eb3a0",
+      "/Users/peppi/.local/bin/nanobot": "e26c4082bff1dea1540a593cc176e4fd092b3f12e7fb9504a1b9717fc42755a0",
+      "/Users/peppi/Dev/nanobot-rs/experiments/context-recovery/endurance.py": "d66d4b31692f4ef21eeb7e66fbfa4e20b9269e1aa6064c4d64dcd1e65588b150",
+      "/Users/peppi/Dev/nanobot-rs/experiments/context-recovery/memory_probe.py": "39b9bf0ddd579bb896489f247d00a19870087368fcc35594b96e6735a936f273"
+    }
+  }
+}
