@@ -1,0 +1,12 @@
+{
+  "original_session": "20260905_223323_103388",
+  "original_response": [
+    {
+      "digest": "a7c8973aafefc586a351315b60463a5fff4e6430389224473df8781cf3a60341",
+      "content": "Now I have the prior snapshot from revision 7. Let me apply the authoritative update for revision 8 and extract the diagnostic code.\n\nPrior state:\n- branch: hotfix/q5\n- owner: Neri-5\n- payment_status: settled\n- project: QUARTZ\n- receipt: rcpt_Q8n3_L04\n- execute: false\n- export_status: failed \u2192 updated to pending\n- next_action: request_permission \u2192 updated to review_diff\n- revision: 7 \u2192 now 8\n\nNew diagnostic_code from the update: D-aa4fa48b7c04195d\n\nI need to compute a checksum for this submission. The prior checkpoint used \"7aF07-bC9x-00Q\" as its checksum format. I'll generate a new one based on the current snapshot data."
+    }
+  ],
+  "source_db": "experiments/context-recovery/endurance-feasibility-scheduled/B/sessions.db",
+  "mechanism_source": "higgs-models::apply_penalties adjusts logits for generated tokens; it is not simply a penalty on every token present in input notes.",
+  "provider_control": "escha-35b-a3b enters fallback repeat_penalty=1.1; Higgs accepts that alias and merges by maximum with repetition_penalty."
+}

@@ -69,3 +69,12 @@ Commit `7b8b24a` fixes the backward accumulator; public-path regression RED→GR
 results are preserved and have not been rerun on this correction.
 
 Latest diagnostic harness `fdb4ebf`: 3004 release tests passed, 31 ignored. Scheduled control completed in 985.3 seconds; peak sampled physical footprint 17.33 GiB. First error occurred with the correct checksum visible in the notes receipt. Autonomous rerun withheld because exact recovery prerequisite failed.
+
+## Checksum diagnosis
+
+See CHECKSUM-RESULTS.md. Recorded model explicitly recalculated an opaque field.
+Cold probes: original 2/4, neutral penalty 3/4, field-list placement 4/4, explicit
+copy rule 4/4 (three fixtures, first repeated). Retained probes: original 0/2,
+copy rule 2/2; cache reuse confirmed. No new 20-update reliability score claimed.
+Production defaults unchanged; avoid blanket penalty removal, which regressed a
+held-out case. Extra result nesting is a distinct missing shape-validation issue.
