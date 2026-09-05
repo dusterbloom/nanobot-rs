@@ -1,0 +1,3791 @@
+{
+  "summary": {
+    "changed_count": 189,
+    "affected_count": 180,
+    "changed_files": 14,
+    "risk_level": "critical"
+  },
+  "changed_symbols": [
+    {
+      "id": "Enum:crates/higgs-engine/src/engine.rs:RequestExecutionPath",
+      "name": "RequestExecutionPath",
+      "type": "Enum",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt",
+      "name": "RequestAllocationReceipt",
+      "type": "Struct",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.prefill",
+      "name": "prefill",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.decode",
+      "name": "decode",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.retained_bytes",
+      "name": "retained_bytes",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.radix_growth_bytes",
+      "name": "radix_growth_bytes",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.execution_path",
+      "name": "execution_path",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.full_prompt_tokens",
+      "name": "full_prompt_tokens",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.suffix_tokens",
+      "name": "suffix_tokens",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Impl:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt",
+      "name": "RequestAllocationReceipt",
+      "type": "Impl",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.new#7",
+      "name": "new",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.prefill#0",
+      "name": "prefill",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.decode#0",
+      "name": "decode",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.execution_path#0",
+      "name": "execution_path",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.full_prompt_tokens#0",
+      "name": "full_prompt_tokens",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.suffix_tokens#0",
+      "name": "suffix_tokens",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.observed_peak_bytes#0",
+      "name": "observed_peak_bytes",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.observed_retained_bytes#0",
+      "name": "observed_retained_bytes",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:RequestAllocationReceipt.allocation_bearing#0",
+      "name": "allocation_bearing",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs-engine/src/engine.rs:RequestAllocationState",
+      "name": "RequestAllocationState",
+      "type": "Struct",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationState.prefill",
+      "name": "prefill",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationState.decode",
+      "name": "decode",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationState.retained_bytes",
+      "name": "retained_bytes",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationState.radix_growth_bytes",
+      "name": "radix_growth_bytes",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationState.execution",
+      "name": "execution",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationState.valid",
+      "name": "valid",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:RequestAllocationState.default#0",
+      "name": "default",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs-engine/src/engine.rs:RequestAllocationCapture",
+      "name": "RequestAllocationCapture",
+      "type": "Struct",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationCapture.previous",
+      "name": "previous",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationCapture.state",
+      "name": "state",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/engine.rs:RequestAllocationCapture.restored",
+      "name": "restored",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Impl:crates/higgs-engine/src/engine.rs:RequestAllocationCapture",
+      "name": "RequestAllocationCapture",
+      "type": "Impl",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:RequestAllocationCapture.start#0",
+      "name": "start",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:RequestAllocationCapture.finish#0",
+      "name": "finish",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:RequestAllocationCapture.restore#0",
+      "name": "restore",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:RequestAllocationCapture.drop#0",
+      "name": "drop",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:record_request_memory_high_water",
+      "name": "record_request_memory_high_water",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:record_request_retained_bytes",
+      "name": "record_request_retained_bytes",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:record_request_radix_growth_bytes",
+      "name": "record_request_radix_growth_bytes",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:record_request_execution",
+      "name": "record_request_execution",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:invalidate_request_allocation_capture",
+      "name": "invalidate_request_allocation_capture",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:crates/higgs-engine/src/engine.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:tests.memory_sample",
+      "name": "memory_sample",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:tests.request_allocation_capture_is_cleared_before_worker_thread_reuse",
+      "name": "request_allocation_capture_is_cleared_before_worker_thread_reuse",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:tests.out_of_order_nested_capture_drop_cannot_restore_stale_state",
+      "name": "out_of_order_nested_capture_drop_cannot_restore_stale_state",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/engine.rs:tests.request_allocation_capture_requires_complete_prefill_and_uses_actual_cache_bytes",
+      "name": "request_allocation_capture_requires_complete_prefill_and_uses_actual_cache_bytes",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/engine.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs-engine/src/mlx_tuning.rs:MlxAllocatorTelemetry",
+      "name": "MlxAllocatorTelemetry",
+      "type": "Struct",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/mlx_tuning.rs:MlxAllocatorTelemetry.memory",
+      "name": "memory",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/mlx_tuning.rs:MlxAllocatorTelemetry.cached_bytes",
+      "name": "cached_bytes",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/mlx_tuning.rs:MlxAllocatorTelemetry.measured_at_unix_ms",
+      "name": "measured_at_unix_ms",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Impl:crates/higgs-engine/src/mlx_tuning.rs:MlxAllocatorTelemetry",
+      "name": "MlxAllocatorTelemetry",
+      "type": "Impl",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/mlx_tuning.rs:MlxAllocatorTelemetry.measure#0",
+      "name": "measure",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Enum:crates/higgs-engine/src/mlx_tuning.rs:MlxMemoryProbeError",
+      "name": "MlxMemoryProbeError",
+      "type": "Enum",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/mlx_tuning.rs:MlxMemoryProbeError.fmt#1",
+      "name": "fmt",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs-engine/src/mlx_tuning.rs:RequestMemorySampler",
+      "name": "RequestMemorySampler",
+      "type": "Struct",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/mlx_tuning.rs:RequestMemorySampler.generation",
+      "name": "generation",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-engine/src/mlx_tuning.rs:RequestMemorySampler.gate_generation",
+      "name": "gate_generation",
+      "type": "Property",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Static:crates/higgs-engine/src/mlx_tuning.rs:REQUEST_MEMORY_SAMPLE_GENERATION",
+      "name": "REQUEST_MEMORY_SAMPLE_GENERATION",
+      "type": "Static",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Impl:crates/higgs-engine/src/mlx_tuning.rs:RequestMemorySampler",
+      "name": "RequestMemorySampler",
+      "type": "Impl",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/mlx_tuning.rs:RequestMemorySampler.start#2",
+      "name": "start",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/mlx_tuning.rs:RequestMemorySampler.start_with_probe#3",
+      "name": "start_with_probe",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/mlx_tuning.rs:RequestMemorySampler.finish#1",
+      "name": "finish",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/mlx_tuning.rs:RequestMemorySampler.finish_with_probe#2",
+      "name": "finish_with_probe",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Impl:crates/higgs-engine/src/mlx_tuning.rs:EngineCostDescription",
+      "name": "EngineCostDescription",
+      "type": "Impl",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/mlx_tuning.rs:EngineCostDescription.runtime_from_model_dir#4",
+      "name": "runtime_from_model_dir",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:crates/higgs-engine/src/mlx_tuning.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/mlx_tuning.rs:tests.request_memory_sampler_records_content_free_prefill_high_water",
+      "name": "request_memory_sampler_records_content_free_prefill_high_water",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/mlx_tuning.rs:tests.request_memory_sampler_records_decode_and_never_understates_baseline",
+      "name": "request_memory_sampler_records_decode_and_never_understates_baseline",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/mlx_tuning.rs:tests.request_memory_sampler_allows_sequential_phases_on_one_gate",
+      "name": "request_memory_sampler_allows_sequential_phases_on_one_gate",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/mlx_tuning.rs:tests.nested_request_memory_sample_invalidates_outer_window",
+      "name": "nested_request_memory_sample_invalidates_outer_window",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/mlx_tuning.rs:tests.reacquiring_mlx_gate_invalidates_old_sample_window",
+      "name": "reacquiring_mlx_gate_invalidates_old_sample_window",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-engine/src/mlx_tuning.rs:tests.runtime_native_escha_charges_fp32_cache_and_allocation_slack",
+      "name": "runtime_native_escha_charges_fp32_cache_and_allocation_slack",
+      "type": "Function",
+      "filePath": "crates/higgs-engine/src/mlx_tuning.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:crates/higgs-models/src/eschamoe.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "crates/higgs-models/src/eschamoe.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-models/src/eschamoe.rs:tests.escha_proj_gather_forward_matches_oracle",
+      "name": "escha_proj_gather_forward_matches_oracle",
+      "type": "Function",
+      "filePath": "crates/higgs-models/src/eschamoe.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-models/src/eschamoe.rs:escha_proj_gather_forward_matches_oracle.check@3180:8",
+      "name": "check",
+      "type": "Function",
+      "filePath": "crates/higgs-models/src/eschamoe.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Static:crates/higgs-models/src/mlx_exec.rs:MLX_GATE_ACQUISITION_GENERATION",
+      "name": "MLX_GATE_ACQUISITION_GENERATION",
+      "type": "Static",
+      "filePath": "crates/higgs-models/src/mlx_exec.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs-models/src/mlx_exec.rs:MlxExecToken",
+      "name": "MlxExecToken",
+      "type": "Struct",
+      "filePath": "crates/higgs-models/src/mlx_exec.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs-models/src/mlx_exec.rs:MlxExecToken.acquisition_generation",
+      "name": "acquisition_generation",
+      "type": "Property",
+      "filePath": "crates/higgs-models/src/mlx_exec.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Impl:crates/higgs-models/src/mlx_exec.rs:MlxExecToken",
+      "name": "MlxExecToken",
+      "type": "Impl",
+      "filePath": "crates/higgs-models/src/mlx_exec.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-models/src/mlx_exec.rs:MlxExecToken.acquisition_generation#0",
+      "name": "acquisition_generation",
+      "type": "Function",
+      "filePath": "crates/higgs-models/src/mlx_exec.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-models/src/mlx_exec.rs:acquire",
+      "name": "acquire",
+      "type": "Function",
+      "filePath": "crates/higgs-models/src/mlx_exec.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:crates/higgs-models/src/mlx_exec.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "crates/higgs-models/src/mlx_exec.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs-models/src/mlx_exec.rs:tests.each_gate_acquisition_has_a_distinct_generation",
+      "name": "each_gate_acquisition_has_a_distinct_generation",
+      "type": "Function",
+      "filePath": "crates/higgs-models/src/mlx_exec.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity.rs:run_reserved_generation",
+      "name": "run_reserved_generation",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/capacity.rs:PressureObservation",
+      "name": "PressureObservation",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/capacity.rs:PressureTelemetry",
+      "name": "PressureTelemetry",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:PressureTelemetry.raw_pressure",
+      "name": "raw_pressure",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:PressureTelemetry.swap_outs_total",
+      "name": "swap_outs_total",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:PressureTelemetry.compressions_total",
+      "name": "compressions_total",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:PressureTelemetry.sampled_at_unix_ms",
+      "name": "sampled_at_unix_ms",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:PressureTelemetry.sample_epoch",
+      "name": "sample_epoch",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:PressureTelemetry.non_normal_pressure_event_epoch",
+      "name": "non_normal_pressure_event_epoch",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity.rs:PressureTelemetry.default#0",
+      "name": "default",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/capacity.rs:CapacityDiagnostics",
+      "name": "CapacityDiagnostics",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityDiagnostics.raw_pressure",
+      "name": "raw_pressure",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityDiagnostics.mlx_cached_bytes",
+      "name": "mlx_cached_bytes",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityDiagnostics.mlx_measured_at_unix_ms",
+      "name": "mlx_measured_at_unix_ms",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityDiagnostics.swap_outs_total",
+      "name": "swap_outs_total",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityDiagnostics.compressions_total",
+      "name": "compressions_total",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityDiagnostics.pressure_sampled_at_unix_ms",
+      "name": "pressure_sampled_at_unix_ms",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityDiagnostics.pressure_sample_epoch",
+      "name": "pressure_sample_epoch",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityDiagnostics.non_normal_pressure_event_epoch",
+      "name": "non_normal_pressure_event_epoch",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityDiagnostics.allocation_observations",
+      "name": "allocation_observations",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityDiagnostics.clean_allocation_observations",
+      "name": "clean_allocation_observations",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityDiagnostics.skipped_allocation_observations",
+      "name": "skipped_allocation_observations",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityDiagnostics.last_observed_prefill_peak_bytes",
+      "name": "last_observed_prefill_peak_bytes",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityDiagnostics.last_observed_decode_peak_bytes",
+      "name": "last_observed_decode_peak_bytes",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityDiagnostics.last_observed_retained_bytes",
+      "name": "last_observed_retained_bytes",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/capacity.rs:CapacityModelDiagnostics",
+      "name": "CapacityModelDiagnostics",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity.rs:CapacityModelDiagnostics.qualified_cold_bands",
+      "name": "qualified_cold_bands",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity.rs:CapacityDiagnostics.default#0",
+      "name": "default",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/capacity.rs:AllocationObservation",
+      "name": "AllocationObservation",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity.rs:CapacityController.qualified_cold_band_count#0",
+      "name": "qualified_cold_band_count",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity.rs:CapacityController.byte_ledger_with_evidence_for_policy#2",
+      "name": "byte_ledger_with_evidence_for_policy",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity.rs:CapacityController.byte_ledger_with_evidence_for_policy.additional_peak@1643:8",
+      "name": "additional_peak",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:crates/higgs/src/capacity.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity.rs:tests.learned_absolute_peak_counts_model_weights_once",
+      "name": "learned_absolute_peak_counts_model_weights_once",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity.rs:tests.learning_requires_three_clean_allocation_observations_over_five_minutes",
+      "name": "learning_requires_three_clean_allocation_observations_over_five_minutes",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity.rs:tests.allocator_underprediction_raises_high_water_ten_percent_and_recomputes",
+      "name": "allocator_underprediction_raises_high_water_ten_percent_and_recomputes",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Trait:crates/higgs/src/capacity/pressure.rs:PressureObservationSink",
+      "name": "PressureObservationSink",
+      "type": "Trait",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/pressure.rs:PressureObservationSink.apply#2",
+      "name": "apply",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/pressure.rs:CapacityRegistry.apply#2",
+      "name": "apply",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/pressure.rs:CapacityPressureCoordinator.apply#2",
+      "name": "apply",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/pressure.rs:unix_time_millis",
+      "name": "unix_time_millis",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/pressure.rs:PressureObserverConfig.start#1",
+      "name": "start",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Impl:crates/higgs/src/capacity/pressure.rs:tests.FakeCounters",
+      "name": "FakeCounters",
+      "type": "Impl",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/pressure.rs:tests.FakeCounters.new#1",
+      "name": "new",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/pressure.rs:tests.FakeCounters.with_results#1",
+      "name": "with_results",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/pressure.rs:tests.wait_for_observations",
+      "name": "wait_for_observations",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/capacity/pressure.rs:RecordingSink",
+      "name": "RecordingSink",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/pressure.rs:RecordingSink.apply#2",
+      "name": "apply",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/pressure.rs:tests.observer_publishes_raw_pressure_counters_and_event_epoch",
+      "name": "observer_publishes_raw_pressure_counters_and_event_epoch",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/pressure.rs:tests.failed_probe_retains_last_valid_totals_and_sample_identity",
+      "name": "failed_probe_retains_last_valid_totals_and_sample_identity",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Const:crates/higgs/src/capacity/registry.rs:PRESSURE_SAMPLE_MAX_AGE_MS",
+      "name": "PRESSURE_SAMPLE_MAX_AGE_MS",
+      "type": "Const",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/registry.rs:unix_time_millis",
+      "name": "unix_time_millis",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/capacity/registry.rs:CapacityCounters",
+      "name": "CapacityCounters",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity/registry.rs:CapacityCounters.allocation_observations",
+      "name": "allocation_observations",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity/registry.rs:CapacityCounters.clean_allocation_observations",
+      "name": "clean_allocation_observations",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity/registry.rs:CapacityCounters.skipped_allocation_observations",
+      "name": "skipped_allocation_observations",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity/registry.rs:CapacityCounters.last_observed_prefill_peak_bytes",
+      "name": "last_observed_prefill_peak_bytes",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity/registry.rs:CapacityCounters.last_observed_decode_peak_bytes",
+      "name": "last_observed_decode_peak_bytes",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity/registry.rs:CapacityCounters.last_observed_retained_bytes",
+      "name": "last_observed_retained_bytes",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/capacity/registry.rs:RegistryState",
+      "name": "RegistryState",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity/registry.rs:RegistryState.pressure_telemetry",
+      "name": "pressure_telemetry",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/capacity/registry.rs:ActiveReservation",
+      "name": "ActiveReservation",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity/registry.rs:ActiveReservation.request",
+      "name": "request",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity/registry.rs:ActiveReservation.predicted_peak_bytes",
+      "name": "predicted_peak_bytes",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity/registry.rs:ActiveReservation.pressure_at_admission",
+      "name": "pressure_at_admission",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity/registry.rs:ActiveReservation.effective_pressure_at_admission",
+      "name": "effective_pressure_at_admission",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity/registry.rs:ActiveReservation.admitted_at_unix_ms",
+      "name": "admitted_at_unix_ms",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/capacity/registry.rs:RequestReservation",
+      "name": "RequestReservation",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/capacity/registry.rs:RequestReservation.observed",
+      "name": "observed",
+      "type": "Property",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Impl:crates/higgs/src/capacity/registry.rs:RequestReservation",
+      "name": "RequestReservation",
+      "type": "Impl",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/registry.rs:RequestReservation.observe#1",
+      "name": "observe",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/registry.rs:RequestReservation.skip_observation#0",
+      "name": "skip_observation",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Impl:crates/higgs/src/capacity/registry.rs:CapacityRegistry",
+      "name": "CapacityRegistry",
+      "type": "Impl",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/registry.rs:CapacityRegistry.new_inner#2",
+      "name": "new_inner",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/registry.rs:CapacityRegistry.diagnostics#0",
+      "name": "diagnostics",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/registry.rs:CapacityRegistry.try_reserve_locked#5",
+      "name": "try_reserve_locked",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/registry.rs:CapacityRegistry.observe_reservation#2",
+      "name": "observe_reservation",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/registry.rs:CapacityRegistry.apply_pressure_observation#1",
+      "name": "apply_pressure_observation",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/registry.rs:CapacityRegistry.apply_pressure_observation_with_telemetry#2",
+      "name": "apply_pressure_observation_with_telemetry",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/registry.rs:CapacityRegistry.apply_pressure_observation_inner#2",
+      "name": "apply_pressure_observation_inner",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:crates/higgs/src/capacity/registry.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/registry.rs:tests.completed_request_observation_trains_before_reservation_release",
+      "name": "completed_request_observation_trains_before_reservation_release",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/capacity/registry.rs:tests.request_observation_is_dirty_when_pressure_activity_is_unknown_or_grows",
+      "name": "request_observation_is_dirty_when_pressure_activity_is_unknown_or_grows",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/anthropic.rs:create_message_non_streaming",
+      "name": "create_message_non_streaming",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/anthropic.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/anthropic.rs:create_message_stream",
+      "name": "create_message_stream",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/anthropic.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:chat_completions_non_streaming",
+      "name": "chat_completions_non_streaming",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:chat_completions_stream",
+      "name": "chat_completions_stream",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:crates/higgs/src/routes/chat.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/chat.rs:tests.retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker",
+      "name": "retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/chat.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/completions.rs:completions_non_streaming",
+      "name": "completions_non_streaming",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/completions.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/completions.rs:completions_stream",
+      "name": "completions_stream",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/completions.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:crates/higgs/src/routes/metrics.rs:CacheMetricsView",
+      "name": "CacheMetricsView",
+      "type": "Struct",
+      "filePath": "crates/higgs/src/routes/metrics.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/routes/metrics.rs:CacheMetricsView.retention_oversized_drops",
+      "name": "retention_oversized_drops",
+      "type": "Property",
+      "filePath": "crates/higgs/src/routes/metrics.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/routes/metrics.rs:CacheMetricsView.retention_last_oversized_bytes",
+      "name": "retention_last_oversized_bytes",
+      "type": "Property",
+      "filePath": "crates/higgs/src/routes/metrics.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/routes/metrics.rs:CacheMetricsView.retention_last_oversized_tokens",
+      "name": "retention_last_oversized_tokens",
+      "type": "Property",
+      "filePath": "crates/higgs/src/routes/metrics.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:crates/higgs/src/routes/metrics.rs:CacheMetricsView.retained_bytes_limit",
+      "name": "retained_bytes_limit",
+      "type": "Property",
+      "filePath": "crates/higgs/src/routes/metrics.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Impl:crates/higgs/src/routes/metrics.rs:CacheMetricsView",
+      "name": "CacheMetricsView",
+      "type": "Impl",
+      "filePath": "crates/higgs/src/routes/metrics.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/metrics.rs:CacheMetricsView.add#1",
+      "name": "add",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/metrics.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:crates/higgs/src/routes/metrics.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "crates/higgs/src/routes/metrics.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/metrics.rs:tests.capacity_diagnostics_render_camel_case_with_no_request_content",
+      "name": "capacity_diagnostics_render_camel_case_with_no_request_content",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/metrics.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/metrics.rs:tests.cache_stats_fixture",
+      "name": "cache_stats_fixture",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/metrics.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/metrics.rs:tests.cache_metrics_aggregate_every_paired_stat",
+      "name": "cache_metrics_aggregate_every_paired_stat",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/metrics.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/routes/metrics.rs:tests.cache_metrics_render_paired_fields_with_stable_names",
+      "name": "cache_metrics_render_paired_fields_with_stable_names",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/metrics.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/state.rs:build_capacity_facts_from_measurements",
+      "name": "build_capacity_facts_from_measurements",
+      "type": "Function",
+      "filePath": "crates/higgs/src/state.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:crates/higgs/src/state.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "crates/higgs/src/state.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/state.rs:tests.post_load_facts_bind_content_and_execution_identity_to_measured_residency",
+      "name": "post_load_facts_bind_content_and_execution_identity_to_measured_residency",
+      "type": "Function",
+      "filePath": "crates/higgs/src/state.rs",
+      "change_type": "touched"
+    }
+  ],
+  "affected_processes": [
+    {
+      "id": "proc_1_capacity_admission_q",
+      "name": "Capacity_admission_queued_handoff_keeps_reclaimed_ceiling_through_recompute → Default",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_2_capacity_admission_q",
+      "name": "Capacity_admission_queued_handoff_keeps_reclaimed_ceiling_through_recompute → RegistryState",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "RegistryState",
+          "step": 10
+        },
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_3_capacity_admission_q",
+      "name": "Capacity_admission_queued_handoff_keeps_reclaimed_ceiling_through_recompute → Registry_pressure_controller",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_4_main",
+      "name": "Main → New_inner",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 10
+        }
+      ]
+    },
+    {
+      "id": "proc_5_capacity_admission_r",
+      "name": "Capacity_admission_rejects_both_anthropic_variants_before_worker_mutation → Prompt_band",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 8
+        }
+      ]
+    },
+    {
+      "id": "proc_18_learned_profile_roun",
+      "name": "Learned_profile_roundtrip_changes_decision_and_mismatch_is_transactional → Persistent_bytes",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 8
+        }
+      ]
+    },
+    {
+      "id": "proc_19_capacity_admission_c",
+      "name": "Capacity_admission_contention_is_strict_fifo → EngineCostDescription",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 7
+        }
+      ]
+    },
+    {
+      "id": "proc_20_capacity_admission_c",
+      "name": "Capacity_admission_contention_is_strict_fifo → CapacityInputs",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 7
+        }
+      ]
+    },
+    {
+      "id": "proc_21_capacity_admission_r",
+      "name": "Capacity_admission_rejects_both_anthropic_variants_before_worker_mutation → Estimate_bytes",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 8
+        }
+      ]
+    },
+    {
+      "id": "proc_85_try_reserve_locked",
+      "name": "Try_reserve_locked → CacheAllocation",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "try_reserve_locked",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_146_cancelled_provisiona",
+      "name": "Cancelled_provisional_needs_later_measured_decrease_to_recover_zero → Record_capacity_transition",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_147_cancelled_provisiona",
+      "name": "Cancelled_provisional_needs_later_measured_decrease_to_recover_zero → PressureObservation",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "PressureObservation",
+          "step": 4
+        },
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_149_capacity_admission_r",
+      "name": "Capacity_admission_rejects_both_anthropic_variants_before_worker_mutation → Default",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "default",
+          "step": 4
+        }
+      ]
+    },
+    {
+      "id": "proc_152_completions",
+      "name": "Completions → Merge_repetition_penalty",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_153_completions",
+      "name": "Completions → SamplingParams",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_154_completions",
+      "name": "Completions → Enable_thinking",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_165_request_allocation_c",
+      "name": "Request_allocation_capture_requires_complete_prefill_and_uses_actual_cache_bytes → Restore",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "request_allocation_capture_requires_complete_prefill_and_uses_actual_cache_bytes",
+          "step": 1
+        },
+        {
+          "symbol": "restore",
+          "step": 3
+        },
+        {
+          "symbol": "finish",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_166_request_allocation_c",
+      "name": "Request_allocation_capture_requires_complete_prefill_and_uses_actual_cache_bytes → New",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "request_allocation_capture_requires_complete_prefill_and_uses_actual_cache_bytes",
+          "step": 1
+        },
+        {
+          "symbol": "finish",
+          "step": 2
+        },
+        {
+          "symbol": "new",
+          "step": 3
+        }
+      ]
+    },
+    {
+      "id": "proc_167_request_allocation_c",
+      "name": "Request_allocation_capture_requires_complete_prefill_and_uses_actual_cache_bytes → Default",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "request_allocation_capture_requires_complete_prefill_and_uses_actual_cache_bytes",
+          "step": 1
+        },
+        {
+          "symbol": "start",
+          "step": 2
+        },
+        {
+          "symbol": "default",
+          "step": 3
+        }
+      ]
+    },
+    {
+      "id": "proc_179_q2_m5_lm_head_argmax",
+      "name": "Q2_m5_lm_head_argmax_candidate_sweep → MlxExecToken",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "MlxExecToken",
+          "step": 3
+        },
+        {
+          "symbol": "acquire",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_209_try_reserve_locked",
+      "name": "Try_reserve_locked → Apply_allocation_totals",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "try_reserve_locked",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_210_capacity_diagnostics",
+      "name": "Capacity_diagnostics_expose_reservation_waiter_rejection_and_outcome_counters → CapacityDiagnostics",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "CapacityDiagnostics",
+          "step": 3
+        },
+        {
+          "symbol": "diagnostics",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_211_capacity_diagnostics",
+      "name": "Capacity_diagnostics_expose_reservation_waiter_rejection_and_outcome_counters → CapacityModelDiagnostics",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "CapacityModelDiagnostics",
+          "step": 3
+        },
+        {
+          "symbol": "diagnostics",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_220_create_message",
+      "name": "Create_message → Image_marker_text",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "create_message_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_221_create_message",
+      "name": "Create_message → Is_vlm",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "create_message_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_222_create_message",
+      "name": "Create_message → Model_name",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "create_message_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_225_completions",
+      "name": "Completions → Extract",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_226_metrics",
+      "name": "Metrics → Add",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "add",
+          "step": 3
+        }
+      ]
+    },
+    {
+      "id": "proc_242_capacity_admission_r",
+      "name": "Capacity_admission_reclaimed_cache_stays_capped_until_final_guard_release → Default",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_243_capacity_admission_r",
+      "name": "Capacity_admission_reclaimed_cache_stays_capped_until_final_guard_release → RegistryState",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "RegistryState",
+          "step": 10
+        },
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_244_capacity_admission_r",
+      "name": "Capacity_admission_reclaimed_cache_stays_capped_until_final_guard_release → Registry_pressure_controller",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_245_cancelling_explicit_",
+      "name": "Cancelling_explicit_provisional_cleanup_does_not_drop_the_cleanup_owner → New_inner",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 10
+        }
+      ]
+    },
+    {
+      "id": "proc_246_capacity_admission_r",
+      "name": "Capacity_admission_rejects_both_chat_variants_before_worker_mutation → Prompt_band",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 8
+        }
+      ]
+    },
+    {
+      "id": "proc_255_restored_suffix_high",
+      "name": "Restored_suffix_high_water_changes_retained_admission → Persistent_bytes",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 8
+        }
+      ]
+    },
+    {
+      "id": "proc_256_main",
+      "name": "Main → EngineCostDescription",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 7
+        }
+      ]
+    },
+    {
+      "id": "proc_257_capacity_admission_d",
+      "name": "Capacity_admission_drain_rejects_queued_work_with_current_generation → CapacityInputs",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 7
+        }
+      ]
+    },
+    {
+      "id": "proc_258_capacity_admission_r",
+      "name": "Capacity_admission_rejects_both_chat_variants_before_worker_mutation → Estimate_bytes",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 8
+        }
+      ]
+    },
+    {
+      "id": "proc_276_completions",
+      "name": "Completions → Gpu_gate",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_358_capacity_admission_c",
+      "name": "Capacity_admission_critical_pressure_interrupts_live_reservations → Record_capacity_transition",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_359_capacity_admission_c",
+      "name": "Capacity_admission_critical_pressure_interrupts_live_reservations → PressureObservation",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "PressureObservation",
+          "step": 4
+        },
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_361_capacity_admission_r",
+      "name": "Capacity_admission_rejects_both_chat_variants_before_worker_mutation → Default",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "default",
+          "step": 4
+        }
+      ]
+    },
+    {
+      "id": "proc_366_create_message",
+      "name": "Create_message → Enable_thinking",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "create_message_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_379_q2_m5_verifier_path_",
+      "name": "Q2_m5_verifier_path_sweep → MlxExecToken",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "MlxExecToken",
+          "step": 3
+        },
+        {
+          "symbol": "acquire",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_391_chat_completions",
+      "name": "Chat_completions → Image_marker_text",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_392_chat_completions",
+      "name": "Chat_completions → Is_vlm",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_393_chat_completions",
+      "name": "Chat_completions → Model_name",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_397_pressure_after_measu",
+      "name": "Pressure_after_measurement_invalidates_unregister_recovery → Default",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_398_pressure_after_measu",
+      "name": "Pressure_after_measurement_invalidates_unregister_recovery → RegistryState",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "RegistryState",
+          "step": 10
+        },
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_399_pressure_after_measu",
+      "name": "Pressure_after_measurement_invalidates_unregister_recovery → Registry_pressure_controller",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_400_retained_suffix_admi",
+      "name": "Retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker → Prompt_band",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker",
+          "step": 1
+        },
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 8
+        }
+      ]
+    },
+    {
+      "id": "proc_407_capacity_admission_r",
+      "name": "Capacity_admission_rejects_both_anthropic_variants_before_worker_mutation → Persistent_bytes",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 8
+        }
+      ]
+    },
+    {
+      "id": "proc_408_begin_drain",
+      "name": "Begin_drain → EngineCostDescription",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_409_main",
+      "name": "Main → CapacityInputs",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 7
+        }
+      ]
+    },
+    {
+      "id": "proc_410_retained_suffix_admi",
+      "name": "Retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker → Estimate_bytes",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker",
+          "step": 1
+        },
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 8
+        }
+      ]
+    },
+    {
+      "id": "proc_411_retained_suffix_admi",
+      "name": "Retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker → CapacityDecision",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_419_cancelled_provisiona",
+      "name": "Cancelled_provisional_needs_later_measured_decrease_to_recover_zero → Lock",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_476_learned_absolute_pea",
+      "name": "Learned_absolute_peak_counts_model_weights_once → Clear_clean_windows",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "learned_absolute_peak_counts_model_weights_once",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_477_capacity_admission_d",
+      "name": "Capacity_admission_dequeue_revalidates_pressure_generation_memory_and_cost → Record_capacity_transition",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_478_capacity_admission_d",
+      "name": "Capacity_admission_dequeue_revalidates_pressure_generation_memory_and_cost → PressureObservation",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "PressureObservation",
+          "step": 4
+        },
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_480_retained_suffix_admi",
+      "name": "Retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker → Default",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker",
+          "step": 1
+        },
+        {
+          "symbol": "default",
+          "step": 4
+        }
+      ]
+    },
+    {
+      "id": "proc_485_chat_completions",
+      "name": "Chat_completions → Enable_thinking",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_495_q2_row2_m5_microbenc",
+      "name": "Q2_row2_m5_microbench_kill_gate → MlxExecToken",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "MlxExecToken",
+          "step": 3
+        },
+        {
+          "symbol": "acquire",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_498_learned_absolute_pea",
+      "name": "Learned_absolute_peak_counts_model_weights_once → Is_clean",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "learned_absolute_peak_counts_model_weights_once",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_499_learned_absolute_pea",
+      "name": "Learned_absolute_peak_counts_model_weights_once → Now_millis",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "learned_absolute_peak_counts_model_weights_once",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_501_blocking_required_po",
+      "name": "Blocking_required_post_admission_miss_returns_http_409 → Image_marker_text",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_502_blocking_required_po",
+      "name": "Blocking_required_post_admission_miss_returns_http_409 → Is_vlm",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_503_blocking_required_po",
+      "name": "Blocking_required_post_admission_miss_returns_http_409 → Model_name",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_507_registration_reduces",
+      "name": "Registration_reduces_optional_caches_to_preserve_minimum_request → Default",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_508_registration_reduces",
+      "name": "Registration_reduces_optional_caches_to_preserve_minimum_request → RegistryState",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "RegistryState",
+          "step": 10
+        },
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_509_registration_reduces",
+      "name": "Registration_reduces_optional_caches_to_preserve_minimum_request → Registry_pressure_controller",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_510_capacity_admission_r",
+      "name": "Capacity_admission_rejects_both_completion_variants_before_worker_mutation → Prompt_band",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 8
+        }
+      ]
+    },
+    {
+      "id": "proc_517_capacity_admission_r",
+      "name": "Capacity_admission_rejects_both_chat_variants_before_worker_mutation → Persistent_bytes",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 8
+        }
+      ]
+    },
+    {
+      "id": "proc_518_try_reserve_locked",
+      "name": "Try_reserve_locked → EngineCostDescription",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "try_reserve_locked",
+          "step": 1
+        },
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_519_begin_drain",
+      "name": "Begin_drain → CapacityInputs",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_520_capacity_admission_r",
+      "name": "Capacity_admission_rejects_both_completion_variants_before_worker_mutation → Estimate_bytes",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 8
+        }
+      ]
+    },
+    {
+      "id": "proc_557_completions",
+      "name": "Completions → New",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_575_completed_request_ob",
+      "name": "Completed_request_observation_trains_before_reservation_release → Record_capacity_transition",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "completed_request_observation_trains_before_reservation_release",
+          "step": 1
+        },
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation_with_telemetry",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_576_completed_request_ob",
+      "name": "Completed_request_observation_trains_before_reservation_release → PressureObservation",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "PressureObservation",
+          "step": 4
+        },
+        {
+          "symbol": "completed_request_observation_trains_before_reservation_release",
+          "step": 1
+        },
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation_with_telemetry",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_578_capacity_admission_r",
+      "name": "Capacity_admission_rejects_both_completion_variants_before_worker_mutation → Default",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "default",
+          "step": 4
+        }
+      ]
+    },
+    {
+      "id": "proc_581_blocking_required_po",
+      "name": "Blocking_required_post_admission_miss_returns_http_409 → Enable_thinking",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_584_eschamoe_gather_qgem",
+      "name": "Eschamoe_gather_qgemm_bench → MlxExecToken",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "MlxExecToken",
+          "step": 3
+        },
+        {
+          "symbol": "acquire",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_588_capacity_interrupted",
+      "name": "Capacity_interrupted_stream_emits_exact_terminal_event_then_done → Image_marker_text",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_589_capacity_interrupted",
+      "name": "Capacity_interrupted_stream_emits_exact_terminal_event_then_done → Is_vlm",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_590_capacity_interrupted",
+      "name": "Capacity_interrupted_stream_emits_exact_terminal_event_then_done → Model_name",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_592_retained_suffix_admi",
+      "name": "Retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker → Working_set_authority_bytes",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_593_snapshots_publish_ca",
+      "name": "Snapshots_publish_cache_bytes_only_after_exact_engine_acknowledgement → Default",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_594_rejected_coload_clea",
+      "name": "Rejected_coload_cleanup_seeds_bounded_recovery_from_zero → RegistryState",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "RegistryState",
+          "step": 10
+        },
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_595_rejected_coload_clea",
+      "name": "Rejected_coload_cleanup_seeds_bounded_recovery_from_zero → Registry_pressure_controller",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_596_stop_awaits_pressure",
+      "name": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Prompt_band",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_603_retained_suffix_admi",
+      "name": "Retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker → Persistent_bytes",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker",
+          "step": 1
+        },
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 8
+        }
+      ]
+    },
+    {
+      "id": "proc_604_capacity_admission_q",
+      "name": "Capacity_admission_queued_handoff_keeps_reclaimed_ceiling_through_recompute → EngineCostDescription",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_605_try_reserve_locked",
+      "name": "Try_reserve_locked → CapacityInputs",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "try_reserve_locked",
+          "step": 1
+        },
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_606_stop_awaits_pressure",
+      "name": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Estimate_bytes",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_611_retained_suffix_admi",
+      "name": "Retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker → Token_ceiling",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_615_capacity_admission_c",
+      "name": "Capacity_admission_critical_pressure_interrupts_live_reservations → Lock",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_623_retained_suffix_admi",
+      "name": "Retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker → Output_tokens",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_650_learning_requires_th",
+      "name": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Clear_clean_windows",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "learning_requires_three_clean_allocation_observations_over_five_minutes",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_651_constrained_shared_l",
+      "name": "Constrained_shared_ledger_recompute_preserves_pressure_downshift → Record_capacity_transition",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_652_constrained_shared_l",
+      "name": "Constrained_shared_ledger_recompute_preserves_pressure_downshift → PressureObservation",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "PressureObservation",
+          "step": 4
+        },
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_656_capacity_interrupted",
+      "name": "Capacity_interrupted_stream_emits_exact_terminal_event_then_done → Enable_thinking",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_657_bench_aligned_fast_q",
+      "name": "Bench_aligned_fast_qmv_m_sweep → MlxExecToken",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "MlxExecToken",
+          "step": 3
+        },
+        {
+          "symbol": "acquire",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_659_learning_requires_th",
+      "name": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Is_clean",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "learning_requires_three_clean_allocation_observations_over_five_minutes",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_660_learning_requires_th",
+      "name": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Now_millis",
+      "process_type": "intra_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "learning_requires_three_clean_allocation_observations_over_five_minutes",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_661_prompt_limit_rejects",
+      "name": "Prompt_limit_rejects_before_blocking_and_streaming_session_mutations → Image_marker_text",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_662_prompt_limit_rejects",
+      "name": "Prompt_limit_rejects_before_blocking_and_streaming_session_mutations → Is_vlm",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_663_prompt_limit_rejects",
+      "name": "Prompt_limit_rejects_before_blocking_and_streaming_session_mutations → Model_name",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_666_stale_unload_measure",
+      "name": "Stale_unload_measurement_cannot_replace_a_later_load_measurement → Default",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_667_snapshots_publish_ca",
+      "name": "Snapshots_publish_cache_bytes_only_after_exact_engine_acknowledgement → RegistryState",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "RegistryState",
+          "step": 10
+        },
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_668_snapshots_publish_ca",
+      "name": "Snapshots_publish_cache_bytes_only_after_exact_engine_acknowledgement → Registry_pressure_controller",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_669_new_swap_out_restart",
+      "name": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Prompt_band",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 5
+        }
+      ]
+    },
+    {
+      "id": "proc_676_capacity_admission_r",
+      "name": "Capacity_admission_rejects_both_completion_variants_before_worker_mutation → Persistent_bytes",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 8
+        }
+      ]
+    },
+    {
+      "id": "proc_677_capacity_admission_r",
+      "name": "Capacity_admission_reclaimed_cache_stays_capped_until_final_guard_release → EngineCostDescription",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_678_capacity_admission_q",
+      "name": "Capacity_admission_queued_handoff_keeps_reclaimed_ceiling_through_recompute → CapacityInputs",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_679_new_swap_out_restart",
+      "name": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Estimate_bytes",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 5
+        }
+      ]
+    },
+    {
+      "id": "proc_687_capacity_admission_d",
+      "name": "Capacity_admission_dequeue_revalidates_pressure_generation_memory_and_cost → Lock",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_719_critical_pressure_ev",
+      "name": "Critical_pressure_evicts_active_optional_caches_but_keeps_draining_reserved → Record_capacity_transition",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_720_critical_pressure_ev",
+      "name": "Critical_pressure_evicts_active_optional_caches_but_keeps_draining_reserved → PressureObservation",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "PressureObservation",
+          "step": 4
+        },
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_724_prompt_limit_rejects",
+      "name": "Prompt_limit_rejects_before_blocking_and_streaming_session_mutations → Enable_thinking",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_non_streaming",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_725_bench_tg_lut4_gate_u",
+      "name": "Bench_tg_lut4_gate_up_bonsai_27b → MlxExecToken",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "MlxExecToken",
+          "step": 3
+        },
+        {
+          "symbol": "acquire",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_728_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → Image_marker_text",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_729_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → Is_vlm",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_730_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → Model_name",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_733_cmd_serve",
+      "name": "Cmd_serve → Default",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_734_stale_unload_measure",
+      "name": "Stale_unload_measurement_cannot_replace_a_later_load_measurement → RegistryState",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "RegistryState",
+          "step": 10
+        },
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_735_stale_unload_measure",
+      "name": "Stale_unload_measurement_cannot_replace_a_later_load_measurement → Registry_pressure_controller",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_736_swap_out_is_critical",
+      "name": "Swap_out_is_critical_until_sixty_clean_seconds → Prompt_band",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 5
+        }
+      ]
+    },
+    {
+      "id": "proc_742_stop_awaits_pressure",
+      "name": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Persistent_bytes",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_743_finish_unregister_re",
+      "name": "Finish_unregister_requires_current_decreased_measurement_to_recover_zero → EngineCostDescription",
+      "process_type": "intra_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_744_capacity_admission_r",
+      "name": "Capacity_admission_reclaimed_cache_stays_capped_until_final_guard_release → CapacityInputs",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_745_swap_out_is_critical",
+      "name": "Swap_out_is_critical_until_sixty_clean_seconds → Estimate_bytes",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 5
+        }
+      ]
+    },
+    {
+      "id": "proc_774_draining_cache_alloc",
+      "name": "Draining_cache_allocation_is_frozen_across_pressure_recomputation → Record_capacity_transition",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_775_draining_cache_alloc",
+      "name": "Draining_cache_allocation_is_frozen_across_pressure_recomputation → PressureObservation",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "PressureObservation",
+          "step": 4
+        },
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_776_required_one_token_p",
+      "name": "Required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 → Enable_thinking",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_777_wide_qmm_row4_matche",
+      "name": "Wide_qmm_row4_matches_cpu_reference → MlxExecToken",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "MlxExecToken",
+          "step": 3
+        },
+        {
+          "symbol": "acquire",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_780_streaming_required_m",
+      "name": "Streaming_required_materialization_failure_errors_before_sse → Image_marker_text",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_781_streaming_required_m",
+      "name": "Streaming_required_materialization_failure_errors_before_sse → Is_vlm",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_782_streaming_required_m",
+      "name": "Streaming_required_materialization_failure_errors_before_sse → Model_name",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_785_active_route_returns",
+      "name": "Active_route_returns_the_stored_snapshot_unchanged → Default",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_786_cmd_serve",
+      "name": "Cmd_serve → RegistryState",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "RegistryState",
+          "step": 10
+        },
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_787_cmd_serve",
+      "name": "Cmd_serve → Registry_pressure_controller",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_788_warning_critical_osc",
+      "name": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Prompt_band",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 5
+        }
+      ]
+    },
+    {
+      "id": "proc_794_new_swap_out_restart",
+      "name": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Persistent_bytes",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 5
+        }
+      ]
+    },
+    {
+      "id": "proc_795_pressure_after_measu",
+      "name": "Pressure_after_measurement_invalidates_unregister_recovery → EngineCostDescription",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_796_finish_unregister_re",
+      "name": "Finish_unregister_requires_current_decreased_measurement_to_recover_zero → CapacityInputs",
+      "process_type": "intra_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_797_warning_critical_osc",
+      "name": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Estimate_bytes",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 5
+        }
+      ]
+    },
+    {
+      "id": "proc_804_capacity_diagnostics",
+      "name": "Capacity_diagnostics_expose_reservation_waiter_rejection_and_outcome_counters → Lock",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "diagnostics",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_824_normal_shared_ledger",
+      "name": "Normal_shared_ledger_recompute_does_not_instantly_restore_capacity → Record_capacity_transition",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_825_normal_shared_ledger",
+      "name": "Normal_shared_ledger_recompute_does_not_instantly_restore_capacity → PressureObservation",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "PressureObservation",
+          "step": 4
+        },
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_826_streaming_required_m",
+      "name": "Streaming_required_materialization_failure_errors_before_sse → Enable_thinking",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_829_streaming_required_w",
+      "name": "Streaming_required_worker_rejection_returns_http_409_before_sse → Image_marker_text",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_830_streaming_required_w",
+      "name": "Streaming_required_worker_rejection_returns_http_409_before_sse → Is_vlm",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_831_streaming_required_w",
+      "name": "Streaming_required_worker_rejection_returns_http_409_before_sse → Model_name",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_834_capacity_admission_c",
+      "name": "Capacity_admission_contention_is_strict_fifo → Default",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 7
+        }
+      ]
+    },
+    {
+      "id": "proc_835_active_route_returns",
+      "name": "Active_route_returns_the_stored_snapshot_unchanged → RegistryState",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "RegistryState",
+          "step": 10
+        },
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_836_active_route_returns",
+      "name": "Active_route_returns_the_stored_snapshot_unchanged → Registry_pressure_controller",
+      "process_type": "cross_community",
+      "step_count": 10,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 9
+        }
+      ]
+    },
+    {
+      "id": "proc_837_critical_is_intrinsi",
+      "name": "Critical_is_intrinsic_to_construction_restore_and_admission → Prompt_band",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 4
+        }
+      ]
+    },
+    {
+      "id": "proc_842_swap_out_is_critical",
+      "name": "Swap_out_is_critical_until_sixty_clean_seconds → Persistent_bytes",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 5
+        }
+      ]
+    },
+    {
+      "id": "proc_843_registration_reduces",
+      "name": "Registration_reduces_optional_caches_to_preserve_minimum_request → EngineCostDescription",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_844_matching_learned_pro",
+      "name": "Matching_learned_profile_restores_across_process_boots → CapacityInputs",
+      "process_type": "intra_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_845_critical_is_intrinsi",
+      "name": "Critical_is_intrinsic_to_construction_restore_and_admission → Estimate_bytes",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 4
+        }
+      ]
+    },
+    {
+      "id": "proc_852_completed_request_ob",
+      "name": "Completed_request_observation_trains_before_reservation_release → Lock",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "completed_request_observation_trains_before_reservation_release",
+          "step": 1
+        },
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation_with_telemetry",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_871_request_observation_",
+      "name": "Request_observation_is_dirty_when_pressure_activity_is_unknown_or_grows → Record_capacity_transition",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "request_observation_is_dirty_when_pressure_activity_is_unknown_or_grows",
+          "step": 1
+        },
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation_with_telemetry",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_872_request_observation_",
+      "name": "Request_observation_is_dirty_when_pressure_activity_is_unknown_or_grows → PressureObservation",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "PressureObservation",
+          "step": 4
+        },
+        {
+          "symbol": "request_observation_is_dirty_when_pressure_activity_is_unknown_or_grows",
+          "step": 1
+        },
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation_with_telemetry",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_873_streaming_required_w",
+      "name": "Streaming_required_worker_rejection_returns_http_409_before_sse → Enable_thinking",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "chat_completions_stream",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_878_main",
+      "name": "Main → Default",
+      "process_type": "cross_community",
+      "step_count": 9,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 7
+        }
+      ]
+    },
+    {
+      "id": "proc_879_capacity_admission_c",
+      "name": "Capacity_admission_contention_is_strict_fifo → RegistryState",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "RegistryState",
+          "step": 8
+        },
+        {
+          "symbol": "new_inner",
+          "step": 7
+        }
+      ]
+    },
+    {
+      "id": "proc_880_learned_absolute_pea",
+      "name": "Learned_absolute_peak_counts_model_weights_once → Prompt_band",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "learned_absolute_peak_counts_model_weights_once",
+          "step": 1
+        },
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 4
+        }
+      ]
+    },
+    {
+      "id": "proc_885_warning_critical_osc",
+      "name": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Persistent_bytes",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 5
+        }
+      ]
+    },
+    {
+      "id": "proc_886_rejected_coload_clea",
+      "name": "Rejected_coload_cleanup_seeds_bounded_recovery_from_zero → EngineCostDescription",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_887_pressure_after_measu",
+      "name": "Pressure_after_measurement_invalidates_unregister_recovery → CapacityInputs",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_888_learned_absolute_pea",
+      "name": "Learned_absolute_peak_counts_model_weights_once → Estimate_bytes",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "learned_absolute_peak_counts_model_weights_once",
+          "step": 1
+        },
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 4
+        }
+      ]
+    },
+    {
+      "id": "proc_894_constrained_shared_l",
+      "name": "Constrained_shared_ledger_recompute_preserves_pressure_downshift → Lock",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_917_begin_drain",
+      "name": "Begin_drain → Default",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_918_capacity_admission_d",
+      "name": "Capacity_admission_drain_rejects_queued_work_with_current_generation → RegistryState",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "RegistryState",
+          "step": 8
+        },
+        {
+          "symbol": "new_inner",
+          "step": 7
+        }
+      ]
+    },
+    {
+      "id": "proc_919_learning_requires_th",
+      "name": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Prompt_band",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "learning_requires_three_clean_allocation_observations_over_five_minutes",
+          "step": 1
+        },
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 4
+        }
+      ]
+    },
+    {
+      "id": "proc_924_critical_is_intrinsi",
+      "name": "Critical_is_intrinsic_to_construction_restore_and_admission → Persistent_bytes",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 4
+        }
+      ]
+    },
+    {
+      "id": "proc_925_snapshots_publish_ca",
+      "name": "Snapshots_publish_cache_bytes_only_after_exact_engine_acknowledgement → EngineCostDescription",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_926_registration_reduces",
+      "name": "Registration_reduces_optional_caches_to_preserve_minimum_request → CapacityInputs",
+      "process_type": "cross_community",
+      "step_count": 8,
+      "changed_steps": [
+        {
+          "symbol": "new_inner",
+          "step": 6
+        }
+      ]
+    },
+    {
+      "id": "proc_927_learning_requires_th",
+      "name": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Estimate_bytes",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "learning_requires_three_clean_allocation_observations_over_five_minutes",
+          "step": 1
+        },
+        {
+          "symbol": "byte_ledger_with_evidence_for_policy",
+          "step": 4
+        }
+      ]
+    },
+    {
+      "id": "proc_933_critical_pressure_ev",
+      "name": "Critical_pressure_evicts_active_optional_caches_but_keeps_draining_reserved → Lock",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "apply_pressure_observation_inner",
+          "step": 3
+        },
+        {
+          "symbol": "apply_pressure_observation",
+          "step": 2
+        }
+      ]
+    }
+  ]
+}

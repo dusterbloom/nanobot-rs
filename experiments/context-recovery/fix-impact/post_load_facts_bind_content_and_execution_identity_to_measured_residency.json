@@ -1,0 +1,22 @@
+{
+  "target": {
+    "id": "Function:crates/higgs/src/state.rs:tests.post_load_facts_bind_content_and_execution_identity_to_measured_residency",
+    "name": "post_load_facts_bind_content_and_execution_identity_to_measured_residency",
+    "type": "Function",
+    "filePath": "crates/higgs/src/state.rs"
+  },
+  "direction": "upstream",
+  "impactedCount": 0,
+  "risk": "UNKNOWN",
+  "riskNote": "No callers resolved. Absence of edges is not evidence the symbol is unused: a caller reaching it through a reference class this index does not record — plain-object property access, a bare-identifier read of a module-scope const — produces no edge to find. Confirm with a text search before treating the change as safe.",
+  "epistemic": "exact",
+  "summary": {
+    "direct": 0,
+    "processes_affected": 0,
+    "modules_affected": 0
+  },
+  "byDepthCounts": {},
+  "affected_processes": [],
+  "affected_modules": [],
+  "byDepth": {}
+}

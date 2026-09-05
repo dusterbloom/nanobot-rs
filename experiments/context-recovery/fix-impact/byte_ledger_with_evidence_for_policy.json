@@ -1,0 +1,1360 @@
+{
+  "target": {
+    "id": "Function:crates/higgs/src/capacity.rs:CapacityController.byte_ledger_with_evidence_for_policy#2",
+    "name": "byte_ledger_with_evidence_for_policy",
+    "type": "Function",
+    "filePath": "crates/higgs/src/capacity.rs"
+  },
+  "direction": "upstream",
+  "impactedCount": 23,
+  "risk": "CRITICAL",
+  "epistemic": "exact",
+  "summary": {
+    "direct": 2,
+    "processes_affected": 11,
+    "modules_affected": 2
+  },
+  "byDepthCounts": {
+    "1": 2,
+    "2": 4,
+    "3": 17
+  },
+  "affected_processes": [
+    {
+      "name": "critical_is_intrinsic_to_construction_restore_and_admission",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "affected_process_count": 7,
+      "total_hits": 23,
+      "earliest_broken_step": 1
+    },
+    {
+      "name": "new_swap_out_restarts_the_clean_minute_without_repeated_downshift",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "affected_process_count": 8,
+      "total_hits": 22,
+      "earliest_broken_step": 2
+    },
+    {
+      "name": "swap_out_is_critical_until_sixty_clean_seconds",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "affected_process_count": 7,
+      "total_hits": 20,
+      "earliest_broken_step": 2
+    },
+    {
+      "name": "warning_critical_oscillation_does_not_ratchet_the_envelope",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "affected_process_count": 7,
+      "total_hits": 20,
+      "earliest_broken_step": 2
+    },
+    {
+      "name": "stop_awaits_pressure_cancellation_before_cadence_and_join",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/pressure.rs",
+      "affected_process_count": 7,
+      "total_hits": 19,
+      "earliest_broken_step": 3
+    },
+    {
+      "name": "retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "affected_process_count": 8,
+      "total_hits": 18,
+      "earliest_broken_step": 1
+    },
+    {
+      "name": "learning_requires_three_clean_allocation_observations_over_five_minutes",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "affected_process_count": 6,
+      "total_hits": 12,
+      "earliest_broken_step": 1
+    },
+    {
+      "name": "suffix_evidence_changes_transient_without_inventing_retained_residency",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "affected_process_count": 6,
+      "total_hits": 12,
+      "earliest_broken_step": 1
+    },
+    {
+      "name": "zero_cold_observations_cannot_replace_static_transient",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "affected_process_count": 6,
+      "total_hits": 12,
+      "earliest_broken_step": 1
+    },
+    {
+      "name": "commit_active",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity/registry.rs",
+      "affected_process_count": 3,
+      "total_hits": 7,
+      "earliest_broken_step": 3
+    },
+    {
+      "name": "dirty_observation_and_pressure_reset_every_clean_window",
+      "type": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "affected_process_count": 3,
+      "total_hits": 3,
+      "earliest_broken_step": 1
+    }
+  ],
+  "affected_modules": [
+    {
+      "name": "Capacity",
+      "hits": 21,
+      "impact": "direct"
+    },
+    {
+      "name": "Cluster_306",
+      "hits": 2,
+      "impact": "direct"
+    }
+  ],
+  "byDepth": {
+    "1": [
+      {
+        "depth": 1,
+        "id": "Function:crates/higgs/src/capacity.rs:CapacityController.byte_ledger_with_evidence#1",
+        "name": "byte_ledger_with_evidence",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_711_learning_requires_th",
+            "label": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_831_suffix_evidence_chan",
+            "label": "Suffix_evidence_changes_transient_without_inventing_retained_residency → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_875_zero_cold_observatio",
+            "label": "Zero_cold_observations_cannot_replace_static_transient → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_830_suffix_evidence_chan",
+            "label": "Suffix_evidence_changes_transient_without_inventing_retained_residency → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_868_zero_cold_observatio",
+            "label": "Zero_cold_observations_cannot_replace_static_transient → Prompt_band",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_712_learning_requires_th",
+            "label": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_704_learning_requires_th",
+            "label": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Prompt_band",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_824_suffix_evidence_chan",
+            "label": "Suffix_evidence_changes_transient_without_inventing_retained_residency → Prompt_band",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_874_zero_cold_observatio",
+            "label": "Zero_cold_observations_cannot_replace_static_transient → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 3
+          }
+        ]
+      },
+      {
+        "depth": 1,
+        "id": "Function:crates/higgs/src/capacity.rs:CapacityController.solve_for_shape_at_current_limits#5",
+        "name": "solve_for_shape_at_current_limits",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_276_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_627_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_287_commit_active",
+            "label": "Commit_active → Token_ceiling",
+            "processType": "cross_community",
+            "step": 5
+          },
+          {
+            "id": "proc_626_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Prompt_band",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_773_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_779_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_37_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 5
+          },
+          {
+            "id": "proc_428_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_546_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → CapacityDecision",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_635_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_637_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → CapacityDecision",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_705_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_263_commit_active",
+            "label": "Commit_active → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 5
+          },
+          {
+            "id": "proc_435_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Token_ceiling",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_545_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_636_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_780_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_21_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Prompt_band",
+            "processType": "cross_community",
+            "step": 5
+          },
+          {
+            "id": "proc_418_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Prompt_band",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_430_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → CapacityDecision",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_534_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Prompt_band",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_717_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Token_ceiling",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_36_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 5
+          },
+          {
+            "id": "proc_52_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Token_ceiling",
+            "processType": "cross_community",
+            "step": 5
+          },
+          {
+            "id": "proc_262_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Prompt_band",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_429_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_642_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Token_ceiling",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_22_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 5
+          },
+          {
+            "id": "proc_38_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → CapacityDecision",
+            "processType": "cross_community",
+            "step": 5
+          },
+          {
+            "id": "proc_277_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_278_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → CapacityDecision",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_544_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_772_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Prompt_band",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_535_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_551_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Token_ceiling",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_419_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 5
+          },
+          {
+            "id": "proc_785_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Token_ceiling",
+            "processType": "cross_community",
+            "step": 3
+          }
+        ]
+      }
+    ],
+    "2": [
+      {
+        "depth": 2,
+        "id": "Function:crates/higgs/src/capacity.rs:CapacityController.admit#1",
+        "name": "admit",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 2,
+        "id": "Function:crates/higgs/src/capacity.rs:CapacityController.byte_ledger#1",
+        "name": "byte_ledger",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_704_learning_requires_th",
+            "label": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Prompt_band",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_831_suffix_evidence_chan",
+            "label": "Suffix_evidence_changes_transient_without_inventing_retained_residency → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_875_zero_cold_observatio",
+            "label": "Zero_cold_observations_cannot_replace_static_transient → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_824_suffix_evidence_chan",
+            "label": "Suffix_evidence_changes_transient_without_inventing_retained_residency → Prompt_band",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_868_zero_cold_observatio",
+            "label": "Zero_cold_observations_cannot_replace_static_transient → Prompt_band",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_874_zero_cold_observatio",
+            "label": "Zero_cold_observations_cannot_replace_static_transient → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_830_suffix_evidence_chan",
+            "label": "Suffix_evidence_changes_transient_without_inventing_retained_residency → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_711_learning_requires_th",
+            "label": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_712_learning_requires_th",
+            "label": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 2
+          }
+        ]
+      },
+      {
+        "depth": 2,
+        "id": "Function:crates/higgs/src/capacity.rs:CapacityController.recompute_for_pressure#2",
+        "name": "recompute_for_pressure",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_592_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Output_tokens",
+            "processType": "intra_community",
+            "step": 3
+          },
+          {
+            "id": "proc_637_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → CapacityDecision",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_705_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_362_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Output_tokens",
+            "processType": "intra_community",
+            "step": 3
+          },
+          {
+            "id": "proc_435_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Token_ceiling",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_545_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_636_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_780_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_276_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_535_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_551_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Token_ceiling",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_627_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_925_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Clear_clean_windows",
+            "processType": "intra_community",
+            "step": 3
+          },
+          {
+            "id": "proc_626_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Prompt_band",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_773_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_779_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_150_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Output_tokens",
+            "processType": "intra_community",
+            "step": 2
+          },
+          {
+            "id": "proc_277_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_278_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → CapacityDecision",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_544_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_772_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Prompt_band",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_419_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_785_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Token_ceiling",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_418_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Prompt_band",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_430_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → CapacityDecision",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_534_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Prompt_band",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_717_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Token_ceiling",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_428_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_546_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → CapacityDecision",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_635_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_262_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Prompt_band",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_429_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_642_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Token_ceiling",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_675_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Output_tokens",
+            "processType": "intra_community",
+            "step": 3
+          }
+        ]
+      },
+      {
+        "depth": 2,
+        "id": "Function:crates/higgs/src/capacity.rs:CapacityController.solve_for_shape#5",
+        "name": "solve_for_shape",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_263_commit_active",
+            "label": "Commit_active → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_287_commit_active",
+            "label": "Commit_active → Token_ceiling",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_37_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_36_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_419_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_22_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_38_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → CapacityDecision",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_52_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Token_ceiling",
+            "processType": "cross_community",
+            "step": 4
+          },
+          {
+            "id": "proc_21_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Prompt_band",
+            "processType": "cross_community",
+            "step": 4
+          }
+        ]
+      }
+    ],
+    "3": [
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:CapacityController.apply_pressure_observation#1",
+        "name": "apply_pressure_observation",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_276_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_428_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_546_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → CapacityDecision",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_627_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_925_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Clear_clean_windows",
+            "processType": "intra_community",
+            "step": 2
+          },
+          {
+            "id": "proc_545_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_535_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_551_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Token_ceiling",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_592_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Output_tokens",
+            "processType": "intra_community",
+            "step": 2
+          },
+          {
+            "id": "proc_705_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_277_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_278_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → CapacityDecision",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_418_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Prompt_band",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_430_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → CapacityDecision",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_534_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Prompt_band",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_544_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_262_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Prompt_band",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_429_swap_out_is_critical",
+            "label": "Swap_out_is_critical_until_sixty_clean_seconds → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_642_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Token_ceiling",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_675_warning_critical_osc",
+            "label": "Warning_critical_oscillation_does_not_ratchet_the_envelope → Output_tokens",
+            "processType": "intra_community",
+            "step": 2
+          },
+          {
+            "id": "proc_362_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Output_tokens",
+            "processType": "intra_community",
+            "step": 2
+          },
+          {
+            "id": "proc_435_new_swap_out_restart",
+            "label": "New_swap_out_restarts_the_clean_minute_without_repeated_downshift → Token_ceiling",
+            "processType": "cross_community",
+            "step": 2
+          }
+        ]
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:CapacityController.solve_static#0",
+        "name": "solve_static",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_37_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_487_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Output_tokens",
+            "processType": "intra_community",
+            "step": 3
+          },
+          {
+            "id": "proc_287_commit_active",
+            "label": "Commit_active → Token_ceiling",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_746_commit_active",
+            "label": "Commit_active → Output_tokens",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_52_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Token_ceiling",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_22_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_38_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → CapacityDecision",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_150_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Output_tokens",
+            "processType": "intra_community",
+            "step": 3
+          },
+          {
+            "id": "proc_36_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_419_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_263_commit_active",
+            "label": "Commit_active → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 3
+          },
+          {
+            "id": "proc_21_stop_awaits_pressure",
+            "label": "Stop_awaits_pressure_cancellation_before_cadence_and_join → Prompt_band",
+            "processType": "cross_community",
+            "step": 3
+          }
+        ]
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.absolute_active_memory_charges_only_unaccounted_residual",
+        "name": "absolute_active_memory_charges_only_unaccounted_residual",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.configured_output_ceiling_is_enforced_during_admission",
+        "name": "configured_output_ceiling_is_enforced_during_admission",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.critical_is_intrinsic_to_construction_restore_and_admission",
+        "name": "critical_is_intrinsic_to_construction_restore_and_admission",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_626_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Prompt_band",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_635_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_637_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → CapacityDecision",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_717_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Token_ceiling",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_419_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_636_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_150_critical_is_intrinsi",
+            "label": "Critical_is_intrinsic_to_construction_restore_and_admission → Output_tokens",
+            "processType": "intra_community",
+            "step": 1
+          }
+        ]
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.direct_critical_recompute_marks_constrained_observation_as_recovery",
+        "name": "direct_critical_recompute_marks_constrained_observation_as_recovery",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.direct_normal_recompute_ends_episode_before_fresh_warning",
+        "name": "direct_normal_recompute_ends_episode_before_fresh_warning",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.dirty_observation_and_pressure_reset_every_clean_window",
+        "name": "dirty_observation_and_pressure_reset_every_clean_window",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_361_dirty_observation_an",
+            "label": "Dirty_observation_and_pressure_reset_every_clean_window → Clear_clean_windows",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_390_dirty_observation_an",
+            "label": "Dirty_observation_and_pressure_reset_every_clean_window → Is_clean",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_391_dirty_observation_an",
+            "label": "Dirty_observation_and_pressure_reset_every_clean_window → Now_millis",
+            "processType": "intra_community",
+            "step": 1
+          }
+        ]
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.exceeded_bound_rewrites_to_an_admissible_request_for_every_path",
+        "name": "exceeded_bound_rewrites_to_an_admissible_request_for_every_path",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.learning_requires_three_clean_allocation_observations_over_five_minutes",
+        "name": "learning_requires_three_clean_allocation_observations_over_five_minutes",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_704_learning_requires_th",
+            "label": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Prompt_band",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_711_learning_requires_th",
+            "label": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_603_learning_requires_th",
+            "label": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Is_clean",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_591_learning_requires_th",
+            "label": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Clear_clean_windows",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_712_learning_requires_th",
+            "label": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_604_learning_requires_th",
+            "label": "Learning_requires_three_clean_allocation_observations_over_five_minutes → Now_millis",
+            "processType": "intra_community",
+            "step": 1
+          }
+        ]
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.one_checked_ledger_accounts_every_cost_and_output_reserve",
+        "name": "one_checked_ledger_accounts_every_cost_and_output_reserve",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.pressure_downshift_uses_exact_aligned_floors",
+        "name": "pressure_downshift_uses_exact_aligned_floors",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.request_shape_failure_is_exceeded_while_model_capacity_is_available",
+        "name": "request_shape_failure_is_exceeded_while_model_capacity_is_available",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises",
+        "name": "retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_780_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_785_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Token_ceiling",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_801_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Clear_clean_windows",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_804_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Is_clean",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_805_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Now_millis",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_773_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Working_set_authority_bytes",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_779_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_772_retained_hits_never_",
+            "label": "Retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises → Prompt_band",
+            "processType": "cross_community",
+            "step": 1
+          }
+        ]
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.retained_request_charges_suffix_prefill_but_full_logical_kv",
+        "name": "retained_request_charges_suffix_prefill_but_full_logical_kv",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.suffix_evidence_changes_transient_without_inventing_retained_residency",
+        "name": "suffix_evidence_changes_transient_without_inventing_retained_residency",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_831_suffix_evidence_chan",
+            "label": "Suffix_evidence_changes_transient_without_inventing_retained_residency → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_849_suffix_evidence_chan",
+            "label": "Suffix_evidence_changes_transient_without_inventing_retained_residency → Clear_clean_windows",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_853_suffix_evidence_chan",
+            "label": "Suffix_evidence_changes_transient_without_inventing_retained_residency → Now_millis",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_830_suffix_evidence_chan",
+            "label": "Suffix_evidence_changes_transient_without_inventing_retained_residency → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_852_suffix_evidence_chan",
+            "label": "Suffix_evidence_changes_transient_without_inventing_retained_residency → Is_clean",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_824_suffix_evidence_chan",
+            "label": "Suffix_evidence_changes_transient_without_inventing_retained_residency → Prompt_band",
+            "processType": "cross_community",
+            "step": 1
+          }
+        ]
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/capacity.rs:tests.zero_cold_observations_cannot_replace_static_transient",
+        "name": "zero_cold_observations_cannot_replace_static_transient",
+        "filePath": "crates/higgs/src/capacity.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_874_zero_cold_observatio",
+            "label": "Zero_cold_observations_cannot_replace_static_transient → Persistent_bytes",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_868_zero_cold_observatio",
+            "label": "Zero_cold_observations_cannot_replace_static_transient → Prompt_band",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_893_zero_cold_observatio",
+            "label": "Zero_cold_observations_cannot_replace_static_transient → Is_clean",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_875_zero_cold_observatio",
+            "label": "Zero_cold_observations_cannot_replace_static_transient → Estimate_bytes",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_894_zero_cold_observatio",
+            "label": "Zero_cold_observations_cannot_replace_static_transient → Now_millis",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_891_zero_cold_observatio",
+            "label": "Zero_cold_observations_cannot_replace_static_transient → Clear_clean_windows",
+            "processType": "intra_community",
+            "step": 1
+          }
+        ]
+      }
+    ]
+  }
+}

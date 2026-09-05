@@ -1,0 +1,433 @@
+{
+  "target": {
+    "id": "Function:src/agent/token_budget.rs:TokenBudget.trim_to_fit_with_age#4",
+    "name": "trim_to_fit_with_age",
+    "type": "Function",
+    "filePath": "src/agent/token_budget.rs"
+  },
+  "direction": "upstream",
+  "impactedCount": 24,
+  "risk": "HIGH",
+  "epistemic": "exact",
+  "summary": {
+    "direct": 7,
+    "processes_affected": 3,
+    "modules_affected": 1
+  },
+  "byDepthCounts": {
+    "1": 7,
+    "2": 12,
+    "3": 5
+  },
+  "affected_processes": [
+    {
+      "name": "run_loop",
+      "type": "Function",
+      "filePath": "src/agent/subagent.rs",
+      "affected_process_count": 10,
+      "total_hits": 10,
+      "earliest_broken_step": 1
+    },
+    {
+      "name": "spawn",
+      "type": "Function",
+      "filePath": "src/agent/subagent.rs",
+      "affected_process_count": 8,
+      "total_hits": 8,
+      "earliest_broken_step": 1
+    },
+    {
+      "name": "test_trim_overflow_resets_warm_prefix_and_keeps_latest_tool_evidence",
+      "type": "Function",
+      "filePath": "src/agent/token_budget.rs",
+      "affected_process_count": 4,
+      "total_hits": 7,
+      "earliest_broken_step": 1
+    }
+  ],
+  "affected_modules": [
+    {
+      "name": "Agent",
+      "hits": 24,
+      "impact": "direct"
+    }
+  ],
+  "byDepth": {
+    "1": [
+      {
+        "depth": 1,
+        "id": "Function:src/agent/token_budget.rs:TokenBudget.trim_to_fit#2",
+        "name": "trim_to_fit",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 1,
+        "id": "Function:src/agent/token_budget.rs:TokenBudget.trim_to_fit_with_age_preserving_prefix#5",
+        "name": "trim_to_fit_with_age_preserving_prefix",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_137_test_trim_overflow_r",
+            "label": "Test_trim_overflow_resets_warm_prefix_and_keeps_latest_tool_evidence → Available_budget",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_771_test_trim_overflow_r",
+            "label": "Test_trim_overflow_resets_warm_prefix_and_keeps_latest_tool_evidence → New",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_138_test_trim_overflow_r",
+            "label": "Test_trim_overflow_resets_warm_prefix_and_keeps_latest_tool_evidence → Estimate_tokens",
+            "processType": "cross_community",
+            "step": 2
+          }
+        ]
+      },
+      {
+        "depth": 1,
+        "id": "Function:src/agent/token_budget.rs:tests.test_age_based_eviction_drops_old_messages",
+        "name": "test_age_based_eviction_drops_old_messages",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 1,
+        "id": "Function:src/agent/token_budget.rs:tests.test_age_based_eviction_preserves_untagged_messages",
+        "name": "test_age_based_eviction_preserves_untagged_messages",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 1,
+        "id": "Function:src/agent/token_budget.rs:tests.test_age_eviction_removes_orphaned_tool_results",
+        "name": "test_age_eviction_removes_orphaned_tool_results",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 1,
+        "id": "Function:src/agent/token_budget.rs:tests.test_age_eviction_skipped_within_budget",
+        "name": "test_age_eviction_skipped_within_budget",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 1,
+        "id": "Function:src/agent/token_budget.rs:tests.test_trim_pins_lcm_summary_blocks",
+        "name": "test_trim_pins_lcm_summary_blocks",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      }
+    ],
+    "2": [
+      {
+        "depth": 2,
+        "id": "Function:src/agent/retention.rs:RetentionPolicy.apply_budget#5",
+        "name": "apply_budget",
+        "filePath": "src/agent/retention.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 2,
+        "id": "Function:src/agent/retention.rs:tests.test_apply_budget_emergency_matches_zeroed_direct_call",
+        "name": "test_apply_budget_emergency_matches_zeroed_direct_call",
+        "filePath": "src/agent/retention.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 2,
+        "id": "Function:src/agent/subagent.rs:SubagentManager._run_subagent#16",
+        "name": "_run_subagent",
+        "filePath": "src/agent/subagent.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 2,
+        "id": "Function:src/agent/token_budget.rs:tests.test_stage2_skips_tool_results_when_assistant_skipped",
+        "name": "test_stage2_skips_tool_results_when_assistant_skipped",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 2,
+        "id": "Function:src/agent/token_budget.rs:tests.test_trim_no_op_when_within_budget",
+        "name": "test_trim_no_op_when_within_budget",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 2,
+        "id": "Function:src/agent/token_budget.rs:tests.test_trim_overflow_resets_warm_prefix_and_keeps_latest_tool_evidence",
+        "name": "test_trim_overflow_resets_warm_prefix_and_keeps_latest_tool_evidence",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_77_test_trim_overflow_r",
+            "label": "Test_trim_overflow_resets_warm_prefix_and_keeps_latest_tool_evidence → New",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_138_test_trim_overflow_r",
+            "label": "Test_trim_overflow_resets_warm_prefix_and_keeps_latest_tool_evidence → Estimate_tokens",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_137_test_trim_overflow_r",
+            "label": "Test_trim_overflow_resets_warm_prefix_and_keeps_latest_tool_evidence → Available_budget",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_771_test_trim_overflow_r",
+            "label": "Test_trim_overflow_resets_warm_prefix_and_keeps_latest_tool_evidence → New",
+            "processType": "cross_community",
+            "step": 1
+          }
+        ]
+      },
+      {
+        "depth": 2,
+        "id": "Function:src/agent/token_budget.rs:tests.test_trim_preserves_exact_latest_user_when_pinned_summary_leaves_too_little_room",
+        "name": "test_trim_preserves_exact_latest_user_when_pinned_summary_leaves_too_little_room",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 2,
+        "id": "Function:src/agent/token_budget.rs:tests.test_trim_preserving_prefix_reports_unavoidable_prefix_trim",
+        "name": "test_trim_preserving_prefix_reports_unavoidable_prefix_trim",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 2,
+        "id": "Function:src/agent/token_budget.rs:tests.test_trim_stage1_truncates_old_tool_results",
+        "name": "test_trim_stage1_truncates_old_tool_results",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 2,
+        "id": "Function:src/agent/token_budget.rs:tests.test_trim_stage2_drops_old_messages",
+        "name": "test_trim_stage2_drops_old_messages",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 2,
+        "id": "Function:src/agent/token_budget.rs:tests.test_trim_stage2_skips_oversized_keeps_smaller",
+        "name": "test_trim_stage2_skips_oversized_keeps_smaller",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 2,
+        "id": "Function:src/agent/token_budget.rs:tests.test_trim_stage3_hard_reset",
+        "name": "test_trim_stage3_hard_reset",
+        "filePath": "src/agent/token_budget.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      }
+    ],
+    "3": [
+      {
+        "depth": 3,
+        "id": "Function:src/agent/retention.rs:tests.test_apply_budget_normal_uses_policy_age_ceiling",
+        "name": "test_apply_budget_normal_uses_policy_age_ceiling",
+        "filePath": "src/agent/retention.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 3,
+        "id": "Function:src/agent/subagent.rs:SubagentManager.run_loop#6",
+        "name": "run_loop",
+        "filePath": "src/agent/subagent.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_50_run_loop",
+            "label": "Run_loop → AgentProfile",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_136_run_loop",
+            "label": "Run_loop → Resolve_model_alias",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_133_run_loop",
+            "label": "Run_loop → With_lms_native_probe_secs",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_226_run_loop",
+            "label": "Run_loop → ProviderSpec",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_135_run_loop",
+            "label": "Run_loop → Is_private_ip",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_225_run_loop",
+            "label": "Run_loop → Rotate_event_log",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_20_run_loop",
+            "label": "Run_loop → Normalize_model_name",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_132_run_loop",
+            "label": "Run_loop → With_jit_gate",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_49_run_loop",
+            "label": "Run_loop → Resolve_capabilities",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_134_run_loop",
+            "label": "Run_loop → With_sampling_penalties",
+            "processType": "cross_community",
+            "step": 1
+          }
+        ]
+      },
+      {
+        "depth": 3,
+        "id": "Function:src/agent/subagent.rs:SubagentManager.spawn#7",
+        "name": "spawn",
+        "filePath": "src/agent/subagent.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_364_spawn",
+            "label": "Spawn → With_jit_gate",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_366_spawn",
+            "label": "Spawn → With_sampling_penalties",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_227_spawn",
+            "label": "Spawn → Unknown_profile_error",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_298_spawn",
+            "label": "Spawn → Normalize_model_name",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_367_spawn",
+            "label": "Spawn → Is_private_ip",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_396_spawn",
+            "label": "Spawn → ProviderSpec",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_228_spawn",
+            "label": "Spawn → SpawnSettings",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_365_spawn",
+            "label": "Spawn → With_lms_native_probe_secs",
+            "processType": "cross_community",
+            "step": 1
+          }
+        ]
+      },
+      {
+        "depth": 3,
+        "id": "Function:src/agent/subagent.rs:tests.test_subagent_adds_user_continuation_after_tool_results",
+        "name": "test_subagent_adds_user_continuation_after_tool_results",
+        "filePath": "src/agent/subagent.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      },
+      {
+        "depth": 3,
+        "id": "Function:src/agent/subagent.rs:tests.test_subagent_no_tool_calls_returns_immediately",
+        "name": "test_subagent_no_tool_calls_returns_immediately",
+        "filePath": "src/agent/subagent.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      }
+    ]
+  }
+}

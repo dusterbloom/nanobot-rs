@@ -1,0 +1,1641 @@
+{
+  "summary": {
+    "changed_count": 163,
+    "affected_count": 31,
+    "changed_files": 58,
+    "risk_level": "critical"
+  },
+  "changed_symbols": [
+    {
+      "id": "Section:AGENTS.md:L109:GitNexus — Code Intelligence",
+      "name": "GitNexus — Code Intelligence",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L115:Always Do",
+      "name": "Always Do",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L125:Never Do",
+      "name": "Never Do",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L132:Resources",
+      "name": "Resources",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L141:CLI",
+      "name": "CLI",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L159:GitNexus — Code Intelligence",
+      "name": "GitNexus — Code Intelligence",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L165:Always Do",
+      "name": "Always Do",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L175:Never Do",
+      "name": "Never Do",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L182:Resources",
+      "name": "Resources",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L191:CLI",
+      "name": "CLI",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:PLAN.md:L1:Current Plan — v0.5 \"Persistent Local Agent\"",
+      "name": "Current Plan — v0.5 \"Persistent Local Agent\"",
+      "type": "Section",
+      "filePath": "PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:PLAN.md:L3:Active follow-up",
+      "name": "Active follow-up",
+      "type": "Section",
+      "filePath": "PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/CAPACITY-FAILURE-EXPLAINED.md:L1:What the observed capacity failure establishes",
+      "name": "What the observed capacity failure establishes",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/CAPACITY-FAILURE-EXPLAINED.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/ENDURANCE-RESULTS.md:L1:Autonomous choice and bounded endurance — 2026-09-05",
+      "name": "Autonomous choice and bounded endurance — 2026-09-05",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/ENDURANCE-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/ENDURANCE-RESULTS.md:L35:What changed in the test",
+      "name": "What changed in the test",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/ENDURANCE-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/ENDURANCE-RESULTS.md:L59:Invalid attempts and configuration findings",
+      "name": "Invalid attempts and configuration findings",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/ENDURANCE-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/ENDURANCE-RESULTS.md:L78:Interpretation and next discriminator",
+      "name": "Interpretation and next discriminator",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/ENDURANCE-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/ENDURANCE-RESULTS.md:L95:Reproduce and evidence",
+      "name": "Reproduce and evidence",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/ENDURANCE-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/ENDURANCE.md:L1:Autonomous context management and endurance experiment",
+      "name": "Autonomous context management and endurance experiment",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/ENDURANCE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HARDENING.md:L1:Prior hardening: location and baseline",
+      "name": "Prior hardening: location and baseline",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HARDENING.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HARDENING.md:L5:Nanobot (merged into main at fa53da4)",
+      "name": "Nanobot (merged into main at fa53da4)",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HARDENING.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HARDENING.md:L21:Higgs (NOT merged into the active nightly checkout)",
+      "name": "Higgs (NOT merged into the active nightly checkout)",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HARDENING.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md:L1:Higgs allocation, retention and capacity audit — 2026-09-05",
+      "name": "Higgs allocation, retention and capacity audit — 2026-09-05",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md:L9:Findings",
+      "name": "Findings",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md:L11:1. Confirmed: the KV cost slope is half the observed native cache slope",
+      "name": "1. Confirmed: the KV cost slope is half the observed native cache slope",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md:L49:2. Confirmed: the 512MiB byte ceiling explains the retention cutoff",
+      "name": "2. Confirmed: the 512MiB byte ceiling explains the retention cutoff",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md:L69:3. Confirmed: native Escha does not imply the direct-GEMM prefill path",
+      "name": "3. Confirmed: native Escha does not imply the direct-GEMM prefill path",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md:L96:4. Confirmed: per-request learning exists but is not connected to production",
+      "name": "4. Confirmed: per-request learning exists but is not connected to production",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md:L122:5. Confirmed: exported peak telemetry is not a per-request allocation trace",
+      "name": "5. Confirmed: exported peak telemetry is not a per-request allocation trace",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md:L138:Why the governor reduces its allowance",
+      "name": "Why the governor reduces its allowance",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md:L154:Design and commit provenance",
+      "name": "Design and commit provenance",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md:L184:Next changes justified by this audit",
+      "name": "Next changes justified by this audit",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-ALLOCATION-AUDIT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-PLAN.md:L1:Higgs allocation and runtime-default repair plan",
+      "name": "Higgs allocation and runtime-default repair plan",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-PLAN.md:L27:End-to-end regression discovered after installation",
+      "name": "End-to-end regression discovered after installation",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L1:Higgs allocation repair — verification record",
+      "name": "Higgs allocation repair — verification record",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L8:Changes",
+      "name": "Changes",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L18:Kernel defaults",
+      "name": "Kernel defaults",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L22:Verification so far",
+      "name": "Verification so far",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L29:Deliberate limits",
+      "name": "Deliberate limits",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L35:Final release validation and installation",
+      "name": "Final release validation and installation",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L45:Live evidence",
+      "name": "Live evidence",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L53:Endurance outcome (not a passing comparison)",
+      "name": "Endurance outcome (not a passing comparison)",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L63:Pre-replay-fix comparison",
+      "name": "Pre-replay-fix comparison",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L78:Nanobot follow-on repair evidence",
+      "name": "Nanobot follow-on repair evidence",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-FIX-RESULTS.md:L90:First post-fix live result",
+      "name": "First post-fix live result",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-FIX-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md:L1:Higgs Escha W2 kernel-default audit",
+      "name": "Higgs Escha W2 kernel-default audit",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md:L8:Decision",
+      "name": "Decision",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md:L20:Real-model matched benchmark",
+      "name": "Real-model matched benchmark",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md:L88:Correctness checks",
+      "name": "Correctness checks",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md:L114:Environment decision table",
+      "name": "Environment decision table",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/HIGGS-KERNEL-DEFAULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md:L1:Local Portal-style workers: assessment, 2026-09-05",
+      "name": "Local Portal-style workers: assessment, 2026-09-05",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md:L5:Conclusion",
+      "name": "Conclusion",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md:L13:What Spotify actually implemented",
+      "name": "What Spotify actually implemented",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md:L23:Existing integration points and boundaries",
+      "name": "Existing integration points and boundaries",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md:L44:Minimal proposed behavior",
+      "name": "Minimal proposed behavior",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md:L54:Model candidates and what is actually present",
+      "name": "Model candidates and what is actually present",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md:L72:Memory and latency envelope",
+      "name": "Memory and latency envelope",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md:L91:Experiment that can justify shipping",
+      "name": "Experiment that can justify shipping",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/LOCAL-PORTAL-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/PLAN.md:L1:Escha context recovery experiment",
+      "name": "Escha context recovery experiment",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/PLAN.md:L6:Design and scope",
+      "name": "Design and scope",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/PLAN.md:L25:Execution",
+      "name": "Execution",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/PLAN.md:L35:Pilot invalidation and corrected run",
+      "name": "Pilot invalidation and corrected run",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/PLAN.md:L67:Additional validity corrections",
+      "name": "Additional validity corrections",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/PLAN.md:L85:Scoring interpretation",
+      "name": "Scoring interpretation",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/POLICY-DISCRIMINATOR.md:L1:Optional versus explicit context-management decision",
+      "name": "Optional versus explicit context-management decision",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/POLICY-DISCRIMINATOR.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/POLICY-RESULTS.md:L1:Context decision policy discriminator — 2026-09-05",
+      "name": "Context decision policy discriminator — 2026-09-05",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/POLICY-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/POLICY-RESULTS.md:L43:Controls and evidence",
+      "name": "Controls and evidence",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/POLICY-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/POLICY-RESULTS.md:L76:Consequence",
+      "name": "Consequence",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/POLICY-RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/RESULTS.md:L1:Escha control and recovery: exploratory live results",
+      "name": "Escha control and recovery: exploratory live results",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/RESULTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/SHRINK-EXACT-ASSESSMENT.md:L1:Can nanobot become much smaller with exactly the same behavior?",
+      "name": "Can nanobot become much smaller with exactly the same behavior?",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/SHRINK-EXACT-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/SHRINK-EXACT-ASSESSMENT.md:L9:Measurement and scope",
+      "name": "Measurement and scope",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/SHRINK-EXACT-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/SHRINK-EXACT-ASSESSMENT.md:L49:Graph evidence and limitations",
+      "name": "Graph evidence and limitations",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/SHRINK-EXACT-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/SHRINK-EXACT-ASSESSMENT.md:L69:Concrete reduction candidates",
+      "name": "Concrete reduction candidates",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/SHRINK-EXACT-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/SHRINK-EXACT-ASSESSMENT.md:L85:The delegation trap: same callee does not imply same behavior",
+      "name": "The delegation trap: same callee does not imply same behavior",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/SHRINK-EXACT-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/SHRINK-EXACT-ASSESSMENT.md:L98:What exact behavior must mean",
+      "name": "What exact behavior must mean",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/SHRINK-EXACT-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/SHRINK-EXACT-ASSESSMENT.md:L114:Smallest first slice and proof gate",
+      "name": "Smallest first slice and proof gate",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/SHRINK-EXACT-ASSESSMENT.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md:L1:Startup capacity diagnosis",
+      "name": "Startup capacity diagnosis",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md:L8:Shared learned profile",
+      "name": "Shared learned profile",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md:L32:Exact 9,216-token ledger",
+      "name": "Exact 9,216-token ledger",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md:L80:Experiment isolation",
+      "name": "Experiment isolation",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md:L89:Profile-key label",
+      "name": "Profile-key label",
+      "type": "Section",
+      "filePath": "experiments/context-recovery/STARTUP-CAPACITY-DIAGNOSIS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:experiments/context-recovery/allocation_live_probe.py:api",
+      "name": "api",
+      "type": "Function",
+      "filePath": "experiments/context-recovery/allocation_live_probe.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:experiments/context-recovery/allocation_live_probe.py:main",
+      "name": "main",
+      "type": "Function",
+      "filePath": "experiments/context-recovery/allocation_live_probe.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:experiments/context-recovery/allocation_live_probe.py:main.monitor@35:4",
+      "name": "monitor",
+      "type": "Function",
+      "filePath": "experiments/context-recovery/allocation_live_probe.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:experiments/context-recovery/endurance.py:summarize",
+      "name": "summarize",
+      "type": "Function",
+      "filePath": "experiments/context-recovery/endurance.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Variable:experiments/context-recovery/report.py:root",
+      "name": "root",
+      "type": "Variable",
+      "filePath": "experiments/context-recovery/report.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Variable:experiments/context-recovery/report.py:trials",
+      "name": "trials",
+      "type": "Variable",
+      "filePath": "experiments/context-recovery/report.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:experiments/context-recovery/run.py:start_higgs",
+      "name": "start_higgs",
+      "type": "Function",
+      "filePath": "experiments/context-recovery/run.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Variable:experiments/context-recovery/verify.py:root",
+      "name": "root",
+      "type": "Variable",
+      "filePath": "experiments/context-recovery/verify.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Variable:experiments/context-recovery/verify_higgs_cache_accounting.py:path",
+      "name": "path",
+      "type": "Variable",
+      "filePath": "experiments/context-recovery/verify_higgs_cache_accounting.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Variable:experiments/context-recovery/verify_higgs_cache_accounting.py:samples",
+      "name": "samples",
+      "type": "Variable",
+      "filePath": "experiments/context-recovery/verify_higgs_cache_accounting.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Variable:experiments/context-recovery/verify_higgs_cache_accounting.py:fixed",
+      "name": "fixed",
+      "type": "Variable",
+      "filePath": "experiments/context-recovery/verify_higgs_cache_accounting.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Variable:experiments/context-recovery/verify_higgs_cache_accounting.py:geometry",
+      "name": "geometry",
+      "type": "Variable",
+      "filePath": "experiments/context-recovery/verify_higgs_cache_accounting.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Variable:experiments/context-recovery/verify_higgs_cache_accounting.py:rows",
+      "name": "rows",
+      "type": "Variable",
+      "filePath": "experiments/context-recovery/verify_higgs_cache_accounting.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Variable:experiments/context-recovery/verify_higgs_cache_accounting.py:cap",
+      "name": "cap",
+      "type": "Variable",
+      "filePath": "experiments/context-recovery/verify_higgs_cache_accounting.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Variable:experiments/context-recovery/verify_higgs_cache_accounting.py:first_oversized",
+      "name": "first_oversized",
+      "type": "Variable",
+      "filePath": "experiments/context-recovery/verify_higgs_cache_accounting.py",
+      "change_type": "touched"
+    },
+    {
+      "id": "Const:src/agent/agent_loop/endurance_eval.rs:ENDURANCE_GUIDE",
+      "name": "ENDURANCE_GUIDE",
+      "type": "Const",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:src/agent/agent_loop/endurance_eval.rs:EnduranceStream",
+      "name": "EnduranceStream",
+      "type": "Struct",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/endurance_eval.rs:EnduranceStream.updates",
+      "name": "updates",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/endurance_eval.rs:EnduranceStream.expected",
+      "name": "expected",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/endurance_eval.rs:EnduranceStream.cursor",
+      "name": "cursor",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/endurance_eval.rs:EnduranceStream.delivered",
+      "name": "delivered",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/endurance_eval.rs:EnduranceStream.results",
+      "name": "results",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/endurance_eval.rs:EnduranceStream.violations",
+      "name": "violations",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/endurance_eval.rs:EnduranceStream.cancel",
+      "name": "cancel",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/endurance_eval.rs:EnduranceStream.started",
+      "name": "started",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Impl:src/agent/agent_loop/endurance_eval.rs:EnduranceStream",
+      "name": "EnduranceStream",
+      "type": "Impl",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:EnduranceStream.new#1",
+      "name": "new",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:EnduranceStream.next#0",
+      "name": "next",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:EnduranceStream.submit#1",
+      "name": "submit",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:EnduranceStream.schema#0",
+      "name": "schema",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:endurance_stream_checks",
+      "name": "endurance_stream_checks",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:endurance_eval_live",
+      "name": "endurance_eval_live",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/endurance_eval.rs:endurance_eval_live.number@168:4",
+      "name": "number",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/endurance_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Const:src/agent/agent_loop/recovery_eval.rs:MODEL",
+      "name": "MODEL",
+      "type": "Const",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Const:src/agent/agent_loop/recovery_eval.rs:CEILING",
+      "name": "CEILING",
+      "type": "Const",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Const:src/agent/agent_loop/recovery_eval.rs:GUIDE",
+      "name": "GUIDE",
+      "type": "Const",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:src/agent/agent_loop/recovery_eval.rs:Case",
+      "name": "Case",
+      "type": "Struct",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:Case.name",
+      "name": "name",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:Case.request",
+      "name": "request",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:Case.events",
+      "name": "events",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:Case.expected",
+      "name": "expected",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:Case.state",
+      "name": "state",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:cases",
+      "name": "cases",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:score",
+      "name": "score",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:page",
+      "name": "page",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:recovery_eval_checks",
+      "name": "recovery_eval_checks",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:src/agent/agent_loop/recovery_eval.rs:EvalState",
+      "name": "EvalState",
+      "type": "Struct",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:EvalState.dir",
+      "name": "dir",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:EvalState.rows",
+      "name": "rows",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:EvalState.live",
+      "name": "live",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:EvalState.used",
+      "name": "used",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:EvalState.prompt_budget",
+      "name": "prompt_budget",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:EvalState.last_actual_prompt",
+      "name": "last_actual_prompt",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:EvalState.stream",
+      "name": "stream",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:EvalState.rollover",
+      "name": "rollover",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:EvalState.actions",
+      "name": "actions",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:EvalState.submissions",
+      "name": "submissions",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Static:src/agent/agent_loop/recovery_eval.rs:ACTIVE",
+      "name": "ACTIVE",
+      "type": "Static",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:complete_batch",
+      "name": "complete_batch",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:complete_batch.ids@83:4",
+      "name": "ids",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:boundary_ready",
+      "name": "boundary_ready",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:recovery_eval_boundary_checks",
+      "name": "recovery_eval_boundary_checks",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Enum:src/agent/agent_loop/recovery_eval.rs:EvalMode",
+      "name": "EvalMode",
+      "type": "Enum",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Struct:src/agent/agent_loop/recovery_eval.rs:EvalTool",
+      "name": "EvalTool",
+      "type": "Struct",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:EvalTool.mode",
+      "name": "mode",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:EvalTool.name",
+      "name": "name",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Property:src/agent/agent_loop/recovery_eval.rs:EvalTool.state",
+      "name": "state",
+      "type": "Property",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:EvalTool.name#0",
+      "name": "name",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:EvalTool.description#0",
+      "name": "description",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:EvalTool.parameters#0",
+      "name": "parameters",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:EvalTool.execute#2",
+      "name": "execute",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:EvalTool.execute.invalid@287:8",
+      "name": "invalid",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:make_agent",
+      "name": "make_agent",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:make_agent_configured",
+      "name": "make_agent_configured",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:seed",
+      "name": "seed",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Enum:src/agent/agent_loop/recovery_eval.rs:RecoveryApproach",
+      "name": "RecoveryApproach",
+      "type": "Enum",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:run_turn",
+      "name": "run_turn",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/recovery_eval.rs:recovery_eval_live",
+      "name": "recovery_eval_live",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:src/agent/agent_loop/recovery_eval.rs:endurance_eval",
+      "name": "endurance_eval",
+      "type": "Module",
+      "filePath": "src/agent/agent_loop/recovery_eval.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Impl:src/agent/agent_loop/shared.rs:AgentLoopShared",
+      "name": "AgentLoopShared",
+      "type": "Impl",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/shared.rs:AgentLoopShared.run_agent_loop#1",
+      "name": "run_agent_loop",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:src/agent/agent_loop/shared.rs:recovery_eval",
+      "name": "recovery_eval",
+      "type": "Module",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    }
+  ],
+  "affected_processes": [
+    {
+      "id": "proc_12_recovery_eval_live",
+      "name": "Recovery_eval_live → Has_size_marker",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "recovery_eval_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_13_recovery_eval_live",
+      "name": "Recovery_eval_live → Is_qwen35_family",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "recovery_eval_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_14_recovery_eval_live",
+      "name": "Recovery_eval_live → Is_qwen36_family",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "recovery_eval_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_15_recovery_eval_live",
+      "name": "Recovery_eval_live → ModelCapabilities",
+      "process_type": "cross_community",
+      "step_count": 7,
+      "changed_steps": [
+        {
+          "symbol": "recovery_eval_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_43_recovery_eval_live",
+      "name": "Recovery_eval_live → Apply_override",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "recovery_eval_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_68_recovery_eval_live",
+      "name": "Recovery_eval_live → Is_local",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "recovery_eval_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_69_recovery_eval_live",
+      "name": "Recovery_eval_live → Reserve_cap",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "recovery_eval_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_70_recovery_eval_live",
+      "name": "Recovery_eval_live → Get_default_model",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "recovery_eval_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_71_process_message",
+      "name": "Process_message → Get_api_base",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "run_agent_loop",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_72_process_message",
+      "name": "Process_message → Supports_higgs_session_cache",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "run_agent_loop",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_107_recovery_eval_live",
+      "name": "Recovery_eval_live → SwappableCoreConfig",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "recovery_eval_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_108_recovery_eval_live",
+      "name": "Recovery_eval_live → MemoryConfig",
+      "process_type": "intra_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "recovery_eval_live",
+          "step": 1
+        },
+        {
+          "symbol": "make_agent_configured",
+          "step": 3
+        },
+        {
+          "symbol": "make_agent",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_190_process_message",
+      "name": "Process_message → Push_draft",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "run_agent_loop",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_291_endurance_eval_live",
+      "name": "Endurance_eval_live → Has_size_marker",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        },
+        {
+          "symbol": "endurance_eval_live",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_292_endurance_eval_live",
+      "name": "Endurance_eval_live → Is_qwen35_family",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        },
+        {
+          "symbol": "endurance_eval_live",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_293_endurance_eval_live",
+      "name": "Endurance_eval_live → Is_qwen36_family",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        },
+        {
+          "symbol": "endurance_eval_live",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_294_endurance_eval_live",
+      "name": "Endurance_eval_live → ModelCapabilities",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        },
+        {
+          "symbol": "endurance_eval_live",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_295_boundary_ready",
+      "name": "Boundary_ready → Name",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "boundary_ready",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_317_endurance_eval_live",
+      "name": "Endurance_eval_live → Apply_override",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        },
+        {
+          "symbol": "endurance_eval_live",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_318_boundary_ready",
+      "name": "Boundary_ready → Condense_description",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "boundary_ready",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_319_boundary_ready",
+      "name": "Boundary_ready → Name",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "boundary_ready",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_331_endurance_eval_live",
+      "name": "Endurance_eval_live → Is_local",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        },
+        {
+          "symbol": "endurance_eval_live",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_332_endurance_eval_live",
+      "name": "Endurance_eval_live → Reserve_cap",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        },
+        {
+          "symbol": "endurance_eval_live",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_333_endurance_eval_live",
+      "name": "Endurance_eval_live → Get_default_model",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "make_agent_configured",
+          "step": 2
+        },
+        {
+          "symbol": "endurance_eval_live",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_334_boundary_ready",
+      "name": "Boundary_ready → Remove_local_hot_model_hazards",
+      "process_type": "cross_community",
+      "step_count": 4,
+      "changed_steps": [
+        {
+          "symbol": "boundary_ready",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_432_boundary_ready",
+      "name": "Boundary_ready → Parameters",
+      "process_type": "cross_community",
+      "step_count": 6,
+      "changed_steps": [
+        {
+          "symbol": "boundary_ready",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_456_process_message",
+      "name": "Process_message → Max_context",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "run_agent_loop",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_457_process_message",
+      "name": "Process_message → Response_reserve",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "run_agent_loop",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_569_process_message",
+      "name": "Process_message → Is_cancelled",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "run_agent_loop",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_773_endurance_eval_live",
+      "name": "Endurance_eval_live → New",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "endurance_eval_live",
+          "step": 1
+        }
+      ]
+    },
+    {
+      "id": "proc_775_endurance_eval_live",
+      "name": "Endurance_eval_live → Now",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "endurance_eval_live",
+          "step": 1
+        },
+        {
+          "symbol": "new",
+          "step": 2
+        }
+      ]
+    }
+  ]
+}

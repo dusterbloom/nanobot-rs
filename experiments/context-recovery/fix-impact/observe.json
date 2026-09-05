@@ -1,0 +1,37 @@
+{
+  "status": "ambiguous",
+  "message": "Found 2 symbols matching 'observe'. Blast radius differs per candidate (max 17 impacted at risk HIGH). Disambiguate with target_uid (or file_path/kind) for a single authoritative result.",
+  "target": {
+    "name": "observe"
+  },
+  "direction": "upstream",
+  "totalCandidates": 2,
+  "impactedCount": null,
+  "risk": "UNKNOWN",
+  "maxImpactedCount": 17,
+  "maxRisk": "HIGH",
+  "candidates": [
+    {
+      "uid": "Function:crates/higgs/src/capacity.rs:CapacityController.observe#1",
+      "name": "observe",
+      "kind": "Function",
+      "filePath": "crates/higgs/src/capacity.rs",
+      "line": 1214,
+      "score": 0.56,
+      "impactedCount": 17,
+      "risk": "HIGH",
+      "direct": 17
+    },
+    {
+      "uid": "Function:crates/higgs-engine/src/mtp.rs:AdaptiveDraftDepth.observe#2",
+      "name": "observe",
+      "kind": "Function",
+      "filePath": "crates/higgs-engine/src/mtp.rs",
+      "line": 115,
+      "score": 0.56,
+      "impactedCount": 1,
+      "risk": "LOW",
+      "direct": 1
+    }
+  ]
+}

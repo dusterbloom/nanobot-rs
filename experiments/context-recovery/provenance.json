@@ -1,0 +1,30 @@
+{
+  "nanobot_commit": "fa53da492f100a7388571913f425c7419e1db1c3",
+  "higgs_commit": "327e5021ef957a7d6968f6780a7644f00b410a9e",
+  "higgs_branch": "feature/adaptive-capacity-higgs",
+  "excluded_higgs_nightly": "5c7605f91 (does not contain adaptive-capacity branch)",
+  "model": "EschaLabs/Qwen3.6-35B-A3B-Escha-W2",
+  "native_required": true,
+  "boundary": "forced checkpoint, not autonomous reset timing",
+  "fixtures": "synthetic task evidence, real code distractors; not private sessions",
+  "higgs_binary": {
+    "path": "/private/tmp/higgs-recovery/higgs-hardened",
+    "sha256": "c3f338aacae9231dd7f501be41c51be5ea40cbeede3d63e908d8b7e04485f2b5"
+  },
+  "nanobot_test_binary": {
+    "path": "/Users/peppi/Dev/nanobot-rs/target/release/deps/nanobot-67848bc0f9b02956",
+    "sha256": "3afc276a89127997077095055029d9b04d8a03e3e891e771c28030ef6ab71521"
+  },
+  "test_config": "/private/tmp/recovery-higgs-corrected.toml",
+  "pilot_excluded": "Output cap 1024 rejected LCM retry at 1534; no model behavior score assigned.",
+  "fresh_regressions": "2 harness checks passed; 52 compaction regressions passed, 1 ignored (corrected binary).",
+  "isolated_config_differences": "retained cache 512MiB rather than 2GiB; prefix cache 128MiB rather than 1GiB; retained tokens 16384 rather than49152. Original generation and local settings restored. User config unchanged.",
+  "invalid_pilots": [
+    "/private/tmp/recovery-eval-results: missing wire guide, late reset, stale artifact scorer",
+    "/private/tmp/recovery-corrected-smoke: unexpected preflight compaction under degraded capacity; interrupted before behavioral scoring"
+  ],
+  "corrected_smoke_note": "First B trial used the preceding binary; the only subsequent Rust change precomputes compaction source rows/turn before acquiring the fixture lock. B path unchanged.",
+  "fresh_server_per_remaining_trial": true,
+  "results_path": "/Users/peppi/Dev/nanobot-rs/experiments/context-recovery/results",
+  "final_validation": "cargo build --release passed; cargo test --release --lib agent::agent_loop: 267 passed, 11 ignored. 12 opt-in live trials separately completed and audited."
+}

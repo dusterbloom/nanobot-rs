@@ -1,0 +1,46 @@
+{
+  "status": "success",
+  "old_name": "compressor_growth_bytes",
+  "new_name": "compressor_activity_delta",
+  "files_affected": 2,
+  "total_edits": 4,
+  "graph_edits": 3,
+  "text_search_edits": 1,
+  "changes": [
+    {
+      "file_path": "crates/higgs/src/capacity.rs",
+      "edits": [
+        {
+          "line": 927,
+          "old_text": "pub compressor_growth_bytes: u64,",
+          "new_text": "pub compressor_activity_delta: u64,",
+          "confidence": "graph"
+        },
+        {
+          "line": 950,
+          "old_text": "compressor_growth_bytes: 0,",
+          "new_text": "compressor_activity_delta: 0,",
+          "confidence": "graph"
+        },
+        {
+          "line": 960,
+          "old_text": "&& self.compressor_growth_bytes == 0",
+          "new_text": "&& self.compressor_activity_delta == 0",
+          "confidence": "graph"
+        }
+      ]
+    },
+    {
+      "file_path": "crates/higgs/src/capacity/registry.rs",
+      "edits": [
+        {
+          "line": 914,
+          "old_text": "compressor_growth_bytes: compression_activity_delta,",
+          "new_text": "compressor_activity_delta: compression_activity_delta,",
+          "confidence": "text_search"
+        }
+      ]
+    }
+  ],
+  "applied": false
+}

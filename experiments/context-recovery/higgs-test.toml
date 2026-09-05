@@ -1,0 +1,19 @@
+[server]
+host = "127.0.0.1"
+port = 9000
+api_key = "higgs"
+max_tokens = 4096
+
+[local]
+allow_runtime_model_load = true
+raise_wired_limit = true
+
+[[models]]
+path = "/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2"
+name = "escha-35b-a3b"
+generation_defaults = { max_tokens = 4096, temperature = 0.0, top_p = 0.95, top_k = 20, min_p = 0.05, speculation = "auto", enable_thinking = false }
+kv_max_sessions = 1
+disk_cache_enabled = true
+kv_max_session_tokens = 16384
+kv_max_retained_bytes = 536870912
+kv_cache_bytes = 134217728

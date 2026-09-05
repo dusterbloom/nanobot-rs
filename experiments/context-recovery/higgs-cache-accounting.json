@@ -1,0 +1,81 @@
+{
+  "source": "/Users/peppi/Dev/nanobot-rs/experiments/context-recovery/endurance-policy-decision/B-telemetry.jsonl",
+  "fixed_gdn_bytes": 65863680,
+  "observed_bytes_per_token": 40960,
+  "estimator_bytes_per_token": 20480,
+  "retained_byte_ceiling": 536870912,
+  "last_fitting_allocated_tokens": 11264,
+  "first_oversized_allocated_tokens": 11520,
+  "matched_points": [
+    {
+      "retained_tokens": 4972,
+      "allocated_tokens": 5120,
+      "observed_bytes": 275578880,
+      "fp32_prediction": 275578880,
+      "fp16_prediction_same_fixed": 170721280
+    },
+    {
+      "retained_tokens": 5085,
+      "allocated_tokens": 5120,
+      "observed_bytes": 275578880,
+      "fp32_prediction": 275578880,
+      "fp16_prediction_same_fixed": 170721280
+    },
+    {
+      "retained_tokens": 7007,
+      "allocated_tokens": 7168,
+      "observed_bytes": 359464960,
+      "fp32_prediction": 359464960,
+      "fp16_prediction_same_fixed": 212664320
+    },
+    {
+      "retained_tokens": 7055,
+      "allocated_tokens": 7168,
+      "observed_bytes": 359464960,
+      "fp32_prediction": 359464960,
+      "fp16_prediction_same_fixed": 212664320
+    },
+    {
+      "retained_tokens": 7169,
+      "allocated_tokens": 7424,
+      "observed_bytes": 369950720,
+      "fp32_prediction": 369950720,
+      "fp16_prediction_same_fixed": 217907200
+    },
+    {
+      "retained_tokens": 9081,
+      "allocated_tokens": 9216,
+      "observed_bytes": 443351040,
+      "fp32_prediction": 443351040,
+      "fp16_prediction_same_fixed": 254607360
+    },
+    {
+      "retained_tokens": 9129,
+      "allocated_tokens": 9216,
+      "observed_bytes": 443351040,
+      "fp32_prediction": 443351040,
+      "fp16_prediction_same_fixed": 254607360
+    },
+    {
+      "retained_tokens": 9244,
+      "allocated_tokens": 9472,
+      "observed_bytes": 453836800,
+      "fp32_prediction": 453836800,
+      "fp16_prediction_same_fixed": 259850240
+    },
+    {
+      "retained_tokens": 11154,
+      "allocated_tokens": 11264,
+      "observed_bytes": 527237120,
+      "fp32_prediction": 527237120,
+      "fp16_prediction_same_fixed": 296550400
+    },
+    {
+      "retained_tokens": 11202,
+      "allocated_tokens": 11264,
+      "observed_bytes": 527237120,
+      "fp32_prediction": 527237120,
+      "fp16_prediction_same_fixed": 296550400
+    }
+  ]
+}

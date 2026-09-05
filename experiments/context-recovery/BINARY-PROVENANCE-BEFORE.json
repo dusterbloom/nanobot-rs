@@ -1,0 +1,31 @@
+{
+  "phase": "before-fixes",
+  "higgs_nightly": "5c7605f91b17cb14c6231361eebcf3071249ef60",
+  "higgs_hardened_source": "327e5021ef957a7d6968f6780a7644f00b410a9e",
+  "artifacts": {
+    "/Users/peppi/.local/bin/higgs": {
+      "sha256": "23b2ddf464760e72f5b3eef7fece6e05b0ac09cfd5f62819b2cc57cab62c1341",
+      "bytes": 37468256
+    },
+    "/private/tmp/higgs-recovery/higgs-hardened": {
+      "sha256": "c3f338aacae9231dd7f501be41c51be5ea40cbeede3d63e908d8b7e04485f2b5",
+      "bytes": 38331920
+    },
+    "/Users/peppi/.local/bin/mlx.metallib": {
+      "sha256": "d4ec42fe79abd9d24922c84a6a160b98e9bba7ebed68dbed844981b1190eafb5",
+      "bytes": 107017614
+    },
+    "/private/tmp/higgs-recovery/mlx.metallib": {
+      "sha256": "d4ec42fe79abd9d24922c84a6a160b98e9bba7ebed68dbed844981b1190eafb5",
+      "bytes": 107017614
+    },
+    "/Users/peppi/.local/bin/nanobot": {
+      "sha256": "94160d1ff720937ed5d4ff73c269827ece45e2bc814a8d0363ca02f534f58301",
+      "bytes": 55346112
+    },
+    "/Users/peppi/Dev/nanobot-rs/target/release/nanobot": {
+      "sha256": "18d5c9bc123d686596b62bf5aa53d843477db9082a5753e8353ff016486c86bc",
+      "bytes": 27150208
+    }
+  }
+}

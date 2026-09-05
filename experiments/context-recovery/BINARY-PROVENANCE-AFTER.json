@@ -1,0 +1,11 @@
+{
+  "higgs_commit": "78da18f13",
+  "sha256": {
+    "/Users/peppi/.local/bin/higgs": "e7a811f1dec325741d4a5d69fa91fcdd93a9f9b0d4040a325f7056d72feec7c7",
+    "/Users/peppi/.local/bin/mlx.metallib": "d4ec42fe79abd9d24922c84a6a160b98e9bba7ebed68dbed844981b1190eafb5",
+    "/Users/peppi/.local/bin/nanobot": "8503b96521535dc1749a816fce3b3f7f3e50495d78a9dea3f7918692affd6cdb",
+    "/private/tmp/higgs-recovery/higgs-hardened": "e7a811f1dec325741d4a5d69fa91fcdd93a9f9b0d4040a325f7056d72feec7c7"
+  },
+  "nanobot_commit": "5d4a680",
+  "higgs_remote_nightly": "890039d7f (78da18f13 push awaiting explicit public-destination approval)"
+}

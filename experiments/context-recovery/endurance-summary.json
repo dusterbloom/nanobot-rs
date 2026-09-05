@@ -1,0 +1,216 @@
+[
+  {
+    "arm": "A",
+    "completed_updates": 5,
+    "context_ceiling": 16384,
+    "correct_updates": 5,
+    "deadline_cancelled": false,
+    "forbidden_actions": 0,
+    "pass": false,
+    "requested_updates": 20,
+    "seconds": 296.61666275,
+    "source_estimated_tokens": 34028,
+    "submission_violations": 0,
+    "turns": [
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3499,
+        "outcome": "Finished",
+        "response": "Snapshot submitted for revision 0:\n- **Project**: QUARTZ\n- **Branch**: release/v2\n- **Owner**: Mira\n- **Checksum**: 5Cd7-k9X2-e10F\n- **Receipt**: rcpt_Q8n3_L04\n- **Payment**: settled\n- **Export**: pending\n- **Next action**: review_diff\n- **Execute**: false\n- **Diagnostic code**: D-47762e2e62293c57\nTurn complete. Waiting for next project update.",
+        "seconds": 51.095273291,
+        "session_id": "20260905_103535_e1c880"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 5569,
+        "outcome": "Finished",
+        "response": "Snapshot submitted for revision 1:\n- **Project**: QUARTZ\n- **Branch**: hotfix/q1 (updated from release/v2)\n- **Owner**: Neri-1 (updated from Mira)\n- **Checksum**: 5Cd7-k9X2-e10F (preserved \u2014 not changed by this update)\n- **Receipt**: rcpt_Q8n3_L04 (preserved)\n- **Payment**: settled (preserved)\n- **Export**: pending (preserved)\n- **Next action**: review_diff (preserved)\n- **Execute**: false (preserved)\n- **Diagnostic code**: D-5e886b6860b8b7a4\nTurn complete. Waiting for next project update.",
+        "seconds": 34.333516583,
+        "session_id": "20260905_103535_e1c880"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 7629,
+        "outcome": "Finished",
+        "response": "Snapshot submitted for revision 2:\n- **Project**: QUARTZ\n- **Branch**: hotfix/q1 (preserved)\n- **Owner**: Neri-1 (preserved)\n- **Checksum**: 5Cd7-k9X2-e10F (preserved)\n- **Receipt**: rcpt_Q8n3_L04 (preserved)\n- **Payment**: settled (preserved)\n- **Export**: failed (updated from pending)\n- **Next action**: request_permission (updated from review_diff)\n- **Execute**: false (preserved)\n- **Diagnostic code**: D-39bec4e4e0de2f7f\nTurn complete. Waiting for next project update.",
+        "seconds": 33.286415834,
+        "session_id": "20260905_103535_e1c880"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 9669,
+        "outcome": "Finished",
+        "response": "Snapshot submitted for revision 3:\n- **Project**: QUARTZ\n- **Branch**: hotfix/q1 (preserved)\n- **Owner**: Neri-1 (preserved)\n- **Checksum**: 7aF03-bC9x-00Q (updated from 5Cd7-k9X2-e10F)\n- **Receipt**: rcpt_Q8n3_L04 (preserved)\n- **Payment**: settled (preserved)\n- **Export**: failed (preserved)\n- **Next action**: request_permission (preserved)\n- **Execute**: false (preserved)\n- **Diagnostic code**: D-4056fe02915122b9\nTurn complete. Waiting for next project update.",
+        "seconds": 40.06737975,
+        "session_id": "20260905_103535_e1c880"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 11696,
+        "outcome": "Finished",
+        "response": "Snapshot submitted for revision 4:\n- **Project**: QUARTZ\n- **Branch**: hotfix/q1 (preserved)\n- **Owner**: Neri-1 (preserved)\n- **Checksum**: 7aF03-bC9x-00Q (preserved)\n- **Receipt**: rcpt_Q8n3_L04 (preserved)\n- **Payment**: settled (preserved)\n- **Export**: pending (updated from failed)\n- **Next action**: review_diff (updated from request_permission)\n- **Execute**: false (preserved)\n- **Diagnostic code**: D-b3c501b29525acfb\nTurn complete. Waiting for next project update.",
+        "seconds": 137.451471875,
+        "session_id": "20260905_103535_e1c880"
+      },
+      {
+        "completed_compactions": 1,
+        "initial_estimated_tokens": 13718,
+        "outcome": "CapacityUnavailable",
+        "response": "[Capacity Unavailable] The local model is out of capacity. Your message is saved and will resume automatically once capacity recovers.",
+        "seconds": 0.168452875,
+        "session_id": "20260905_103535_e1c880"
+      }
+    ],
+    "voluntary_resets": 0,
+    "artifact_pass": false,
+    "pending_capacity_turns": 1,
+    "control_tool_calls": {
+      "context_status": 0,
+      "notes": 0,
+      "new_context": 0,
+      "history": 0,
+      "recall": 0,
+      "lcm_expand": 0
+    },
+    "source_tokens_scope": "entire planned stream; not necessarily all delivered",
+    "actual_output_reservations": [
+      2048,
+      6144
+    ],
+    "submission_attempts": 5,
+    "forbidden_attempts": 0,
+    "compaction_attempts": 0,
+    "completed_compactions": 1,
+    "tool_errors": 0,
+    "model_requests": 11,
+    "logical_input_tokens": 88011,
+    "output_tokens": 1431,
+    "wire_errors": [],
+    "reset_events": [],
+    "repeated_boundary_coverage": false,
+    "first_wrong_revision": null,
+    "peak_actual_prompt_tokens": 13047,
+    "delivered_update_bytes": 0,
+    "delivered_tool_bytes": 300,
+    "delivered_tool_estimated_window_equivalents": 0.00457763671875,
+    "delivered_update_estimated_window_equivalents": 0.0,
+    "snapshots_per_minute": 1.0114064301669108,
+    "source_window_equivalents": 2.076904296875,
+    "resets_below_quarter_estimated_budget": 0,
+    "telemetry_errors": 0,
+    "observed_boot_ids": [
+      "4a810493-1879-440a-a71c-718de529fe40"
+    ],
+    "minimum_server_prompt_capacity": 0,
+    "maximum_mlx_active_bytes": 12909016864,
+    "observed_downshifts": 7,
+    "valid_measurement": true,
+    "process_exit": 0,
+    "watchdog_terminated": false,
+    "unexpected_server_restart": false,
+    "artifact_directory": "experiments/context-recovery/endurance-main/A"
+  },
+  {
+    "arm": "B",
+    "completed_updates": 5,
+    "context_ceiling": 16384,
+    "correct_updates": 5,
+    "deadline_cancelled": false,
+    "forbidden_actions": 0,
+    "pass": false,
+    "requested_updates": 20,
+    "seconds": 266.154330125,
+    "source_estimated_tokens": 34028,
+    "submission_violations": 0,
+    "turns": [
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 3706,
+        "outcome": "Finished",
+        "response": "Turn complete. Snapshot submitted for revision 0 with diagnostic code D-47762e2e62293c57. Waiting for next project update.",
+        "seconds": 67.789408083,
+        "session_id": "20260905_105247_ac4ec8"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 5949,
+        "outcome": "Finished",
+        "response": "Turn complete. Snapshot submitted for revision 1 with diagnostic code D-5e886b6860b8b7a4. The authoritative_update changed branch to \"hotfix/q1\" and owner to \"Neri-1\"; all other fields preserved from revision 0. Waiting for next update.",
+        "seconds": 28.113189625,
+        "session_id": "20260905_105247_ac4ec8"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 7919,
+        "outcome": "Finished",
+        "response": "Turn complete. Snapshot submitted for revision 2 with diagnostic code D-39bec4e4e0de2f7f. The authoritative_update changed export_status to \"failed\" and next_action to \"request_permission\"; all other fields preserved from revision 1. Waiting for next update.",
+        "seconds": 28.817024584,
+        "session_id": "20260905_105247_ac4ec8"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 9874,
+        "outcome": "Finished",
+        "response": "Turn complete. Snapshot submitted for revision 3 with diagnostic code D-4056fe02915122b9. The authoritative_update changed checksum to \"7aF03-bC9x-00Q\"; all other fields preserved from revision 2. Waiting for next update.",
+        "seconds": 30.470209875,
+        "session_id": "20260905_105247_ac4ec8"
+      },
+      {
+        "completed_compactions": 0,
+        "initial_estimated_tokens": 11808,
+        "outcome": "CapacityUnavailable",
+        "response": "[Capacity Unavailable] The local model is out of capacity. Your message is saved and will resume automatically once capacity recovers.",
+        "seconds": 110.756299042,
+        "session_id": "20260905_105247_ac4ec8"
+      }
+    ],
+    "voluntary_resets": 0,
+    "artifact_pass": false,
+    "pending_capacity_turns": 1,
+    "control_tool_calls": {
+      "context_status": 0,
+      "notes": 0,
+      "new_context": 0,
+      "history": 0,
+      "recall": 0,
+      "lcm_expand": 0
+    },
+    "source_tokens_scope": "entire planned stream; not necessarily all delivered",
+    "actual_output_reservations": [
+      2048,
+      6144
+    ],
+    "submission_attempts": 5,
+    "forbidden_attempts": 0,
+    "compaction_attempts": 0,
+    "completed_compactions": 0,
+    "tool_errors": 0,
+    "model_requests": 10,
+    "logical_input_tokens": 77611,
+    "output_tokens": 1165,
+    "wire_errors": [],
+    "reset_events": [],
+    "repeated_boundary_coverage": false,
+    "first_wrong_revision": null,
+    "peak_actual_prompt_tokens": 13007,
+    "delivered_update_bytes": 0,
+    "delivered_tool_bytes": 300,
+    "delivered_tool_estimated_window_equivalents": 0.00457763671875,
+    "delivered_update_estimated_window_equivalents": 0.0,
+    "snapshots_per_minute": 1.127165580432617,
+    "source_window_equivalents": 2.076904296875,
+    "resets_below_quarter_estimated_budget": 0,
+    "telemetry_errors": 0,
+    "observed_boot_ids": [
+      "a2dcee2d-fb39-4d8c-8c31-3575aee17659"
+    ],
+    "minimum_server_prompt_capacity": 0,
+    "maximum_mlx_active_bytes": 12909016864,
+    "observed_downshifts": 6,
+    "valid_measurement": true,
+    "process_exit": 0,
+    "watchdog_terminated": false,
+    "unexpected_server_restart": false,
+    "artifact_directory": "experiments/context-recovery/endurance-corrected/B"
+  }
+]

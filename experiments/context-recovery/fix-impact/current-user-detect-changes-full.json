@@ -1,0 +1,238 @@
+{
+  "summary": {
+    "changed_count": 22,
+    "affected_count": 6,
+    "changed_files": 6,
+    "risk_level": "high"
+  },
+  "changed_symbols": [
+    {
+      "id": "Section:AGENTS.md:L109:GitNexus — Code Intelligence",
+      "name": "GitNexus — Code Intelligence",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L115:Always Do",
+      "name": "Always Do",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L125:Never Do",
+      "name": "Never Do",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L132:Resources",
+      "name": "Resources",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:AGENTS.md:L141:CLI",
+      "name": "CLI",
+      "type": "Section",
+      "filePath": "AGENTS.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L159:GitNexus — Code Intelligence",
+      "name": "GitNexus — Code Intelligence",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L165:Always Do",
+      "name": "Always Do",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L175:Never Do",
+      "name": "Never Do",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L182:Resources",
+      "name": "Resources",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:CLAUDE.md:L191:CLI",
+      "name": "CLI",
+      "type": "Section",
+      "filePath": "CLAUDE.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:PLAN.md:L1:Current Plan — v0.5 \"Persistent Local Agent\"",
+      "name": "Current Plan — v0.5 \"Persistent Local Agent\"",
+      "type": "Section",
+      "filePath": "PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Section:PLAN.md:L3:Active follow-up",
+      "name": "Active follow-up",
+      "type": "Section",
+      "filePath": "PLAN.md",
+      "change_type": "touched"
+    },
+    {
+      "id": "Impl:src/agent/agent_loop/shared.rs:AgentLoopShared",
+      "name": "AgentLoopShared",
+      "type": "Impl",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/shared.rs:AgentLoopShared.run_agent_loop#1",
+      "name": "run_agent_loop",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/shared.rs:AgentLoopShared.handle_capacity_interruption#3",
+      "name": "handle_capacity_interruption",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/agent_loop/shared.rs:AgentLoopShared.attempt_capacity_exceeded_recovery#2",
+      "name": "attempt_capacity_exceeded_recovery",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/token_budget.rs:protected_tail_start",
+      "name": "protected_tail_start",
+      "type": "Function",
+      "filePath": "src/agent/token_budget.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/token_budget.rs:keep_recent_within_budget",
+      "name": "keep_recent_within_budget",
+      "type": "Function",
+      "filePath": "src/agent/token_budget.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/token_budget.rs:hard_reset",
+      "name": "hard_reset",
+      "type": "Function",
+      "filePath": "src/agent/token_budget.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:src/agent/token_budget.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "src/agent/token_budget.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/token_budget.rs:tests.test_trim_preserves_exact_latest_user_when_pinned_summary_leaves_too_little_room",
+      "name": "test_trim_preserves_exact_latest_user_when_pinned_summary_leaves_too_little_room",
+      "type": "Function",
+      "filePath": "src/agent/token_budget.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:src/agent/token_budget.rs:tests.test_available_budget",
+      "name": "test_available_budget",
+      "type": "Function",
+      "filePath": "src/agent/token_budget.rs",
+      "change_type": "touched"
+    }
+  ],
+  "affected_processes": [
+    {
+      "id": "proc_71_process_message",
+      "name": "Process_message → Get_api_base",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "run_agent_loop",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_72_process_message",
+      "name": "Process_message → Supports_higgs_session_cache",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "run_agent_loop",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_190_process_message",
+      "name": "Process_message → Push_draft",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "run_agent_loop",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_456_process_message",
+      "name": "Process_message → Max_context",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "run_agent_loop",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_457_process_message",
+      "name": "Process_message → Response_reserve",
+      "process_type": "cross_community",
+      "step_count": 5,
+      "changed_steps": [
+        {
+          "symbol": "run_agent_loop",
+          "step": 2
+        }
+      ]
+    },
+    {
+      "id": "proc_569_process_message",
+      "name": "Process_message → Is_cancelled",
+      "process_type": "cross_community",
+      "step_count": 3,
+      "changed_steps": [
+        {
+          "symbol": "run_agent_loop",
+          "step": 2
+        }
+      ]
+    }
+  ]
+}

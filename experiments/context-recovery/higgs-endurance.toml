@@ -1,0 +1,22 @@
+[server]
+host = "127.0.0.1"
+port = 9000
+api_key = "higgs"
+max_tokens = 8192
+
+[local]
+allow_runtime_model_load = true
+raise_wired_limit = true
+
+[[models]]
+path = "/Users/peppi/.cache/lm-studio/models/EschaLabs/Qwen3.6-35B-A3B-Escha-W2"
+name = "escha-35b-a3b"
+generation_defaults = { max_tokens = 8192, temperature = 0.0, top_p = 0.95, top_k = 20, min_p = 0.05, speculation = "auto", enable_thinking = false }
+kv_max_sessions = 1
+disk_cache_enabled = true
+kv_max_session_tokens = 16384
+# Native FP32 KV + GDN needs 736,952,320 bytes at 16,384 slots.
+# Keep the byte ceiling above that geometry so the 16K experiment tests
+# context decisions rather than an unintended 11,264-token retention cliff.
+kv_max_retained_bytes = 805306368
+kv_cache_bytes = 134217728

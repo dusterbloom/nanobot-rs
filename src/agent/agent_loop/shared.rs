@@ -1994,6 +1994,12 @@ impl AgentLoopShared {
             // was blocked/rejected (see the Continue arm below).
             ctx.flow.round_executed_no_tools = false;
             let outcome = self.run_iteration(ctx, iteration).await;
+            // Opt-in experiment only: a reset occurs after durable batch completion.
+            #[cfg(test)]
+            if recovery_eval::boundary_ready(ctx).await {
+                ctx.turn_outcome = TurnOutcome::Finished;
+                break;
+            }
 
             // Check for pending backtrack (set by BacktrackTool during tool execution).
             {
@@ -7527,3 +7533,7 @@ mod cache_pressure_tests {
         assert!(!should_allow_checkpoint(0.40, 0.85));
     }
 }
+
+#[cfg(test)]
+#[path = "recovery_eval.rs"]
+mod recovery_eval;

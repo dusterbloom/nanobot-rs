@@ -1,0 +1,144 @@
+{
+  "target": {
+    "id": "Function:src/agent/agent_loop/shared.rs:AgentLoopShared.attempt_capacity_exceeded_recovery#2",
+    "name": "attempt_capacity_exceeded_recovery",
+    "type": "Function",
+    "filePath": "src/agent/agent_loop/shared.rs"
+  },
+  "direction": "upstream",
+  "impactedCount": 3,
+  "risk": "LOW",
+  "epistemic": "exact",
+  "summary": {
+    "direct": 1,
+    "processes_affected": 2,
+    "modules_affected": 1
+  },
+  "byDepthCounts": {
+    "1": 1,
+    "2": 1,
+    "3": 1
+  },
+  "affected_processes": [
+    {
+      "name": "process_message",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "affected_process_count": 6,
+      "total_hits": 6,
+      "earliest_broken_step": 2
+    },
+    {
+      "name": "step_call_llm",
+      "type": "Function",
+      "filePath": "src/agent/agent_loop/shared.rs",
+      "affected_process_count": 4,
+      "total_hits": 4,
+      "earliest_broken_step": 1
+    }
+  ],
+  "affected_modules": [
+    {
+      "name": "Agent_loop",
+      "hits": 3,
+      "impact": "direct"
+    }
+  ],
+  "byDepth": {
+    "1": [
+      {
+        "depth": 1,
+        "id": "Function:src/agent/agent_loop/shared.rs:AgentLoopShared.step_call_llm#3",
+        "name": "step_call_llm",
+        "filePath": "src/agent/agent_loop/shared.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_196_step_call_llm",
+            "label": "Step_call_llm → Hash_tools",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_194_step_call_llm",
+            "label": "Step_call_llm → Discard_selected_expansion_checkpoint",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_195_step_call_llm",
+            "label": "Step_call_llm → Arm",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_505_step_call_llm",
+            "label": "Step_call_llm → Now",
+            "processType": "cross_community",
+            "step": 1
+          }
+        ]
+      }
+    ],
+    "2": [
+      {
+        "depth": 2,
+        "id": "Function:src/agent/agent_loop/shared.rs:AgentLoopShared.run_iteration#2",
+        "name": "run_iteration",
+        "filePath": "src/agent/agent_loop/shared.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      }
+    ],
+    "3": [
+      {
+        "depth": 3,
+        "id": "Function:src/agent/agent_loop/shared.rs:AgentLoopShared.run_agent_loop#1",
+        "name": "run_agent_loop",
+        "filePath": "src/agent/agent_loop/shared.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_457_process_message",
+            "label": "Process_message → Response_reserve",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_456_process_message",
+            "label": "Process_message → Max_context",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_71_process_message",
+            "label": "Process_message → Get_api_base",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_72_process_message",
+            "label": "Process_message → Supports_higgs_session_cache",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_569_process_message",
+            "label": "Process_message → Is_cancelled",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_190_process_message",
+            "label": "Process_message → Push_draft",
+            "processType": "cross_community",
+            "step": 2
+          }
+        ]
+      }
+    ]
+  }
+}

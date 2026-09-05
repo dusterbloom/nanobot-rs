@@ -1,0 +1,337 @@
+{
+  "target": {
+    "id": "Function:crates/higgs/src/state.rs:build_capacity_facts_from_measurements",
+    "name": "build_capacity_facts_from_measurements",
+    "type": "Function",
+    "filePath": "crates/higgs/src/state.rs"
+  },
+  "direction": "upstream",
+  "impactedCount": 8,
+  "risk": "CRITICAL",
+  "epistemic": "exact",
+  "summary": {
+    "direct": 2,
+    "processes_affected": 7,
+    "modules_affected": 5
+  },
+  "byDepthCounts": {
+    "1": 2,
+    "2": 2,
+    "3": 4
+  },
+  "affected_processes": [
+    {
+      "name": "main",
+      "type": "Function",
+      "filePath": "crates/higgs/src/main.rs",
+      "affected_process_count": 8,
+      "total_hits": 8,
+      "earliest_broken_step": 2
+    },
+    {
+      "name": "load_engines",
+      "type": "Function",
+      "filePath": "crates/higgs/src/main.rs",
+      "affected_process_count": 5,
+      "total_hits": 5,
+      "earliest_broken_step": 1
+    },
+    {
+      "name": "load_model",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/models.rs",
+      "affected_process_count": 4,
+      "total_hits": 4,
+      "earliest_broken_step": 1
+    },
+    {
+      "name": "cmd_serve",
+      "type": "Function",
+      "filePath": "crates/higgs/src/main.rs",
+      "affected_process_count": 3,
+      "total_hits": 3,
+      "earliest_broken_step": 1
+    },
+    {
+      "name": "build_engine_with_capacity",
+      "type": "Function",
+      "filePath": "crates/higgs/src/state.rs",
+      "affected_process_count": 2,
+      "total_hits": 2,
+      "earliest_broken_step": 1
+    },
+    {
+      "name": "load_disabled_returns_forbidden",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/models.rs",
+      "affected_process_count": 1,
+      "total_hits": 1,
+      "earliest_broken_step": 1
+    },
+    {
+      "name": "load_existing_name_conflicts",
+      "type": "Function",
+      "filePath": "crates/higgs/src/routes/models.rs",
+      "affected_process_count": 1,
+      "total_hits": 1,
+      "earliest_broken_step": 1
+    }
+  ],
+  "affected_modules": [
+    {
+      "name": "Routes",
+      "hits": 4,
+      "impact": "indirect"
+    },
+    {
+      "name": "Capacity",
+      "hits": 1,
+      "impact": "indirect"
+    },
+    {
+      "name": "Cluster_179",
+      "hits": 1,
+      "impact": "direct"
+    },
+    {
+      "name": "Cluster_235",
+      "hits": 1,
+      "impact": "direct"
+    },
+    {
+      "name": "Cluster_307",
+      "hits": 1,
+      "impact": "indirect"
+    }
+  ],
+  "byDepth": {
+    "1": [
+      {
+        "depth": 1,
+        "id": "Function:crates/higgs/src/state.rs:build_engine_with_capacity",
+        "name": "build_engine_with_capacity",
+        "filePath": "crates/higgs/src/state.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_240_build_engine_with_ca",
+            "label": "Build_engine_with_capacity → LoadCapacitySnapshot",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_241_build_engine_with_ca",
+            "label": "Build_engine_with_capacity → Resident_and_workspace",
+            "processType": "intra_community",
+            "step": 1
+          }
+        ]
+      },
+      {
+        "depth": 1,
+        "id": "Function:crates/higgs/src/state.rs:tests.post_load_facts_bind_content_and_execution_identity_to_measured_residency",
+        "name": "post_load_facts_bind_content_and_execution_identity_to_measured_residency",
+        "filePath": "crates/higgs/src/state.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      }
+    ],
+    "2": [
+      {
+        "depth": 2,
+        "id": "Function:crates/higgs/src/main.rs:load_engines",
+        "name": "load_engines",
+        "filePath": "crates/higgs/src/main.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_220_load_engines",
+            "label": "Load_engines → CacheAllocationPlan",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_221_load_engines",
+            "label": "Load_engines → Err_download",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_394_load_engines",
+            "label": "Load_engines → Apply_allocation_totals",
+            "processType": "intra_community",
+            "step": 1
+          },
+          {
+            "id": "proc_222_load_engines",
+            "label": "Load_engines → Ok_download",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_315_load_engines",
+            "label": "Load_engines → CacheAllocation",
+            "processType": "intra_community",
+            "step": 1
+          }
+        ]
+      },
+      {
+        "depth": 2,
+        "id": "Function:crates/higgs/src/routes/models.rs:load_model",
+        "name": "load_model",
+        "filePath": "crates/higgs/src/routes/models.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_739_load_model",
+            "label": "Load_model → Is_turboquant",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_236_load_model",
+            "label": "Load_model → Key_bits",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_237_load_model",
+            "label": "Load_model → Value_bits",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_505_load_model",
+            "label": "Load_model → KvCacheConfig",
+            "processType": "cross_community",
+            "step": 1
+          }
+        ]
+      }
+    ],
+    "3": [
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/main.rs:cmd_serve",
+        "name": "cmd_serve",
+        "filePath": "crates/higgs/src/main.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_23_main",
+            "label": "Main → Decision",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_407_main",
+            "label": "Main → Active_reservation_bytes",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_896_main",
+            "label": "Main → Default",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_257_main",
+            "label": "Main → EngineCostDescription",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_814_cmd_serve",
+            "label": "Cmd_serve → RegistryState",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_3_main",
+            "label": "Main → New_inner",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_408_main",
+            "label": "Main → SharedLedger",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_414_main",
+            "label": "Main → CapacityInputs",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_709_main",
+            "label": "Main → Lock",
+            "processType": "cross_community",
+            "step": 2
+          },
+          {
+            "id": "proc_761_cmd_serve",
+            "label": "Cmd_serve → Default",
+            "processType": "cross_community",
+            "step": 1
+          },
+          {
+            "id": "proc_815_cmd_serve",
+            "label": "Cmd_serve → Registry_pressure_controller",
+            "processType": "cross_community",
+            "step": 1
+          }
+        ]
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/routes/models.rs:tests.load_disabled_returns_forbidden",
+        "name": "load_disabled_returns_forbidden",
+        "filePath": "crates/higgs/src/routes/models.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_827_load_disabled_return",
+            "label": "Load_disabled_returns_forbidden → Env",
+            "processType": "cross_community",
+            "step": 1
+          }
+        ]
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/routes/models.rs:tests.load_existing_name_conflicts",
+        "name": "load_existing_name_conflicts",
+        "filePath": "crates/higgs/src/routes/models.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": [
+          {
+            "id": "proc_871_load_existing_name_c",
+            "label": "Load_existing_name_conflicts → Env",
+            "processType": "cross_community",
+            "step": 1
+          }
+        ]
+      },
+      {
+        "depth": 3,
+        "id": "Function:crates/higgs/src/routes/models.rs:tests.runtime_load_rejects_invalid_pflash_before_path_resolution",
+        "name": "runtime_load_rejects_invalid_pflash_before_path_resolution",
+        "filePath": "crates/higgs/src/routes/models.rs",
+        "relationType": "CALLS",
+        "confidence": 0.85,
+        "processes": []
+      }
+    ]
+  }
+}

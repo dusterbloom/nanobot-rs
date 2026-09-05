@@ -1,0 +1,32 @@
+{
+  "summary": {
+    "changed_count": 3,
+    "affected_count": 0,
+    "changed_files": 1,
+    "risk_level": "low"
+  },
+  "changed_symbols": [
+    {
+      "id": "Function:crates/higgs/src/state.rs:build_capacity_facts_from_measurements",
+      "name": "build_capacity_facts_from_measurements",
+      "type": "Function",
+      "filePath": "crates/higgs/src/state.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Module:crates/higgs/src/state.rs:tests",
+      "name": "tests",
+      "type": "Module",
+      "filePath": "crates/higgs/src/state.rs",
+      "change_type": "touched"
+    },
+    {
+      "id": "Function:crates/higgs/src/state.rs:tests.post_load_facts_bind_content_and_execution_identity_to_measured_residency",
+      "name": "post_load_facts_bind_content_and_execution_identity_to_measured_residency",
+      "type": "Function",
+      "filePath": "crates/higgs/src/state.rs",
+      "change_type": "touched"
+    }
+  ],
+  "affected_processes": []
+}

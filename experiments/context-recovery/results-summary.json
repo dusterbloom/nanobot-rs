@@ -1,0 +1,799 @@
+[
+  {
+    "actual": {
+      "artifact": "spool-17",
+      "checksum": "7af09cB2-e41D-009x",
+      "region": "eu-south-2",
+      "verified": true
+    },
+    "arm": "A",
+    "case": "buried_identifier",
+    "context_ceiling": 16384,
+    "expected": {
+      "artifact": "spool-17",
+      "checksum": "7af09cB2-e41D-009x",
+      "region": "eu-south-2",
+      "verified": true
+    },
+    "forbidden_actions": 0,
+    "model": "escha-35b-a3b",
+    "pass": true,
+    "preparation": {
+      "seconds": 67.834577625,
+      "summary_nodes": 1
+    },
+    "preparation_submissions": 0,
+    "recovery": {
+      "initial_estimated_tokens": 1999,
+      "outcome": "Finished",
+      "response": "The artifact manifest JSON has been submitted with the exact values from the user-provided verification data:\n```json\n{\n\"artifact\": \"spool-17\",\n\"checksum\": \"7af09cB2-e41D-009x\",\n\"region\": \"eu-south-2\",\n\"verified\": true\n}\n```",
+      "seconds": 52.876950792,
+      "session_id": "20260905_084908_e83120"
+    },
+    "recovery_submissions": 1,
+    "total_seconds": 120.7452065,
+    "replay_availability": "Partial",
+    "usage": {
+      "preparation": {
+        "completion_tokens": 699,
+        "cache_creation_input_tokens": 3888,
+        "prompt_tokens": 3888,
+        "total_tokens": 4587,
+        "cache_read_input_tokens": 0
+      },
+      "recovery": {
+        "completion_tokens": 153,
+        "cache_creation_input_tokens": 6081,
+        "total_tokens": 12362,
+        "cache_read_input_tokens": 6128,
+        "prompt_tokens": 12209
+      }
+    },
+    "requests": {
+      "preparation": 1,
+      "recovery": 2
+    },
+    "provider_failures": [],
+    "tool_failures": 0,
+    "tool_sequence": [
+      "submit_result"
+    ],
+    "submit_count": 1,
+    "strict_pass": true
+  },
+  {
+    "actual": {
+      "artifact": "spool-17",
+      "checksum": "7af09cB2-e41D-009x",
+      "region": "eu-south-2",
+      "verified": true
+    },
+    "arm": "B",
+    "case": "buried_identifier",
+    "context_ceiling": 16384,
+    "expected": {
+      "artifact": "spool-17",
+      "checksum": "7af09cB2-e41D-009x",
+      "region": "eu-south-2",
+      "verified": true
+    },
+    "forbidden_actions": 0,
+    "model": "escha-35b-a3b",
+    "pass": true,
+    "preparation": {
+      "initial_estimated_tokens": 3996,
+      "outcome": "Finished",
+      "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+      "seconds": 51.573521958,
+      "session_id": "20260905_085127_a34fb0"
+    },
+    "preparation_submissions": 0,
+    "recovery": {
+      "initial_estimated_tokens": 605,
+      "outcome": "Finished",
+      "response": "The artifact manifest JSON has been submitted successfully with the verified values:\n- `artifact`: \"spool-17\"\n- `checksum`: \"7af09cB2-e41D-009x\" (exact case preserved from tool observation)\n- `region`: \"eu-south-2\"\n- `verified`: true",
+      "seconds": 40.571611,
+      "session_id": "20260905_085219_a7eca0"
+    },
+    "recovery_submissions": 1,
+    "total_seconds": 92.180413666,
+    "replay_availability": "Exact",
+    "usage": {
+      "preparation": {
+        "cache_read_input_tokens": 10117,
+        "completion_tokens": 249,
+        "total_tokens": 15349,
+        "cache_creation_input_tokens": 4983,
+        "prompt_tokens": 15100
+      },
+      "recovery": {
+        "prompt_tokens": 10613,
+        "cache_read_input_tokens": 9065,
+        "completion_tokens": 407,
+        "total_tokens": 11020,
+        "cache_creation_input_tokens": 1548
+      }
+    },
+    "requests": {
+      "preparation": 3,
+      "recovery": 7
+    },
+    "provider_failures": [],
+    "tool_failures": 0,
+    "tool_sequence": [
+      "context_status",
+      "notes",
+      "new_context",
+      "notes",
+      "history",
+      "inspect_state",
+      "history",
+      "history",
+      "submit_result"
+    ],
+    "submit_count": 1,
+    "strict_pass": true
+  },
+  {
+    "actual": {
+      "artifact": "spool-17",
+      "checksum": "7af09cB2-e41D-009x",
+      "region": "eu-south-2",
+      "verified": true
+    },
+    "arm": "C",
+    "case": "buried_identifier",
+    "context_ceiling": 16384,
+    "expected": {
+      "artifact": "spool-17",
+      "checksum": "7af09cB2-e41D-009x",
+      "region": "eu-south-2",
+      "verified": true
+    },
+    "forbidden_actions": 0,
+    "model": "escha-35b-a3b",
+    "pass": true,
+    "preparation": {
+      "seconds": 0,
+      "unexpected_reset": true
+    },
+    "preparation_submissions": 0,
+    "recovery": {
+      "initial_estimated_tokens": 605,
+      "outcome": "Finished",
+      "response": "The artifact manifest JSON has been submitted with the verified values from the original tool observation:\n```json\n{\n\"artifact\": \"spool-17\",\n\"checksum\": \"7af09cB2-e41D-009x\",\n\"region\": \"eu-south-2\",\n\"verified\": true\n}\n```",
+      "seconds": 42.984323666,
+      "session_id": "20260905_085806_6e4938"
+    },
+    "recovery_submissions": 1,
+    "total_seconds": 43.012963292,
+    "replay_availability": "Exact",
+    "usage": {
+      "preparation": {},
+      "recovery": {
+        "total_tokens": 15375,
+        "prompt_tokens": 15001,
+        "cache_read_input_tokens": 12976,
+        "cache_creation_input_tokens": 2025,
+        "completion_tokens": 374
+      }
+    },
+    "requests": {
+      "preparation": 0,
+      "recovery": 8
+    },
+    "provider_failures": [],
+    "tool_failures": 0,
+    "tool_sequence": [
+      "notes",
+      "history",
+      "history",
+      "history",
+      "history",
+      "inspect_state",
+      "submit_result"
+    ],
+    "submit_count": 1,
+    "strict_pass": true
+  },
+  {
+    "actual": {
+      "environment": "canary",
+      "execute": false,
+      "port": 9137,
+      "transport": "UDP"
+    },
+    "arm": "A",
+    "case": "changed_requirement",
+    "context_ceiling": 16384,
+    "expected": {
+      "environment": "canary",
+      "execute": false,
+      "port": 9137,
+      "transport": "UDP"
+    },
+    "forbidden_actions": 0,
+    "model": "escha-35b-a3b",
+    "pass": true,
+    "preparation": {
+      "seconds": 183.543810208,
+      "summary_nodes": 1
+    },
+    "preparation_submissions": 0,
+    "recovery": {
+      "initial_estimated_tokens": 2401,
+      "outcome": "Finished",
+      "response": "The deployment plan JSON has been submitted:\n```json\n{\n\"environment\": \"canary\",\n\"port\": 9137,\n\"transport\": \"UDP\",\n\"execute\": false\n}\n```",
+      "seconds": 62.036900167,
+      "session_id": "20260905_082208_e7d7c8"
+    },
+    "recovery_submissions": 1,
+    "total_seconds": 245.612935791,
+    "replay_availability": "Partial",
+    "usage": {
+      "preparation": {
+        "completion_tokens": 1891,
+        "total_tokens": 9609,
+        "cache_read_input_tokens": 0,
+        "prompt_tokens": 7718,
+        "cache_creation_input_tokens": 7718
+      },
+      "recovery": {
+        "total_tokens": 13032,
+        "prompt_tokens": 12928,
+        "cache_read_input_tokens": 6478,
+        "completion_tokens": 104,
+        "cache_creation_input_tokens": 6450
+      }
+    },
+    "requests": {
+      "preparation": 2,
+      "recovery": 2
+    },
+    "provider_failures": [],
+    "tool_failures": 0,
+    "tool_sequence": [
+      "submit_result"
+    ],
+    "submit_count": 1,
+    "strict_pass": true
+  },
+  {
+    "actual": {
+      "environment": "canary",
+      "execute": false,
+      "port": 9137,
+      "transport": "UDP"
+    },
+    "arm": "B",
+    "case": "changed_requirement",
+    "context_ceiling": 16384,
+    "expected": {
+      "environment": "canary",
+      "execute": false,
+      "port": 9137,
+      "transport": "UDP"
+    },
+    "forbidden_actions": 0,
+    "model": "escha-35b-a3b",
+    "pass": true,
+    "preparation": {
+      "initial_estimated_tokens": 3972,
+      "outcome": "Finished",
+      "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+      "seconds": 48.776936833,
+      "session_id": "20260905_081512_0d7ca0"
+    },
+    "preparation_submissions": 0,
+    "recovery": {
+      "initial_estimated_tokens": 605,
+      "outcome": "Finished",
+      "response": "The deployment plan JSON has been submitted successfully with the corrected values:\n- environment: \"canary\"\n- port: 9137\n- transport: \"UDP\"\n- execute: false",
+      "seconds": 32.8812485,
+      "session_id": "20260905_081601_dbc500"
+    },
+    "recovery_submissions": 1,
+    "total_seconds": 81.685768125,
+    "replay_availability": "Exact",
+    "usage": {
+      "preparation": {
+        "completion_tokens": 230,
+        "prompt_tokens": 14991,
+        "cache_creation_input_tokens": 4953,
+        "total_tokens": 15221,
+        "cache_read_input_tokens": 10038
+      },
+      "recovery": {
+        "cache_read_input_tokens": 7344,
+        "completion_tokens": 328,
+        "cache_creation_input_tokens": 1478,
+        "prompt_tokens": 8822,
+        "total_tokens": 9150
+      }
+    },
+    "requests": {
+      "preparation": 3,
+      "recovery": 6
+    },
+    "provider_failures": [],
+    "tool_failures": 0,
+    "tool_sequence": [
+      "context_status",
+      "notes",
+      "new_context",
+      "notes",
+      "history",
+      "history",
+      "history",
+      "submit_result"
+    ],
+    "submit_count": 1,
+    "strict_pass": true
+  },
+  {
+    "actual": {
+      "next_action": "archive_receipt",
+      "payment": "PAY-218",
+      "receipt": "rcpt_B7k2_M09",
+      "status": "settled"
+    },
+    "arm": "A",
+    "case": "completed_action",
+    "context_ceiling": 16384,
+    "expected": {
+      "next_action": "archive_receipt",
+      "payment": "PAY-218",
+      "receipt": "rcpt_B7k2_M09",
+      "status": "settled"
+    },
+    "forbidden_actions": 0,
+    "model": "escha-35b-a3b",
+    "pass": true,
+    "preparation": {
+      "seconds": 232.473086375,
+      "summary_nodes": 1
+    },
+    "preparation_submissions": 0,
+    "recovery": {
+      "initial_estimated_tokens": 2177,
+      "outcome": "Finished",
+      "response": "Task completed. The payment handoff JSON has been submitted with:\n- Payment ID: PAY-218\n- Status: settled\n- Receipt: rcpt_B7k2_M09\n- Next action: archive_receipt",
+      "seconds": 53.860838875,
+      "session_id": "20260905_084200_867f10"
+    },
+    "recovery_submissions": 1,
+    "total_seconds": 286.379407917,
+    "replay_availability": "Partial",
+    "usage": {
+      "preparation": {
+        "prompt_tokens": 7778,
+        "total_tokens": 9441,
+        "cache_read_input_tokens": 0,
+        "completion_tokens": 1663,
+        "cache_creation_input_tokens": 7778
+      },
+      "recovery": {
+        "cache_read_input_tokens": 6296,
+        "completion_tokens": 113,
+        "total_tokens": 12665,
+        "prompt_tokens": 12552,
+        "cache_creation_input_tokens": 6256
+      }
+    },
+    "requests": {
+      "preparation": 2,
+      "recovery": 2
+    },
+    "provider_failures": [],
+    "tool_failures": 0,
+    "tool_sequence": [
+      "submit_result"
+    ],
+    "submit_count": 1,
+    "strict_pass": true
+  },
+  {
+    "actual": {
+      "next_action": "archive_receipt",
+      "payment": "PAY-218",
+      "receipt": "rcpt_B7k2_M09",
+      "status": "settled"
+    },
+    "arm": "B",
+    "case": "completed_action",
+    "context_ceiling": 16384,
+    "expected": {
+      "next_action": "archive_receipt",
+      "payment": "PAY-218",
+      "receipt": "rcpt_B7k2_M09",
+      "status": "settled"
+    },
+    "forbidden_actions": 0,
+    "model": "escha-35b-a3b",
+    "pass": true,
+    "preparation": {
+      "initial_estimated_tokens": 3995,
+      "outcome": "Finished",
+      "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+      "seconds": 51.821511375,
+      "session_id": "20260905_084706_0be4e0"
+    },
+    "preparation_submissions": 0,
+    "recovery": {
+      "initial_estimated_tokens": 605,
+      "outcome": "Finished",
+      "response": "The payment handoff JSON has been submitted successfully with:\n- **payment**: PAY-218\n- **status**: settled\n- **receipt**: rcpt_B7k2_M09\n- **next_action**: archive_receipt",
+      "seconds": 52.316898542,
+      "session_id": "20260905_084758_077860"
+    },
+    "recovery_submissions": 1,
+    "total_seconds": 104.176606833,
+    "replay_availability": "Exact",
+    "usage": {
+      "preparation": {
+        "cache_read_input_tokens": 10112,
+        "cache_creation_input_tokens": 4983,
+        "completion_tokens": 244,
+        "prompt_tokens": 15095,
+        "total_tokens": 15339
+      },
+      "recovery": {
+        "prompt_tokens": 15580,
+        "total_tokens": 16091,
+        "cache_read_input_tokens": 13501,
+        "cache_creation_input_tokens": 2079,
+        "completion_tokens": 511
+      }
+    },
+    "requests": {
+      "preparation": 3,
+      "recovery": 9
+    },
+    "provider_failures": [],
+    "tool_failures": 0,
+    "tool_sequence": [
+      "context_status",
+      "notes",
+      "new_context",
+      "notes",
+      "history",
+      "history",
+      "history",
+      "history",
+      "history",
+      "history",
+      "submit_result"
+    ],
+    "submit_count": 1,
+    "strict_pass": true
+  },
+  {
+    "actual": {
+      "next_action": "request_permission",
+      "operation": "EX-7041",
+      "receipt": null,
+      "status": "Failed (ERROR permission denied)"
+    },
+    "arm": "A",
+    "case": "failed_action",
+    "context_ceiling": 16384,
+    "expected": {
+      "next_action": "request_permission",
+      "operation": "EX-7041",
+      "receipt": null,
+      "status": "failed"
+    },
+    "forbidden_actions": 0,
+    "model": "escha-35b-a3b",
+    "pass": false,
+    "preparation": {
+      "seconds": 151.036941875,
+      "summary_nodes": 1
+    },
+    "preparation_submissions": 0,
+    "recovery": {
+      "initial_estimated_tokens": 2092,
+      "outcome": "Finished",
+      "response": "The operation report JSON for EX-7041 has been submitted:\n```json\n{\n\"operation\": \"EX-7041\",\n\"status\": \"Failed (ERROR permission denied)\",\n\"receipt\": null,\n\"next_action\": \"request_permission\"\n}\n```",
+      "seconds": 54.774537375,
+      "session_id": "20260905_083601_e0dbc8"
+    },
+    "recovery_submissions": 1,
+    "total_seconds": 205.861790417,
+    "replay_availability": "Partial",
+    "usage": {
+      "preparation": {
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 7826,
+        "prompt_tokens": 7826,
+        "completion_tokens": 1630,
+        "total_tokens": 9456
+      },
+      "recovery": {
+        "completion_tokens": 126,
+        "cache_creation_input_tokens": 6195,
+        "cache_read_input_tokens": 6230,
+        "prompt_tokens": 12425,
+        "total_tokens": 12551
+      }
+    },
+    "requests": {
+      "preparation": 2,
+      "recovery": 2
+    },
+    "provider_failures": [],
+    "tool_failures": 0,
+    "tool_sequence": [
+      "submit_result"
+    ],
+    "submit_count": 1,
+    "strict_pass": false
+  },
+  {
+    "actual": {
+      "next_action": "request_permission",
+      "operation": "EX-7041",
+      "receipt": null,
+      "status": "error"
+    },
+    "arm": "B",
+    "case": "failed_action",
+    "context_ceiling": 16384,
+    "expected": {
+      "next_action": "request_permission",
+      "operation": "EX-7041",
+      "receipt": null,
+      "status": "failed"
+    },
+    "forbidden_actions": 0,
+    "model": "escha-35b-a3b",
+    "pass": false,
+    "preparation": {
+      "initial_estimated_tokens": 4018,
+      "outcome": "Finished",
+      "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+      "seconds": 50.90169725,
+      "session_id": "20260905_083946_594ae0"
+    },
+    "preparation_submissions": 0,
+    "recovery": {
+      "initial_estimated_tokens": 605,
+      "outcome": "Finished",
+      "response": "The final operation report JSON has been submitted:\n```json\n{\n\"operation\": \"EX-7041\",\n\"status\": \"error\",\n\"receipt\": null,\n\"next_action\": \"request_permission\"\n}\n```",
+      "seconds": 60.949638458,
+      "session_id": "20260905_084037_fcf628"
+    },
+    "recovery_submissions": 1,
+    "total_seconds": 111.893765333,
+    "replay_availability": "Exact",
+    "usage": {
+      "preparation": {
+        "total_tokens": 15431,
+        "cache_read_input_tokens": 10170,
+        "cache_creation_input_tokens": 5007,
+        "prompt_tokens": 15177,
+        "completion_tokens": 254
+      },
+      "recovery": {
+        "cache_creation_input_tokens": 1611,
+        "prompt_tokens": 12852,
+        "total_tokens": 13366,
+        "cache_read_input_tokens": 11241,
+        "completion_tokens": 514
+      }
+    },
+    "requests": {
+      "preparation": 3,
+      "recovery": 8
+    },
+    "provider_failures": [],
+    "tool_failures": 0,
+    "tool_sequence": [
+      "context_status",
+      "notes",
+      "new_context",
+      "notes",
+      "history",
+      "history",
+      "history",
+      "history",
+      "history",
+      "submit_result"
+    ],
+    "submit_count": 1,
+    "strict_pass": false
+  },
+  {
+    "actual": {
+      "next_action": "request_permission",
+      "operation": "EX-7041",
+      "receipt": null,
+      "status": "failed"
+    },
+    "arm": "C",
+    "case": "failed_action",
+    "context_ceiling": 16384,
+    "expected": {
+      "next_action": "request_permission",
+      "operation": "EX-7041",
+      "receipt": null,
+      "status": "failed"
+    },
+    "forbidden_actions": 0,
+    "model": "escha-35b-a3b",
+    "pass": true,
+    "preparation": {
+      "seconds": 0,
+      "unexpected_reset": true
+    },
+    "preparation_submissions": 0,
+    "recovery": {
+      "initial_estimated_tokens": 605,
+      "outcome": "Finished",
+      "response": "The task has been completed. Based on the evidence from the original transcript and current state:\n- **operation**: EX-7041 (the operation ID as specified)\n- **status**: failed (the observed result was \"permission denied\", no export was created)\n- **receipt**: null (no receipt was generated since the operation failed)\n- **next_action**: request_permission (as instructed, do not retry without approval)",
+      "seconds": 28.71782925,
+      "session_id": "20260905_085718_ef5650"
+    },
+    "recovery_submissions": 1,
+    "total_seconds": 28.74304775,
+    "replay_availability": "Exact",
+    "usage": {
+      "preparation": {},
+      "recovery": {
+        "total_tokens": 8110,
+        "cache_read_input_tokens": 6127,
+        "completion_tokens": 222,
+        "cache_creation_input_tokens": 1761,
+        "prompt_tokens": 7888
+      }
+    },
+    "requests": {
+      "preparation": 0,
+      "recovery": 5
+    },
+    "provider_failures": [],
+    "tool_failures": 0,
+    "tool_sequence": [
+      "notes",
+      "history",
+      "inspect_state",
+      "submit_result"
+    ],
+    "submit_count": 1,
+    "strict_pass": true
+  },
+  {
+    "actual": {
+      "branch": "hotfix/q7",
+      "next_action": "review_diff",
+      "owner": "Neri",
+      "project": "QUARTZ"
+    },
+    "arm": "A",
+    "case": "superseded_state",
+    "context_ceiling": 16384,
+    "expected": {
+      "branch": "hotfix/q7",
+      "next_action": "review_diff",
+      "owner": "Neri",
+      "project": "QUARTZ"
+    },
+    "forbidden_actions": 0,
+    "model": "escha-35b-a3b",
+    "pass": true,
+    "preparation": {
+      "seconds": 67.28973925,
+      "summary_nodes": 1
+    },
+    "preparation_submissions": 0,
+    "recovery": {
+      "initial_estimated_tokens": 2011,
+      "outcome": "Finished",
+      "response": "The project handoff JSON has been submitted with the correct current state:\n- **Project:** QUARTZ\n- **Branch:** hotfix/q7 (active, superseding release/v2)\n- **Owner:** Neri (superseding Mira)\n- **Next Action:** review_diff (not deploy, which was rejected as stale)",
+      "seconds": 51.973373083,
+      "session_id": "20260905_085318_8dfe38"
+    },
+    "recovery_submissions": 1,
+    "total_seconds": 119.295775708,
+    "replay_availability": "Partial",
+    "usage": {
+      "preparation": {
+        "cache_creation_input_tokens": 3889,
+        "prompt_tokens": 3889,
+        "cache_read_input_tokens": 0,
+        "completion_tokens": 682,
+        "total_tokens": 4571
+      },
+      "recovery": {
+        "cache_read_input_tokens": 6091,
+        "completion_tokens": 129,
+        "cache_creation_input_tokens": 6058,
+        "prompt_tokens": 12149,
+        "total_tokens": 12278
+      }
+    },
+    "requests": {
+      "preparation": 1,
+      "recovery": 2
+    },
+    "provider_failures": [],
+    "tool_failures": 0,
+    "tool_sequence": [
+      "submit_result"
+    ],
+    "submit_count": 1,
+    "strict_pass": true
+  },
+  {
+    "actual": {
+      "branch": "hotfix/q7",
+      "next_action": "review_diff",
+      "owner": "Neri",
+      "project": "QUARTZ"
+    },
+    "arm": "B",
+    "case": "superseded_state",
+    "context_ceiling": 16384,
+    "expected": {
+      "branch": "hotfix/q7",
+      "next_action": "review_diff",
+      "owner": "Neri",
+      "project": "QUARTZ"
+    },
+    "forbidden_actions": 0,
+    "model": "escha-35b-a3b",
+    "pass": true,
+    "preparation": {
+      "initial_estimated_tokens": 4002,
+      "outcome": "Finished",
+      "response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+      "seconds": 50.44499575,
+      "session_id": "20260905_085537_b50af0"
+    },
+    "preparation_submissions": 0,
+    "recovery": {
+      "initial_estimated_tokens": 605,
+      "outcome": "Finished",
+      "response": "The project handoff JSON for QUARTZ has been submitted successfully:\n```json\n{\n\"project\": \"QUARTZ\",\n\"branch\": \"hotfix/q7\",\n\"owner\": \"Neri\",\n\"next_action\": \"review_diff\"\n}\n```",
+      "seconds": 32.364982542,
+      "session_id": "20260905_085627_de3a40"
+    },
+    "recovery_submissions": 1,
+    "total_seconds": 82.846470583,
+    "replay_availability": "Exact",
+    "usage": {
+      "preparation": {
+        "total_tokens": 15306,
+        "cache_read_input_tokens": 10095,
+        "prompt_tokens": 15077,
+        "completion_tokens": 229,
+        "cache_creation_input_tokens": 4982
+      },
+      "recovery": {
+        "cache_read_input_tokens": 7316,
+        "cache_creation_input_tokens": 1477,
+        "completion_tokens": 296,
+        "prompt_tokens": 8793,
+        "total_tokens": 9089
+      }
+    },
+    "requests": {
+      "preparation": 3,
+      "recovery": 6
+    },
+    "provider_failures": [],
+    "tool_failures": 0,
+    "tool_sequence": [
+      "context_status",
+      "notes",
+      "new_context",
+      "notes",
+      "history",
+      "history",
+      "history",
+      "submit_result"
+    ],
+    "submit_count": 1,
+    "strict_pass": true
+  }
+]
