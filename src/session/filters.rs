@@ -16,29 +16,6 @@ use crate::agent::context_hygiene::cap_tool_result_for_replay;
 #[cfg(test)]
 use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
 
-/// Estimate tokens for a single JSON message (cheap heuristic: chars / 4).
-///
-/// ponytail: deliberately NOT the tiktoken counter (PERF-02 evaluated
-/// 2026-07-09 and aborted). This is a coarse DB-load pre-filter; the
-/// accurate tiktoken trim (`trim_to_fit_with_age_preserving_prefix`,
-/// shared.rs) runs downstream every turn and corrects any error here.
-/// Swapping estimators shifts every long session's drop boundary once at
-/// upgrade — a full re-prefill (~45s on a 35B) per session for no
-/// correctness win. Revisit only if a real overflow traces back to here.
-fn estimate_msg_tokens(m: &Value) -> usize {
-    let content_len = m
-        .get("content")
-        .and_then(|v| v.as_str())
-        .map(|s| s.len())
-        .unwrap_or(0);
-    let tc_len = m
-        .get("tool_calls")
-        .map(|v| v.to_string().len())
-        .unwrap_or(0);
-    // ~4 chars per token is a conservative estimate (tiktoken cl100k_base).
-    (content_len + tc_len + 20) / 4 // +20 for role/JSON overhead
-}
-
 /// A real conversational user turn: a `role: "user"` message that is NOT an
 /// injected synthetic scaffolding nudge (grounding, format-anchor, response
 /// boundary, iteration notice, etc.). Only these count as turns and serve as
@@ -100,7 +77,7 @@ fn skip_leading_orphan_tools(messages: &[Value], start: usize) -> usize {
 }
 
 /// Filter messages: respect clear markers, skip orphaned tool results,
-/// filter non-replayable synthetics, apply turn limit, token budget, and map to wire format.
+/// filter non-replayable synthetics, apply turn limit, and map to wire format.
 ///
 /// This is the primary entry point — it applies all filtering stages
 /// in sequence:
@@ -112,8 +89,6 @@ fn skip_leading_orphan_tools(messages: &[Value], start: usize) -> usize {
 /// 4. Turn limit — keep only the last `max_turns` user-assistant pairs
 /// 5. Per-message filter/map — strip non-replayable synthetics, clear markers, summaries;
 ///    copy role, content, tool_calls, tool_call_id, name, _turn to wire format
-/// 6. Token budget — drop oldest messages until total tokens ≤ budget
-///    (prevents context bombs when sessions accumulate large tool results)
 pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize) -> Vec<Value> {
     // Stage 1: max_messages window — start index into `messages`.
     // max_messages=0 means "no limit".
@@ -248,78 +223,11 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
         })
         .collect();
 
-    // Stage 6: Token budget — prevent context bombs from sessions that
-    // accumulated large tool results. Walk backward from the end, keeping
-    // messages until the cumulative token count exceeds the budget.
-    // Budget is derived from max_messages: since the LCM history limit already
-    // calculates "30% of context / 150 tokens per message", we use
-    // max_messages * 150 as the token ceiling. This gives history at most
-    // 30% of the context window in tokens, not just in message count.
-    let token_budget = max_messages.saturating_mul(150);
-    if token_budget == 0 {
-        // max_messages=0 means "no limit" in Stage 1; honour that here too.
-        return mapped;
-    }
-    let total_tokens: usize = mapped.iter().map(|m| estimate_msg_tokens(m)).sum();
-    if total_tokens <= token_budget {
-        return mapped;
-    }
-
-    // Over budget. Drop whole oldest turns in quantized batches (hysteresis) —
-    // the same reasoning as the Stage-4 turn limit. The original code kept "the
-    // last `token_budget` tokens", a boundary that slides one turn per reload
-    // once history saturates the budget, re-prefilling the entire context on the
-    // live server every turn. Batching the drop keeps the kept-history head
-    // byte-stable for several reloads between drops, so the prefix cache stays
-    // warm. Whole-turn granularity also avoids starting the wire history on an
-    // assistant/tool message.
-    let turn_starts: Vec<usize> = (0..mapped.len())
-        .filter(|&i| is_real_user_turn(&mapped[i]))
-        .collect();
-    // Fewest oldest turns to drop so the kept suffix fits the budget.
-    let mut min_drop = turn_starts.len();
-    for (d, &ts) in turn_starts.iter().enumerate() {
-        let kept: usize = mapped[ts..].iter().map(estimate_msg_tokens).sum();
-        if kept <= token_budget {
-            min_drop = d;
-            break;
-        }
-    }
-    // Quantize the drop up to a whole batch so the boundary advances only every
-    // `batch` reloads (stable plateaus = warm prefix cache between drops).
-    let batch = (max_turns / 2).max(1);
-    let dropped_turns = if min_drop == 0 {
-        0
-    } else {
-        let quantized = ((min_drop + batch - 1) / batch * batch).min(turn_starts.len());
-        if quantized == turn_starts.len() && min_drop < turn_starts.len() {
-            // Quantizing up would wipe ALL history even though the newest
-            // turn(s) fit the budget — a max_turns-derived batch (e.g. 30) in a
-            // token window holding only ~4 fat turns rounds every 1-turn drop
-            // up to "drop everything". Quantization is a cache nicety, never a
-            // license to drop more than the ceiling demands: fall back to the
-            // exact minimum. (The boundary slides per reload in this regime,
-            // but this is precisely where LCM compaction takes over anyway.)
-            min_drop
-        } else {
-            quantized
-        }
-    };
-    let keep_from = turn_starts
-        .get(dropped_turns)
-        .copied()
-        .unwrap_or(mapped.len());
-    let keep_from = skip_leading_orphan_tools(&mapped, keep_from);
-    if keep_from > 0 {
-        warn!(
-            dropped_turns,
-            budget_tokens = token_budget,
-            total_tokens = total_tokens,
-            kept_messages = mapped.len() - keep_from,
-            "token_budget_trim: dropped oldest whole turns from session history"
-        );
-    }
-    mapped[keep_from..].to_vec()
+    // Loading history must not invent a token ceiling from a message count.
+    // The agent's effective TokenBudget and LCM own context fitting; dropping
+    // turns here hides them from compaction and silently destroys recall even
+    // while the actual provider prompt fits. Keep row/turn limits above only.
+    mapped
 }
 
 /// Cap an oversized tool-result body to the shared replay limit. Deterministic
@@ -390,42 +298,6 @@ mod tests {
     fn test_empty_input_returns_empty() {
         let result = filter_history(&[], 100, 0);
         assert!(result.is_empty());
-    }
-
-    /// Stage-6 batch scale regression: with fat turns (~1000 tokens each) and a
-    /// token ceiling that only fits one, the drop quantizer must keep the
-    /// newest turn — the old `max_turns/2` batch (30) ceil-quantized a 4-turn
-    /// drop up to 30, `.min(len)` clamped it to "all", and the entire history
-    /// was silently wiped on every reload.
-    #[test]
-    fn test_token_budget_trim_keeps_newest_turn_with_fat_turns() {
-        let fat = "x".repeat(4000); // ~1000 tokens
-        let mut messages = Vec::new();
-        for i in 0..5 {
-            messages.push(user(&format!("TURN_{i} question")));
-            messages.push(assistant(&fat));
-        }
-        // max_messages=14 → token ceiling 14*150 = 2100; max_turns=60 → the
-        // old batch would be 30.
-        let result = filter_history(&messages, 14, 60);
-
-        assert!(
-            !result.is_empty(),
-            "history must never be wiped entirely by the token-budget trim"
-        );
-        let kept_tokens: usize = result.iter().map(estimate_msg_tokens).sum();
-        assert!(
-            kept_tokens <= 14 * 150,
-            "kept suffix must respect the ceiling, got {kept_tokens}"
-        );
-        assert!(
-            result.iter().any(|m| {
-                m.get("content")
-                    .and_then(|c| c.as_str())
-                    .is_some_and(|c| c.contains("TURN_4"))
-            }),
-            "the newest turn must survive the trim"
-        );
     }
 
     #[test]
@@ -857,69 +729,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_token_budget_drops_at_real_user_turn_boundary() {
-        // When over the Stage-6 token budget, the kept head must begin at a real
-        // user turn — we drop whole oldest turns rather than slicing mid-turn and
-        // leaving the history starting on an assistant message. Here the natural
-        // budget cut lands on `a1` (the response to a large user turn); the snap
-        // must advance it forward to the next real user turn (`q2`).
-        let big_user = "x".repeat(8000); // ~2000 tokens, dwarfs the budget
-        let messages = vec![
-            user("q0"),
-            assistant("a0"),
-            json!({"role": "user", "content": big_user}),
-            assistant("a1"),
-            user("q2"),
-            assistant("a2"),
-        ];
-        // max_messages=6 == len (no Stage-1 window drop); Stage-6 budget = 900.
-        let result = filter_history(&messages, 6, 0);
-
-        assert!(!result.is_empty());
-        assert_eq!(
-            role_of(&result[0]),
-            "user",
-            "kept history must start at a real user turn, not mid-turn"
-        );
-        assert_eq!(result[0]["content"], "q2");
-    }
-
-    #[test]
-    fn test_token_budget_hysteresis_keeps_prefix_stable() {
-        // The Stage-6 token budget must also drop in whole-turn batches, not
-        // slide one turn per reload once history saturates the budget. Heavy
-        // turns (large assistant content) make the token budget bind before the
-        // Stage-4 turn limit; with batch=5 the kept head must hold for several
-        // reloads between drops (warm prefix cache), not shift every turn.
-        let max_turns = 10;
-        let max_messages = 100; // token_budget = 15000; Stage-1 window won't bind
-        let big = "y".repeat(10_000); // ~2505 tokens per assistant message
-        let mut messages = Vec::new();
-        let mut reloads = Vec::new();
-        for t in 0..14 {
-            messages.push(user(&format!("q{t}")));
-            messages.push(json!({"role": "assistant", "content": format!("{t}:{big}")}));
-            reloads.push(filter_history(&messages, max_messages, max_turns));
-        }
-        let head_shifts = reloads
-            .windows(2)
-            .filter(|w| {
-                let (prev, cur) = (&w[0], &w[1]);
-                let append_only =
-                    prev.len() <= cur.len() && prev.iter().zip(cur.iter()).all(|(a, b)| a == b);
-                !append_only
-            })
-            .count();
-        // The budget binds ~turn 6; sliding would give ~8 head shifts. Batched
-        // drops must keep it to at most 3.
-        assert!(
-            head_shifts <= 3,
-            "Stage-6 token budget is sliding every reload ({head_shifts} head shifts) \
-             instead of dropping in batches — the prefix cache busts every turn"
-        );
-    }
-
     // ------------------------------------------------------------------
     // Wire format field preservation
     // ------------------------------------------------------------------
@@ -1048,40 +857,29 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Stage 6: Token budget
+    // History budget ownership
     // ------------------------------------------------------------------
 
     #[test]
-    fn test_token_budget_drops_old_messages_when_over_budget() {
-        // max_messages=6 → token budget = 6 * 150 = 900 tokens.
-        // Each "x".repeat(2000) message is ~500 tokens (2020 chars / 4).
-        // 3 such messages = ~1500 tokens > 900 budget.
-        let big = "x".repeat(2000);
-        let messages = vec![
-            user(&big),          // ~500 tokens (oldest, should be dropped)
-            assistant(&big),     // ~500 tokens (should be dropped)
-            user("recent"),      // ~6 tokens (kept)
-            assistant("answer"), // ~7 tokens (kept)
-        ];
-        let result = filter_history(&messages, 6, 0);
-        // The two big messages (~1000 tokens) exceed the budget of 900.
-        // Walking backward: "answer" (7) + "recent" (6) = 13, well under 900.
-        // Adding assistant(&big) would be 13 + 500 = 513, still under.
-        // Adding user(&big) would be 513 + 500 = 1013 > 900 → stop.
-        // So we keep 3 messages.
-        assert!(
-            result.len() <= 3,
-            "expected at most 3 messages, got {}",
-            result.len()
-        );
-        // The last message must be the "answer"
-        assert_eq!(result.last().unwrap()["content"], "answer");
+    fn history_reload_keeps_long_turns_for_the_context_budget_owner() {
+        let mut messages = Vec::new();
+        for batch in 1..=8 {
+            messages.push(user(&format!("BATCH_{batch} {}", "archive ".repeat(2400))));
+            messages.push(assistant("OK"));
+        }
+        // A 49K context loads 229 messages. That count is not a 34350-token
+        // ceiling: the agent must see every turn before fitting/compacting it.
+        let result = filter_history(&messages, 229, 600);
+        assert_eq!(result.len(), messages.len());
+        assert!(result[0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("BATCH_1 "));
     }
 
     #[test]
     fn test_token_budget_zero_max_messages_preserves_all() {
-        // max_messages=0 means "no limit" in Stage 1. Stage 6 must honour
-        // that contract and not drop everything (H1 regression guard).
+        // max_messages=0 means no row limit.
         let messages = vec![
             user("hello"),
             assistant("world"),
@@ -1107,46 +905,25 @@ mod tests {
 
     #[test]
     fn test_token_budget_skips_orphaned_tool_results_at_boundary() {
-        // When token budget drops messages, the new boundary might land on
-        // a tool result whose parent assistant+tool_calls was dropped.
-        // The orphan-skip must advance past it.
-        //
-        // Layout: [assistant+tc (big), tool_result (big), user, assistant]
-        // max_messages=2 → budget = 300 tokens.
-        // The big messages (~500 tokens each) blow the budget; backward walk
-        // keeps user + assistant (~13 tokens), then can't fit tool_result.
-        // keep_from lands at index 2 (user) — no orphan at boundary.
-        //
-        // To force the orphan case: budget must fit the tool_result but NOT
-        // its parent. Use max_messages=5 → budget=750. Backward walk keeps
-        // assistant(6) + user(6) + tool_result(~505) = 517 < 750, then tries
-        // assistant+tc (~45) = 562 < 750 — fits. So we need the tool result
-        // to be the tipping point.
-        //
-        // Simplest: make the assistant+tool_calls message large so it busts
-        // the budget, leaving tool_result as first kept message (orphaned).
-        let big_args = "y".repeat(3000); // ~750 tokens in tool_calls JSON
+        let big_args = "y".repeat(3000);
         let messages = vec![
             json!({
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "exec", "arguments": &big_args}}]
+                "role": "assistant", "content": "",
+                "tool_calls": [{"id": "c1", "type": "function", "function": {
+                    "name": "exec", "arguments": &big_args
+                }}]
             }),
             json!({"role": "tool", "tool_call_id": "c1", "name": "exec", "content": "ok"}),
             user("question"),
             assistant("answer"),
         ];
-        // max_messages=4 → budget = 600 tokens.
-        // assistant+tc is ~770 tokens (big_args alone). Total > 600.
-        // Backward walk: answer(7) + question(7) + tool(8) = 22 < 600.
-        // Adding assistant+tc (770) = 792 > 600 → stop. keep_from = 1 (tool).
-        // Orphan skip advances past the tool result → keep_from = 2.
-        let result = filter_history(&messages, 4, 0);
-        assert!(
-            result.iter().all(|m| role_of(m) != "tool"),
-            "orphaned tool result at token-budget boundary must be skipped"
-        );
-        assert_eq!(result.len(), 2, "only user + assistant should remain");
+        // Size alone must not split a valid tool pair. If the explicit row
+        // window excludes its parent, the orphan still must be removed.
+        let complete = filter_history(&messages, 4, 0);
+        assert_eq!(complete.len(), 4);
+        assert_eq!(complete[1]["tool_call_id"], "c1");
+        let result = filter_history(&messages, 3, 0);
+        assert_eq!(result.len(), 2);
         assert_eq!(result[0]["content"], "question");
         assert_eq!(result[1]["content"], "answer");
     }

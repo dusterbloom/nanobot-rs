@@ -13965,6 +13965,8 @@ mod capacity_exceeded {
     struct Capacity413Provider {
         requests: AtomicU64,
         typed_failures: u32,
+        prompt_limits: std::sync::Mutex<Vec<u64>>,
+        output_limits: std::sync::Mutex<Vec<u32>>,
     }
 
     #[async_trait]
@@ -13979,11 +13981,18 @@ mod capacity_exceeded {
             _thinking_budget: Option<u32>,
             _top_p: Option<f64>,
         ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            self.output_limits.lock().unwrap().push(_max_tokens);
+            self.prompt_limits.lock().unwrap().push(
+                _messages[0]
+                    [crate::providers::openai_compat::NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD]
+                    .as_u64()
+                    .expect("Higgs request must carry its effective prompt limit"),
+            );
             let n = self.requests.fetch_add(1, Ordering::SeqCst);
             if (n as u32) < self.typed_failures {
                 return Err(crate::errors::ProviderError::HiggsCapacityExceeded {
-                    safe_prompt_tokens: 800,
-                    safe_total_tokens: 1_024,
+                    safe_prompt_tokens: 8_192,
+                    safe_total_tokens: 12_288,
                     boot_id: "boot-1".to_string(),
                     generation: 3,
                 }
@@ -13996,6 +14005,34 @@ mod capacity_exceeded {
                 usage: std::collections::HashMap::new(),
             })
         }
+        fn fetch_higgs_capacity<'a>(
+            &'a self,
+            _model: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Option<crate::agent::capacity::HiggsCapacityFetch>,
+                            crate::errors::ProviderError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async {
+                // Discovery remains broader than the typed request-specific rejection.
+                let profile = serde_json::from_value(json!({
+                    "schemaVersion":1,"model":"local-model","modelFingerprint":"test-model",
+                    "bootId":"boot-mock","generation":1,"availability":"available","pressure":"normal",
+                    "safeTotalTokens":12288,"recommendedOutputTokens":512,"maxPromptTokens":11776,
+                    "retainedSessionTokens":0,"retainedBytes":0,"prefixCacheBytes":0,"basis":"conservative"
+                })).unwrap();
+                Ok(Some(crate::agent::capacity::HiggsCapacityFetch::Profile(
+                    profile,
+                )))
+            })
+        }
+
         fn get_default_model(&self) -> &str {
             "local-model"
         }
@@ -14009,6 +14046,8 @@ mod capacity_exceeded {
 
     struct TurnRecord {
         provider_calls: u64,
+        prompt_limits: Vec<u64>,
+        output_limits: Vec<u32>,
         event_kinds: Vec<&'static str>,
         outcome: String,
         reply: String,
@@ -14022,6 +14061,8 @@ mod capacity_exceeded {
         let provider = Arc::new(Capacity413Provider {
             requests: AtomicU64::new(0),
             typed_failures,
+            prompt_limits: std::sync::Mutex::new(Vec::new()),
+            output_limits: std::sync::Mutex::new(Vec::new()),
         });
         let workspace = tempfile::tempdir().unwrap().keep();
         let core = build_swappable_core(SwappableCoreConfig {
@@ -14032,7 +14073,7 @@ mod capacity_exceeded {
             max_continuations: 1,
             max_tokens: 512,
             temperature: 0.0,
-            max_context_tokens: 4_096,
+            max_context_tokens: 16_384,
             brave_api_key: None,
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
@@ -14061,7 +14102,7 @@ mod capacity_exceeded {
                 std::env::temp_dir().join(format!("nanobot-413-{}.sqlite", uuid::Uuid::new_v4())),
             ),
         });
-        let counters = test_runtime_counters(4_096);
+        let counters = test_runtime_counters(16_384);
         let core_handle = AgentHandle::new(core, counters);
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
         let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
@@ -14120,8 +14161,12 @@ mod capacity_exceeded {
             )
             .await
             .unwrap();
+        let prompt_limits = provider.prompt_limits.lock().unwrap().clone();
+        let output_limits = provider.output_limits.lock().unwrap().clone();
         TurnRecord {
             provider_calls: provider.requests.load(Ordering::SeqCst),
+            prompt_limits,
+            output_limits,
             event_kinds,
             outcome,
             reply,
@@ -14155,6 +14200,37 @@ mod capacity_exceeded {
             "one logical turn: request -> failed(413) -> request -> response -> finished"
         );
         assert_eq!(record.outcome, "finished");
+    }
+
+    #[tokio::test]
+    async fn adaptive_output_never_exceeds_live_server_reserve() {
+        let record = drive_typed_turn(0, "explain in detail how this works").await;
+        assert_eq!(record.output_limits, vec![512]);
+        assert_eq!(record.provider_calls, 1);
+        assert_eq!(record.outcome, "finished");
+        assert_eq!(record.pending_count, 0);
+    }
+
+    #[tokio::test]
+    async fn typed_capacity_retry_keeps_tighter_wire_limit_than_discovery() {
+        let record = drive_typed_turn(1, "answer briefly").await;
+        assert_eq!(record.prompt_limits, vec![11_776, 8_192]);
+        assert_eq!(record.outcome, "finished");
+    }
+
+    #[tokio::test]
+    async fn pending_capacity_reply_reports_server_limits_not_configured_ceiling() {
+        let record = drive_typed_turn(2, "report capacity precisely").await;
+        assert!(
+            record.reply.contains("safe prompt 8192"),
+            "{}",
+            record.reply
+        );
+        assert!(
+            record.reply.contains("safe total 12288"),
+            "{}",
+            record.reply
+        );
     }
 
     #[tokio::test]

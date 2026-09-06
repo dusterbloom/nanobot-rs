@@ -426,7 +426,18 @@ impl Default for TurnCapacityRecovery {
     }
 }
 
+fn capacity_pending_reply(error: &anyhow::Error) -> String {
+    format!("[Capacity Unavailable] {error}. This turn is saved as pending work; retry once capacity recovers.")
+}
+
 fn next_preflight_generation(current: TurnCapacityRecovery) -> TurnCapacityRecovery {
+    // Compaction during a rejected request's retry must not reset the retry cap.
+    if matches!(
+        current,
+        TurnCapacityRecovery::RetryIssued { .. } | TurnCapacityRecovery::Terminal { .. }
+    ) {
+        return current;
+    }
     let generation = match current {
         TurnCapacityRecovery::Idle => 0,
         TurnCapacityRecovery::PreflightCompacted { generation }
@@ -2779,6 +2790,11 @@ impl AgentLoopShared {
                 generation: generation.saturating_add(1),
             };
             self.suspend_capacity_turn(ctx, None).await;
+            // Earlier tool narration must not suppress the terminal failure notice.
+            if ctx.flow.content_was_streamed {
+                send_retract_reply_marker(&ctx.text_delta_tx);
+                ctx.flow.content_was_streamed = false;
+            }
             return CapacityExceededRecovery::TurnPending;
         }
 
@@ -2842,6 +2858,15 @@ impl AgentLoopShared {
         // the effective budget from the live endpoint before the re-entry.
         ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
         self.resolve_effective_budget(ctx).await;
+        // A 413 can describe a tighter request-specific window than discovery
+        // (e.g. retained growth). Refresh may shrink it further, never widen it.
+        let total = ctx.effective_budget.max_context().min(safe_total_tokens);
+        let prompt = ctx
+            .effective_budget
+            .available_budget(0)
+            .min(safe_prompt_tokens)
+            .min(total);
+        ctx.effective_budget = TokenBudget::new(total, total - prompt);
         ctx.capacity_recovery = TurnCapacityRecovery::RetryIssued {
             generation: generation.saturating_add(1),
         };
@@ -3944,7 +3969,7 @@ impl AgentLoopShared {
             }
         };
         let local_artifact_action = local_artifact_action_for_turn(ctx);
-        adaptive_max_tokens_for_artifact_action(
+        let requested = adaptive_max_tokens_for_artifact_action(
             base,
             had_long,
             user_text,
@@ -3953,7 +3978,15 @@ impl AgentLoopShared {
             local_artifact_action,
             thinking_budget,
             &ctx.core.adaptive_tokens,
-        )
+        );
+        // Input length and /long are preferences, not permission to exceed
+        // Higgs's output ceiling. Such a rejection cannot be fixed by LCM.
+        self.core_handle
+            .capacity
+            .describe(&ctx.core.token_budget, 0)
+            .map_or(requested, |limits| {
+                requested.min(limits.output_tokens.try_into().unwrap_or(u32::MAX))
+            })
     }
 
     // -----------------------------------------------------------------------
@@ -4812,10 +4845,10 @@ impl AgentLoopShared {
             let frozen_tool_hash =
                 crate::agent::prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
             let max_prompt_tokens = ctx
-                .core
-                .token_budget
+                .effective_budget
                 .max_context()
                 .saturating_sub(max_tokens as usize)
+                .min(ctx.effective_budget.available_budget(0))
                 .min(u32::MAX as usize) as u32;
             let retained_checkpoint = ctx.higgs_session_route.retained_checkpoint().cloned();
             let reservation = retained_checkpoint.as_ref().and_then(|checkpoint| {
@@ -5006,12 +5039,7 @@ impl AgentLoopShared {
                             CapacityExceededRecovery::TurnPending => {
                                 counters.mark_inference_finished();
                                 return StepResult::Done(IterationOutcome::Complete {
-                                    content: format!(
-                                        "[Capacity Unavailable] The live capacity window shrank \
-                                         (safe prompt {safe} tokens). This turn is saved as pending \
-                                         work; retry once capacity recovers.",
-                                        safe = ctx.effective_budget.max_context()
-                                    ),
+                                    content: capacity_pending_reply(&e),
                                     outcome: TurnOutcome::CapacityUnavailable,
                                 });
                             }
@@ -5080,12 +5108,7 @@ impl AgentLoopShared {
                             CapacityExceededRecovery::TurnPending => {
                                 counters.mark_inference_finished();
                                 return StepResult::Done(IterationOutcome::Complete {
-                                    content: format!(
-                                        "[Capacity Unavailable] The live capacity window shrank \
-                                         (safe prompt {safe} tokens). This turn is saved as pending \
-                                         work; retry once capacity recovers.",
-                                        safe = ctx.effective_budget.max_context()
-                                    ),
+                                    content: capacity_pending_reply(&e),
                                     outcome: TurnOutcome::CapacityUnavailable,
                                 });
                             }
@@ -5352,7 +5375,7 @@ impl AgentLoopShared {
                         CapacityExceededRecovery::TurnPending => {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Complete {
-                                content: "[Capacity Unavailable] The live capacity window shrank; this turn is saved as pending work.".to_string(),
+                                content: capacity_pending_reply(&e),
                                 outcome: TurnOutcome::CapacityUnavailable,
                             });
                         }

@@ -266,7 +266,7 @@ pub(crate) struct Footer {
     pub model: String,
     pub ctx_used: usize,
     pub ctx_max: usize,
-    /// Compact live-capacity segment (`16K/4K legacy`), `None` when no
+    /// Explicit live prompt/output capacity segment, `None` when no
     /// snapshot is installed (cloud provider, pre-discovery) — the footer
     /// then degrades to configured-only and shows nothing.
     pub capacity: Option<String>,
@@ -3166,12 +3166,12 @@ fn footer_line(
 }
 
 /// Footer segment for the installed capacity snapshot: effective live limits
-/// plus the source label (`16K/4K legacy`, `48K/4K adaptive · constrained`).
+/// with explicit prompt/output labels so the reserve cannot read as usage.
 /// An unavailable snapshot keeps the configured ceiling and says so.
 pub(crate) fn capacity_footer_label(d: &CapacityDescription) -> String {
     let limits = format!(
-        "{}/{}",
-        format_k_tokens(d.total_tokens as u64),
+        "prompt {} · output {}",
+        format_k_tokens(d.total_tokens.saturating_sub(d.output_tokens) as u64),
         format_k_tokens(d.output_tokens as u64)
     );
     let mut label = match d.source {
@@ -5037,7 +5037,7 @@ mod tests {
             total_tokens: 16_384,
             output_tokens: 4_096,
         });
-        assert_eq!(legacy, "16K/4K legacy");
+        assert_eq!(legacy, "prompt 12K · output 4K legacy");
 
         let adaptive = capacity_footer_label(&CapacityDescription {
             source: CapacitySource::Adaptive {
@@ -5049,7 +5049,10 @@ mod tests {
             total_tokens: 49_152,
             output_tokens: 4_096,
         });
-        assert_eq!(adaptive, "48K/4K adaptive (learned) · constrained");
+        assert_eq!(
+            adaptive,
+            "prompt 44K · output 4K adaptive (learned) · constrained"
+        );
         // Normal pressure stays quiet — the footer is calm by design.
         let calm = capacity_footer_label(&CapacityDescription {
             source: CapacitySource::Adaptive {
@@ -5061,7 +5064,7 @@ mod tests {
             total_tokens: 49_152,
             output_tokens: 4_096,
         });
-        assert_eq!(calm, "48K/4K adaptive (conservative)");
+        assert_eq!(calm, "prompt 44K · output 4K adaptive (conservative)");
 
         let mut footer = test_footer();
         footer.capacity = Some(legacy);
@@ -5073,7 +5076,7 @@ mod tests {
             0,
         )));
         assert!(
-            with_capacity.contains("capacity 16K/4K legacy"),
+            with_capacity.contains("capacity prompt 12K · output 4K legacy"),
             "footer: {with_capacity}"
         );
     }

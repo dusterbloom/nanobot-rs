@@ -215,18 +215,26 @@ fn clear_normal_screen() {
 
 /// Snapshot the quiet footer state (cwd / model / context usage) from the core.
 fn footer_snapshot(core: &SharedCoreHandle) -> Footer {
-    let used = core.counters.last_context_used.load(Ordering::Relaxed) as usize;
-    let max = core.counters.last_context_max.load(Ordering::Relaxed) as usize;
-    let model = core.swappable().model.clone();
+    // History estimates omit rendered instructions/tools. Show the last actual
+    // provider prompt against the same live prompt budget used by the loop.
+    let used = core
+        .counters
+        .last_actual_prompt_tokens
+        .load(Ordering::Relaxed) as usize;
+    let current = core.swappable();
+    let max = core
+        .capacity
+        .effective_budget(&current.token_budget, 0)
+        .available_budget(0);
+    let model = current.model.clone();
     let cwd = std::env::current_dir()
         .ok()
         .map(|p| home_relative(&p))
         .unwrap_or_else(|| "?".into());
-    // Effective live limits beside the configured ctx ceiling above; `None`
-    // (cloud / pre-discovery) renders no capacity segment at all.
+    // Cloud / pre-discovery has no separate capacity description.
     let capacity = core
         .capacity
-        .describe(&core.swappable().token_budget, 0)
+        .describe(&current.token_budget, 0)
         .map(|d| capacity_footer_label(&d));
     Footer {
         cwd,
