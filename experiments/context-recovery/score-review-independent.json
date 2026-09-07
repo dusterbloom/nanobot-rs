@@ -1,0 +1,141 @@
+{
+  "method": "Rebuild expected state from authoritative deltas and visible diagnostic lines; cross-check submissions against action receipts; ignore stored pass booleans.",
+  "exact_correct": 13,
+  "total": 20,
+  "rows": [
+    {
+      "revision": 0,
+      "exact": true,
+      "wrong_fields_after_unwrapping": [],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 1,
+      "exact": true,
+      "wrong_fields_after_unwrapping": [],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 2,
+      "exact": true,
+      "wrong_fields_after_unwrapping": [],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 3,
+      "exact": true,
+      "wrong_fields_after_unwrapping": [],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 4,
+      "exact": true,
+      "wrong_fields_after_unwrapping": [],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 5,
+      "exact": true,
+      "wrong_fields_after_unwrapping": [],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 6,
+      "exact": true,
+      "wrong_fields_after_unwrapping": [],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 7,
+      "exact": true,
+      "wrong_fields_after_unwrapping": [],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 8,
+      "exact": false,
+      "wrong_fields_after_unwrapping": [
+        "checksum"
+      ],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 9,
+      "exact": false,
+      "wrong_fields_after_unwrapping": [
+        "checksum"
+      ],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 10,
+      "exact": false,
+      "wrong_fields_after_unwrapping": [
+        "checksum"
+      ],
+      "extra_result_wrapper": true
+    },
+    {
+      "revision": 11,
+      "exact": true,
+      "wrong_fields_after_unwrapping": [],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 12,
+      "exact": true,
+      "wrong_fields_after_unwrapping": [],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 13,
+      "exact": true,
+      "wrong_fields_after_unwrapping": [],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 14,
+      "exact": false,
+      "wrong_fields_after_unwrapping": [
+        "checksum"
+      ],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 15,
+      "exact": true,
+      "wrong_fields_after_unwrapping": [],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 16,
+      "exact": false,
+      "wrong_fields_after_unwrapping": [
+        "checksum"
+      ],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 17,
+      "exact": false,
+      "wrong_fields_after_unwrapping": [
+        "checksum"
+      ],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 18,
+      "exact": false,
+      "wrong_fields_after_unwrapping": [
+        "checksum"
+      ],
+      "extra_result_wrapper": false
+    },
+    {
+      "revision": 19,
+      "exact": true,
+      "wrong_fields_after_unwrapping": [],
+      "extra_result_wrapper": false
+    }
+  ]
+}

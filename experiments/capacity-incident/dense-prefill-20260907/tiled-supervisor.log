@@ -1,0 +1,72 @@
+In file included from /private/tmp/higgs-dense-prefill/d256.metal:1:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.metal:6:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:3:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/attn.h:6:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/mma.h:11:
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/utils/integral_constant.h:108:6: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+  if constexpr (start < stop) {
+     ^
+In file included from /private/tmp/higgs-dense-prefill/d256.metal:1:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.metal:6:
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:356:16: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+            if constexpr (is_bool) {
+               ^
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:426:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:436:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+4 warnings generated.
+Now drawing from 'Battery Power'
+ -InternalBattery-0 (id=22872163)	64%; discharging; (no estimate) present: true
+
+SHAPE 1024 8192
+{"tile":64,"max_abs":0,"relative_l2":0}
+{"tile":128,"max_abs":0,"relative_l2":0}
+{"tile":256,"max_abs":0,"relative_l2":0}
+{"tile":512,"max_abs":0,"relative_l2":0}
+{"nq":1024,"nk":8192,"tile":1024,"median_ms":78.5225}
+{"nq":1024,"nk":8192,"tile":64,"median_ms":81.8499}
+{"nq":1024,"nk":8192,"tile":128,"median_ms":76.7757}
+{"nq":1024,"nk":8192,"tile":256,"median_ms":76.9482}
+{"nq":1024,"nk":8192,"tile":512,"median_ms":71.6078}
+{"nq":1024,"nk":8192,"tile":512,"median_ms":71.4038}
+{"nq":1024,"nk":8192,"tile":256,"median_ms":76.6471}
+{"nq":1024,"nk":8192,"tile":128,"median_ms":76.6593}
+{"nq":1024,"nk":8192,"tile":64,"median_ms":82.1687}
+{"nq":1024,"nk":8192,"tile":1024,"median_ms":78.6366}
+
+SHAPE 1024 32768
+{"tile":64,"max_abs":0,"relative_l2":0}
+{"tile":128,"max_abs":0,"relative_l2":0}
+{"tile":256,"max_abs":0,"relative_l2":0}
+{"tile":512,"max_abs":0,"relative_l2":0}
+{"nq":1024,"nk":32768,"tile":1024,"median_ms":391.819}
+{"nq":1024,"nk":32768,"tile":64,"median_ms":330.023}
+{"nq":1024,"nk":32768,"tile":128,"median_ms":334.284}
+{"nq":1024,"nk":32768,"tile":256,"median_ms":368.757}
+{"nq":1024,"nk":32768,"tile":512,"median_ms":422.542}
+{"nq":1024,"nk":32768,"tile":512,"median_ms":418.369}
+{"nq":1024,"nk":32768,"tile":256,"median_ms":359.859}
+{"nq":1024,"nk":32768,"tile":128,"median_ms":331.441}
+{"nq":1024,"nk":32768,"tile":64,"median_ms":345.061}
+{"nq":1024,"nk":32768,"tile":1024,"median_ms":399.13}
+
+SHAPE 1024 45056
+{"tile":64,"max_abs":0,"relative_l2":0}
+{"tile":128,"max_abs":0,"relative_l2":0}
+{"tile":256,"max_abs":0,"relative_l2":0}
+{"tile":512,"max_abs":0,"relative_l2":0}
+{"nq":1024,"nk":45056,"tile":1024,"median_ms":570.177}
+{"nq":1024,"nk":45056,"tile":64,"median_ms":471.103}
+{"nq":1024,"nk":45056,"tile":128,"median_ms":462.832}
+{"nq":1024,"nk":45056,"tile":256,"median_ms":494.99}
+{"nq":1024,"nk":45056,"tile":512,"median_ms":524.141}
+{"nq":1024,"nk":45056,"tile":512,"median_ms":524.705}
+{"nq":1024,"nk":45056,"tile":256,"median_ms":501.574}
+{"nq":1024,"nk":45056,"tile":128,"median_ms":463.654}
+{"nq":1024,"nk":45056,"tile":64,"median_ms":459.913}
+{"nq":1024,"nk":45056,"tile":1024,"median_ms":564.341}
+
+COMPLETE

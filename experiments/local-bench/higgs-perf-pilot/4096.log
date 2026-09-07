@@ -1,0 +1,195 @@
+2026-09-06 02:33:49 - evalscope - INFO: Save the result to: /Users/peppi/Dev/nanobot-rs/experiments/local-bench/higgs-perf-pilot/4096/escha-35b-a3b
+Running[perf]:   0%|          | 0/1 [00:00<?, ?it/s]                                                    2026-09-06 02:33:49 - evalscope - INFO: Starting benchmark with args: 
+Running[perf]:   0%|          | 0/1 [00:00<?, ?it/s]                                                    2026-09-06 02:33:49 - evalscope - INFO: {
+    "model": "escha-35b-a3b",
+    "model_id": "escha-35b-a3b",
+    "attn_implementation": null,
+    "api": "openai",
+    "tokenizer_path": null,
+    "port": 8877,
+    "url": "http://127.0.0.1:9000/v1/chat/completions",
+    "headers": {
+        "Authorization": "**********"
+    },
+    "connect_timeout": null,
+    "read_timeout": 180,
+    "total_timeout": 300,
+    "api_key": "**********",
+    "no_test_connection": false,
+    "number": 3,
+    "parallel": 1,
+    "rate": -1.0,
+    "warmup_num": 0.0,
+    "open_loop": false,
+    "sleep_interval": 5,
+    "duration": null,
+    "sla_auto_tune": false,
+    "sla_variable": "parallel",
+    "sla_params": null,
+    "sla_num_runs": 3,
+    "sla_upper_bound": 65536,
+    "sla_lower_bound": 1,
+    "sla_fixed_parallel": null,
+    "sla_number_multiplier": null,
+    "db_commit_interval": 1000,
+    "queue_size_multiplier": 5,
+    "in_flight_task_multiplier": 2,
+    "num_workers": 0,
+    "log_every_n_query": 100,
+    "debug": false,
+    "enable_progress_tracker": false,
+    "visualizer": null,
+    "wandb_api_key": null,
+    "swanlab_api_key": null,
+    "swanlab_host": null,
+    "name": null,
+    "outputs_dir": "/Users/peppi/Dev/nanobot-rs/experiments/local-bench/higgs-perf-pilot/4096/escha-35b-a3b",
+    "no_timestamp": true,
+    "max_prompt_length": 131072,
+    "min_prompt_length": 0,
+    "prefix_length": 0,
+    "prompt": "@/Users/peppi/Dev/nanobot-rs/experiments/local-bench/prompt-4096.txt",
+    "query_template": "@/Users/peppi/Dev/nanobot-rs/experiments/local-bench/perf-query.json",
+    "apply_chat_template": true,
+    "image_width": 224,
+    "image_height": 224,
+    "image_format": "RGB",
+    "image_num": 1,
+    "image_patch_size": 28,
+    "dataset": "openqa",
+    "dataset_path": null,
+    "data_source": null,
+    "dataset_offset": 0,
+    "dataset_args": null,
+    "frequency_penalty": null,
+    "repetition_penalty": null,
+    "logprobs": null,
+    "max_tokens": 256,
+    "min_tokens": null,
+    "n_choices": null,
+    "seed": null,
+    "stop": null,
+    "stop_token_ids": null,
+    "stream": true,
+    "temperature": 0.0,
+    "top_p": null,
+    "top_k": null,
+    "extra_args": {},
+    "tokenize_prompt": false,
+    "multi_turn": false,
+    "min_turns": 1,
+    "max_turns": null,
+    "multi_turn_args": null
+}
+Running[perf]:   0%|          | 0/1 [00:00<?, ?it/s]                                                    2026-09-06 02:33:49 - evalscope - INFO: uvloop event loop policy installed (asyncio.sleep precision improved)
+Running[perf]:   0%|          | 0/1 [00:00<?, ?it/s]                                                    2026-09-06 02:33:50 - evalscope - INFO: Test connection successful.
+Running[perf]:   0%|          | 0/1 [00:00<?, ?it/s]                                                    2026-09-06 02:33:50 - evalscope - INFO: Save the data base to: /Users/peppi/Dev/nanobot-rs/experiments/local-bench/higgs-perf-pilot/4096/escha-35b-a3b/parallel_1_number_3/benchmark_data.db
+Running[perf]:   0%|          | 0/1 [00:00<?, ?it/s]
+Processing[parallel_1_number_3]:   0%|          | 0/3 [00:00<?, ?it/s][A
+Processing[parallel_1_number_3]:  33%|███▎      | 1/3 [00:25<00:51, 25.64s/it][A
+Processing[parallel_1_number_3]:  67%|██████▋   | 2/3 [00:55<00:28, 28.24s/it][A
+Processing[parallel_1_number_3]: 100%|██████████| 3/3 [01:25<00:00, 28.77s/it][A                                                    
+                                                                              [A2026-09-06 02:35:15 - evalscope - INFO: Processing[parallel_1_number_3] 100%| 3/3 [Elapsed: 01:25 < Remaining: 00:00, 28.77s/it]
+Running[perf]:   0%|          | 0/1 [01:26<?, ?it/s]
+Processing[parallel_1_number_3]: 100%|██████████| 3/3 [01:25<00:00, 28.77s/it][AProcessing[parallel_1_number_3]: 100%|██████████| 3/3 [01:25<00:00, 28.40s/it]
+                                                    2026-09-06 02:35:15 - evalscope - INFO: 
+Benchmarking summary:
+┌───────────────────────────┬───────────┐
+│ Metric                    │     Value │
+├───────────────────────────┼───────────┤
+│ ── General ──             │           │
+│ Test Duration (s)         │      85.1 │
+│ Concurrency               │         1 │
+│ Request Rate (req/s)      │        -1 │
+│ Total / Success / Failed  │ 3 / 3 / 0 │
+│ Req Throughput (req/s)    │      0.04 │
+│ ── Latency ──             │           │
+│ Avg Latency (s)           │    28.367 │
+│ Avg TTFT (ms)             │  17378.06 │
+│ Avg TPOT (ms)             │     43.09 │
+│ Avg ITL (ms)              │     43.09 │
+│ ── Tokens ──              │           │
+│ Avg Input Tokens          │      4108 │
+│ Avg Output Tokens         │       256 │
+│ Output Throughput (tok/s) │      9.02 │
+│ Total Throughput (tok/s)  │    153.84 │
+│ ── Multi-turn ──          │           │
+│ KV Cache Hit Rate (%)     │      24.9 │
+└───────────────────────────┴───────────┘
+Running[perf]:   0%|          | 0/1 [01:26<?, ?it/s]                                                    2026-09-06 02:35:15 - evalscope - INFO: 
+Percentile results:
+┌────────────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┬──────────┐
+│ Metric         │      min │       1% │       5% │      10% │      25% │      50% │      75% │      90% │      95% │      99% │      max │
+├────────────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┼──────────┤
+│ Latency (s)    │    25.64 │    25.64 │    25.64 │    25.64 │    25.64 │    29.39 │    30.06 │    30.06 │    30.06 │    30.06 │    30.06 │
+│ TTFT (ms)      │ 14652.85 │ 14652.85 │ 14652.85 │ 14652.85 │ 14652.85 │ 18409.76 │ 19071.57 │ 19071.57 │ 19071.57 │ 19071.57 │ 19071.57 │
+│ ITL (ms)       │     5.09 │    42.28 │    42.43 │    42.49 │    42.67 │    43.01 │    43.55 │     44.3 │    44.73 │    45.68 │    50.08 │
+│ TPOT (ms)      │    43.08 │    43.08 │    43.08 │    43.08 │    43.08 │    43.09 │    43.11 │    43.11 │    43.11 │    43.11 │    43.11 │
+│ Input tokens   │     4108 │     4108 │     4108 │     4108 │     4108 │     4108 │     4108 │     4108 │     4108 │     4108 │     4108 │
+│ Output tokens  │      256 │      256 │      256 │      256 │      256 │      256 │      256 │      256 │      256 │      256 │      256 │
+│ Output (tok/s) │     8.52 │     8.52 │     8.52 │     8.52 │     8.52 │     8.71 │     9.98 │     9.98 │     9.98 │     9.98 │     9.98 │
+│ Total (tok/s)  │   145.16 │   145.16 │   145.16 │   145.16 │   145.16 │   148.46 │   170.19 │   170.19 │   170.19 │   170.19 │   170.19 │
+│ Decode (tok/s) │     23.2 │     23.2 │     23.2 │     23.2 │     23.2 │    23.21 │    23.21 │    23.21 │    23.21 │    23.21 │    23.21 │
+└────────────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
+Running[perf]:   0%|          | 0/1 [01:26<?, ?it/s]                                                    2026-09-06 02:35:15 - evalscope - INFO: 
+Workload throughput (3 samples):
+┌─────────────────────┬───────────┬────────────┬─────────────────────┐
+│ Metric (tok/s)      │   Overall │   Last 30s │   Steady (drop 20%) │
+├─────────────────────┼───────────┼────────────┼─────────────────────┤
+│ Total Prompt tok/s  │    144.82 │     138.18 │              138.18 │
+│ New Prompt tok/s    │    132.78 │     138.18 │              138.18 │
+│ Cached Prompt tok/s │     12.03 │          0 │                   0 │
+│ Completion tok/s    │      9.02 │       8.61 │                8.61 │
+└─────────────────────┴───────────┴────────────┴─────────────────────┘
+Running[perf]:   0%|          | 0/1 [01:26<?, ?it/s]                                                    2026-09-06 02:35:15 - evalscope - INFO: Save the summary to: /Users/peppi/Dev/nanobot-rs/experiments/local-bench/higgs-perf-pilot/4096/escha-35b-a3b/parallel_1_number_3
+Running[perf]:   0%|          | 0/1 [01:26<?, ?it/s]Running[perf]: 100%|██████████| 1/1 [01:26<00:00, 86.18s/it]                                                            2026-09-06 02:35:15 - evalscope - INFO: Running[perf] 100%| 1/1 [Elapsed: 01:26 < Remaining: 00:00, 86.18s/it]
+Running[perf]: 100%|██████████| 1/1 [01:26<00:00, 86.18s/it]Running[perf]: 100%|██████████| 1/1 [01:26<00:00, 86.18s/it]
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ Performance Test Summary Report                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+Basic Information:
+┌───────────────────────┬──────────────────────────────────────────────────────┐
+│ Model                 │ escha-35b-a3b                                        │
+│ Test Dataset          │ openqa                                               │
+│ API Type              │ openai                                               │
+│ Total Generated       │ 768.0 tokens                                         │
+│ Avg Output Rate       │ 9.02 tok/s                                           │
+│ Total Test Time       │ 85.1 s                                               │
+│ Output Path           │ /Users/peppi/Dev/nanobot-rs/experiments/local-bench… │
+└───────────────────────┴──────────────────────────────────────────────────────┘
+
+
+            Performance Overview             
+┏━━━━━━┳━━━━━━┳━━━━━┳━━━━━━┳━━━━━━━┳━━━━━━━━┓
+┃Conc. ┃ Rate ┃ Num ┃  RPS ┃ Gen/s ┃ Success┃
+┡━━━━━━╇━━━━━━╇━━━━━╇━━━━━━╇━━━━━━━╇━━━━━━━━┩
+│    1 │    - │   3 │ 0.04 │  9.02 │    100%│
+└──────┴──────┴─────┴──────┴───────┴────────┘
+
+
+                           Per-Request Metrics                            
+┏━━━━━━┳━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━┓
+┃Conc. ┃ Rate ┃ Metric        ┃      avg ┃      p50 ┃      p99 ┃      max┃
+┡━━━━━━╇━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━┩
+│    1 │    - │ Latency (s)   │   28.367 │    29.39 │    30.06 │    30.06│
+│      │      │ TTFT (ms)     │ 17378.06 │ 18409.76 │ 19071.57 │ 19071.57│
+│      │      │ TPOT (ms)     │    43.09 │    43.09 │    43.11 │    43.11│
+│      │      │ Input Tokens  │     4108 │     4108 │     4108 │     4108│
+│      │      │ Output Tokens │      256 │      256 │      256 │      256│
+│      │      │ Cache Hit (%) │    24.9% │        - │        - │        -│
+│      │      │ Decode toks/s │    23.21 │        - │        - │        -│
+└──────┴──────┴───────────────┴──────────┴──────────┴──────────┴─────────┘
+
+
+                             Workload Throughput                             
+┏━━━━━━┳━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┓
+┃Conc. ┃ Rate ┃ Metric (tok/s)      ┃ Overall ┃ Last 30s ┃ Steady (drop 20%)┃
+┡━━━━━━╇━━━━━━╇━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━┩
+│    1 │    - │ Total Prompt tok/s  │  144.82 │   138.18 │            138.18│
+│      │      │ New Prompt tok/s    │  132.78 │   138.18 │            138.18│
+│      │      │ Cached Prompt tok/s │   12.03 │        0 │                 0│
+│      │      │ Completion tok/s    │    9.02 │     8.61 │              8.61│
+└──────┴──────┴─────────────────────┴─────────┴──────────┴──────────────────┘
+2026-09-06 02:35:15 - evalscope - INFO: Performance summary saved to: /Users/peppi/Dev/nanobot-rs/experiments/local-bench/higgs-perf-pilot/4096/escha-35b-a3b/performance_summary.txt
+2026-09-06 02:35:15 - evalscope - INFO: HTML report generated: /Users/peppi/Dev/nanobot-rs/experiments/local-bench/higgs-perf-pilot/4096/escha-35b-a3b/perf_report.html

@@ -1,0 +1,12 @@
+{
+  "counterSets" : [
+    {
+      "name" : "timestamp",
+      "counters" : [
+        "GPUTimestamp"
+      ]
+    }
+  ],
+  "device" : "Apple M4",
+  "maxThreadgroupMemoryLength" : 32768
+}

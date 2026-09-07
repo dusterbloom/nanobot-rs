@@ -1,5 +1,9 @@
 # Current Plan — v0.5 "Persistent Local Agent"
 
+## Active follow-up
+
+- [ ] [Durable subagent lifecycle and guaranteed final delivery](docs/superpowers/plans/2026-09-02-durable-subagent-lifecycle.md)
+
 **SHIPPED** (all phases landed on main):
 
 - [x] E1 Idle agency (`a51b792`): designated-session idle turns, warm-only +

@@ -1,0 +1,25 @@
+{
+  "label": "continuation",
+  "seconds": 1.1833555839839391,
+  "ttft_seconds": 1.1832265419943724,
+  "last_token_seconds": 1.1832265419943724,
+  "usage": {
+    "prompt_tokens": 45055,
+    "completion_tokens": 3,
+    "total_tokens": 45058,
+    "prompt_tokens_details": {
+      "cached_tokens": 45037
+    }
+  },
+  "finish": "stop",
+  "progress": [
+    {
+      "total": 45059,
+      "cache": 45037,
+      "processed": 45037,
+      "time_ms": 119
+    }
+  ],
+  "answer": "Neri",
+  "native_user_tokens": null
+}

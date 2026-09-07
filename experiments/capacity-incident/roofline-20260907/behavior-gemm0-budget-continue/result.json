@@ -1,0 +1,34 @@
+{
+  "label": "budget-continue",
+  "seconds": 11.449365084001329,
+  "ttft_seconds": 11.097682291991077,
+  "last_token_seconds": 11.449107833992457,
+  "usage": {
+    "prompt_tokens": 2084,
+    "completion_tokens": 13,
+    "total_tokens": 2097
+  },
+  "finish": "stop",
+  "progress": [
+    {
+      "total": 2084,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 11
+    },
+    {
+      "total": 2084,
+      "cache": 0,
+      "processed": 1024,
+      "time_ms": 5077
+    },
+    {
+      "total": 2084,
+      "cache": 0,
+      "processed": 2048,
+      "time_ms": 9769
+    }
+  ],
+  "answer": "{\n  \"action\": \"continue_work\"\n}",
+  "native_user_tokens": null
+}

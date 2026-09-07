@@ -1,0 +1,34 @@
+{
+  "label": "inventory",
+  "seconds": 11.70315912499791,
+  "ttft_seconds": 11.388280041981488,
+  "last_token_seconds": 11.702884333994007,
+  "usage": {
+    "prompt_tokens": 2085,
+    "completion_tokens": 12,
+    "total_tokens": 2097
+  },
+  "finish": "stop",
+  "progress": [
+    {
+      "total": 2085,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 12
+    },
+    {
+      "total": 2085,
+      "cache": 0,
+      "processed": 1024,
+      "time_ms": 5179
+    },
+    {
+      "total": 2085,
+      "cache": 0,
+      "processed": 2048,
+      "time_ms": 9971
+    }
+  ],
+  "answer": "{\n  \"inventory\": 96\n}",
+  "native_user_tokens": null
+}

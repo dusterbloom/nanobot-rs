@@ -1,0 +1,15 @@
+2026-09-06T15:13:16.377862Z  WARN nanobot::agent::pid_file: killing stale agent process (singleton guard) old_pid=38228
+2026-09-06T15:13:16.480115Z  INFO nanobot::repl: startup_phase phase="web_autostart_spawned" phase_ms=0 total_ms=0
+2026-09-06T15:13:16.489124Z  INFO nanobot::repl: startup_phase phase="local_discovery_done" phase_ms=9 total_ms=9
+2026-09-06T15:13:16.489181Z  INFO nanobot::repl: local inference: using http://127.0.0.1:9000/v1 serving escha-35b-a3b (discovered) endpoint=http://127.0.0.1:9000/v1 model=escha-35b-a3b
+2026-09-06T15:13:16.489207Z  INFO nanobot::repl: startup_phase phase="local_backend_ready" phase_ms=0 total_ms=9
+2026-09-06T15:13:16.489218Z  INFO nanobot::repl: delegation_config_at_core_build delegation_mode=Inline(DelegationStrictPolicy { strict_no_tools_main: false, strict_router_schema: false, strict_local_only: false, strict_toolplan_validation: true }) strict_no_tools_main=false strict_router_schema=false is_local=true
+2026-09-06T15:13:16.489238Z  INFO nanobot::repl: startup_phase phase="endpoint_probe_done" phase_ms=0 total_ms=9
+2026-09-06T15:13:16.493456Z  INFO nanobot::repl: startup_phase phase="core_and_agent_built" phase_ms=4 total_ms=13
+
+2026-09-06T15:13:16.604662Z  WARN nanobot::agent::agent_loop::shared: higgs_capacity_exceeded_compacting_for_retry session=cli:kiss-long-1788707595 generation=0 safe_prompt_tokens=79872 safe_total_tokens=83968
+2026-09-06T15:13:16.648515Z  WARN nanobot::agent::agent_loop::shared: higgs_capacity_exceeded_retry_terminal session=cli:kiss-long-1788707595 generation=1 safe_prompt_tokens=79872 safe_total_tokens=83968
+[K[2m[Capacity Unavailable] Higgs capacity exceeded (safe prompt 79872, safe total 83968, boot 494a5038-e053-42bd-839b-1700b111d54d, generation 6). This turn is saved as pending work; retry once capacity recovers.[0m[2K[1A[2K[1A[2K[1m[36m▞▞▞[0m [Capacity Unavailable] Higgs capacity exceeded (safe prompt 79872, safe total 83968, boot 494a5038-e053-42bd-839b-1700b111d54d, generation 6). This turn is saved as pending work; retry once capacity recovers.
+
+[2m⧗ 0.2s  ttft 0.16s  52 tok[0m
+

@@ -1,0 +1,18 @@
+2026-09-06T15:40:05.001611Z  INFO nanobot::repl: startup_phase phase="web_autostart_spawned" phase_ms=0 total_ms=0
+2026-09-06T15:40:05.009227Z  INFO nanobot::repl: startup_phase phase="local_discovery_done" phase_ms=7 total_ms=7
+2026-09-06T15:40:05.009284Z  INFO nanobot::repl: local inference: using http://127.0.0.1:9000/v1 serving escha-35b-a3b (discovered) endpoint=http://127.0.0.1:9000/v1 model=escha-35b-a3b
+2026-09-06T15:40:05.009320Z  INFO nanobot::repl: startup_phase phase="local_backend_ready" phase_ms=0 total_ms=7
+2026-09-06T15:40:05.009330Z  INFO nanobot::repl: delegation_config_at_core_build delegation_mode=Inline(DelegationStrictPolicy { strict_no_tools_main: false, strict_router_schema: false, strict_local_only: false, strict_toolplan_validation: true }) strict_no_tools_main=false strict_router_schema=false is_local=true
+2026-09-06T15:40:05.009381Z  INFO nanobot::repl: startup_phase phase="endpoint_probe_done" phase_ms=0 total_ms=7
+2026-09-06T15:40:05.024459Z  INFO nanobot::repl: startup_phase phase="core_and_agent_built" phase_ms=15 total_ms=23
+
+2026-09-06T15:40:19.237495Z  WARN nanobot::providers::openai_compat: SSE stream error: error decoding response body
+2026-09-06T15:40:19.237623Z  WARN nanobot::providers::openai_compat: sse_stream_ended_without_done content_len=0 reasoning_len=0 inline_thinking_len=0 tool_calls=0
+2026-09-06T15:40:19.244576Z ERROR nanobot::agent::agent_loop::response: llm_provider_error model=local:escha-35b-a3b error=LLM stream ended before the backend produced any response content or tool-call payload.
+2026-09-06T15:40:19.250243Z ERROR nanobot::agent::agent_loop::response: Local LLM backend health endpoint was unavailable
+[1m[36m▞▞▞[0m [LLM Error] LLM stream ended before the backend produced any response content or tool-call payload.
+  
+[K[2mThe local backend health endpoint was unavailable during the follow-up probe.[0m[2K  The local backend health endpoint was unavailable during the follow-up probe.
+
+[2m⧗ 14.3s  ttft 14.23s  44 tok[0m
+

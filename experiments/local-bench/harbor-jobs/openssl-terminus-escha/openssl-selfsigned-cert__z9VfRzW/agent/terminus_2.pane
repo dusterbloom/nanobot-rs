@@ -1,0 +1,98 @@
+[?2004hroot@46e2f50c66be:/app# asciinema rec --stdin /logs/agent/recording.cast
+[?2004l[0;32masciinema: recording asciicast to /logs/agent/recording.cast[0m
+[0;32masciinema: press <ctrl-d> or type "exit" when you're done[0m
+[?2004hroot@46e2f50c66be:/app# clear
+[?2004l[H[J[3J[?2004hroot@46e2f50c66be:/app# mkdir -p /app/ssl/
+[?2004l[?2004hroot@46e2f50c66be:/app# openssl genrsa -out /app/ssl/server.key 2048
+[?2004l[?2004hroot@46e2f50c66be:/app# chmod 600 /app/ssl/server.key
+[?2004l[?2004hroot@46e2f50c66be:/app# openssl req -new -x509 -key /app/ssl/server.key -out /app/ssl/server.crt -days 365 -subj "/O=DevOps Team/CN=dev-internal.company.local"
+[?2004l[?2004hroot@46e2f50c66be:/app# cat /app/ssl/server.key /app/ssl/server.crt > /app/ssl/server.pem
+[?2004l[?2004hroot@46e2f50c66be:/app# echo '=== Certificate Subject ===' > /app/ssl/verification.txt && openssl x509 -in /app/ssl/server.crt -noout -subject >> /app/ssl/verification.txt && echo '' >> /app/ssl/verification.txt && echo '=== Validity Dates ===' >> /app/ssl/verification.txt && openssl x509 -in /app/ssl/server.crt -noout -dates >> /app/ssl/verification.txt && echo '' >> /app/ssl/verification.txt && echo '=== SHA-256 Fingerprint ===' >> /app/ssl/verification.txt && openssl x509 -in /app/ssl/server.crt -noout -fingerprint -sha256 >> /app/ssl/verification.txt
+[?2004l[?2004hroot@46e2f50c66be:/app# cat /app/ssl/verification.txt
+[?2004l=== Certificate Subject ===
+subject=O = DevOps Team, CN = dev-internal.company.local
+
+=== Validity Dates ===
+notBefore=Sep  6 00:38:00 2026 GMT
+notAfter=Sep  6 00:38:00 2027 GMT
+
+=== SHA-256 Fingerprint ===
+sha256 Fingerprint=55:DF:47:E5:B2:4D:41:C3:70:D7:AF:72:C6:36:15:50:05:2A:D0:A6:8F:EB:80:BF:E3:2B:59:02:E7:1A:F3:82
+[?2004hroot@46e2f50c66be:/app# cat > /app/check_cert.py << 'EOF'
+[?2004l[?2004h> import subprocess
+[?2004l[?2004h> import sys
+[?2004l[?2004h> from datetime import datetime
+[?2004l[?2004h> 
+[?2004l[?2004h> def check_certificate(cert_path):
+[?2004l[?2004h>     try:
+[?2004l[?2004h>         # Check if certificate exists
+[?2004l[?2004h>         import os
+[?2004l[?2004h>         if not os.path.exists(cert_path):
+[?2004l[?2004h>             print(f"Error: Certificate file not found at {cert_path}")
+[?2004l[?2004h>             return False
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Load and verify certificate using openssl
+[?2004l[?2004h>         result = subprocess.run(
+[?2004l[?2004h>             ['openssl', 'x509', '-in', cert_path, '-noout', '-text'],
+[?2004l[?2004h>             capture_output=True, text=True
+[?2004l[?2004h>         )
+[?2004l[?2004h>         if result.returncode != 0:
+[?2004l[?2004h>             print(f"Error loading certificate: {result.stderr}")
+[?2004l[?2004h>             return False
+[?2004l[?2004h> 
+[?2004l[?2004h>         output = result.stdout
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Extract Common Name
+[?2004l[?2004h>         cn_result = subprocess.run(
+[?2004l[?2004h>             ['openssl', 'x509', '-in', cert_path, '-noout', '-subject'],
+[?2004l[?2004h>             capture_output=True, text=True
+[?2004l[?2004h>         )
+[?2004l[?2004h>         subject = cn_result.stdout.strip()
+[?2004l[?2004h>         cn = None
+[?2004l[?2004h>         for part in subject.split(','):
+[?2004l[?2004h>             part = part.strip()
+[?2004l[?2004h>             if part.startswith('CN =') or part.startswith('CN='):
+[?2004l[?2004h>                 cn = part.split('=')[1].strip() if '=' in part else part.split(':')[1].strip()
+[?2004l[?2004h>                 break
+[?2004l[?2004h> 
+[?2004l[?2004h>         # Extract validity dates
+[?2004l[?2004h>         dates_result = subprocess.run(
+[?2004l[?2004h>             ['openssl', 'x509', '-in', cert_path, '-noout', '-enddate'],
+[?2004l[?2004h>             capture_output=True, text=True
+[?2004l[?2004h>         )
+[?2004l[?2004h>         end_date_str = dates_result.stdout.strip().split('=')[1].strip()
+[?2004l[?2004h>         # Parse OpenSSL date format like "May  5 12:00:00 2026 GMT"
+[?2004l[?2004h>         exp_date = datetime.strptime(end_date_str, "%b %d %H:%M:%S %Y %Z")
+[?2004l[?2004h>         expiration_formatted = exp_date.strftime("%Y-%m-%d")
+[?2004l[?2004h> 
+[?2004l[?2004h>         print(f"Certificate loaded successfully.")
+[?2004l[?2004h>         print(f"Common Name (CN): {cn}")
+[?2004l[?2004h>         print(f"Expiration Date: {expiration_formatted}")
+[?2004l[?2004h>         print(f"Subject: {subject}")
+[?2004l[?2004h>         print("Certificate verification successful")
+[?2004l[?2004h>         return True
+[?2004l[?2004h> 
+[?2004l[?2004h>     except Exception as e:
+[?2004l[?2004h>         print(f"Error during certificate verification: {e}")
+[?2004l[?2004h>         return False
+[?2004l[?2004h> 
+[?2004l[?2004h> if __name__ == '__main__':
+[?2004l[?2004h>     cert_file = '/app/ssl/server.crt'
+[?2004l[?2004h>     success = check_certificate(cert_file)
+[?2004l[?2004h>     sys.exit(0 if success else 1)
+[?2004l[?2004h> EOF
+[?2004l[?2004hroot@46e2f50c66be:/app# python3 /app/check_cert.py
+[?2004lCertificate loaded successfully.
+Common Name (CN): dev-internal.company.local
+Expiration Date: 2027-09-06
+Subject: subject=O = DevOps Team, CN = dev-internal.company.local
+Certificate verification successful
+[?2004hroot@46e2f50c66be:/app# ls -la /app/ssl/
+[?2004ltotal 24
+drwxr-xr-x 2 root root 4096 Sep  6 00:38 .
+drwxr-xr-x 1 root root 4096 Sep  6 00:38 ..
+-rw-r--r-- 1 root root 1220 Sep  6 00:38 server.crt
+-rw------- 1 root root 1704 Sep  6 00:37 server.key
+-rw-r--r-- 1 root root 2924 Sep  6 00:38 server.pem
+-rw-r--r-- 1 root root  322 Sep  6 00:38 verification.txt
+[?2004hroot@46e2f50c66be:/app# 

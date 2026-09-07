@@ -1,0 +1,22 @@
+{
+  "fallback": {
+    "rounds": 6,
+    "median_ms": 382.448
+  },
+  "query128": {
+    "rounds": 6,
+    "median_ms": 291.5695
+  },
+  "reg": {
+    "rounds": 6,
+    "median_ms": 427.4625
+  },
+  "reg_causal": {
+    "rounds": 6,
+    "median_ms": 1127.135
+  },
+  "regbool_causal": {
+    "rounds": 6,
+    "median_ms": 1139.595
+  }
+}

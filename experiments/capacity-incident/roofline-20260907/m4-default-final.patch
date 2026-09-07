@@ -1,0 +1,396 @@
+diff --git a/crates/higgs-engine/src/runtime_identity.rs b/crates/higgs-engine/src/runtime_identity.rs
+index 9337abc84..8aad14a67 100644
+--- a/crates/higgs-engine/src/runtime_identity.rs
++++ b/crates/higgs-engine/src/runtime_identity.rs
+@@ -174,7 +174,7 @@ fn resolved_runtime_identity_with_selection(
+         "mlxAllocatorPolicy": allocator_policy,
+         "eschamoeNative": is_eschamoe && nonzero("HIGGS_ESCHA_NATIVE", true),
+         "eschamoeAffineBitsOverride": escha_affine_bits,
+-        "eschamoeTrellisGemm": is_eschamoe && env("HIGGS_ESCHA_TRELLIS_GEMM").as_deref() == Some("1"),
++        "eschamoeTrellisGemm": is_eschamoe && higgs_models::eschamoe::resolve_trellis_gemm_mode(env("HIGGS_ESCHA_TRELLIS_GEMM").as_deref()),
+         "eschamoeQgemmSimd": is_eschamoe && nonzero("HIGGS_ESCHA_QGEMM_SIMD", true),
+         "eschamoeQgemmBlockRows": if env("HIGGS_ESCHA_QGEMM_BM").as_deref() == Some("64") { 64 } else { 32 },
+         "mlaLatentCache": mla_latent_cache,
+@@ -269,6 +269,24 @@ fn is_truthy(raw: &str) -> bool {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn escha_identity_describes_the_executing_kernel_default() {
++        let identity = serde_json::to_value(resolved_runtime_identity(true, false)).unwrap();
++        assert_eq!(
++            identity["eschamoeTrellisGemm"],
++            serde_json::json!(higgs_models::eschamoe::trellis_gemm_mode())
++        );
++        for (raw, expected) in [("0", false), ("1", true)] {
++            let env = |name: &str| (name == "HIGGS_ESCHA_TRELLIS_GEMM").then(|| raw.to_owned());
++            let escha =
++                serde_json::to_value(resolved_runtime_identity_with(true, false, env)).unwrap();
++            let other =
++                serde_json::to_value(resolved_runtime_identity_with(false, false, env)).unwrap();
++            assert_eq!(escha["eschamoeTrellisGemm"], expected);
++            assert_eq!(other["eschamoeTrellisGemm"], false);
++        }
++    }
++
+     #[test]
+     fn identity_serializes_the_typed_selection_without_auto_placeholders() {
+         let selection = higgs_models::qwen3_next::ResolvedDenseRuntimeSelections {
+diff --git a/crates/higgs-engine/tests/runtime_identity.rs b/crates/higgs-engine/tests/runtime_identity.rs
+index 53d27af80..3b543091a 100644
+--- a/crates/higgs-engine/tests/runtime_identity.rs
++++ b/crates/higgs-engine/tests/runtime_identity.rs
+@@ -72,7 +72,14 @@ fn every_runtime_or_layout_mutation_changes_the_capacity_identity() {
+         ("HIGGS_DSPARK_TOPK_MARKOV_KERNEL", "1"),
+         ("HIGGS_ESCHA_NATIVE", "0"),
+         ("HIGGS_ESCHA_AFFINE_BITS", "3"),
+-        ("HIGGS_ESCHA_TRELLIS_GEMM", "1"),
++        (
++            "HIGGS_ESCHA_TRELLIS_GEMM",
++            if higgs_models::eschamoe::resolve_trellis_gemm_mode(None) {
++                "0"
++            } else {
++                "1"
++            },
++        ),
+         ("HIGGS_ESCHA_QGEMM_SIMD", "0"),
+         ("HIGGS_ESCHA_QGEMM_BM", "64"),
+         ("HIGGS_NO_MEM_LIMIT", "1"),
+diff --git a/crates/higgs-models/src/eschamoe.rs b/crates/higgs-models/src/eschamoe.rs
+index 10e18b996..94af1a9c2 100644
+--- a/crates/higgs-models/src/eschamoe.rs
++++ b/crates/higgs-models/src/eschamoe.rs
+@@ -1394,16 +1394,27 @@ pub fn native_mode() -> bool {
+ 
+ /// Report whether the prefill path uses the trellis GEMM kernel.
+ ///
+-/// Set `HIGGS_ESCHA_TRELLIS_GEMM=1` to select the kernel. The default is the
+-/// scratch path of [`EschaProj::scratch_matmul`]. The GEMM kernel drops the
+-/// dense scratch weight and the host read of the expert ids, and the scratch
+-/// path stays as the reference. Despite winning isolated synthetic kernels,
+-/// GEMM was slower in full-model 1,024-token Escha W2 prefill. SIMD selection
+-/// only applies after GEMM is explicitly enabled. The choice is read once and
+-/// cached: the caller is the per-layer expert forward.
++/// Base M4 defaults to GEMM after matched Escha W2 16K/45K serving checks;
++/// other hardware retains [`EschaProj::scratch_matmul`] until measured.
++/// GEMM drops the dense scratch weight and host read of expert ids, but its
++/// accumulation rounds differently from scratch. Keep the reference available:
++/// `HIGGS_ESCHA_TRELLIS_GEMM=0` selects scratch, `=1` selects GEMM on any host.
++/// The choice is read once and cached in the per-layer expert forward.
+ pub fn trellis_gemm_mode() -> bool {
+     static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *MODE.get_or_init(|| std::env::var("HIGGS_ESCHA_TRELLIS_GEMM").is_ok_and(|v| v == "1"))
++    *MODE.get_or_init(|| {
++        resolve_trellis_gemm_mode(std::env::var("HIGGS_ESCHA_TRELLIS_GEMM").ok().as_deref())
++    })
++}
++
++/// Resolve the same expert kernel choice for execution and capacity identity.
++#[must_use]
++pub fn resolve_trellis_gemm_mode(raw: Option<&str>) -> bool {
++    trellis_gemm_mode_for_brand(raw, crate::utils::apple_cpu_brand())
++}
++
++fn trellis_gemm_mode_for_brand(raw: Option<&str>, brand: Option<&str>) -> bool {
++    raw.map_or_else(|| crate::utils::is_base_m4(brand), |value| value == "1")
+ }
+ 
+ /// Select the gather QGEMM kernel variant. Default: simdgroup fragments
+@@ -1787,6 +1798,28 @@ fn trellis_expert_bytes(config: &serde_json::Value) -> Option<u64> {
+     clippy::print_stderr
+ )]
+ mod tests {
++    #[test]
++    fn trellis_gemm_default_is_m4_only_and_preserves_explicit_overrides() {
++        for (raw, brand, expected) in [
++            (None, Some("Apple M4"), true),
++            (None, Some(" Apple M4 "), true),
++            (None, Some("Apple M4 Pro"), false),
++            (None, Some("Apple M4 Max"), false),
++            (None, Some("Apple M5"), false),
++            (None, None, false),
++            (Some("0"), Some("Apple M4"), false),
++            (Some("1"), Some("Apple M4 Pro"), true),
++            (Some("1"), None, true),
++            (Some("yes"), Some("Apple M4"), false),
++        ] {
++            assert_eq!(
++                super::trellis_gemm_mode_for_brand(raw, brand),
++                expected,
++                "override={raw:?}, brand={brand:?}"
++            );
++        }
++    }
++
+     use mlx_rs::ops::indexing::IndexOp;
+     use mlx_rs::{Array, Dtype};
+ 
+@@ -3141,9 +3174,9 @@ mod tests {
+ 
+     /// The native gather forward must match the oracle on both row paths.
+     ///
+-    /// The matvec path takes six rows with unsorted ids. The scratch path
+-    /// takes 40 sorted rows and guards the measured production default. Both
+-    /// compare row by row against `dequant_expert`.
++    /// Six unsorted rows exercise matvec; 40 sorted rows exercise prefill.
++    /// Both prefill kernels retain the same row-wise `dequant_expert` oracle
++    /// bound, and default dispatch must exactly match the selected kernel.
+     #[test]
+     fn escha_proj_gather_forward_matches_oracle() {
+         let _exec = crate::mlx_exec::acquire();
+@@ -3189,39 +3222,47 @@ mod tests {
+             let got = proj.gather_forward(&x, &eids).unwrap();
+             assert_eq!(got.shape(), [n, out_f], "{label}");
+             let want = oracle(&x, ids);
+-            let err = got
+-                .subtract(&want)
+-                .unwrap()
+-                .abs()
+-                .unwrap()
+-                .max(None)
+-                .unwrap()
+-                .item::<f32>();
+-            let scale = want.abs().unwrap().max(None).unwrap().item::<f32>();
+-            eprintln!("{label}: max |native - oracle| = {err} (scale {scale})");
+-            assert!(err <= 2e-3 * scale, "{label}: {err} vs scale {scale}");
++            let check_accuracy = |actual: &Array| {
++                let err = actual
++                    .subtract(&want)
++                    .unwrap()
++                    .abs()
++                    .unwrap()
++                    .max(None)
++                    .unwrap()
++                    .item::<f32>();
++                let scale = want.abs().unwrap().max(None).unwrap().item::<f32>();
++                assert!(err <= 2e-3 * scale, "{label}: {err} vs scale {scale}");
++            };
++            check_accuracy(&got);
+ 
+             if ids.len() > EschaProj::GATHER_QMV_MAX_ROWS as usize {
+-                let scratch = proj.gather_forward_mode(&x, &eids, false).unwrap();
+-                let got_bits: Vec<u32> = got
+-                    .as_slice::<f32>()
+-                    .iter()
+-                    .map(|value| value.to_bits())
+-                    .collect();
+-                let scratch_bits: Vec<u32> = scratch
+-                    .as_slice::<f32>()
+-                    .iter()
+-                    .map(|value| value.to_bits())
+-                    .collect();
+-                assert_eq!(got_bits, scratch_bits, "{label}: default scratch route");
++                for gemm in [false, true] {
++                    let explicit = proj.gather_forward_mode(&x, &eids, gemm).unwrap();
++                    check_accuracy(&explicit);
++                    if gemm == trellis_gemm_mode() {
++                        for (row, (actual, expected)) in got
++                            .as_slice::<f32>()
++                            .iter()
++                            .zip(explicit.as_slice::<f32>())
++                            .enumerate()
++                        {
++                            assert_eq!(
++                                actual.to_bits(),
++                                expected.to_bits(),
++                                "{label}: default route, gemm={gemm}, element={row}"
++                            );
++                        }
++                    }
++                }
+             }
+         };
+ 
+         // Six rows, unsorted ids: the matvec kernel path.
+         check(&[2, 0, 3, 1, 2, 0], "matvec path");
+-        // Forty sorted rows: the scratch decode path.
++        // Forty sorted rows: both prefill kernels.
+         let sorted: Vec<u32> = (0..40u32).map(|i| i / 10).collect();
+-        check(&sorted, "scratch path");
++        check(&sorted, "prefill path");
+     }
+ 
+     /// Compare the GPU tile decode with the CPU reference for one spec.
+diff --git a/crates/higgs-models/src/qwen3_next.rs b/crates/higgs-models/src/qwen3_next.rs
+index 003247c07..9d05fd794 100644
+--- a/crates/higgs-models/src/qwen3_next.rs
++++ b/crates/higgs-models/src/qwen3_next.rs
+@@ -36,6 +36,8 @@ use mlx_rs::{
+ };
+ use serde::Deserialize;
+ 
++use crate::utils::apple_cpu_brand;
++
+ // ---------------------------------------------------------------------------
+ // FFI error capture for gather_qmm
+ // ---------------------------------------------------------------------------
+@@ -1585,7 +1587,6 @@ fn silu_direct(x: &Array) -> Result<Array, Exception> {
+ }
+ 
+ static COMPILED_GATING_ENABLED: OnceLock<bool> = OnceLock::new();
+-static APPLE_CPU_BRAND: OnceLock<Option<String>> = OnceLock::new();
+ static COMPILED_GDN_DECODE_ENABLED: OnceLock<bool> = OnceLock::new();
+ static ASYNC_LAYER_STATE_EVAL_ENABLED: OnceLock<bool> = OnceLock::new();
+ 
+@@ -1596,30 +1597,8 @@ fn parse_compiled_gating_enabled(raw: Option<&str>) -> bool {
+     )
+ }
+ 
+-fn apple_cpu_brand() -> Option<&'static str> {
+-    APPLE_CPU_BRAND
+-        .get_or_init(|| {
+-            #[cfg(target_os = "macos")]
+-            {
+-                std::process::Command::new("sysctl")
+-                    .args(["-n", "machdep.cpu.brand_string"])
+-                    .output()
+-                    .ok()
+-                    .filter(|out| out.status.success())
+-                    .and_then(|out| String::from_utf8(out.stdout).ok())
+-                    .map(|s| s.trim().to_owned())
+-                    .filter(|s| !s.is_empty())
+-            }
+-            #[cfg(not(target_os = "macos"))]
+-            {
+-                None
+-            }
+-        })
+-        .as_deref()
+-}
+-
+ fn should_force_dense_decode_safe_defaults_for_brand(brand: Option<&str>) -> bool {
+-    matches!(brand.map(str::trim), Some("Apple M4"))
++    crate::utils::is_base_m4(brand)
+ }
+ 
+ fn compiled_gating_enabled() -> bool {
+@@ -4672,7 +4651,7 @@ impl Qwen3NextAttention {
+ 
+         let tq_prof = tq_profile_enabled() && L == 1;
+         let canonical_rows = L > 1 && row_schedule == DFlashRowSchedule::CanonicalS1;
+-        let attn_t0 = tq_prof.then(std::time::Instant::now);
++        let mut attn_t0 = None;
+         let output = if canonical_rows {
+             // Preserve the useful batched Q/K/V projections, then execute the
+             // stateful part as the exact S1 transition. Appending K/V one row
+@@ -4690,15 +4669,22 @@ impl Qwen3NextAttention {
+             }
+             ops::concatenate_axis(&rows.iter().collect::<Vec<_>>(), 1)?
+         } else {
+-            let append_t0 = tq_prof.then(|| {
+-                let _ = mlx_rs::transforms::eval([&keys, &values]);
+-                std::time::Instant::now()
+-            });
++            // MLX is lazy: evaluate all projections before timing the cache
++            // append, then start the SDPA timer only after the append finishes.
++            // Otherwise "attn_ms" includes projections and cache writes and
++            // cannot identify the long-context attention bottleneck.
++            let append_t0 = if tq_prof {
++                mlx_rs::transforms::eval([&queries, &keys, &values])?;
++                Some(std::time::Instant::now())
++            } else {
++                None
++            };
+             let view = cache.update_and_view(keys, values)?;
+             if let Some(t0) = append_t0 {
+-                let _ = mlx_rs::transforms::eval(cache.eval_targets());
++                mlx_rs::transforms::eval(cache.eval_targets())?;
+                 PROF_TQ_APPEND_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+                 PROF_TQ_N.with(|c| c.set(c.get() + 1));
++                attn_t0 = Some(std::time::Instant::now());
+             }
+ 
+             if mask.is_none() && L == 1 {
+@@ -4719,7 +4705,7 @@ impl Qwen3NextAttention {
+             }
+         };
+         if let Some(t0) = attn_t0 {
+-            let _ = mlx_rs::transforms::eval([&output]);
++            mlx_rs::transforms::eval([&output])?;
+             PROF_TQ_ATTN_NS.with(|c| c.set(c.get() + t0.elapsed().as_nanos()));
+         }
+         if diag_attn {
+@@ -8803,11 +8789,11 @@ impl Qwen3NextCausalLM {
+             None
+         };
+ 
+-        // HIGGS_PROFILE=1: instrument per-layer timing with eval barriers.
+-        // Samples one full-attention cycle (the leading GDN layers plus the
+-        // first FA layer) and extrapolates to this model's real layer counts,
+-        // which depend on `full_attention_interval` and `num_hidden_layers`.
+-        let profiling = std::env::var("HIGGS_PROFILE").is_ok_and(|v| v == "1") && T == 1;
++        // HIGGS_PROFILE=1: sample decode and bounded prefill chunks inside
++        // the serving path, retaining its allocator and cache policy. Eval
++        // barriers measure one full-attention cycle (leading GDN layers plus
++        // first FA layer); the extrapolation is diagnostic, not wall time.
++        let profiling = std::env::var("HIGGS_PROFILE").is_ok_and(|v| v == "1");
+         let prof_fa_layers = self.model.layers.iter().filter(|l| !l.is_linear).count();
+         let prof_gdn_layers = self.model.layers.len() - prof_fa_layers;
+         // Sample through the first FA layer so both layer types are covered for
+@@ -8944,6 +8930,7 @@ impl Qwen3NextCausalLM {
+                     (fa_attn_avg + fa_mlp_avg) * prof_fa_layers as f64,
+                 );
+                 tracing::info!(
++                    query_tokens = T,
+                     gdn_layers = prof_gdn_layers,
+                     fa_layers = prof_fa_layers,
+                     gdn_attn_ms = format!("{:.2}", gdn_attn_avg / 1e6),
+diff --git a/crates/higgs-models/src/utils.rs b/crates/higgs-models/src/utils.rs
+index 4a65edefe..cdff4d16f 100644
+--- a/crates/higgs-models/src/utils.rs
++++ b/crates/higgs-models/src/utils.rs
+@@ -1162,3 +1162,31 @@ mod tests {
+         );
+     }
+ }
++
++/// Cached hardware discovery shared by model dispatch and runtime identity.
++pub(crate) fn apple_cpu_brand() -> Option<&'static str> {
++    static APPLE_CPU_BRAND: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
++    APPLE_CPU_BRAND
++        .get_or_init(|| {
++            #[cfg(target_os = "macos")]
++            {
++                std::process::Command::new("/usr/sbin/sysctl")
++                    .args(["-n", "machdep.cpu.brand_string"])
++                    .output()
++                    .ok()
++                    .filter(|out| out.status.success())
++                    .and_then(|out| String::from_utf8(out.stdout).ok())
++                    .map(|s| s.trim().to_owned())
++                    .filter(|s| !s.is_empty())
++            }
++            #[cfg(not(target_os = "macos"))]
++            {
++                None
++            }
++        })
++        .as_deref()
++}
++
++pub(crate) fn is_base_m4(brand: Option<&str>) -> bool {
++    matches!(brand.map(str::trim), Some("Apple M4"))
++}
+diff --git a/docs/models.md b/docs/models.md
+index affa31369..404dd7bef 100644
+--- a/docs/models.md
++++ b/docs/models.md
+@@ -198,9 +198,15 @@ varies per projection, so a checkpoint named `W2` is not uniformly 2-bit — the
+ trellis download is 12.3 GB for the 35B release; converted, it is roughly
+ 22 GB. Size the machine for the resident number, not the download.
+ 
+-`HIGGS_ESCHA_TRELLIS_GEMM=1` selects an experimental large-prefill MoE kernel.
+-It does not affect decode and remains opt-in until its full-model validation
+-promotes it.
++Native Escha prefill uses packed trellis GEMM by default on base Apple M4.
++Matched AC tests with Escha W2 and 1024-token chunks reduced 16K requests from
++90–94 s to 82–83 s and a retained 45K request from 307.8 s to 286.7 s, with no
++new swapouts. Both 45K runs recalled the tested facts and reused 45,037 tokens
++on the follow-up. Seven behavior probes produced identical answers (six passed;
++both missed one inventory calculation). These checks do not establish universal
++numerical equivalence: GEMM and scratch round differently. Other hardware keeps
++scratch pending matched measurements. `HIGGS_ESCHA_TRELLIS_GEMM=0` selects scratch;
++`=1` selects GEMM on any host. Decode kernel selection is unchanged.
+ 
+ **Limitations.**
+ 

@@ -1,0 +1,137 @@
+   Compiling higgs-models v1.7.0 (/private/tmp/higgs-m4-roofline/crates/higgs-models)
+warning: unused import: `async_eval`
+   --> crates/higgs-models/src/mlx_exec.rs:164:26
+    |
+164 |     use super::{acquire, async_eval, eval, held};
+    |                          ^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `mlx_rs::ops::indexing::IndexOp`
+  --> crates/higgs-models/src/metal_kernel.rs:25:5
+   |
+25 | use mlx_rs::ops::indexing::IndexOp;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `row_count_pad`
+    --> crates/higgs-models/src/metal_kernel.rs:1210:9
+     |
+1210 |     let row_count_pad = u32::try_from(rows_pad)
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_row_count_pad`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `higgs-models` (lib test) generated 3 warnings (run `cargo fix --lib -p higgs-models --tests` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 59.04s
+     Running unittests src/lib.rs (/Users/peppi/Dev/higgs/target/release/deps/higgs_models-c3e54f692729b75f)
+
+running 2 tests
+test qwen3_next::tests::dense_prefill_attention_bounds_scratch_and_preserves_offset_mask ... ok
+test qwen3_next::tests::dense_prefill_attention_preserves_noncausal_keys_and_broadcast_masks ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 815 filtered out; finished in 0.29s
+
+TEST_EXIT 0
+   Compiling higgs-models v1.7.0 (/private/tmp/higgs-m4-roofline/crates/higgs-models)
+warning: higgs@1.7.0: Copied mlx.metallib to /Users/peppi/Dev/higgs/target/release/mlx.metallib
+warning: unused import: `mlx_rs::ops::indexing::IndexOp`
+  --> crates/higgs-models/src/metal_kernel.rs:25:5
+   |
+25 | use mlx_rs::ops::indexing::IndexOp;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `row_count_pad`
+    --> crates/higgs-models/src/metal_kernel.rs:1210:9
+     |
+1210 |     let row_count_pad = u32::try_from(rows_pad)
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_row_count_pad`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `QGEMM_SEMANTICS_SOURCE` is never used
+    --> crates/higgs-models/src/metal_kernel.rs:1387:7
+     |
+1387 | const QGEMM_SEMANTICS_SOURCE: &str = r"
+     |       ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling higgs-engine v1.7.0 (/private/tmp/higgs-m4-roofline/crates/higgs-engine)
+warning: method `record_forwarded` is never used
+   --> crates/higgs-engine/src/decode/token_ledger.rs:176:19
+    |
+144 | impl TokenLedger {
+    | ---------------- method in this implementation
+...
+176 |     pub(crate) fn record_forwarded(&mut self, token: u32) -> Result<(),...
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused `Result` that must be used
+    --> crates/higgs-engine/src/simple.rs:5269:13
+     |
+5269 | ...   higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+     = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+     |
+5269 |             let _ = higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+     |             +++++++
+
+warning: unused `Result` that must be used
+     --> crates/higgs-engine/src/simple.rs:10075:13
+      |
+10075 | ...   higgs_models::progress::report_prefill_progress(offset, seq_len);
+      |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+      |
+10075 |             let _ = higgs_models::progress::report_prefill_progress(offset, seq_len);
+      |             +++++++
+
+warning: unused `Result` that must be used
+     --> crates/higgs-engine/src/simple.rs:10095:9
+      |
+10095 | ...   higgs_models::progress::report_prefill_progress(seq_len, seq_len);
+      |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+      |
+10095 |         let _ = higgs_models::progress::report_prefill_progress(seq_len, seq_len);
+      |         +++++++
+
+warning: unused `Result` that must be used
+     --> crates/higgs-engine/src/simple.rs:10272:9
+      |
+10272 | ...   higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+      |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+      |
+10272 |         let _ = higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+      |         +++++++
+
+warning: unused return value of `std::option::Option::<T>::map_or` that must be used
+     --> crates/higgs-engine/src/simple.rs:13284:13
+      |
+13284 | ...   crate::stop::generation_stop().map_or((), |stop| stop.note_progress());
+      |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: if you don't need the returned value, use `if let` instead
+help: use `let _ = ...` to ignore the resulting value
+      |
+13284 |             let _ = crate::stop::generation_stop().map_or((), |stop| stop.note_progress());
+      |             +++++++
+
+   Compiling higgs v1.7.0 (/private/tmp/higgs-m4-roofline/crates/higgs)
+warning: `higgs-engine` (lib) generated 6 warnings
+warning: `higgs-models` (lib) generated 3 warnings (run `cargo fix --lib -p higgs-models` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 1m 01s

@@ -1,0 +1,40 @@
+{
+  "label": "planned-action",
+  "seconds": 10.504655584023567,
+  "ttft_seconds": 9.936273833998712,
+  "last_token_seconds": 10.50439175000065,
+  "usage": {
+    "prompt_tokens": 2094,
+    "completion_tokens": 18,
+    "total_tokens": 2112
+  },
+  "finish": "stop",
+  "progress": [
+    {
+      "total": 2094,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 14
+    },
+    {
+      "total": 2094,
+      "cache": 0,
+      "processed": 1024,
+      "time_ms": 4274
+    },
+    {
+      "total": 2094,
+      "cache": 0,
+      "processed": 2048,
+      "time_ms": 8454
+    },
+    {
+      "total": 2094,
+      "cache": 0,
+      "processed": 2080,
+      "time_ms": 9171
+    }
+  ],
+  "answer": "{\n  \"published\": false,\n  \"needs_approval\": true\n}",
+  "native_user_tokens": null
+}

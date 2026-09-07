@@ -1,0 +1,84 @@
+In file included from /private/tmp/higgs-fused-v2/original.metal:2:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:3:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/attn.h:6:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/mma.h:11:
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/utils/integral_constant.h:108:6: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+  if constexpr (start < stop) {
+     ^
+In file included from /private/tmp/higgs-fused-v2/original.metal:2:
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:356:16: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+            if constexpr (is_bool) {
+               ^
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:426:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:436:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+4 warnings generated.
+In file included from /private/tmp/higgs-fused-v2/plain.metal:2:
+In file included from /private/tmp/higgs-fused-v2/plain/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:3:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/attn.h:6:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/mma.h:11:
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/utils/integral_constant.h:108:6: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+  if constexpr (start < stop) {
+     ^
+In file included from /private/tmp/higgs-fused-v2/plain.metal:2:
+/private/tmp/higgs-fused-v2/plain/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:356:16: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+            if constexpr (is_bool) {
+               ^
+/private/tmp/higgs-fused-v2/plain/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:426:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+/private/tmp/higgs-fused-v2/plain/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:436:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+4 warnings generated.
+In file included from /private/tmp/higgs-fused-v2/reg.metal:2:
+In file included from /private/tmp/higgs-fused-v2/reg/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:3:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/attn.h:6:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/mma.h:11:
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/utils/integral_constant.h:108:6: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+  if constexpr (start < stop) {
+     ^
+In file included from /private/tmp/higgs-fused-v2/reg.metal:2:
+/private/tmp/higgs-fused-v2/reg/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:365:16: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+            if constexpr (is_bool) {
+               ^
+/private/tmp/higgs-fused-v2/reg/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:435:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+/private/tmp/higgs-fused-v2/reg/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:445:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+4 warnings generated.
+/private/tmp/higgs-fused-v2/probe.cpp:27:16: error: no matching function for call to 'multiply'
+   27 |   if(stress){q=multiply(q,3.0f);k=multiply(k,3.0f);eval(q,k);}
+      |                ^~~~~~~~
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/ops.h:830:15: note: candidate function not viable: no known conversion from 'float' to 'const array' for 2nd argument
+  830 | MLX_API array multiply(const array& a, const array& b, StreamOrDevice s = {});
+      |               ^                        ~~~~~~~~~~~~~~
+/private/tmp/higgs-fused-v2/probe.cpp:27:35: error: no matching function for call to 'multiply'
+   27 |   if(stress){q=multiply(q,3.0f);k=multiply(k,3.0f);eval(q,k);}
+      |                                   ^~~~~~~~
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/ops.h:830:15: note: candidate function not viable: no known conversion from 'float' to 'const array' for 2nd argument
+  830 | MLX_API array multiply(const array& a, const array& b, StreamOrDevice s = {});
+      |               ^                        ~~~~~~~~~~~~~~
+2 errors generated.
+Traceback (most recent call last):
+  File "/private/tmp/higgs-fused-v2/build.py", line 9, in <module>
+    subprocess.run(cmd+[str(p/'probe.cpp'),str(p/'attention.cpp'),str(b/'lib/libmlx.a'),'-framework','Metal','-framework','Foundation','-framework','Accelerate','-o',str(p/'probe')],check=True)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 577, in run
+    raise CalledProcessError(retcode, process.args,
+                             output=stdout, stderr=stderr)
+subprocess.CalledProcessError: Command '['/usr/bin/clang++', '-std=c++20', '-O3', '-DNDEBUG', '-DMLX_STATIC', '-DMLX_METAL_NO_NAX', '-DFMT_HEADER_ONLY=1', '-mmacosx-version-min=26.0', '-I/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src', '-I/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/metal_cpp-src', '-I/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/fmt-src/include', '-I/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/json-src/single_include/nlohmann', '/private/tmp/higgs-fused-v2/probe.cpp', '/private/tmp/higgs-fused-v2/attention.cpp', '/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/lib/libmlx.a', '-framework', 'Metal', '-framework', 'Foundation', '-framework', 'Accelerate', '-o', '/private/tmp/higgs-fused-v2/probe']' returned non-zero exit status 1.
+RESTORED {"bootId": "1179e262-a834-47a2-8806-ce0c4f578808", "activeReservations": 0, "activeReservationBytes": 0, "oldestReservationAgeMs": null, "queuedWaiters": 0, "pressure": "normal", "rawPressure": "normal", "mlxActiveBytes": 12377847584, "mlxPeakBytes": 13253030432, "mlxCachedBytes": 0, "mlxMeasuredAtUnixMs": 1788778123667, "swapOutDelta": 0, "compressorDelta": 0, "swapOutsTotal": 3943498, "compressionsTotal": 148512879, "pressureSampledAtUnixMs": 1788778123635, "pressureSampleEpoch": 13, "nonNormalPressureEventEpoch": 0, "allocationObservations": 0, "cleanAllocationObservations": 0, "skippedAllocationObservations": 0, "lastObservedPrefillPeakBytes": null, "lastObservedDecodePeakBytes": null, "lastObservedRetainedBytes": null, "downshifts": 0, "rejections": {"exceeded": 0, "unavailable": 0}, "stopOutcomes": {}, "models": [{"model": "escha-35b-a3b", "generation": 2, "available": true, "basis": "conservative", "pressure": "normal", "safeTotalTokens": 51200, "recommendedOutputTokens": 4096, "maxPromptTokens": 47104, "usableBytes": 21440482509, "qualifiedColdBands": 0}]}
+Traceback (most recent call last):
+  File "/private/tmp/higgs-fused-v2/supervise.py", line 8, in <module>
+    subprocess.run(['python3','build.py'],cwd=p,check=True)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 577, in run
+    raise CalledProcessError(retcode, process.args,
+                             output=stdout, stderr=stderr)
+subprocess.CalledProcessError: Command '['python3', 'build.py']' returned non-zero exit status 1.

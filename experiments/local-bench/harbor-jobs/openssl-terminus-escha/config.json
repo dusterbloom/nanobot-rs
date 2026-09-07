@@ -1,0 +1,45 @@
+{
+    "job_name": "openssl-terminus-escha",
+    "jobs_dir": "experiments/local-bench/harbor-jobs",
+    "n_concurrent_trials": 1,
+    "environment": {
+        "type": "docker",
+        "force_build": true,
+        "override_cpus": 1,
+        "override_memory_mb": 2048
+    },
+    "agents": [
+        {
+            "name": "terminus-2",
+            "model_name": "openai/escha-35b-a3b",
+            "extra_allowed_hosts": [
+                "127.0.0.1"
+            ],
+            "kwargs": {
+                "api_base": "http://127.0.0.1:9000/v1",
+                "temperature": 0,
+                "max_turns": 30,
+                "proactive_summarization_threshold": 2048,
+                "model_info": {
+                    "max_input_tokens": 10240,
+                    "max_output_tokens": 2048,
+                    "max_tokens": 12288,
+                    "input_cost_per_token": 0,
+                    "output_cost_per_token": 0
+                },
+                "llm_call_kwargs": {
+                    "max_tokens": 2048,
+                    "extra_body": {
+                        "repeat_penalty": 1.1,
+                        "enable_thinking": false
+                    }
+                }
+            }
+        }
+    ],
+    "tasks": [
+        {
+            "path": "/private/tmp/local-bench-datasets/terminal-bench/openssl-selfsigned-cert"
+        }
+    ]
+}

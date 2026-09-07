@@ -1,0 +1,55 @@
+{
+  "commit": "d77352ef8",
+  "sha256": {
+    "higgs": "a9eb4019bc05e03bb1f8d5ffb10ab58713a6ad2f811b8d6249e6857081d37b58",
+    "mlx.metallib": "d4ec42fe79abd9d24922c84a6a160b98e9bba7ebed68dbed844981b1190eafb5"
+  },
+  "answer": "READY",
+  "seconds": 0.6841414170048665,
+  "capacity": {
+    "bootId": "436b90e6-a8d5-450d-a9dc-fc193aa5a1dd",
+    "activeReservations": 0,
+    "activeReservationBytes": 0,
+    "oldestReservationAgeMs": null,
+    "queuedWaiters": 0,
+    "pressure": "normal",
+    "rawPressure": "normal",
+    "mlxActiveBytes": 12381779744,
+    "mlxPeakBytes": 12486993092,
+    "mlxCachedBytes": 114775464,
+    "mlxMeasuredAtUnixMs": 1788775989698,
+    "swapOutDelta": 0,
+    "compressorDelta": 2347,
+    "swapOutsTotal": 3943498,
+    "compressionsTotal": 147775629,
+    "pressureSampledAtUnixMs": 1788775989001,
+    "pressureSampleEpoch": 11,
+    "nonNormalPressureEventEpoch": 0,
+    "allocationObservations": 1,
+    "cleanAllocationObservations": 0,
+    "skippedAllocationObservations": 0,
+    "lastObservedPrefillPeakBytes": 12590069633,
+    "lastObservedDecodePeakBytes": 12486993092,
+    "lastObservedRetainedBytes": 0,
+    "downshifts": 0,
+    "rejections": {
+      "exceeded": 0,
+      "unavailable": 0
+    },
+    "stopOutcomes": {},
+    "models": [
+      {
+        "model": "escha-35b-a3b",
+        "generation": 2,
+        "available": true,
+        "basis": "conservative",
+        "pressure": "normal",
+        "safeTotalTokens": 51200,
+        "recommendedOutputTokens": 4096,
+        "maxPromptTokens": 47104,
+        "usableBytes": 21440482509,
+        "qualifiedColdBands": 0
+      }
+    ]
+  }
+}

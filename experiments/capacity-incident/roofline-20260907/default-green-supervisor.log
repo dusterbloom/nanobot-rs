@@ -1,0 +1,11 @@
+{"command": ["cargo", "test", "--release", "-p", "higgs-models", "--lib", "trellis_gemm_default_is_m4_only_and_preserves_explicit_overrides"], "exit": 0, "log": "/private/tmp/higgs-roofline-evidence/green-0.log"}
+{"command": ["cargo", "test", "--release", "-p", "higgs-models", "--lib", "eschamoe_gather_qgemm_matches_scratch_matmul"], "exit": 0, "log": "/private/tmp/higgs-roofline-evidence/green-1.log"}
+{"command": ["cargo", "test", "--release", "-p", "higgs-models", "--lib", "eschamoe_gather_kernels_preserve_logical_row_bits"], "exit": 0, "log": "/private/tmp/higgs-roofline-evidence/green-2.log"}
+{"command": ["cargo", "test", "--release", "-p", "higgs-models", "--lib", "escha_proj_gather_forward_matches_oracle"], "exit": 0, "log": "/private/tmp/higgs-roofline-evidence/green-3.log"}
+{"command": ["cargo", "test", "--release", "-p", "higgs-models", "--lib", "base_m4"], "exit": 0, "log": "/private/tmp/higgs-roofline-evidence/green-4.log"}
+{"command": ["cargo", "test", "--release", "-p", "higgs-engine", "--lib"], "exit": 0, "log": "/private/tmp/higgs-roofline-evidence/green-5.log"}
+{"command": ["cargo", "test", "--release", "-p", "higgs-engine", "--test", "runtime_identity"], "exit": 0, "log": "/private/tmp/higgs-roofline-evidence/green-6.log"}
+{"command": ["cargo", "test", "--release", "-p", "higgs", "--lib"], "exit": 0, "log": "/private/tmp/higgs-roofline-evidence/green-7.log"}
+{"command": ["cargo", "build", "--release", "-p", "higgs"], "exit": 0, "log": "/private/tmp/higgs-roofline-evidence/green-8.log"}
+higgs fbf8b3e8b9f3450c7f4caa1fb8f1f32baf39f307a69d4edb20ff8eb0e87697a2
+mlx.metallib d4ec42fe79abd9d24922c84a6a160b98e9bba7ebed68dbed844981b1190eafb5

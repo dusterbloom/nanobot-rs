@@ -1,0 +1,77 @@
+{
+  "conditions": {
+    "policy": "User authorized profiling regardless of power; do not compare timing directly to AC baseline",
+    "power_before": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=22872163)\t80%; discharging; (no estimate) present: true\n",
+    "settings": "Battery Power:\n Sleep On Power Button 1\n lowpowermode         0\n standby              1\n ttyskeepawake        1\n hibernatemode        3\n powernap             1\n hibernatefile        /var/vm/sleepimage\n displaysleep         60\n womp                 0\n networkoversleep     0\n sleep                1\n lessbright           1\n tcpkeepalive         1\n disksleep            10\nAC Power:\n Sleep On Power Button 1\n lowpowermode         0\n standby              1\n ttyskeepawake        1\n hibernatemode        3\n powernap             1\n hibernatefile        /var/vm/sleepimage\n displaysleep         0\n womp                 1\n networkoversleep     0\n sleep                1\n tcpkeepalive         1\n disksleep            10\n"
+  },
+  "prefill_all_drop_first_two": {
+    "samples": 29,
+    "median_per_layer_ms": {
+      "gdn_attn_ms": 45.02,
+      "gdn_mlp_ms": 63.61,
+      "fa_attn_ms": 206.05,
+      "fa_mlp_ms": 67.39
+    },
+    "extrapolated_component_share": {
+      "gdn_attn_ms": 0.22535164266764554,
+      "gdn_mlp_ms": 0.31840555286736855,
+      "fa_attn_ms": 0.34380057731133096,
+      "fa_mlp_ms": 0.11244222715365491
+    }
+  },
+  "prefill_early_chunks_3_to_8": {
+    "samples": 6,
+    "median_per_layer_ms": {
+      "gdn_attn_ms": 43.144999999999996,
+      "gdn_mlp_ms": 62.415,
+      "fa_attn_ms": 72.0,
+      "fa_mlp_ms": 64.87
+    },
+    "extrapolated_component_share": {
+      "gdn_attn_ms": 0.2853819865505457,
+      "gdn_mlp_ms": 0.4128431264469188,
+      "fa_attn_ms": 0.1587476573696395,
+      "fa_mlp_ms": 0.14302722963289605
+    }
+  },
+  "prefill_late_last_eight_full_chunks": {
+    "samples": 8,
+    "median_per_layer_ms": {
+      "gdn_attn_ms": 46.760000000000005,
+      "gdn_mlp_ms": 65.125,
+      "fa_attn_ms": 348.86,
+      "fa_mlp_ms": 71.43
+    },
+    "extrapolated_component_share": {
+      "gdn_attn_ms": 0.18556905594983764,
+      "gdn_mlp_ms": 0.2584513423595632,
+      "fa_attn_ms": 0.46148860036113737,
+      "fa_mlp_ms": 0.0944910013294618
+    }
+  },
+  "decode_drop_first_five": {
+    "samples": 123,
+    "median_per_layer_ms": {
+      "gdn_attn_ms": 0.81,
+      "gdn_mlp_ms": 0.7,
+      "fa_attn_ms": 4.81,
+      "fa_mlp_ms": 0.7
+    },
+    "extrapolated_component_share": {
+      "gdn_attn_ms": 0.2420318725099602,
+      "gdn_mlp_ms": 0.20916334661354583,
+      "fa_attn_ms": 0.4790836653386454,
+      "fa_mlp_ms": 0.06972111553784861
+    }
+  },
+  "decode_append_ms_per_fa_layer": 0.78,
+  "decode_attention_ms_per_fa_layer": 4.004,
+  "limitations": "Same-run early/late chunk comparison shares power conditions. Existing16K was AC,32K battery/LPMoff; cross-run differences do not isolate context. Barrier instrumentation/leading-cycle extrapolation are not actual wall-time shares or GPU utilization.",
+  "memory": {
+    "peak_process_gib": 17.17438580095768,
+    "new_swapout_pages": 0,
+    "pressure_states": [
+      "normal"
+    ]
+  }
+}

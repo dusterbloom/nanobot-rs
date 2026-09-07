@@ -1,0 +1,906 @@
+   Compiling higgs-models v1.7.0 (/private/tmp/higgs-m4-roofline/crates/higgs-models)
+warning: higgs@1.7.0: Copied mlx.metallib to /Users/peppi/Dev/higgs/target/release/mlx.metallib
+warning: unused import: `mlx_rs::ops::indexing::IndexOp`
+  --> crates/higgs-models/src/metal_kernel.rs:25:5
+   |
+25 | use mlx_rs::ops::indexing::IndexOp;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `row_count_pad`
+    --> crates/higgs-models/src/metal_kernel.rs:1210:9
+     |
+1210 |     let row_count_pad = u32::try_from(rows_pad)
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_row_count_pad`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `QGEMM_SEMANTICS_SOURCE` is never used
+    --> crates/higgs-models/src/metal_kernel.rs:1387:7
+     |
+1387 | const QGEMM_SEMANTICS_SOURCE: &str = r"
+     |       ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling higgs-engine v1.7.0 (/private/tmp/higgs-m4-roofline/crates/higgs-engine)
+warning: method `record_forwarded` is never used
+   --> crates/higgs-engine/src/decode/token_ledger.rs:176:19
+    |
+144 | impl TokenLedger {
+    | ---------------- method in this implementation
+...
+176 |     pub(crate) fn record_forwarded(&mut self, token: u32) -> Result<(),...
+    |                   ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused `Result` that must be used
+    --> crates/higgs-engine/src/simple.rs:5269:13
+     |
+5269 | ...   higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+     = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+     |
+5269 |             let _ = higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+     |             +++++++
+
+warning: unused `Result` that must be used
+     --> crates/higgs-engine/src/simple.rs:10075:13
+      |
+10075 | ...   higgs_models::progress::report_prefill_progress(offset, seq_len);
+      |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+      |
+10075 |             let _ = higgs_models::progress::report_prefill_progress(offset, seq_len);
+      |             +++++++
+
+warning: unused `Result` that must be used
+     --> crates/higgs-engine/src/simple.rs:10095:9
+      |
+10095 | ...   higgs_models::progress::report_prefill_progress(seq_len, seq_len);
+      |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+      |
+10095 |         let _ = higgs_models::progress::report_prefill_progress(seq_len, seq_len);
+      |         +++++++
+
+warning: unused `Result` that must be used
+     --> crates/higgs-engine/src/simple.rs:10272:9
+      |
+10272 | ...   higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+      |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+      |
+10272 |         let _ = higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+      |         +++++++
+
+warning: unused return value of `std::option::Option::<T>::map_or` that must be used
+     --> crates/higgs-engine/src/simple.rs:13284:13
+      |
+13284 | ...   crate::stop::generation_stop().map_or((), |stop| stop.note_progress());
+      |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: if you don't need the returned value, use `if let` instead
+help: use `let _ = ...` to ignore the resulting value
+      |
+13284 |             let _ = crate::stop::generation_stop().map_or((), |stop| stop.note_progress());
+      |             +++++++
+
+warning: `higgs-engine` (lib) generated 6 warnings
+warning: `higgs-models` (lib) generated 3 warnings (run `cargo fix --lib -p higgs-models` to apply 1 suggestion)
+   Compiling higgs v1.7.0 (/private/tmp/higgs-m4-roofline/crates/higgs)
+warning: function `refresh_after_engine_drop_locked` is never used
+    --> crates/higgs/src/state.rs:1935:4
+     |
+1935 | fn refresh_after_engine_drop_locked(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `measure_after_engine_drop_locked` is never used
+    --> crates/higgs/src/state.rs:1943:4
+     |
+1943 | fn measure_after_engine_drop_locked(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `higgs` (lib test) generated 2 warnings
+    Finished `release` profile [optimized] target(s) in 1m 24s
+     Running unittests src/lib.rs (/Users/peppi/Dev/higgs/target/release/deps/higgs-ac76403a7ae1883c)
+
+running 782 tests
+test anthropic_adapter::tests::test_anthropic_messages_to_engine_content_blocks ... ok
+test anthropic_adapter::tests::test_anthropic_messages_to_engine_empty_messages ... ok
+test anthropic_adapter::tests::test_anthropic_messages_to_engine_mixed_blocks_filters_non_text ... ok
+test anthropic_adapter::tests::test_anthropic_messages_to_engine_multiple_messages ... ok
+test anthropic_adapter::tests::test_anthropic_messages_to_engine_with_system ... ok
+test anthropic_adapter::tests::test_anthropic_messages_to_engine_without_system ... ok
+test anthropic_adapter::tests::test_finish_reason_mapping ... ok
+test anthropic_adapter::tests::test_only_non_text_content_blocks_results_in_empty_content ... ok
+test anthropic_adapter::tests::test_render_anthropic_markers_defaults_to_image_marker ... ok
+test anthropic_adapter::tests::test_render_anthropic_markers_keeps_tool_blocks_dropped ... ok
+test anthropic_adapter::tests::test_render_anthropic_markers_nested_tool_result_images ... ok
+test anthropic_adapter::tests::test_render_anthropic_markers_passes_plain_text_through ... ok
+test anthropic_adapter::tests::test_render_anthropic_markers_splices_marker_at_image_positions ... ok
+test anthropic_adapter::tests::test_system_as_empty_string ... ok
+test anthropic_adapter::tests::test_unicode_content ... ok
+test anthropic_adapter::tests::test_very_long_content ... ok
+test attach::tests::load_history_handles_missing_files ... ok
+test attach::tests::load_history_reads_rotated_files ... ok
+test attach::tests::load_history_skips_malformed_lines ... ok
+test attach::tests::load_history_skips_old_entries ... ok
+test attach::tests::parse_entry_with_error ... ok
+test attach::tests::parse_malformed_json ... ok
+test attach::tests::parse_missing_fields ... ok
+test attach::tests::parse_routing_method_missing ... ok
+test attach::tests::parse_routing_method_variants ... ok
+test attach::tests::parse_valid_entry ... ok
+test auto_router::tests::build_prompt_filters_system_messages ... ok
+test auto_router::tests::build_prompt_includes_all_routes ... ok
+test auto_router::tests::build_prompt_includes_conversation ... ok
+test auto_router::tests::parse_clean_json ... ok
+test auto_router::tests::parse_empty_returns_none ... ok
+test auto_router::tests::parse_garbage_returns_none ... ok
+test auto_router::tests::parse_other_returns_none ... ok
+test auto_router::tests::parse_single_quoted_json ... ok
+test auto_router::tests::parse_unknown_name_returns_none ... ok
+test auto_router::tests::parse_with_preamble ... ok
+test capacity::pressure::platform::tests::decoder_requires_both_counter_fields_and_a_successful_call ... ok
+test capacity::pressure::platform::tests::owned_host_port_releases_exactly_once ... ok
+test capacity::pressure::platform::tests::returned_count_is_interpreted_as_integer_slots_for_each_field ... ok
+test capacity::pressure::tests::compressor_growth_constrains_without_an_invented_rate_threshold ... ok
+test capacity::pressure::tests::constrained_observation_downshifts_once ... ok
+test capacity::pressure::tests::counter_rollback_is_zero_delta_and_becomes_the_new_baseline ... ok
+test capacity::pressure::tests::critical_observation_downshifts_once_and_rejects_new_admission ... ok
+test capacity::pressure::tests::critical_to_constrained_to_normal_recovers_without_another_downshift ... ok
+test capacity::pressure::tests::drop_fallback_cancels_producers_and_aborts_the_consumer ... ok
+test capacity::pressure::tests::elapsed_swap_timer_does_not_override_current_critical_pressure ... ok
+test capacity::pressure::tests::failed_observer_start_cancels_the_started_source_and_returns_no_handle ... ok
+test capacity::pressure::tests::failed_probe_retains_last_valid_totals_and_sample_identity ... ok
+test capacity::pressure::tests::new_swap_out_restarts_the_clean_minute_without_repeated_downshift ... ok
+test capacity::pressure::tests::normal_recovery_recomputes_current_capacity ... ok
+test capacity::pressure::tests::normal_recovery_stays_unavailable_without_current_memory_authority ... ok
+test capacity::pressure::tests::observer_publishes_raw_pressure_counters_and_event_epoch ... ok
+test capacity::pressure::tests::one_observer_feeds_the_process_registry_sink ... ok
+test capacity::pressure::tests::periodic_counter_sample_detects_compression_without_pressure_transition ... ok
+test capacity::pressure::tests::periodic_counter_sample_detects_swap_without_pressure_transition ... ok
+test capacity::pressure::tests::portable_noop_pressure_source_owns_a_stoppable_handle ... ok
+test capacity::pressure::tests::pressure_events_are_sampled_and_applied_exactly_once ... ok
+test capacity::pressure::tests::quiet_swap_recovery_respects_current_ledger_and_model_cap ... ok
+test capacity::pressure::tests::quiet_swap_recovery_restores_configured_context ... ok
+test capacity::pressure::tests::seeded_baseline_ignores_historical_nonzero_totals ... ok
+test capacity::pressure::tests::stop_awaits_pressure_cancellation_before_cadence_and_join ... ok
+test capacity::pressure::tests::swap_out_is_critical_until_sixty_clean_seconds ... ok
+test capacity::pressure::tests::warning_critical_oscillation_does_not_ratchet_the_envelope ... ok
+test capacity::profile::tests::learned_profile_is_atomic_evidence_only_and_fail_closed ... ok
+test capacity::registry::tests::active_output_only_snapshot_zeroes_unavailable_wire_limits ... ok
+test capacity::registry::tests::all_models_share_one_residency_ledger ... ok
+test capacity::registry::tests::allocated_caches_are_reserved_by_every_models_solver ... ok
+test capacity::registry::tests::cache_publication_invalidates_unregister_recovery ... ok
+test capacity::registry::tests::cancelled_provisional_needs_later_measured_decrease_to_recover_zero ... ok
+test capacity::registry::tests::capacity_admission_cache_reclamation_is_not_counted_before_acknowledgement ... ok
+test capacity::registry::tests::capacity_admission_contention_is_strict_fifo ... ok
+test capacity::registry::tests::capacity_admission_critical_pressure_interrupts_live_reservations ... ok
+test capacity::registry::tests::capacity_admission_dequeue_revalidates_pressure_generation_memory_and_cost ... ok
+test capacity::registry::tests::capacity_admission_drain_cancels_and_joins_active_reservations ... ok
+test capacity::registry::tests::capacity_admission_drain_rejects_queued_work_with_current_generation ... ok
+test capacity::registry::tests::capacity_admission_drain_waits_for_worker_owned_reservations ... ok
+test capacity::registry::tests::capacity_admission_dropping_queued_waiter_removes_it_and_wakes_progress ... ok
+test capacity::registry::tests::capacity_admission_guard_releases_on_success_error_and_unwind ... ok
+test capacity::registry::tests::capacity_admission_queued_handoff_keeps_reclaimed_ceiling_through_recompute ... ok
+test capacity::registry::tests::capacity_admission_reclaimed_cache_stays_capped_until_final_guard_release ... ok
+test capacity::registry::tests::capacity_admission_reclamation_preserves_detached_draining_cache_floor ... ok
+test capacity::registry::tests::capacity_admission_requested_output_is_reserved_exactly ... ok
+test capacity::registry::tests::capacity_admission_two_requests_cannot_reserve_the_same_bytes ... ok
+test capacity::registry::tests::capacity_diagnostics_expose_reservation_waiter_rejection_and_outcome_counters ... ok
+test capacity::registry::tests::capacity_revision_during_drain_cannot_strand_the_lifecycle_token ... ok
+test capacity::registry::tests::capacity_revision_during_publication_cannot_strand_the_lifecycle_token ... ok
+test capacity::registry::tests::completed_request_observation_trains_before_reservation_release ... ok
+test capacity::registry::tests::constrained_shared_ledger_recompute_preserves_pressure_downshift ... ok
+test capacity::registry::tests::constrained_zero_is_not_reseeded_by_shared_ledger_recompute ... ok
+test capacity::registry::tests::critical_pressure_evicts_active_optional_caches_but_keeps_draining_reserved ... ok
+test capacity::registry::tests::draining_cache_allocation_is_frozen_across_pressure_recomputation ... ok
+test capacity::registry::tests::draining_keeps_identity_unavailable_until_explicit_finish ... ok
+test capacity::registry::tests::dropping_drain_token_rolls_back_to_active ... ok
+test capacity::registry::tests::failed_dynamic_registration_does_not_expand_the_known_catalog ... ok
+test capacity::registry::tests::final_unregister_refreshes_memory_without_bypassing_recovery_ramp ... ok
+test capacity::registry::tests::fingerprint_fails_closed_for_missing_or_non_directory_root ... ok
+test capacity::registry::tests::fingerprint_follows_file_symlinks_but_rejects_directory_symlinks ... ok
+test capacity::registry::tests::fingerprint_ignores_runtime_cache_logs_and_unrelated_files ... ok
+test capacity::registry::tests::fingerprint_is_stable_and_invalidated_by_content_or_relative_path ... ok
+test capacity::registry::tests::finish_unregister_requires_current_decreased_measurement_to_recover_zero ... ok
+test capacity::registry::tests::known_unloaded_snapshot_is_zeroed_and_uses_process_boot_id ... ok
+test capacity::registry::tests::later_load_measurement_survives_out_of_order_registration_commits ... ok
+test capacity::registry::tests::learned_profile_headroom_regression_falls_back_conservative ... ok
+test capacity::registry::tests::load_snapshot_subtracts_active_residency_from_safe_envelope ... ok
+test capacity::registry::tests::matching_learned_profile_restores_across_process_boots ... ok
+test capacity::registry::tests::minimum_request_fit_is_monotonic_in_total_cache_bytes ... ok
+test capacity::registry::tests::normal_noop_policy_recompute_conservatively_invalidates_recovery ... ok
+test capacity::registry::tests::normal_shared_ledger_recompute_keeps_current_capacity_bound ... ok
+test capacity::registry::tests::policy_revision_overflow_permanently_disables_recovery_authority ... ok
+test capacity::registry::tests::pressure_after_measurement_invalidates_unregister_recovery ... ok
+test capacity::registry::tests::pressure_seed_before_boot_registration_controls_first_policy ... ok
+test capacity::registry::tests::pressure_updates_every_active_model_under_one_registry_revision ... ok
+test capacity::registry::tests::process_cache_allocations_stay_inside_one_shared_envelope ... ok
+test capacity::registry::tests::process_pressure_state_is_retained_before_any_model_registers ... ok
+test capacity::registry::tests::registration_is_transactional_and_generation_is_monotonic ... ok
+test capacity::registry::tests::registration_reduces_optional_caches_to_preserve_minimum_request ... ok
+test capacity::registry::tests::rejected_coload_cleanup_seeds_bounded_recovery_from_zero ... ok
+test capacity::registry::tests::request_observation_is_dirty_when_pressure_activity_is_unknown_or_grows ... ok
+test capacity::registry::tests::retained_token_cap_never_exceeds_the_published_prompt_cap ... ok
+test capacity::registry::tests::snapshots_publish_cache_bytes_only_after_exact_engine_acknowledgement ... ok
+test capacity::registry::tests::stale_cache_policy_revision_cannot_be_published ... ok
+test capacity::registry::tests::stale_decreased_measurement_cannot_authorize_unregister_recovery ... ok
+test capacity::registry::tests::stale_unload_measurement_cannot_replace_a_later_load_measurement ... ok
+test capacity::registry::tests::unsupported_cache_classes_are_neither_allocated_nor_charged ... ok
+test capacity::registry::tests::zero_cache_ceiling_is_automatic_and_does_not_disable_other_models ... ok
+test capacity::registry::tests::zero_retained_token_config_publishes_the_effective_prompt_cap ... ok
+test capacity::tests::absolute_active_memory_charges_only_unaccounted_residual ... ok
+test capacity::tests::allocator_underprediction_raises_high_water_ten_percent_and_recomputes ... ok
+test capacity::tests::allocator_underprediction_restarts_clean_qualification ... ok
+test capacity::tests::capacity_enums_reject_unknown_values ... ok
+test capacity::tests::capacity_exceeded_matches_openai_shaped_413_body ... ok
+test capacity::tests::capacity_interrupted_matches_terminal_sse_body ... ok
+test capacity::tests::capacity_snapshot_matches_schema_v1_json ... ok
+test capacity::tests::capacity_snapshot_rejects_non_v1_schema_at_deserialization ... ok
+test capacity::tests::capacity_unavailable_matches_openai_shaped_503_body ... ok
+test capacity::tests::checked_overflow_fails_unavailable ... ok
+test capacity::tests::cold_evidence_cannot_skip_an_unobserved_prompt_band ... ok
+test capacity::tests::component_high_water_recomputes_publication_without_aggregate_underprediction ... ok
+test capacity::tests::configured_output_ceiling_is_enforced_during_admission ... ok
+test capacity::tests::controller_uses_smaller_nonzero_authority_and_protects_os_reserve ... ok
+test capacity::tests::critical_construction_and_restore_recover_bounded_on_constrained_observation ... ok
+test capacity::tests::critical_is_intrinsic_to_construction_restore_and_admission ... ok
+test capacity::tests::direct_critical_recompute_marks_constrained_observation_as_recovery ... ok
+test capacity::tests::direct_normal_recompute_ends_episode_before_fresh_warning ... ok
+test capacity::tests::dirty_observation_and_pressure_reset_every_clean_window ... ok
+test capacity::tests::each_controller_gets_a_new_boot_id ... ok
+test capacity::tests::escha_geometry_reproduces_injected_32_and_64_gib_relationships ... ok
+test capacity::tests::exceeded_bound_rewrites_to_an_admissible_request_for_every_path ... ok
+test capacity::tests::generation_is_comparable_only_within_one_boot ... ok
+test capacity::tests::known_but_unloaded_snapshot_is_unavailable_with_zero_token_fields ... ok
+test capacity::tests::learned_absolute_peak_counts_model_weights_once ... ok
+test capacity::tests::learned_profile_roundtrip_changes_decision_and_mismatch_is_transactional ... ok
+test capacity::tests::learning_requires_three_clean_allocation_observations_over_five_minutes ... ok
+test capacity::tests::minimum_completion_byte_reserve_fails_closed_near_the_boundary ... ok
+test capacity::tests::missing_or_zero_authority_is_unavailable ... ok
+test capacity::tests::normal_startup_has_no_invented_token_discount ... ok
+test capacity::tests::numeric_configuration_only_lowers_automatic_capacity ... ok
+test capacity::tests::odd_high_water_rounds_ten_percent_up_and_non_allocations_do_not_train ... ok
+test capacity::tests::one_checked_ledger_accounts_every_cost_and_output_reserve ... ok
+test capacity::tests::pressure_downshift_uses_exact_aligned_floors ... ok
+test capacity::tests::published_limits_and_admission_use_same_aligned_inequality ... ok
+test capacity::tests::request_shape_failure_is_exceeded_while_model_capacity_is_available ... ok
+test capacity::tests::restored_published_boundary_admits_every_execution_path ... ok
+test capacity::tests::restored_suffix_high_water_changes_retained_admission ... ok
+test capacity::tests::retained_and_radix_underprediction_train_only_retained_evidence ... ok
+test capacity::tests::retained_hits_never_lower_cold_evidence_and_pressure_freezes_rises ... ok
+test capacity::tests::retained_kv_already_charged_does_not_shrink_long_context ... ok
+test capacity::tests::retained_request_charges_suffix_prefill_but_full_logical_kv ... ok
+test capacity::tests::suffix_evidence_changes_transient_without_inventing_retained_residency ... ok
+test capacity::tests::typed_unknown_model_is_distinct_from_axum_legacy_route_absence ... ok
+test capacity::tests::zero_cold_observations_cannot_replace_static_transient ... ok
+test cli_config::tests::get_missing_key_errors ... ok
+test cli_config::tests::get_reads_nested_value ... ok
+test cli_config::tests::get_table_key_errors ... ok
+test cli_config::tests::set_creates_nested_tables ... ok
+test cli_config::tests::set_integer_value ... ok
+test cli_config::tests::set_preserves_existing_values ... ok
+test cli_config::tests::set_string_value ... ok
+test config::tests::auto_router_force_deserializes ... ok
+test config::tests::auto_router_matches_model_by_name ... ok
+test config::tests::auto_router_model_auto_injected_when_enabled ... ok
+test config::tests::auto_router_model_not_duplicated_when_already_listed ... ok
+test config::tests::auto_router_model_not_injected_when_disabled ... ok
+test config::tests::config_defaults_preserve_behavior ... ok
+test config::tests::test_api_format_deserialization ... ok
+test config::tests::test_auto_router_defaults ... ok
+test config::tests::test_batch_support_model_types_excludes_nanbeige ... ok
+test config::tests::test_config_file_cli_overlay ... ok
+test config::tests::test_config_file_defaults_mla_latent_cache_to_none ... ok
+test config::tests::test_config_file_parses_local_and_model_mlx_profile ... ok
+test config::tests::test_config_file_parses_mla_latent_cache_field ... ok
+test config::tests::test_config_file_parses_toml ... ok
+test config::tests::test_config_file_parses_turboquant_model_fields ... ok
+test config::tests::test_config_file_rejects_baseline_local_profile ... ok
+test config::tests::test_config_file_rejects_baseline_model_profile ... ok
+test config::tests::test_config_file_rejects_invalid_pflash_settings_before_model_load ... ok
+test config::tests::test_config_file_rejects_mla_latent_cache_with_turboquant ... ok
+test config::tests::test_config_mode_no_models_no_providers_rejected ... ok
+test config::tests::test_config_mode_providers_only_ok ... ok
+test config::tests::test_default_higgs_config ... ok
+test config::tests::test_default_metrics_log_path_for_profile_contains_profile_name ... ok
+test config::tests::test_default_metrics_log_path_for_profile_different_names ... ok
+test config::tests::test_duplicate_model_names_rejected ... ok
+test config::tests::test_empty_model_name_rejected ... ok
+test config::tests::test_kv_retention_defaults_parse_and_map ... ok
+test config::tests::test_log_path_default_vs_profile ... ok
+test config::tests::test_logging_defaults ... ok
+test config::tests::test_mlx_profile_cli_overrides_env_and_config_default ... ok
+test config::tests::test_mlx_profile_env_overrides_local_default ... ok
+test config::tests::test_mlx_profile_parse_rejects_baseline ... ok
+test config::tests::test_model_generation_defaults_deserialized ... ok
+test config::tests::test_model_mlx_profile_override_beats_cli_env_and_local ... ok
+test config::tests::test_model_name_deserialized ... ok
+test config::tests::test_model_name_optional ... ok
+test config::tests::test_negative_timeout_rejected ... ok
+test config::tests::test_pflash_auto_prefill_ratio_defaults_and_parses ... ok
+test config::tests::test_pid_path_default_vs_profile ... ok
+test config::tests::test_profile_config_path_different_names ... ok
+test config::tests::test_profile_config_path_format ... ok
+test config::tests::test_profile_config_path_shares_parent_with_default ... ok
+test config::tests::test_retention_defaults ... ok
+test config::tests::test_route_references_unknown_provider_rejected ... ok
+test config::tests::test_route_to_higgs_provider_ok ... ok
+test config::tests::test_simple_mode_builds_models ... ok
+test config::tests::test_simple_mode_cli_overrides ... ok
+test config::tests::test_simple_mode_duplicate_models_rejected ... ok
+test config::tests::test_simple_mode_empty_model_rejected ... ok
+test config::tests::test_simple_mode_no_models_rejected ... ok
+test config::tests::test_simple_mode_rejects_turboquant_batch ... ok
+test config::tests::test_simple_mode_turboquant_cli_flags ... ok
+test config::tests::test_validate_profile_name_rejects_control_chars ... ok
+test config::tests::test_validate_profile_name_rejects_empty ... ok
+test config::tests::test_validate_profile_name_rejects_shell_metacharacters ... ok
+test config::tests::test_validate_profile_name_rejects_special_chars ... ok
+test config::tests::test_validate_profile_name_rejects_traversal ... ok
+test config::tests::test_validate_profile_name_rejects_unicode ... ok
+test config::tests::test_validate_profile_name_valid ... ok
+test config::tests::test_write_private_file_owner_only_permissions ... ok
+test cors_tests::empty_list_disables_cors ... ok
+test cors_tests::explicit_origins_enable_cors ... ok
+test cors_tests::only_invalid_origins_disable_cors ... ok
+test cors_tests::unset_origins_disable_cors ... ok
+test cors_tests::wildcard_enables_permissive_cors ... ok
+test daemon::tests::cmd_init_creates_config_file ... ok
+test daemon::tests::cmd_init_noop_when_config_exists ... ok
+test daemon::tests::cmd_init_profile_creates_named_config ... ok
+test daemon::tests::config_dir_falls_back_to_home ... ok
+test daemon::tests::config_dir_respects_env_override ... ok
+test daemon::tests::create_metrics_without_logger ... ok
+test daemon::tests::health_response_is_ok_handles_chunked_json_body ... ok
+test daemon::tests::health_response_is_ok_handles_pretty_printed_body ... ok
+test daemon::tests::health_response_is_ok_parses_json_body ... ok
+test daemon::tests::health_response_is_ok_rejects_non_ok_status ... ok
+test daemon::tests::log_path_profile_suffix ... ok
+test daemon::tests::log_path_suffix ... ok
+test daemon::tests::pid_is_alive_false_for_nonexistent ... ok
+test daemon::tests::pid_is_alive_for_own_process ... ok
+test daemon::tests::pid_path_profile_suffix ... ok
+test daemon::tests::pid_path_suffix ... ok
+test daemon::tests::read_pid_none_for_non_numeric ... ok
+test daemon::tests::read_pid_none_when_no_file ... ok
+test daemon::tests::read_pid_returns_valid_pid ... ok
+test daemon::tests::remove_pid_file_noop_when_missing ... ok
+test daemon::tests::remove_pid_file_removes_file ... ok
+test daemon::tests::resolve_host_maps_ipv4_wildcard ... ok
+test daemon::tests::resolve_host_maps_ipv6_wildcard ... ok
+test daemon::tests::resolve_host_passes_through_other ... ok
+test daemon::tests::retention_duration_one_year_when_disabled ... ok
+test daemon::tests::retention_duration_uses_configured_minutes ... ok
+test daemon::tests::write_and_read_pid_file ... ok
+test doctor::tests::doctor_warns_when_image_cap_exceeds_body_cap ... ok
+test doctor::tests::prefill_yield_tokens_accepts_disabled_quantum ... ok
+test doctor::tests::prefill_yield_tokens_rejects_small_nonzero_values ... ok
+test doctor::tests::prefill_yield_tokens_warns_below_recommended_quantum ... ok
+test doctor::tests::test_api_key_set_passes ... ok
+test doctor::tests::test_auto_router_disabled_skips ... ok
+test doctor::tests::test_auto_router_empty_model_fails ... ok
+test doctor::tests::test_auto_router_model_not_downloaded_fails ... ok
+test doctor::tests::test_auto_router_no_descriptions_warns ... ok
+test doctor::tests::test_auto_router_unknown_model_fails ... ok
+test doctor::tests::test_correct_local_table_passes ... ok
+test doctor::tests::test_cors_invalid_origin_fails ... ok
+test doctor::tests::test_cors_valid_origin_list_passes ... ok
+test doctor::tests::test_cors_wildcard_on_loopback_passes ... ok
+test doctor::tests::test_cors_wildcard_on_network_host_warns ... ok
+test doctor::tests::test_default_higgs_no_models_warns ... ok
+test doctor::tests::test_default_provider_exists ... ok
+test doctor::tests::test_default_provider_missing_fails ... ok
+test doctor::tests::test_doctor_disable_vision_noop_not_flagged_for_vlm ... ok
+test doctor::tests::test_doctor_disable_vision_noop_warns_for_text_checkpoint ... ok
+test doctor::tests::test_doctor_no_longer_warns_tower_ignored_for_multimodal_gemma ... ok
+test doctor::tests::test_doctor_warns_tower_ignored_for_multimodal_checkpoint ... ok
+test doctor::tests::test_duplicate_models_warns ... ok
+test doctor::tests::test_eschamoe_conflicting_quant_method_fails ... ok
+test doctor::tests::test_eschamoe_estimate_reads_nested_text_config ... ok
+test doctor::tests::test_eschamoe_exceeds_ram_warns_memory ... ok
+test doctor::tests::test_eschamoe_fits_ram_passes_memory_check ... ok
+test doctor::tests::test_eschamoe_malformed_quantize_config_fails ... ok
+test doctor::tests::test_eschamoe_measured_metal_working_set_drives_the_memory_check ... ok
+test doctor::tests::test_eschamoe_native_estimate_uses_the_trellis_rate ... ok
+test doctor::tests::test_eschamoe_resident_estimate_formula ... ok
+test doctor::tests::test_fail_increments_counter ... ok
+test doctor::tests::test_host_garbage_warns ... ok
+test doctor::tests::test_host_ipv4_passes ... ok
+test doctor::tests::test_host_ipv6_passes ... ok
+test doctor::tests::test_host_localhost_passes ... ok
+test doctor::tests::test_image_fetch_timeout_nan_fails ... ok
+test doctor::tests::test_image_fetch_timeout_negative_fails ... ok
+test doctor::tests::test_image_fetch_timeout_positive_passes ... ok
+test doctor::tests::test_image_fetch_timeout_zero_fails ... ok
+test doctor::tests::test_kv_suffix_above_session_cap_warns ... ok
+test doctor::tests::test_local_key_under_server_warns ... ok
+test doctor::tests::test_max_body_size_huge_warns ... ok
+test doctor::tests::test_max_body_size_zero_fails ... ok
+test doctor::tests::test_max_image_dimension_above_range_fails ... ok
+test doctor::tests::test_max_image_dimension_below_range_fails ... ok
+test doctor::tests::test_max_image_dimension_in_range_passes ... ok
+test doctor::tests::test_max_tokens_zero_fails ... ok
+test doctor::tests::test_mla_latent_cache_architecture_env_off_suppresses_warning ... ok
+test doctor::tests::test_mla_latent_cache_architecture_env_on_warns_for_non_deepseek ... ok
+test doctor::tests::test_mla_latent_cache_architecture_noop_when_unset ... ok
+test doctor::tests::test_mla_latent_cache_architecture_passes_for_deepseek_v2 ... ok
+test doctor::tests::test_mla_latent_cache_architecture_warns_for_non_deepseek ... ok
+test doctor::tests::test_mla_latent_cache_env_off_masks_turboquant_conflict_as_warning ... ok
+test doctor::tests::test_mla_latent_cache_env_on_triggers_turboquant_conflict ... ok
+test doctor::tests::test_mla_latent_cache_turboquant_conflict_fails_in_check_models ... ok
+test doctor::tests::test_no_duplicates_passes ... ok
+test doctor::tests::test_non_eschamoe_dir_is_silent ... ok
+test doctor::tests::test_non_loopback_host_with_api_key_no_warning ... ok
+test doctor::tests::test_non_loopback_host_without_api_key_warns ... ok
+test doctor::tests::test_orphaned_provider_warns ... ok
+test doctor::tests::test_pass_increments_counter ... ok
+test doctor::tests::test_port_available_ipv6_localhost ... ok
+test doctor::tests::test_port_zero_available ... ok
+test doctor::tests::test_rate_limit_nonzero_passes ... ok
+test doctor::tests::test_referenced_provider_not_orphaned ... ok
+test doctor::tests::test_route_higgs_no_models_warns ... ok
+test doctor::tests::test_route_unknown_provider_fails ... ok
+test doctor::tests::test_route_valid_provider_passes ... ok
+test doctor::tests::test_server_default_passes ... ok
+test doctor::tests::test_timeout_infinite_fails ... ok
+test doctor::tests::test_timeout_nan_fails ... ok
+test doctor::tests::test_timeout_negative_fails ... ok
+test doctor::tests::test_timeout_unusually_high_warns ... ok
+test doctor::tests::test_timeout_zero_fails ... ok
+test doctor::tests::test_unreachable_provider_warns ... ok
+test doctor::tests::test_vision_status_disabled_by_escape_hatch ... ok
+test doctor::tests::test_vision_status_none_for_text_checkpoint ... ok
+test doctor::tests::test_vision_status_none_for_text_only_gemma ... ok
+test doctor::tests::test_vision_status_supported_for_multimodal_gemma ... ok
+test doctor::tests::test_vision_status_supported_for_vision_adapter ... ok
+test doctor::tests::test_vision_status_tower_ignored_for_text_adapter ... ok
+test doctor::tests::test_warn_increments_counter ... ok
+test error::tests::capacity_admission_errors_preserve_exact_typed_envelopes ... ok
+test error::tests::context_limit_and_required_continuation_have_stable_codes ... ok
+test error::tests::test_bad_request_returns_400_with_actual_message ... ok
+test error::tests::test_bad_request_with_empty_message ... ok
+test error::tests::test_bad_request_with_very_long_message ... ok
+test error::tests::test_engine_error_returns_500_with_masked_message ... ok
+test error::tests::test_engine_template_error_masked ... ok
+test error::tests::test_engine_tokenization_error_masked ... ok
+test error::tests::test_error_code_field_is_null ... ok
+test error::tests::test_error_response_content_type_is_json ... ok
+test error::tests::test_error_response_json_structure ... ok
+test error::tests::test_internal_error_returns_500_with_masked_message ... ok
+test error::tests::test_internal_error_with_empty_message_still_masked ... ok
+test error::tests::test_proxy_error_masks_upstream_details ... ok
+test error::tests::test_proxy_error_returns_502 ... ok
+test infrastructure_path_tests::capacity_endpoint_is_not_counted_as_api_traffic ... ok
+test media::tests::accepts_image_within_max_dimension ... ok
+test media::tests::decodes_base64_data_uri ... ok
+test media::tests::dimension_cap_applies_to_anthropic_base64_image ... ok
+test media::tests::extracts_anthropic_image_block ... ok
+test media::tests::extracts_anthropic_max_dims ... ok
+test media::tests::extracts_anthropic_tool_result_image ... ok
+test media::tests::extracts_anthropic_url_source_image ... ok
+test media::tests::preserves_openai_detail ... ok
+test media::tests::preserves_position_order_across_parts ... ok
+test media::tests::rejects_image_over_max_dimension ... ok
+test media::tests::rejects_non_image_media_type ... ok
+test media::tests::rejects_oversize_image ... ok
+test media::tests::rejects_unsupported_anthropic_image_source ... ok
+test metrics::tests::concurrent_pending_finalize_and_eviction ... ok
+test metrics::tests::evict_removes_old_records ... ok
+test metrics::tests::fail_stream_marks_pending_record_as_server_error ... ok
+test metrics::tests::finalize_stable_after_eviction ... ok
+test metrics::tests::finalize_stream_ignores_unknown_id ... ok
+test metrics::tests::finalize_stream_updates_record_by_id ... ok
+test metrics::tests::finalize_stream_writes_to_logger ... ok
+test metrics::tests::group_by_model ... ok
+test metrics::tests::higgs_routing_method_in_record ... ok
+test metrics::tests::percentile_duration ... ok
+test metrics::tests::percentile_empty_returns_zero ... ok
+test metrics::tests::percentile_single_value ... ok
+test metrics::tests::record_pending_returns_unique_ids ... ok
+test metrics::tests::record_writes_to_logger ... ok
+test metrics::tests::records_and_retrieves ... ok
+test metrics::tests::requests_per_minute_buckets ... ok
+test metrics::tests::routing_method_display ... ok
+test metrics::tests::snapshot_excludes_expired ... ok
+test metrics::tests::snapshot_returns_owned_data ... ok
+test metrics::tests::status_counts_all_codes ... ok
+test metrics::tests::tokens_per_minute_buckets ... ok
+test metrics::tests::window_returns_configured_duration ... ok
+test metrics_log::tests::test_append_after_reopen ... ok
+test metrics_log::tests::test_creates_parent_directories ... ok
+test metrics_log::tests::test_multiple_writes_append ... ok
+test metrics_log::tests::test_no_rotation_under_limit ... ok
+test metrics_log::tests::test_oldest_file_deleted_on_rotation ... ok
+test metrics_log::tests::test_rotated_path_format ... ok
+test metrics_log::tests::test_rotation_shifts_files ... ok
+test metrics_log::tests::test_rotation_when_size_exceeded ... ok
+test metrics_log::tests::test_write_line_creates_file_content ... ok
+test model_download::tests::download_failure_propagates ... ok
+test model_download::tests::empty_input_treated_as_no ... ok
+test model_download::tests::non_interactive_error_contains_exact_command ... ok
+test model_download::tests::non_interactive_returns_error_with_hint ... ok
+test model_download::tests::non_interactive_writes_no_prompt ... ok
+test model_download::tests::prompt_contains_model_id ... ok
+test model_download::tests::user_confirms_lowercase_succeeds ... ok
+test model_download::tests::user_confirms_uppercase_succeeds ... ok
+test model_download::tests::user_declines_does_not_call_download ... ok
+test model_resolver::tests::test_hf_cache_from_env_empty_string_ignored ... ok
+test model_resolver::tests::test_hf_cache_from_env_hf_home_appends_hub ... ok
+test model_resolver::tests::test_hf_cache_from_env_hf_hub_cache_takes_priority ... ok
+test model_resolver::tests::test_hf_cache_from_env_legacy_over_hf_home ... ok
+test model_resolver::tests::test_hf_cache_from_env_none_when_all_unset ... ok
+test model_resolver::tests::test_hf_cache_from_env_whitespace_only_ignored ... ok
+test model_resolver::tests::test_is_hf_model_id_absolute_path_is_false ... ok
+test model_resolver::tests::test_is_hf_model_id_empty_name_is_false ... ok
+test model_resolver::tests::test_is_hf_model_id_empty_org_is_false ... ok
+test model_resolver::tests::test_is_hf_model_id_nested_slash_is_false ... ok
+test model_resolver::tests::test_is_hf_model_id_no_slash_is_false ... ok
+test model_resolver::tests::test_is_hf_model_id_tilde_path_is_false ... ok
+test model_resolver::tests::test_is_hf_model_id_valid ... ok
+test model_resolver::tests::test_resolve_existing_directory_returns_as_is ... ok
+test model_resolver::tests::test_resolve_hf_empty_refs_main_is_err ... ok
+test model_resolver::tests::test_resolve_hf_hash_with_trailing_newline ... ok
+test model_resolver::tests::test_resolve_hf_model_id_from_cache ... ok
+test model_resolver::tests::test_resolve_hf_model_id_not_in_cache_is_err ... ok
+test model_resolver::tests::test_resolve_hf_snapshot_dir_missing_is_err ... ok
+test model_resolver::tests::test_resolve_no_cache_for_hf_id_is_err ... ok
+test model_resolver::tests::test_resolve_nonexistent_plain_path_is_err ... ok
+test model_resolver::tests::test_resolve_tilde_expansion_nonexistent_is_err ... ok
+test model_resolver::tests::test_resolve_tilde_path_error_mentions_expanded_path ... ok
+test proxy::tests::filter_response_removes_hop_by_hop ... ok
+test proxy::tests::forwarding_headers_inject_api_key ... ok
+test proxy::tests::forwarding_headers_preserve_auth_when_not_stripping ... ok
+test proxy::tests::forwarding_headers_set_content_length ... ok
+test proxy::tests::forwarding_headers_strip_accept_encoding ... ok
+test proxy::tests::forwarding_headers_strip_auth_when_requested ... ok
+test proxy::tests::forwarding_headers_strip_host ... ok
+test proxy::tests::hop_by_hop_headers_filtered ... ok
+test proxy::tests::long_error_body_truncated_with_marker ... ok
+test proxy::tests::rewrite_model_changes_field ... ok
+test proxy::tests::rewrite_model_invalid_json_errors ... ok
+test proxy::tests::short_error_body_unchanged ... ok
+test proxy::tests::stub_count_tokens_returns_json ... ok
+test proxy::tests::truncation_respects_utf8_boundaries ... ok
+test reasoning::tests::configured_default_can_enable_thinking ... ok
+test reasoning::tests::defaults_any_thinking_capable_model_off ... ok
+test reasoning::tests::defaults_qwen36_off_from_engine_name_even_when_aliased ... ok
+test reasoning::tests::defaults_qwen36_off_from_route_name ... ok
+test reasoning::tests::defaults_unrecognized_thinking_model_off ... ok
+test reasoning::tests::engine_default_off_overrides_explicit_request ... ok
+test reasoning::tests::explicit_enable_thinking_false_overrides_reasoning_effort ... ok
+test reasoning::tests::explicit_true_cannot_force_a_non_thinking_engine ... ok
+test reasoning::tests::honors_empty_reasoning_as_not_explicit ... ok
+test reasoning::tests::honors_explicit_reasoning_request ... ok
+test reasoning::tests::honors_reasoning_none ... ok
+test router::tests::auto_candidates_built_from_descriptions ... ok
+test router::tests::auto_model_with_higgs_default_picks_first_engine ... ok
+test router::tests::auto_model_with_remote_default_rejects_without_rewrite ... ok
+test router::tests::auto_router_model_resolved_by_name ... ok
+test router::tests::auto_router_model_resolved_by_path ... ok
+test router::tests::auto_router_model_resolved_by_path_without_name ... ok
+test router::tests::description_only_route_not_in_pattern_routes ... ok
+test router::tests::description_without_name_errors ... ok
+test router::tests::duplicate_route_names_error ... ok
+test router::tests::empty_model_falls_to_default ... ok
+test router::tests::exact_local_model_beats_regex_route ... ok
+test router::tests::first_matching_route_wins ... ok
+test router::tests::force_mode_falls_through_without_engine ... ok
+test router::tests::force_mode_unmatched_falls_to_default ... ok
+test router::tests::higgs_default_errors_when_model_not_found ... ok
+test router::tests::higgs_route_errors_when_model_not_found ... ok
+test router::tests::insert_remove_and_contains_engine ... ok
+test router::tests::inserted_engine_and_defaults_publish_as_one_entry ... ok
+test router::tests::invalid_regex_returns_error ... ok
+test router::tests::local_model_names_lists_engines ... ok
+test router::tests::local_model_resolution_carries_generation_defaults ... ok
+test router::tests::missing_default_provider_returns_error ... ok
+test router::tests::missing_route_provider_returns_error ... ok
+test router::tests::no_routes_no_providers_uses_higgs_default ... ok
+test router::tests::remote_pattern_resolves_to_anthropic ... ok
+test router::tests::remote_pattern_with_model_rewrite ... ok
+test router::tests::resolved_route_includes_provider_name ... ok
+test router::tests::route_without_pattern_or_description_errors ... ok
+test router::tests::unmatched_model_falls_to_default ... ok
+test routes::anthropic::tests::capacity_admission_rejects_both_anthropic_variants_before_worker_mutation ... ok
+test routes::anthropic::tests::test_create_message_image_on_text_model_returns_400 ... ok
+test routes::anthropic::tests::test_create_message_stream_image_on_text_model_returns_400 ... ok
+test routes::anthropic::tests::test_create_message_text_request_passes_gate ... ok
+test routes::capacity::tests::active_route_returns_the_stored_snapshot_unchanged ... ok
+test routes::capacity::tests::capacity_route_uses_the_chat_authentication_layer ... ok
+test routes::capacity::tests::known_unloaded_is_200_with_zero_capacity_fields ... ok
+test routes::capacity::tests::missing_or_blank_model_is_bad_request_not_legacy_absence ... ok
+test routes::capacity::tests::unknown_model_is_exact_typed_404 ... ok
+test routes::chat::tests::automatic_and_none_tool_choices_do_not_add_constraints ... ok
+test routes::chat::tests::axum_session_extensions_preserve_status_usage_and_mutation_order ... ok
+test routes::chat::tests::axum_session_prefill_mode_is_authoritative_before_mutation ... ok
+test routes::chat::tests::blocking_required_post_admission_miss_returns_http_409 ... ok
+test routes::chat::tests::capacity_admission_rejects_both_chat_variants_before_worker_mutation ... ok
+test routes::chat::tests::capacity_interrupted_stream_emits_exact_terminal_event_then_done ... ok
+test routes::chat::tests::generation_defaults_fill_omitted_sampling_fields ... ok
+test routes::chat::tests::named_tool_choice_restricts_schema_and_validates_name ... ok
+test routes::chat::tests::prompt_limit_rejects_before_blocking_and_streaming_session_mutations ... ok
+test routes::chat::tests::prompt_limit_uses_authoritative_rendered_token_count ... ok
+test routes::chat::tests::request_sampling_fields_override_generation_defaults ... ok
+test routes::chat::tests::required_one_token_prefill_stream_accepts_zero_prefix_or_returns_409 ... ok
+test routes::chat::tests::required_tool_choice_builds_one_schema_variant_per_function ... ok
+test routes::chat::tests::required_tool_choice_rejects_missing_tools_and_json_response_format ... ok
+test routes::chat::tests::required_tool_choice_rejects_non_object_arguments_and_duplicate_names ... ok
+test routes::chat::tests::retained_session_drop_ids_are_deduplicated_and_sorted ... ok
+test routes::chat::tests::retained_suffix_admission_charges_uncached_suffix_and_revalidates_at_worker ... ok
+test routes::chat::tests::session_continuation_allows_plain_session_id ... ok
+test routes::chat::tests::session_continuation_checkpoint_id_takes_precedence ... ok
+test routes::chat::tests::session_continuation_rejects_unsupported_request_shapes ... ok
+test routes::chat::tests::session_lease_ttl_is_bounded_to_wire_contract ... ok
+test routes::chat::tests::session_prefill_mode_requires_session_and_zero_budget ... ok
+test routes::chat::tests::session_response_marks_only_confirmed_lease ... ok
+test routes::chat::tests::session_response_preserves_length_finish_reason ... ok
+test routes::chat::tests::session_usage_reports_reused_prefix_as_cached ... ok
+test routes::chat::tests::streaming_error_uses_openai_error_envelope ... ok
+test routes::chat::tests::streaming_required_materialization_failure_errors_before_sse ... ok
+test routes::chat::tests::streaming_required_worker_rejection_returns_http_409_before_sse ... ok
+test routes::chat::tests::test_chat_completions_image_on_text_model_returns_400 ... ok
+test routes::chat::tests::test_chat_completions_stream_image_on_text_model_returns_400 ... ok
+test routes::chat::tests::test_check_vision_capability_accepts_images_on_vlm ... ok
+test routes::chat::tests::test_check_vision_capability_accepts_no_images_on_text_model ... ok
+test routes::chat::tests::test_check_vision_capability_rejects_images_on_text_model ... ok
+test routes::chat::tests::test_convert_messages ... ok
+test routes::chat::tests::test_convert_messages_empty_list ... ok
+test routes::chat::tests::test_convert_messages_with_null_content ... ok
+test routes::chat::tests::test_convert_messages_with_tool_calls ... ok
+test routes::chat::tests::test_convert_messages_with_tool_calls_complex_arguments ... ok
+test routes::chat::tests::test_current_unix_timestamp_reasonable_value ... ok
+test routes::chat::tests::test_generate_request_id_format ... ok
+test routes::chat::tests::test_generate_request_id_uniqueness ... ok
+test routes::chat::tests::test_render_markers_defaults_to_image_marker ... ok
+test routes::chat::tests::test_render_markers_passes_plain_text_messages_through ... ok
+test routes::chat::tests::test_render_markers_splices_marker_at_image_positions ... ok
+test routes::completions::tests::capacity_admission_rejects_both_completion_variants_before_worker_mutation ... ok
+test routes::embeddings::tests::embedding_input_accepts_plain_strings ... ok
+test routes::embeddings::tests::embedding_input_rejects_image_url_content ... ok
+test routes::health::tests::test_health_returns_ok ... ok
+test routes::metrics::tests::cache_metrics_aggregate_every_paired_stat ... ok
+test routes::metrics::tests::cache_metrics_render_paired_fields_with_stable_names ... ok
+test routes::metrics::tests::capacity_diagnostics_render_camel_case_with_no_request_content ... ok
+test routes::metrics::tests::response_aggregates_snapshot ... ok
+test routes::models::tests::cancelling_after_disabled_route_insertion_removes_the_uncommitted_entry ... ok
+test routes::models::tests::cancelling_committed_publication_restores_existing_engine_policy ... ok
+test routes::models::tests::cancelling_explicit_provisional_cleanup_does_not_drop_the_cleanup_owner ... ok
+test routes::models::tests::cancelling_runtime_load_waits_for_cleanup_and_never_registers ... ok
+test routes::models::tests::cancelling_unload_keeps_drain_cleanup_owned_until_final_unregister ... ok
+test routes::models::tests::capacity_admission_unload_waits_for_active_worker_reservation ... ok
+test routes::models::tests::drain_and_drop_drops_sole_owner_immediately ... ok
+test routes::models::tests::drain_and_drop_times_out_and_detaches ... ok
+test routes::models::tests::drain_and_drop_waits_for_in_flight_clone ... ok
+test routes::models::tests::list_models_reports_capabilities ... ok
+test routes::models::tests::load_disabled_returns_forbidden ... ok
+test routes::models::tests::load_existing_name_conflicts ... ok
+test routes::models::tests::pressure_racing_cache_publication_finishes_on_latest_revision ... ok
+test routes::models::tests::publish_loaded_engine_commits_capacity_before_route_visibility ... ok
+test routes::models::tests::router_insertion_failure_rolls_back_active_capacity ... ok
+test routes::models::tests::runtime_load_rejects_invalid_pflash_before_path_resolution ... ok
+test routes::models::tests::successful_route_insertion_exposes_capacity_and_route_as_one_commit ... ok
+test routes::models::tests::test_model_objects_have_correct_fields ... ok
+test routes::models::tests::unload_auto_router_model_is_refused ... ok
+test routes::models::tests::unload_marks_capacity_unavailable_and_keeps_known_identity ... ok
+test routes::models::tests::unload_removes_engine_and_frees_it ... ok
+test routes::models::tests::unload_unknown_returns_not_found ... ok
+test sse::tests::anthropic_delta_matches_serde ... ok
+test sse::tests::chat_chunk_matches_serde_for_content_delta ... ok
+test sse::tests::chat_chunk_matches_serde_with_finish_reason ... ok
+test sse::tests::chat_chunk_matches_serde_with_logprobs ... ok
+test sse::tests::chat_chunk_matches_serde_with_role ... ok
+test sse::tests::chat_prompt_progress_chunk_is_valid_json_with_expected_shape ... ok
+test sse::tests::chat_usage_chunk_matches_serde ... ok
+test sse::tests::completion_chunk_matches_serde ... ok
+test sse::tests::snapshot_byte_stream_matches_full_serde ... ok
+test state::tests::build_engine_rejects_invalid_pflash_before_model_load ... ok
+test state::tests::capacity_profile_environment_uses_the_canonical_engine_identity ... ok
+test state::tests::constrained_load_config_disables_optional_sidecars_only ... ok
+test state::tests::exposed_model_name_is_identical_for_catalog_and_loaded_paths ... ok
+test state::tests::gemma_expert_reshape_preserves_full_artifact_bound_across_pressure_transition ... ok
+test state::tests::load_boundary_policy_aborts_critical_before_allocation ... ok
+test state::tests::load_boundary_policy_charges_native_raw_plus_current_group ... ok
+test state::tests::load_boundary_policy_uses_native_resident_floor ... ok
+test state::tests::loader_cleanup_failure_is_not_hidden_by_original_error ... ok
+test state::tests::loader_unwind_drops_partial_state_before_cleanup ... ok
+test state::tests::model_load_measurement_window_is_serialized_by_the_inference_gate ... ok
+test state::tests::optional_load_preserves_affine_target_resident_upper_bound ... ok
+test state::tests::optional_sidecar_suppression_notice_fires_exactly_once ... ok
+test state::tests::post_load_facts_bind_content_and_execution_identity_to_measured_residency ... ok
+test state::tests::preload_policy_rejects_definite_overcommit_before_loader_entry ... ok
+test state::tests::runtime_identity_supports_non_qwen_and_nested_qwen_configs ... ok
+test state::tests::stub_engine_preprocess_images_errors ... ok
+test state::tests::stub_engine_reports_no_vision ... ok
+test translate::tests::anthropic_response_to_openai_basic ... ok
+test translate::tests::anthropic_stop_reason_mapping ... ok
+test translate::tests::anthropic_to_openai_basic_request ... ok
+test translate::tests::anthropic_to_openai_stop_sequences_become_stop ... ok
+test translate::tests::anthropic_to_openai_system_as_array ... ok
+test translate::tests::anthropic_tool_use_to_openai_tool_calls ... ok
+test translate::tests::extract_tool_results_array_content ... ok
+test translate::tests::extract_tool_results_empty_array_content ... ok
+test translate::tests::extract_tool_results_missing_content ... ok
+test translate::tests::extract_tool_results_mixed_blocks ... ok
+test translate::tests::extract_tool_results_string_content ... ok
+test translate::tests::multiple_system_messages_joined ... ok
+test translate::tests::openai_response_to_anthropic_basic ... ok
+test translate::tests::openai_to_anthropic_basic_request ... ok
+test translate::tests::openai_to_anthropic_stop_becomes_stop_sequences ... ok
+test translate::tests::openai_to_anthropic_tools_translation ... ok
+test translate::tests::openai_to_anthropic_uses_default_max_tokens ... ok
+test translate::tests::openai_tool_message_to_anthropic_tool_result ... ok
+test tui::tests::ctrl_c_quits ... ok
+test tui::tests::d_detaches_in_foreground ... ok
+test tui::tests::d_ignored_in_attached ... ok
+test tui::tests::footer_hides_detach_in_attached ... ok
+test tui::tests::footer_shows_detach_in_foreground ... ok
+test tui::tests::from_config_copies_auto_router ... ok
+test tui::tests::from_config_copies_default_provider ... ok
+test tui::tests::from_config_extracts_model_name_from_path ... ok
+test tui::tests::from_config_includes_remote_providers ... ok
+test tui::tests::from_config_injects_higgs_provider_when_models_exist ... ok
+test tui::tests::from_config_maps_routes ... ok
+test tui::tests::from_config_no_duplicate_higgs_when_already_a_provider ... ok
+test tui::tests::from_config_no_higgs_provider_without_models ... ok
+test tui::tests::from_config_none_profile ... ok
+test tui::tests::from_config_passes_profile ... ok
+test tui::tests::from_config_providers_are_sorted ... ok
+test tui::tests::from_config_uses_explicit_model_name ... ok
+test tui::tests::h_l_navigate_tabs ... ok
+test tui::tests::left_arrow_cycles_backward ... ok
+test tui::tests::left_right_resets_scroll ... ok
+test tui::tests::number_keys_reset_scroll ... ok
+test tui::tests::number_keys_switch_tabs ... ok
+test tui::tests::plain_c_does_not_quit ... ok
+test tui::tests::q_quits ... ok
+test tui::tests::right_arrow_cycles_forward ... ok
+test tui::tests::routing_footer_shows_resize_hint ... ok
+test tui::tests::routing_sidebar_resize_clamps ... ok
+test tui::tests::routing_sidebar_resizes_only_on_routing_tab ... ok
+test tui::tests::scroll_j_k ... ok
+test tui::tests::tab_cycles_through_tabs ... ok
+test tui::tests::tab_resets_scroll ... ok
+test tui::views::errors::tests::draw_no_errors ... ok
+test tui::views::errors::tests::draw_with_errors ... ok
+test tui::views::models::tests::draw_empty_metrics_no_panic ... ok
+test tui::views::models::tests::draw_with_records_contains_model_name ... ok
+test tui::views::models::tests::model_table_excludes_error_latency_from_percentiles ... ok
+test tui::views::models::tests::model_table_groups_by_model ... ok
+test tui::views::models::tests::model_table_includes_configured_with_zero_traffic ... ok
+test tui::views::overview::tests::draw_empty_metrics_no_panic ... ok
+test tui::views::overview::tests::draw_with_records_contains_expected_text ... ok
+test tui::views::overview::tests::duration_style_at_p50 ... ok
+test tui::views::overview::tests::duration_style_at_p95 ... ok
+test tui::views::overview::tests::duration_style_at_p99 ... ok
+test tui::views::overview::tests::duration_style_below_p50 ... ok
+test tui::views::overview::tests::status_color_ranges ... ok
+test tui::views::overview::tests::status_label_known_codes ... ok
+test tui::views::overview::tests::status_label_unknown_code ... ok
+test tui::views::overview::tests::time_axis_labels_count ... ok
+test tui::views::overview::tests::value_axis_labels_count ... ok
+test tui::views::providers::tests::draw_empty_metrics_no_panic ... ok
+test tui::views::providers::tests::draw_shows_configured_zero_traffic_providers ... ok
+test tui::views::providers::tests::draw_with_records_contains_provider ... ok
+test tui::views::routing::tests::bottom_panel_columns_follow_sidebar_width ... ok
+test tui::views::routing::tests::draw_auto_router_enabled ... ok
+test tui::views::routing::tests::draw_no_config_no_panic ... ok
+test tui::views::routing::tests::draw_with_config_no_panic ... ok
+test tui::views::tests::format_duration_millis ... ok
+test tui::views::tests::format_duration_minutes ... ok
+test tui::views::tests::format_duration_seconds ... ok
+test tui::views::tests::format_time_ago_days ... ok
+test tui::views::tests::format_time_ago_hours ... ok
+test tui::views::tests::format_time_ago_minutes ... ok
+test tui::views::tests::format_time_ago_seconds ... ok
+test tui::views::tests::format_tokens_thresholds ... ok
+test types::anthropic::tests::test_anthropic_content_blocks ... ok
+test types::anthropic::tests::test_anthropic_content_blocks_mixed_types ... ok
+test types::anthropic::tests::test_anthropic_content_text ... ok
+test types::anthropic::tests::test_anthropic_content_text_deserialization ... ok
+test types::anthropic::tests::test_anthropic_content_tool_result_block ... ok
+test types::anthropic::tests::test_anthropic_content_tool_use_block ... ok
+test types::anthropic::tests::test_anthropic_request_deserialization ... ok
+test types::anthropic::tests::test_anthropic_request_with_stop_sequences ... ok
+test types::anthropic::tests::test_anthropic_request_with_tools ... ok
+test types::anthropic::tests::test_anthropic_response_serialization ... ok
+test types::anthropic::tests::test_code_execution_tool_result_block ... ok
+test types::anthropic::tests::test_content_block_delta_event_type_field ... ok
+test types::anthropic::tests::test_content_block_start_event_type_field ... ok
+test types::anthropic::tests::test_content_block_stop_event_type_field ... ok
+test types::anthropic::tests::test_count_tokens_request ... ok
+test types::anthropic::tests::test_count_tokens_request_empty_messages ... ok
+test types::anthropic::tests::test_count_tokens_request_with_system_prompt ... ok
+test types::anthropic::tests::test_create_message_request_max_tokens_zero ... ok
+test types::anthropic::tests::test_create_message_request_temperature_zero ... ok
+test types::anthropic::tests::test_document_block ... ok
+test types::anthropic::tests::test_image_block ... ok
+test types::anthropic::tests::test_message_delta_event_type_field ... ok
+test types::anthropic::tests::test_message_start_event_serialization ... ok
+test types::anthropic::tests::test_message_start_event_type_field ... ok
+test types::anthropic::tests::test_message_stop_event_type_field ... ok
+test types::anthropic::tests::test_redacted_thinking_block ... ok
+test types::anthropic::tests::test_server_tool_use_block ... ok
+test types::anthropic::tests::test_system_as_array_of_blocks ... ok
+test types::anthropic::tests::test_system_as_string ... ok
+test types::anthropic::tests::test_thinking_block ... ok
+test types::anthropic::tests::test_thinking_block_excluded_from_to_text ... ok
+test types::anthropic::tests::test_tool_result_content_as_array_of_blocks ... ok
+test types::anthropic::tests::test_tool_result_with_very_long_content ... ok
+test types::anthropic::tests::test_tool_use_with_complex_json_input ... ok
+test types::anthropic::tests::test_unknown_block_type_becomes_other ... ok
+test types::anthropic::tests::test_web_search_tool_result_block ... ok
+test types::openai::tests::chat_request_parses_prefill_and_session_lease_controls ... ok
+test types::openai::tests::chat_request_parses_tool_choice_modes_and_named_function ... ok
+test types::openai::tests::chat_request_rejects_unknown_session_cache_policy ... ok
+test types::openai::tests::test_chat_completion_chunk_serialization ... ok
+test types::openai::tests::test_chat_completion_delta_skips_none_fields ... ok
+test types::openai::tests::test_chat_message_with_null_content ... ok
+test types::openai::tests::test_chat_message_without_content_field ... ok
+test types::openai::tests::test_chat_request_accepts_both_repetition_and_repeat_penalty ... ok
+test types::openai::tests::test_chat_request_accepts_max_completion_tokens_alias ... ok
+test types::openai::tests::test_chat_request_accepts_max_output_tokens_alias ... ok
+test types::openai::tests::test_chat_request_accepts_repeat_penalty_field ... ok
+test types::openai::tests::test_chat_request_cache_bypass_deserialization ... ok
+test types::openai::tests::test_chat_request_drop_session_id_deserialization ... ok
+test types::openai::tests::test_chat_request_full_deserialization ... ok
+test types::openai::tests::test_chat_request_minimal_deserialization ... ok
+test types::openai::tests::test_chat_request_reasoning_deserialization ... ok
+test types::openai::tests::test_chat_request_with_max_tokens_zero ... ok
+test types::openai::tests::test_chat_request_with_temperature_zero ... ok
+test types::openai::tests::test_chat_request_with_top_p_one ... ok
+test types::openai::tests::test_chat_request_with_top_p_zero ... ok
+test types::openai::tests::test_chat_response_serialization ... ok
+test types::openai::tests::test_chat_response_with_tool_calls_serialization ... ok
+test types::openai::tests::test_completion_chunk_serialization ... ok
+test types::openai::tests::test_completion_request_accepts_max_completion_tokens_alias ... ok
+test types::openai::tests::test_completion_request_accepts_max_output_tokens_alias ... ok
+test types::openai::tests::test_completion_request_accepts_repeat_penalty_field ... ok
+test types::openai::tests::test_completion_request_all_optional_fields_missing ... ok
+test types::openai::tests::test_completion_request_all_optional_fields_present ... ok
+test types::openai::tests::test_completion_request_deserialization ... ok
+test types::openai::tests::test_completion_request_with_stop_sequences_as_array ... ok
+test types::openai::tests::test_embedding_input_single_vs_array ... ok
+test types::openai::tests::test_embedding_request_multiple ... ok
+test types::openai::tests::test_embedding_request_single ... ok
+test types::openai::tests::test_embedding_response_serialization ... ok
+test types::openai::tests::test_extra_unknown_fields_silently_ignored ... ok
+test types::openai::tests::test_merge_repetition_penalty_takes_max ... ok
+test types::openai::tests::test_message_content_has_images ... ok
+test types::openai::tests::test_message_content_image_urls ... ok
+test types::openai::tests::test_message_content_parts_deserialization ... ok
+test types::openai::tests::test_message_content_string_deserialization ... ok
+test types::openai::tests::test_message_content_text_method ... ok
+test types::openai::tests::test_message_content_text_serializes_as_string ... ok
+test types::openai::tests::test_model_list_serialization ... ok
+test types::openai::tests::test_response_format_json_mode ... ok
+test types::openai::tests::test_response_format_json_schema ... ok
+test types::openai::tests::test_response_format_with_json_schema_type ... ok
+test types::openai::tests::test_stop_sequence_extract ... ok
+test types::openai::tests::test_stop_sequence_into_vec ... ok
+test types::openai::tests::test_stop_sequence_multiple_deserialization ... ok
+test types::openai::tests::test_stop_sequence_single ... ok
+test types::openai::tests::test_streaming_chunk_with_finish_reason ... ok
+test types::openai::tests::test_tool_call_message_deserialization ... ok
+test types::openai::tests::test_tool_call_serialization ... ok
+test types::openai::tests::usage_emits_confirmed_session_lease_only ... ok
+test types::openai::tests::usage_reports_cached_tokens_only_when_nonzero ... ok
+
+test result: ok. 782 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s
+

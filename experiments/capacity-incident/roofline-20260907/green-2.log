@@ -1,0 +1,31 @@
+warning: unused import: `async_eval`
+   --> crates/higgs-models/src/mlx_exec.rs:164:26
+    |
+164 |     use super::{acquire, async_eval, eval, held};
+    |                          ^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `mlx_rs::ops::indexing::IndexOp`
+  --> crates/higgs-models/src/metal_kernel.rs:25:5
+   |
+25 | use mlx_rs::ops::indexing::IndexOp;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `row_count_pad`
+    --> crates/higgs-models/src/metal_kernel.rs:1210:9
+     |
+1210 |     let row_count_pad = u32::try_from(rows_pad)
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_row_count_pad`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `higgs-models` (lib test) generated 3 warnings (run `cargo fix --lib -p higgs-models --tests` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.10s
+     Running unittests src/lib.rs (/Users/peppi/Dev/higgs/target/release/deps/higgs_models-c3e54f692729b75f)
+
+running 1 test
+test eschamoe::tests::eschamoe_gather_kernels_preserve_logical_row_bits ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 814 filtered out; finished in 0.05s
+

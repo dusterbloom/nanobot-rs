@@ -1,0 +1,62 @@
+Now drawing from 'Battery Power'
+ -InternalBattery-0 (id=22872163)	65%; discharging; (no estimate) present: true
+
+SHAPE 32 1024
+{"nq":32,"nk":1024,"causal":0,"max_abs":4.09782e-07,"relative_l2":8.23263e-07}
+{"nq":32,"nk":1024,"causal":1,"max_abs":4.09782e-07,"relative_l2":8.23263e-07}
+{"nq":32,"nk":1024,"arm":0,"median_ms":1.29467}
+{"nq":32,"nk":1024,"arm":1,"median_ms":0.924667}
+{"nq":32,"nk":1024,"arm":2,"median_ms":2.77267}
+{"nq":32,"nk":1024,"arm":2,"median_ms":2.85542}
+{"nq":32,"nk":1024,"arm":1,"median_ms":0.760167}
+{"nq":32,"nk":1024,"arm":0,"median_ms":0.731625}
+
+SHAPE 31 1055
+{"nq":31,"nk":1055,"causal":0,"max_abs":5.06639e-07,"relative_l2":8.35939e-07}
+{"nq":31,"nk":1055,"causal":1,"max_abs":5.06639e-07,"relative_l2":8.35939e-07}
+{"nq":31,"nk":1055,"arm":0,"median_ms":1.058}
+{"nq":31,"nk":1055,"arm":1,"median_ms":1.08179}
+{"nq":31,"nk":1055,"arm":2,"median_ms":2.62821}
+{"nq":31,"nk":1055,"arm":2,"median_ms":1.88667}
+{"nq":31,"nk":1055,"arm":1,"median_ms":0.738417}
+{"nq":31,"nk":1055,"arm":0,"median_ms":0.708334}
+
+SHAPE 1024 1024
+{"nq":1024,"nk":1024,"causal":0,"max_abs":7.15256e-07,"relative_l2":3.51679e-07}
+{"nq":1024,"nk":1024,"causal":1,"max_abs":7.15256e-07,"relative_l2":3.51679e-07}
+{"nq":1024,"nk":1024,"arm":0,"median_ms":8.96475}
+{"nq":1024,"nk":1024,"arm":1,"median_ms":8.93304}
+{"nq":1024,"nk":1024,"arm":2,"median_ms":28.2726}
+{"nq":1024,"nk":1024,"arm":2,"median_ms":28.3432}
+{"nq":1024,"nk":1024,"arm":1,"median_ms":8.75346}
+{"nq":1024,"nk":1024,"arm":0,"median_ms":8.75688}
+
+SHAPE 1024 8192
+{"nq":1024,"nk":8192,"causal":0,"max_abs":5.58794e-07,"relative_l2":2.21072e-06}
+{"nq":1024,"nk":8192,"causal":1,"max_abs":5.58794e-07,"relative_l2":2.21072e-06}
+{"nq":1024,"nk":8192,"arm":0,"median_ms":78.8304}
+{"nq":1024,"nk":8192,"arm":1,"median_ms":79.6323}
+{"nq":1024,"nk":8192,"arm":2,"median_ms":455.166}
+{"nq":1024,"nk":8192,"arm":2,"median_ms":463.262}
+{"nq":1024,"nk":8192,"arm":1,"median_ms":82.6265}
+{"nq":1024,"nk":8192,"arm":0,"median_ms":78.396}
+
+SHAPE 1024 32768
+{"nq":1024,"nk":32768,"causal":0,"max_abs":6.48201e-07,"relative_l2":4.62075e-06}
+{"nq":1024,"nk":32768,"causal":1,"max_abs":6.48201e-07,"relative_l2":4.62075e-06}
+{"nq":1024,"nk":32768,"arm":0,"median_ms":394.209}
+{"nq":1024,"nk":32768,"arm":1,"median_ms":457.209}
+{"nq":1024,"nk":32768,"arm":2,"median_ms":2357.32}
+{"nq":1024,"nk":32768,"arm":2,"median_ms":1558.58}
+{"nq":1024,"nk":32768,"arm":1,"median_ms":480.636}
+{"nq":1024,"nk":32768,"arm":0,"median_ms":408.462}
+
+SHAPE 1024 45056
+Traceback (most recent call last):
+  File "/private/tmp/higgs-dense-prefill/run.py", line 18, in <module>
+    time.sleep(1);idle();assert swaps()==before,'New swapping; stop benchmark'
+                  ~~~~^^
+  File "/private/tmp/higgs-dense-prefill/run.py", line 10, in idle
+    m=capacity();assert m['activeReservations']==0 and m['queuedWaiters']==0 and m['pressure']=='normal','Server busy or memory pressure; stop benchmark'
+                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: Server busy or memory pressure; stop benchmark

@@ -1,0 +1,98 @@
+[0m
+> build · glm-5.3-flash
+[0m
+[0m$ [0mgit status --short | head -20; git log --oneline -3
+M crates/higgs-engine/src/runtime_identity.rs
+ M crates/higgs-engine/src/simple.rs
+ M crates/higgs-models/src/eschamoe.rs
+ M crates/higgs-models/src/qwen3_next.rs
+ M crates/higgs-models/src/utils.rs
+ M crates/higgs/src/capacity.rs
+ M crates/higgs/src/capacity/pressure.rs
+ M crates/higgs/src/capacity/registry.rs
+ec61d0c7d fix: bound long-context memory overhead
+eae52c17d docs: refresh nightly README and architecture
+dd6730133 fix(api): enforce required tool calls
+[0m
+[0m✱ [0mGrep "HIGGS_ESCHA_TRELLIS_GEMM"[90m 15 matches[0m
+[0m✱ [0mGrep "sysctl|set_var"[90m 23 matches[0m
+[0m✱ [0mGrep "trellis_gemm_mode|resolve_trellis_gemm_mode"[90m 12 matches[0m
+[0m→ [0mRead crates/higgs-engine/src/runtime_identity.rs[90m [offset=140, limit=160][0m
+[0m→ [0mRead crates/higgs-engine/src/simple.rs[90m [offset=18210, limit=25][0m
+[0m→ [0mRead crates/higgs/src/state.rs[90m [offset=2060, limit=20][0m
+[0m→ [0mRead crates/higgs-models/src/eschamoe.rs[90m [offset=1390, limit=35][0m
+[0m✱ [0mGrep "mod utils|pub mod utils"[90m 1 match[0m
+The patch is applied in this working tree. Verifying signatures and cross-crate usage before reporting.
+[0m→ [0mRead crates/higgs-engine/src/runtime_identity.rs[90m [limit=80, offset=30][0m
+[0m→ [0mRead crates/higgs-models/src/qwen3_next.rs[90m [limit=100, offset=4630][0m
+[0m→ [0mRead crates/higgs-models/src/qwen3_next.rs[90m [limit=70, offset=8770][0m
+[0m→ [0mRead crates/higgs-models/src/utils.rs[90m [limit=35, offset=1158][0m
+[0m
+[0m$ [0mrg -n 'dflash_set_test_env\(' crates/higgs-engine/src/simple.rs | rg -i 'trellis' ; rg -n 'HIGGS_ESCHA_TRELLIS_GEMM' crates/higgs-engine/src/simple.rs; echo "---"; sed -n '60,95p' crates/higgs-engine/tests/runtime_identity.rs
+---
+        ("HIGGS_QGEMV_NSG", "16"),
+        ("HIGGS_CACHE_QGEMV_CONFIGS", "1"),
+        ("HIGGS_CACHE_GATED_DELTA_CONFIGS", "0"),
+        ("HIGGS_DENSE_FFN_GATE_UP", "separate"),
+        ("HIGGS_MOE_FFN_GATE_UP", "1"),
+        ("HIGGS_QGEMM_MXFP4", "1"),
+        ("HIGGS_DSPARK_NATIVE_VERIFY", "1"),
+        ("HIGGS_DSPARK_Q2_ROW2_MLP", "0"),
+        ("HIGGS_DSPARK_Q2_HEAD_ARGMAX", "0"),
+        ("HIGGS_DSPARK_TOPK_FAST", "32"),
+        ("HIGGS_DSPARK_TOPK_COMPARE", "16"),
+        ("HIGGS_DSPARK_TOPK_BASE_KERNEL", "1"),
+        ("HIGGS_DSPARK_TOPK_MARKOV_KERNEL", "1"),
+        ("HIGGS_ESCHA_NATIVE", "0"),
+        ("HIGGS_ESCHA_AFFINE_BITS", "3"),
+        ("HIGGS_ESCHA_TRELLIS_GEMM", "1"),
+        ("HIGGS_ESCHA_QGEMM_SIMD", "0"),
+        ("HIGGS_ESCHA_QGEMM_BM", "64"),
+        ("HIGGS_NO_MEM_LIMIT", "1"),
+        ("HIGGS_WIRED_LIMIT_MODE", "legacy"),
+    ];
+
+    for (name, value) in mutations {
+        assert_ne!(
+            identity_with(&[(name, value)]),
+            baseline,
+            "{name} must participate in the canonical runtime identity"
+        );
+    }
+}
+
+#[test]
+fn runtime_identity_normalizes_equivalent_inputs_and_model_context() {
+    assert_eq!(
+        identity_with(&[("HIGGS_COMPILED_GATING", " off ")]),
+        identity_with(&[("HIGGS_COMPILED_GATING", "0")])
+[0m
+Two final verification reads, then the report.
+[0m→ [0mRead crates/higgs-models/src/eschamoe.rs[90m [limit=18, offset=1422][0m
+## Review: M4 trellis-GEMM default + profiling timer fix
+
+No blocking correctness issues found. Ranked findings:
+
+**1. Planned final body — verified, no issue.**
+`raw.map_or_else(|| crate::utils::is_base_m4(brand), |value| value == "1")` satisfies all 10 cases in `trellis_gemm_default_is_m4_only_and_preserves_explicit_overrides` (eschamoe.rs:1802), including the `" Apple M4 "` trim and `Some("0")`/`Some("yes")` overrides. Caveats, not bugs: exact `"Apple M4"` match excludes Pro/Max/M5 (deliberate) and any future variant spelling; brand detection failing (bare `"sysctl"` PATH lookup at utils.rs:1173 vs absolute `/usr/sbin/sysctl` at state.rs:2250) silently degrades to default-off — execution and identity stay consistent since both share the cached source, so this is a silent-policy, not a fingerprint, risk.
+
+**2. Fingerprint agreement — holds.**
+Execution `trellis_gemm_mode()` (eschamoe.rs:1404), engine identity (runtime_identity.rs:177), and capacity logging (state.rs:2071) all route through `resolve_trellis_gemm_mode` / shared cached `apple_cpu_brand`. Only divergence path: env mutated after the OnceLock pins — `set_var` exists only in ignored/manual tests and doctor-restore, not production. Low.
+
+**3. Doc drift on flip (must fix when landing the final body).**
+eschamoe.rs:1397 "The default is the scratch path" and :1401-1402 "SIMD selection only applies after GEMM is explicitly enabled" become false on base M4; docs/models.md:201 likewise. Flipping also changes `eschamoeTrellisGemm` in the runtime identity on M4 → identity-keyed persisted state gets a new key once (intended; rollout-visible).
+
+**4. Profiling timers — semantics changed, consumers must know.**
+- `PROF_TQ_ATTN_NS` no longer includes projections + cache append (timer now starts after append eval, qwen3_next.rs:4683-4709); previously collected attn_ms is not comparable to new runs.
+- Q-projection time is now invisible in both buckets (Q eval moved before both timers, :4677).
+- canonical branch unaffected: `tq_prof` requires L==1, `canonical_rows` requires L>1 — mutually exclusive, so the old early timer was dead there too.
+- `let _ =` → `?` on evals: under profiling, eval failure now aborts the forward instead of skipping timing. Arguably correct; flag-only behavior change.
+- `profiling` ungated from `T == 1` (:8796): prefill now gets per-layer barriers on the sampled prefix. "bounded prefill chunks" (:8792) is enforced by the serving stack's chunking, not here — an unchunked large-T forward barrier-syncs per sampled layer. Diagnostic-only; `query_tokens = T` (:8934) makes extrapolation misuse detectable. Acceptable.
+
+**5. Accidental production changes — none found.**
+All attention-path edits are `tq_prof`-gated; today's `trellis_gemm_mode_for_brand` body is exactly equivalent to the old check (incl. non-UTF-8 env → false); `is_base_m4` is logic-identical to the old inline match; the engine identity field resolves identically under the current body.
+
+**6. Test fragility (low).**
+`escha_identity_describes_the_executing_kernel_default` (runtime_identity.rs:273) compares live-env identity against OnceLock-cached `trellis_gemm_mode()` — policy-agnostic and stays green through the flip, but is order-sensitive if anything in the higgs-engine unit-test binary ever mutates `HIGGS_ESCHA_TRELLIS_GEMM` (nothing currently does; the dflash env harness is ignored/manual, the integration test is a separate binary). The eschamoe RED test is pure (no env/brand dependence) — correctly pins the planned policy.
+
+Per instructions, no performance claims are made from source; the pending seven matched-behavior cases and AC measurements are outside this diff.

@@ -1,0 +1,34 @@
+{
+  "label": "budget-reset",
+  "seconds": 11.508022624999285,
+  "ttft_seconds": 11.158630417019594,
+  "last_token_seconds": 11.50778725001146,
+  "usage": {
+    "prompt_tokens": 2084,
+    "completion_tokens": 13,
+    "total_tokens": 2097
+  },
+  "finish": "stop",
+  "progress": [
+    {
+      "total": 2084,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 11
+    },
+    {
+      "total": 2084,
+      "cache": 0,
+      "processed": 1024,
+      "time_ms": 5072
+    },
+    {
+      "total": 2084,
+      "cache": 0,
+      "processed": 2048,
+      "time_ms": 9833
+    }
+  ],
+  "answer": "{\n  \"action\": \"checkpoint_reset\"\n}",
+  "native_user_tokens": null
+}

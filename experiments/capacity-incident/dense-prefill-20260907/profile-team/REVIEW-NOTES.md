@@ -1,0 +1,5 @@
+GLM model verified zai-coding-plan/glm-5.3-flash. Its peeled-tail proposal is testable; claims of guaranteed bit identity, register residency and uniquely identifying compiler cause are too strong. Source-preserved arithmetic order does not prove compiler bit identity. Failing peel would not establish a unique cause. Routine sub-agent implements isolated diagnostic; main validates.
+
+Mask-template test completed: query128291.57ms, reg-explicit427.46ms, reg-causal float1127.14ms, reg-causal bool1139.60ms (six round medians at32K). All normal/stress/tail checks pass. No material recovery from unused mask type alone. Actual hardware limiter remains unresolved.
+
+Local fast_scan: LLVM IR emitted with metal -S -emit-llvm can show intermediate structure only; cannot establish final register allocation/spills/occupancy. Function-constant specialization happens later, so unspecialized IR would not resolve this split. No installed metal-objdump/metal-nm/metal-dsymutil found. HY4 task failed402; replaced locally, not silently represented as HY4 work.

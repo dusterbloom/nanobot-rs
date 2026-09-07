@@ -1,0 +1,77 @@
+{
+  "runs": [
+    {
+      "name": "32k-0-block0",
+      "seconds": 192.44137254200177,
+      "ttft": 183.14385745799518,
+      "decode_interval": 9.295824041997548,
+      "usage": {
+        "prompt_tokens": 31995,
+        "completion_tokens": 128,
+        "total_tokens": 32123
+      },
+      "answer": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46",
+      "peakGiB": 17.361077174544334,
+      "swapouts": 0,
+      "pressure": [
+        "normal"
+      ]
+    },
+    {
+      "name": "32k-1-block1",
+      "seconds": 195.27770741700078,
+      "ttft": 186.04723283299245,
+      "decode_interval": 9.230190334026702,
+      "usage": {
+        "prompt_tokens": 31995,
+        "completion_tokens": 128,
+        "total_tokens": 32123
+      },
+      "answer": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46",
+      "peakGiB": 15.557564556598663,
+      "swapouts": 0,
+      "pressure": [
+        "normal"
+      ]
+    },
+    {
+      "name": "32k-2-block0",
+      "seconds": 192.96370329198544,
+      "ttft": 183.81117449997691,
+      "decode_interval": 9.152339749998646,
+      "usage": {
+        "prompt_tokens": 31995,
+        "completion_tokens": 128,
+        "total_tokens": 32123
+      },
+      "answer": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46",
+      "peakGiB": 17.338783994317055,
+      "swapouts": 0,
+      "pressure": [
+        "normal"
+      ]
+    }
+  ],
+  "seconds": {
+    "control_mean": 192.7025379169936,
+    "candidate": 195.27770741700078,
+    "change_percent": 1.336344361544639
+  },
+  "ttft": {
+    "control_mean": 183.47751597898605,
+    "candidate": 186.04723283299245,
+    "change_percent": 1.400562265242744
+  },
+  "decode_interval": {
+    "control_mean": 9.224081895998097,
+    "candidate": 9.230190334026702,
+    "change_percent": 0.06622272110632377
+  },
+  "peakGiB": {
+    "control_mean": 17.349930584430695,
+    "candidate": 15.557564556598663,
+    "change_percent": -10.330681261863074
+  },
+  "answers_identical": true,
+  "control_ttft_drift_percent": 0.3643676895550785
+}

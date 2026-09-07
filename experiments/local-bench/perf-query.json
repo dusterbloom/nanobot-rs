@@ -1,0 +1,14 @@
+{
+  "model": "%m",
+  "messages": [
+    {
+      "role": "user",
+      "content": "%p"
+    }
+  ],
+  "max_tokens": 256,
+  "temperature": 0,
+  "repeat_penalty": 1.1,
+  "enable_thinking": false,
+  "stream": true
+}

@@ -1,0 +1,10 @@
+{
+  "seconds": 0.7373626670159865,
+  "answer": "READY",
+  "usage": {
+    "prompt_tokens": 20,
+    "completion_tokens": 2,
+    "total_tokens": 22
+  },
+  "finish": "stop"
+}

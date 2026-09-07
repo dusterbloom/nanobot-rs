@@ -1,0 +1,76 @@
+{
+  "label": "failed-action",
+  "seconds": 38.235735624999506,
+  "ttft_seconds": 37.11298574999091,
+  "last_token_seconds": 38.235540041001514,
+  "usage": {
+    "prompt_tokens": 8234,
+    "completion_tokens": 29,
+    "total_tokens": 8263
+  },
+  "finish": "stop",
+  "progress": [
+    {
+      "total": 8234,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 14
+    },
+    {
+      "total": 8234,
+      "cache": 0,
+      "processed": 1024,
+      "time_ms": 4303
+    },
+    {
+      "total": 8234,
+      "cache": 0,
+      "processed": 2048,
+      "time_ms": 8492
+    },
+    {
+      "total": 8234,
+      "cache": 0,
+      "processed": 3072,
+      "time_ms": 12833
+    },
+    {
+      "total": 8234,
+      "cache": 0,
+      "processed": 4096,
+      "time_ms": 17246
+    },
+    {
+      "total": 8234,
+      "cache": 0,
+      "processed": 5120,
+      "time_ms": 21709
+    },
+    {
+      "total": 8234,
+      "cache": 0,
+      "processed": 6144,
+      "time_ms": 26248
+    },
+    {
+      "total": 8234,
+      "cache": 0,
+      "processed": 7168,
+      "time_ms": 30878
+    },
+    {
+      "total": 8234,
+      "cache": 0,
+      "processed": 8192,
+      "time_ms": 35606
+    },
+    {
+      "total": 8234,
+      "cache": 0,
+      "processed": 8224,
+      "time_ms": 36291
+    }
+  ],
+  "answer": "{\n  \"deployed\": false,\n  \"version\": null,\n  \"next_action\": \"ask_permission\"\n}",
+  "native_user_tokens": null
+}

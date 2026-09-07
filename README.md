@@ -1,10 +1,10 @@
 # nanobot
 
-A Rust assistant that connects your conversations, models, tools, and durable memory.
+Make a local model a dependable working assistant—even when the conversation outgrows its context window.
 
 ## TL;DR
 
-Use cloud models or local inference through Higgs and other compatible servers. Nanobot manages the conversation and executes tools; the model server handles inference. SQLite history, LCM summaries, and workspace memory support long sessions.
+Our ambition: the strongest local-model harness on a MacBook. Nanobot brings tools, durable history, and recovery; Higgs brings inference tuned for Apple Silicon. Together, they aim to finish useful work within laptop memory. Superiority is a hypothesis we are testing, not a benchmark result. Cloud providers work too.
 
 ```sh
 cargo build --release

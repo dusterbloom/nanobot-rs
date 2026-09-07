@@ -1,0 +1,6 @@
+{
+  "model": "openrouter/tencent/hy4-preview",
+  "status": 402,
+  "message": "Insufficient credits",
+  "retryable": false
+}

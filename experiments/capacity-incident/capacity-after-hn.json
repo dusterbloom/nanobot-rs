@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "model": "escha-35b-a3b",
+  "modelFingerprint": "sha256:adf23a8e2f3b720f38311bd469a5df275b2d41fb6bfeb0e0cb337244b3dbfa2a",
+  "bootId": "fa19230c-60b4-4ab3-babf-c6ec03ad566c",
+  "generation": 2,
+  "availability": "available",
+  "pressure": "normal",
+  "safeTotalTokens": 73728,
+  "recommendedOutputTokens": 4096,
+  "maxPromptTokens": 69632,
+  "retainedSessionTokens": 16384,
+  "retainedBytes": 805306368,
+  "prefixCacheBytes": 134217728,
+  "basis": "conservative"
+}

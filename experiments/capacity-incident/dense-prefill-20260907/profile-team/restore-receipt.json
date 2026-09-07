@@ -1,0 +1,21 @@
+{
+  "answer": "READY",
+  "seconds": 0.7695824170077685,
+  "higgs_sha256": "a9eb4019bc05e03bb1f8d5ffb10ab58713a6ad2f811b8d6249e6857081d37b58",
+  "pressure": "normal",
+  "models": [
+    {
+      "model": "escha-35b-a3b",
+      "generation": 2,
+      "available": true,
+      "basis": "conservative",
+      "pressure": "normal",
+      "safeTotalTokens": 51200,
+      "recommendedOutputTokens": 4096,
+      "maxPromptTokens": 47104,
+      "usableBytes": 21440482509,
+      "qualifiedColdBands": 0
+    }
+  ],
+  "restoration": "automatic startup capacity rejected; manual retry succeeded"
+}

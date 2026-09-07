@@ -1,0 +1,521 @@
+diff --git a/src/agent/agent_loop/shared.rs b/src/agent/agent_loop/shared.rs
+index d8378f6..ae9fd7a 100644
+--- a/src/agent/agent_loop/shared.rs
++++ b/src/agent/agent_loop/shared.rs
+@@ -426,7 +426,18 @@ impl Default for TurnCapacityRecovery {
+     }
+ }
+ 
++fn capacity_pending_reply(error: &anyhow::Error) -> String {
++    format!("[Capacity Unavailable] {error}. This turn is saved as pending work; retry once capacity recovers.")
++}
++
+ fn next_preflight_generation(current: TurnCapacityRecovery) -> TurnCapacityRecovery {
++    // Compaction during a rejected request's retry must not reset the retry cap.
++    if matches!(
++        current,
++        TurnCapacityRecovery::RetryIssued { .. } | TurnCapacityRecovery::Terminal { .. }
++    ) {
++        return current;
++    }
+     let generation = match current {
+         TurnCapacityRecovery::Idle => 0,
+         TurnCapacityRecovery::PreflightCompacted { generation }
+@@ -2779,6 +2790,11 @@ impl AgentLoopShared {
+                 generation: generation.saturating_add(1),
+             };
+             self.suspend_capacity_turn(ctx, None).await;
++            // Earlier tool narration must not suppress the terminal failure notice.
++            if ctx.flow.content_was_streamed {
++                send_retract_reply_marker(&ctx.text_delta_tx);
++                ctx.flow.content_was_streamed = false;
++            }
+             return CapacityExceededRecovery::TurnPending;
+         }
+ 
+@@ -2842,6 +2858,15 @@ impl AgentLoopShared {
+         // the effective budget from the live endpoint before the re-entry.
+         ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
+         self.resolve_effective_budget(ctx).await;
++        // A 413 can describe a tighter request-specific window than discovery
++        // (e.g. retained growth). Refresh may shrink it further, never widen it.
++        let total = ctx.effective_budget.max_context().min(safe_total_tokens);
++        let prompt = ctx
++            .effective_budget
++            .available_budget(0)
++            .min(safe_prompt_tokens)
++            .min(total);
++        ctx.effective_budget = TokenBudget::new(total, total - prompt);
+         ctx.capacity_recovery = TurnCapacityRecovery::RetryIssued {
+             generation: generation.saturating_add(1),
+         };
+@@ -4812,10 +4837,10 @@ impl AgentLoopShared {
+             let frozen_tool_hash =
+                 crate::agent::prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
+             let max_prompt_tokens = ctx
+-                .core
+-                .token_budget
++                .effective_budget
+                 .max_context()
+                 .saturating_sub(max_tokens as usize)
++                .min(ctx.effective_budget.available_budget(0))
+                 .min(u32::MAX as usize) as u32;
+             let retained_checkpoint = ctx.higgs_session_route.retained_checkpoint().cloned();
+             let reservation = retained_checkpoint.as_ref().and_then(|checkpoint| {
+@@ -5006,12 +5031,7 @@ impl AgentLoopShared {
+                             CapacityExceededRecovery::TurnPending => {
+                                 counters.mark_inference_finished();
+                                 return StepResult::Done(IterationOutcome::Complete {
+-                                    content: format!(
+-                                        "[Capacity Unavailable] The live capacity window shrank \
+-                                         (safe prompt {safe} tokens). This turn is saved as pending \
+-                                         work; retry once capacity recovers.",
+-                                        safe = ctx.effective_budget.max_context()
+-                                    ),
++                                    content: capacity_pending_reply(&e),
+                                     outcome: TurnOutcome::CapacityUnavailable,
+                                 });
+                             }
+@@ -5080,12 +5100,7 @@ impl AgentLoopShared {
+                             CapacityExceededRecovery::TurnPending => {
+                                 counters.mark_inference_finished();
+                                 return StepResult::Done(IterationOutcome::Complete {
+-                                    content: format!(
+-                                        "[Capacity Unavailable] The live capacity window shrank \
+-                                         (safe prompt {safe} tokens). This turn is saved as pending \
+-                                         work; retry once capacity recovers.",
+-                                        safe = ctx.effective_budget.max_context()
+-                                    ),
++                                    content: capacity_pending_reply(&e),
+                                     outcome: TurnOutcome::CapacityUnavailable,
+                                 });
+                             }
+@@ -5352,7 +5367,7 @@ impl AgentLoopShared {
+                         CapacityExceededRecovery::TurnPending => {
+                             counters.mark_inference_finished();
+                             return StepResult::Done(IterationOutcome::Complete {
+-                                content: "[Capacity Unavailable] The live capacity window shrank; this turn is saved as pending work.".to_string(),
++                                content: capacity_pending_reply(&e),
+                                 outcome: TurnOutcome::CapacityUnavailable,
+                             });
+                         }
+diff --git a/src/tui_app/app.rs b/src/tui_app/app.rs
+index 6ee07bb..572c01a 100644
+--- a/src/tui_app/app.rs
++++ b/src/tui_app/app.rs
+@@ -266,7 +266,7 @@ pub(crate) struct Footer {
+     pub model: String,
+     pub ctx_used: usize,
+     pub ctx_max: usize,
+-    /// Compact live-capacity segment (`16K/4K legacy`), `None` when no
++    /// Explicit live prompt/output capacity segment, `None` when no
+     /// snapshot is installed (cloud provider, pre-discovery) — the footer
+     /// then degrades to configured-only and shows nothing.
+     pub capacity: Option<String>,
+@@ -3166,12 +3166,12 @@ fn footer_line(
+ }
+ 
+ /// Footer segment for the installed capacity snapshot: effective live limits
+-/// plus the source label (`16K/4K legacy`, `48K/4K adaptive · constrained`).
++/// with explicit prompt/output labels so the reserve cannot read as usage.
+ /// An unavailable snapshot keeps the configured ceiling and says so.
+ pub(crate) fn capacity_footer_label(d: &CapacityDescription) -> String {
+     let limits = format!(
+-        "{}/{}",
+-        format_k_tokens(d.total_tokens as u64),
++        "prompt {} · output {}",
++        format_k_tokens(d.total_tokens.saturating_sub(d.output_tokens) as u64),
+         format_k_tokens(d.output_tokens as u64)
+     );
+     let mut label = match d.source {
+@@ -5037,7 +5037,7 @@ mod tests {
+             total_tokens: 16_384,
+             output_tokens: 4_096,
+         });
+-        assert_eq!(legacy, "16K/4K legacy");
++        assert_eq!(legacy, "prompt 12K · output 4K legacy");
+ 
+         let adaptive = capacity_footer_label(&CapacityDescription {
+             source: CapacitySource::Adaptive {
+@@ -5049,7 +5049,10 @@ mod tests {
+             total_tokens: 49_152,
+             output_tokens: 4_096,
+         });
+-        assert_eq!(adaptive, "48K/4K adaptive (learned) · constrained");
++        assert_eq!(
++            adaptive,
++            "prompt 44K · output 4K adaptive (learned) · constrained"
++        );
+         // Normal pressure stays quiet — the footer is calm by design.
+         let calm = capacity_footer_label(&CapacityDescription {
+             source: CapacitySource::Adaptive {
+@@ -5061,7 +5064,7 @@ mod tests {
+             total_tokens: 49_152,
+             output_tokens: 4_096,
+         });
+-        assert_eq!(calm, "48K/4K adaptive (conservative)");
++        assert_eq!(calm, "prompt 44K · output 4K adaptive (conservative)");
+ 
+         let mut footer = test_footer();
+         footer.capacity = Some(legacy);
+@@ -5073,7 +5076,7 @@ mod tests {
+             0,
+         )));
+         assert!(
+-            with_capacity.contains("capacity 16K/4K legacy"),
++            with_capacity.contains("capacity prompt 12K · output 4K legacy"),
+             "footer: {with_capacity}"
+         );
+     }
+diff --git a/src/tui_app/mod.rs b/src/tui_app/mod.rs
+index 160708a..51221f4 100644
+--- a/src/tui_app/mod.rs
++++ b/src/tui_app/mod.rs
+@@ -215,18 +215,26 @@ fn clear_normal_screen() {
+ 
+ /// Snapshot the quiet footer state (cwd / model / context usage) from the core.
+ fn footer_snapshot(core: &SharedCoreHandle) -> Footer {
+-    let used = core.counters.last_context_used.load(Ordering::Relaxed) as usize;
+-    let max = core.counters.last_context_max.load(Ordering::Relaxed) as usize;
+-    let model = core.swappable().model.clone();
++    // History estimates omit rendered instructions/tools. Show the last actual
++    // provider prompt against the same live prompt budget used by the loop.
++    let used = core
++        .counters
++        .last_actual_prompt_tokens
++        .load(Ordering::Relaxed) as usize;
++    let current = core.swappable();
++    let max = core
++        .capacity
++        .effective_budget(&current.token_budget, 0)
++        .available_budget(0);
++    let model = current.model.clone();
+     let cwd = std::env::current_dir()
+         .ok()
+         .map(|p| home_relative(&p))
+         .unwrap_or_else(|| "?".into());
+-    // Effective live limits beside the configured ctx ceiling above; `None`
+-    // (cloud / pre-discovery) renders no capacity segment at all.
++    // Cloud / pre-discovery has no separate capacity description.
+     let capacity = core
+         .capacity
+-        .describe(&core.swappable().token_budget, 0)
++        .describe(&current.token_budget, 0)
+         .map(|d| capacity_footer_label(&d));
+     Footer {
+         cwd,
+
+HIGGS PATCH
+diff --git a/crates/higgs/src/capacity.rs b/crates/higgs/src/capacity.rs
+index 9f9db2651..eb8e84f3b 100644
+--- a/crates/higgs/src/capacity.rs
++++ b/crates/higgs/src/capacity.rs
+@@ -1123,13 +1123,10 @@ impl<C: Clock> CapacityController<C> {
+         }
+         let effective_pressure = if swap_is_sticky {
+             MemoryPressure::Critical
+-        } else if observation.pressure == MemoryPressure::Normal && observation.compressor_delta > 0
+-        {
+-            // Compressor growth is deterministic evidence that a nominally normal
+-            // system is dirty. It freezes rises and uses the constrained reserve;
+-            // no arbitrary compression-rate threshold is invented.
+-            MemoryPressure::Constrained
+         } else {
++            // Global compression activity is not an OS pressure verdict. It
++            // disqualifies clean learning below, but must not ratchet a healthy
++            // conversation's context down whenever macOS compresses a page.
+             observation.pressure
+         };
+ 
+diff --git a/crates/higgs/src/capacity/pressure.rs b/crates/higgs/src/capacity/pressure.rs
+index 62b68204f..a577a0aa9 100644
+--- a/crates/higgs/src/capacity/pressure.rs
++++ b/crates/higgs/src/capacity/pressure.rs
+@@ -974,11 +974,17 @@ mod tests {
+             compressor_delta: 1,
+         });
+ 
+-        assert_eq!(controller.pressure(), MemoryPressure::Constrained);
+-        assert_eq!(
+-            constrained.safe_total_tokens,
+-            floor_1024(initial * 75 / 100)
+-        );
++        // A global compression counter is activity, not an OS pressure verdict.
++        assert_eq!(controller.pressure(), MemoryPressure::Normal);
++        assert_eq!(constrained.safe_total_tokens, initial);
++        for compressor_delta in [0, 1, 0, 100, 0] {
++            let decision = controller.apply_pressure_observation(PressureObservation {
++                pressure: MemoryPressure::Normal,
++                swap_out_delta: 0,
++                compressor_delta,
++            });
++            assert_eq!(decision.safe_total_tokens, initial);
++        }
+     }
+ 
+     #[derive(Clone)]
+@@ -1355,7 +1361,9 @@ mod tests {
+         wait_for_samples(&calls, 2).await;
+ 
+         let controller = controller.lock().await;
+-        assert_eq!(controller.pressure(), MemoryPressure::Constrained);
++        // Sampling compression still happens, but only the OS/swap signal
++        // may promote the pressure state.
++        assert_eq!(controller.pressure(), MemoryPressure::Normal);
+         assert_eq!(
+             controller.decision().availability,
+             CapacityAvailability::Available
+diff --git a/crates/higgs/src/capacity/registry.rs b/crates/higgs/src/capacity/registry.rs
+index 020676b98..970277c2e 100644
+--- a/crates/higgs/src/capacity/registry.rs
++++ b/crates/higgs/src/capacity/registry.rs
+@@ -2435,10 +2435,14 @@ fn snapshot_for(
+     pressure: MemoryPressure,
+     allocation: CacheAllocation,
+ ) -> CapacitySnapshot {
+-    let active = entry
+-        .active
+-        .as_ref()
+-        .filter(|active| active.published && !active.draining);
++    let active = entry.active.as_ref().filter(|active| {
++        active.published
++                && !active.draining
++                && active.controller.decision().availability == CapacityAvailability::Available
++                // Internal zero-prompt decisions serve registration/admission
++                // calculations, but are not usable public chat envelopes.
++                && active.controller.decision().max_prompt_tokens > 0
++    });
+     let (availability, safe_total_tokens, recommended_output_tokens, max_prompt_tokens) = active
+         .map(|active| {
+             let decision = active.controller.decision();
+@@ -3637,6 +3641,22 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn active_output_only_snapshot_zeroes_unavailable_wire_limits() {
++        let registry = CapacityRegistry::new(["escha".to_owned()]);
++        let mut model = facts("escha", 5 * GIB);
++        model.configured_total_token_ceiling = Some(4096);
++        register(&registry, model);
++        let snapshot = registry.snapshot("escha").unwrap();
++        assert_eq!(snapshot.availability, CapacityAvailability::Unavailable);
++        assert_eq!(snapshot.safe_total_tokens, 0);
++        assert_eq!(snapshot.recommended_output_tokens, 0);
++        assert_eq!(snapshot.max_prompt_tokens, 0);
++        assert_eq!(snapshot.retained_session_tokens, 0);
++        assert_eq!(snapshot.retained_bytes, 0);
++        assert_eq!(snapshot.prefix_cache_bytes, 0);
++    }
++
+     #[test]
+     fn known_unloaded_snapshot_is_zeroed_and_uses_process_boot_id() {
+         let registry = CapacityRegistry::new(["escha".to_owned(), "draft".to_owned()]);
+@@ -3802,7 +3822,16 @@ mod tests {
+         first.configured_total_token_ceiling = Some(1_024);
+         first.configured_output_token_ceiling = Some(1_024);
+         register(&registry, first);
+-        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 1_024);
++        assert_eq!(
++            registry.lock().models["first"]
++                .active
++                .as_ref()
++                .unwrap()
++                .controller
++                .decision()
++                .safe_total_tokens,
++            1_024
++        );
+ 
+         registry.apply_pressure_observation(PressureObservation {
+             pressure: MemoryPressure::Constrained,
+@@ -3811,7 +3840,13 @@ mod tests {
+         });
+ 
+         assert_eq!(
+-            registry.snapshot("first").unwrap().safe_total_tokens,
++            registry.lock().models["first"]
++                .active
++                .as_ref()
++                .unwrap()
++                .controller
++                .decision()
++                .safe_total_tokens,
+             0,
+             "the shared-ledger pass must preserve the pressure controller's zero downshift"
+         );
+@@ -3835,11 +3870,26 @@ mod tests {
+                 swap_out_delta: u64::from(pressure == MemoryPressure::Critical),
+                 compressor_delta: 1,
+             });
+-            assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
++            assert_eq!(
++                registry.lock().models["first"]
++                    .active
++                    .as_ref()
++                    .unwrap()
++                    .controller
++                    .decision()
++                    .safe_total_tokens,
++                0
++            );
+ 
+             drop(provisional);
+             assert_eq!(
+-                registry.snapshot("first").unwrap().safe_total_tokens,
++                registry.lock().models["first"]
++                    .active
++                    .as_ref()
++                    .unwrap()
++                    .controller
++                    .decision()
++                    .safe_total_tokens,
+                 0,
+                 "rolling back metadata before engine cleanup is not recovery evidence"
+             );
+@@ -3861,7 +3911,13 @@ mod tests {
+                 metal_recommended_working_set_bytes: Some(24 * GIB),
+             });
+             assert_eq!(
+-                registry.snapshot("first").unwrap().safe_total_tokens,
++                registry.lock().models["first"]
++                    .active
++                    .as_ref()
++                    .unwrap()
++                    .controller
++                    .decision()
++                    .safe_total_tokens,
+                 expected_after_decrease,
+                 "a later authoritative decrease may seed only when pressure policy permits it"
+             );
+@@ -3948,8 +4004,20 @@ mod tests {
+         assert!(registry.publish_cache_allocation_revision(plan.revision));
+         let snapshot = registry.snapshot("escha").unwrap();
+ 
+-        assert_eq!(snapshot.availability, CapacityAvailability::Available);
+-        assert_eq!(snapshot.safe_total_tokens, 1_024);
++        // Registration can reserve an internal output-only minimum, but a
++        // public chat envelope must have room for a prompt.
++        assert_eq!(snapshot.availability, CapacityAvailability::Unavailable);
++        assert_eq!(snapshot.safe_total_tokens, 0);
++        assert_eq!(
++            registry.lock().models["escha"]
++                .active
++                .as_ref()
++                .unwrap()
++                .controller
++                .decision()
++                .safe_total_tokens,
++            1_024
++        );
+         assert!(allocated_cache > 0);
+         assert!(allocated_cache < 3 * GIB);
+     }
+@@ -4119,7 +4187,16 @@ mod tests {
+     fn finish_unregister_requires_current_decreased_measurement_to_recover_zero() {
+         let (registry, drain) = draining_registry_with_zero_survivor();
+         registry.finish_unregister(drain, None).unwrap();
+-        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
++        assert_eq!(
++            registry.lock().models["first"]
++                .active
++                .as_ref()
++                .unwrap()
++                .controller
++                .decision()
++                .safe_total_tokens,
++            0
++        );
+ 
+         for active_bytes in [5 * GIB, 6 * GIB] {
+             let (registry, drain) = draining_registry_with_zero_survivor();
+@@ -4133,7 +4210,13 @@ mod tests {
+                 .finish_unregister(drain, Some(measurement))
+                 .unwrap();
+             assert_eq!(
+-                registry.snapshot("first").unwrap().safe_total_tokens,
++                registry.lock().models["first"]
++                    .active
++                    .as_ref()
++                    .unwrap()
++                    .controller
++                    .decision()
++                    .safe_total_tokens,
+                 0,
+                 "an equal or increased measurement is not recovery evidence"
+             );
+@@ -4147,12 +4230,27 @@ mod tests {
+             metal_recommended_working_set_bytes: Some(24 * GIB),
+         });
+         registry.finish_unregister(drain, Some(decreased)).unwrap();
+-        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 1_024);
++        assert_eq!(
++            registry.lock().models["first"]
++                .active
++                .as_ref()
++                .unwrap()
++                .controller
++                .decision()
++                .safe_total_tokens,
++            1_024
++        );
+ 
+         let registry = CapacityRegistry::new(["first".to_owned(), "second".to_owned()]);
+         register(&registry, facts("first", 5 * GIB));
+         register(&registry, facts("second", 5 * GIB));
+-        let full = registry.snapshot("first").unwrap().safe_total_tokens;
++        let full = registry.lock().models["first"]
++            .active
++            .as_ref()
++            .unwrap()
++            .controller
++            .decision()
++            .safe_total_tokens;
+         assert!(full > 8_192);
+         registry.refresh_memory(MlxMemorySnapshot {
+             active_bytes: 20 * GIB,
+@@ -4160,7 +4258,16 @@ mod tests {
+             memory_limit_bytes: Some(24 * GIB),
+             metal_recommended_working_set_bytes: Some(24 * GIB),
+         });
+-        assert_eq!(registry.snapshot("first").unwrap().safe_total_tokens, 0);
++        assert_eq!(
++            registry.lock().models["first"]
++                .active
++                .as_ref()
++                .unwrap()
++                .controller
++                .decision()
++                .safe_total_tokens,
++            0
++        );
+         let drain = registry.begin_drain("second").unwrap();
+         let decreased = registry.refresh_memory(MlxMemorySnapshot {
+             active_bytes: 5 * GIB,
+@@ -4169,12 +4276,24 @@ mod tests {
+             metal_recommended_working_set_bytes: Some(14 * GIB),
+         });
+         assert_eq!(
+-            registry.snapshot("first").unwrap().safe_total_tokens,
++            registry.lock().models["first"]
++                .active
++                .as_ref()
++                .unwrap()
++                .controller
++                .decision()
++                .safe_total_tokens,
+             0,
+             "the measured decrease alone has no headroom while the draining model is reserved"
+         );
+         registry.finish_unregister(drain, Some(decreased)).unwrap();
+-        let recovered = registry.snapshot("first").unwrap().safe_total_tokens;
++        let recovered = registry.lock().models["first"]
++            .active
++            .as_ref()
++            .unwrap()
++            .controller
++            .decision()
++            .safe_total_tokens;
+         assert_eq!(recovered, 8_192);
+         assert!(recovered < full, "measured recovery must not jump to full");
+     }

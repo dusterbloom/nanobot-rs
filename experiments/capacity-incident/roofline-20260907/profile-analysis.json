@@ -1,0 +1,35 @@
+{
+  "prefill_chunks_drop_first_two": {
+    "samples": 13,
+    "extrapolated_median_components_ms": {
+      "gdn_attn_ms": 1333.1999999999998,
+      "gdn_mlp_ms": 1878.0,
+      "fa_attn_ms": 1117.9,
+      "fa_mlp_ms": 649.4
+    },
+    "component_share": {
+      "gdn_attn_ms": 0.26779150346489905,
+      "gdn_mlp_ms": 0.3772220548357939,
+      "fa_attn_ms": 0.22454554584714273,
+      "fa_mlp_ms": 0.1304408958521643
+    }
+  },
+  "decode_drop_first_five": {
+    "samples": 123,
+    "extrapolated_median_components_ms": {
+      "gdn_attn_ms": 21.9,
+      "gdn_mlp_ms": 20.400000000000002,
+      "fa_attn_ms": 25.8,
+      "fa_mlp_ms": 6.800000000000001
+    },
+    "component_share": {
+      "gdn_attn_ms": 0.29238985313751664,
+      "gdn_mlp_ms": 0.27236315086782376,
+      "fa_attn_ms": 0.34445927903871826,
+      "fa_mlp_ms": 0.09078771695594126
+    }
+  },
+  "decode_append_ms_per_fa_layer": 0.465,
+  "decode_attention_ms_per_fa_layer": 1.66,
+  "caveat": "Eval-barrier attribution, sampled leading attention cycle extrapolated across layers; not uninstrumented wall-time shares, roofline utilization, or a claim that ANE can offload these whole components."
+}

@@ -1,0 +1,39 @@
+{
+    "id": "78f52843-0fc7-483a-97ba-1320df598437",
+    "started_at": "2026-09-06T02:36:49.636320",
+    "updated_at": "2026-09-06T02:39:17.127984",
+    "finished_at": "2026-09-06T02:39:17.127984",
+    "n_total_trials": 1,
+    "stats": {
+        "n_completed_trials": 1,
+        "n_errored_trials": 0,
+        "n_running_trials": 0,
+        "n_pending_trials": 0,
+        "n_cancelled_trials": 0,
+        "n_retries": 0,
+        "evals": {
+            "terminus-2__escha-35b-a3b__adhoc": {
+                "n_trials": 1,
+                "n_errors": 0,
+                "metrics": [
+                    {
+                        "mean": 1.0
+                    }
+                ],
+                "pass_at_k": {},
+                "reward_stats": {
+                    "reward": {
+                        "1.0": [
+                            "openssl-selfsigned-cert__z9VfRzW"
+                        ]
+                    }
+                },
+                "exception_stats": {}
+            }
+        },
+        "n_input_tokens": 8785,
+        "n_cache_tokens": 1024,
+        "n_output_tokens": 1719,
+        "cost_usd": null
+    }
+}

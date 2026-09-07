@@ -1,0 +1,14 @@
+{
+    "task": {
+        "path": "/private/tmp/local-bench-datasets/terminal-bench/openssl-selfsigned-cert"
+    },
+    "trial_name": "openssl-selfsigned-cert__acGX6gn",
+    "trials_dir": "experiments/local-bench/harbor-jobs/openssl-oracle",
+    "environment": {
+        "type": "docker",
+        "force_build": true,
+        "override_cpus": 1,
+        "override_memory_mb": 2048
+    },
+    "job_id": "4cdceb7f-8047-40f0-8615-dbb7b2cc2c25"
+}

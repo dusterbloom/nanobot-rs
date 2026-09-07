@@ -1,0 +1,15 @@
+{
+  "src/agent/agent_core.rs": "e545313844602bf709a991ba7199d1830eea8791dcd66b2a64df848bd6f6a552",
+  "src/agent/agent_loop/budget.rs": "68935fa9bc28e79039eb394053990d5f8d621b1e8b0802cfa55d746d7453b3a7",
+  "src/agent/agent_loop/compaction.rs": "cd52027a71a49e216f9d8bd4de76e489b55b1a2810888b5abb0cb1757fe959d4",
+  "src/agent/agent_loop/endurance_eval.rs": "8e30829156eb9de0f8040dac3bb95921eb02fa1a5521c67f51626c44cd73b116",
+  "src/agent/agent_loop/mod.rs": "33f550cd0edb0d629ef226864551a2928752426bab84d30dc713db14971a4f25",
+  "src/agent/agent_loop/recovery_eval.rs": "ddcf0449836c884ce12cfad08adb3bfb27ec191081ed6a22873522cd7d496456",
+  "src/agent/agent_loop/shared.rs": "189b8e6916cf3bf93ce356766d8a4f26a61848bdb65ecaf2b015c277d57f9e4e",
+  "src/agent/agent_loop/tests.rs": "a150b81879daa2516f4e16f496182f5284a912ce4ef83ea41ea16c66b3c75c52",
+  "src/agent/compaction.rs": "158af4c64be8deec6eb3e0986af3139a6bc996ee9a8bd85395ccac584ab8c82e",
+  "src/agent/lcm.rs": "819da1127e3b36d90373c23eea741547abf0c5eea9945e7cfbb83c8a7600fe7d",
+  "src/agent/prepare_context.rs": "baf082c6cd4dcd517831e58272facb10ae9207d0a140cda5145560d5bbd216c7",
+  "src/agent/router.rs": "8dfd9e0c2c896cb170ba7396cf86a4de4e546f1e27c3a03314c1ac335a59fadf",
+  "src/session/db.rs": "90f6b2c0aa8b379e8f97a86aef3a1ebe977bb62a4e6d4a075b8f4621adf138c4"
+}

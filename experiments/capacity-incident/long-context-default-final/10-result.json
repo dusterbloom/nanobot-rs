@@ -1,0 +1,9 @@
+{
+  "seconds": 359.45743107795715,
+  "exit": 0,
+  "answer": "Here's the article I selected from Hacker News:\n**Title:** Cloud in a Bottle: making self-hosting accessible to everyone\n**Link:** https://cloudinabottle.org\n**Summary:** Cloud in a Bottle is an open-source \"operating system\" for personal cloud hosting that lets you install web-native apps with one click on hardware you control \u2014 whether it's an old laptop, your own VPS, or a managed instance from Imbue. It provides a catalog of pre-packaged apps (like Nextcloud, Jellyfin, Vaultwarden, Open WebUI) and lets users deploy their own containerized apps via git repos, all running in isolated security sandboxes with data stored legibly on disk.\n---\nArchive keys from earlier batches:\n- **Launch key:** LANTERN-4729-QZ\n- **Recovery key:** COPPER-8163-VX\n- **Project name:** Alder",
+  "fact_recall": true,
+  "request_purposes": {
+    "main": 18
+  }
+}

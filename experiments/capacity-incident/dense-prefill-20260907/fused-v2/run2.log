@@ -1,0 +1,69 @@
+In file included from /private/tmp/higgs-fused-v2/original.metal:2:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:3:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/attn.h:6:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/mma.h:11:
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/utils/integral_constant.h:108:6: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+  if constexpr (start < stop) {
+     ^
+In file included from /private/tmp/higgs-fused-v2/original.metal:2:
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:356:16: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+            if constexpr (is_bool) {
+               ^
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:426:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:436:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+4 warnings generated.
+In file included from /private/tmp/higgs-fused-v2/plain.metal:2:
+In file included from /private/tmp/higgs-fused-v2/plain/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:3:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/attn.h:6:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/mma.h:11:
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/utils/integral_constant.h:108:6: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+  if constexpr (start < stop) {
+     ^
+In file included from /private/tmp/higgs-fused-v2/plain.metal:2:
+/private/tmp/higgs-fused-v2/plain/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:356:16: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+            if constexpr (is_bool) {
+               ^
+/private/tmp/higgs-fused-v2/plain/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:426:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+/private/tmp/higgs-fused-v2/plain/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:436:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+4 warnings generated.
+In file included from /private/tmp/higgs-fused-v2/reg.metal:2:
+In file included from /private/tmp/higgs-fused-v2/reg/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:3:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/attn.h:6:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/mma.h:11:
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/utils/integral_constant.h:108:6: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+  if constexpr (start < stop) {
+     ^
+In file included from /private/tmp/higgs-fused-v2/reg.metal:2:
+/private/tmp/higgs-fused-v2/reg/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:365:16: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+            if constexpr (is_bool) {
+               ^
+/private/tmp/higgs-fused-v2/reg/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:435:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+/private/tmp/higgs-fused-v2/reg/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:445:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+4 warnings generated.
+BUILD PASSED
+SHAPE 31 1055
+SHAPE EXIT 31 1055 0
+SHAPE 1024 8192
+SHAPE EXIT 1024 8192 0
+SHAPE 1024 32768
+SHAPE EXIT 1024 32768 0
+SHAPE 1024 45056
+SHAPE EXIT 1024 45056 0
+COMPLETE
+Traceback (most recent call last):
+  File "/private/tmp/higgs-fused-v2/supervise.py", line 30, in <module>
+    else:raise RuntimeError('Restored server did not become ready')
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Restored server did not become ready

@@ -1,0 +1,22 @@
+{
+  "label": "matched45k",
+  "seconds": 307.8128627910046,
+  "ttft_seconds": 304.45084195799427,
+  "last_token_seconds": 307.8125287909934,
+  "usage": {
+    "prompt_tokens": 45003,
+    "completion_tokens": 35,
+    "total_tokens": 45038
+  },
+  "finish": "stop",
+  "progress": [
+    {
+      "total": 45003,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 12
+    }
+  ],
+  "answer": "Launch key: LANTERN-4729-QZ\nRecovery key: COPPER-8163-VX\nCurrent project owner: Neri",
+  "native_user_tokens": 44992
+}

@@ -1,0 +1,13 @@
+2026-09-06T15:32:24.687506Z  INFO nanobot::repl: startup_phase phase="web_autostart_spawned" phase_ms=0 total_ms=0
+2026-09-06T15:32:24.694542Z  INFO nanobot::repl: startup_phase phase="local_discovery_done" phase_ms=7 total_ms=7
+2026-09-06T15:32:24.694572Z  INFO nanobot::repl: local inference: using http://127.0.0.1:9000/v1 serving escha-35b-a3b (discovered) endpoint=http://127.0.0.1:9000/v1 model=escha-35b-a3b
+2026-09-06T15:32:24.694592Z  INFO nanobot::repl: startup_phase phase="local_backend_ready" phase_ms=0 total_ms=7
+2026-09-06T15:32:24.694601Z  INFO nanobot::repl: delegation_config_at_core_build delegation_mode=Inline(DelegationStrictPolicy { strict_no_tools_main: false, strict_router_schema: false, strict_local_only: false, strict_toolplan_validation: true }) strict_no_tools_main=false strict_router_schema=false is_local=true
+2026-09-06T15:32:24.694617Z  INFO nanobot::repl: startup_phase phase="endpoint_probe_done" phase_ms=0 total_ms=7
+2026-09-06T15:32:24.710116Z  INFO nanobot::repl: startup_phase phase="core_and_agent_built" phase_ms=15 total_ms=22
+
+2026-09-06T15:32:24.930670Z  WARN nanobot::agent::agent_loop::shared: higgs_capacity_unavailable_turn_suspended session=cli:kiss-long-1788708542 retry_after_ms=5000
+[K[2m[Capacity Unavailable] The local model is out of capacity. Your message is saved and will resume automatically once capacity recovers.[0m[2K[1A[2K[1m[36m▞▞▞[0m [Capacity Unavailable] The local model is out of capacity. Your message is saved and will resume automatically once capacity recovers.
+
+[2m⧗ 0.2s  ttft 0.22s  33 tok[0m
+

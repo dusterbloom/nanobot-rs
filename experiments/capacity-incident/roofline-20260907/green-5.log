@@ -1,0 +1,769 @@
+   Compiling higgs-models v1.7.0 (/private/tmp/higgs-m4-roofline/crates/higgs-models)
+warning: unused import: `mlx_rs::ops::indexing::IndexOp`
+  --> crates/higgs-models/src/metal_kernel.rs:25:5
+   |
+25 | use mlx_rs::ops::indexing::IndexOp;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `row_count_pad`
+    --> crates/higgs-models/src/metal_kernel.rs:1210:9
+     |
+1210 |     let row_count_pad = u32::try_from(rows_pad)
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_row_count_pad`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `QGEMM_SEMANTICS_SOURCE` is never used
+    --> crates/higgs-models/src/metal_kernel.rs:1387:7
+     |
+1387 | const QGEMM_SEMANTICS_SOURCE: &str = r"
+     |       ^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `higgs-models` (lib) generated 3 warnings (run `cargo fix --lib -p higgs-models` to apply 1 suggestion)
+   Compiling higgs-engine v1.7.0 (/private/tmp/higgs-m4-roofline/crates/higgs-engine)
+warning: variable does not need to be mutable
+    --> crates/higgs-engine/src/batch_engine.rs:1738:14
+     |
+1738 | ...   let (mut alive, _alive_worker_rx) = make_active_request(8, vec![]);
+     |            ----^^^^^
+     |            |
+     |            help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> crates/higgs-engine/src/batch_engine.rs:1739:14
+     |
+1739 | ...   let (mut pressured, _pressured_rx) = make_active_request(8, vec!...
+     |            ----^^^^^^^^^
+     |            |
+     |            help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/higgs-engine/src/batch_engine.rs:1740:14
+     |
+1740 | ...   let (mut disconnected, _disconnected_rx) = make_active_request(8...
+     |            ----^^^^^^^^^^^^
+     |            |
+     |            help: remove this `mut`
+
+warning: unused `Result` that must be used
+    --> crates/higgs-engine/src/simple.rs:5269:13
+     |
+5269 | ...   higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+     = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+     |
+5269 |             let _ = higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+     |             +++++++
+
+warning: unused `Result` that must be used
+     --> crates/higgs-engine/src/simple.rs:10075:13
+      |
+10075 | ...   higgs_models::progress::report_prefill_progress(offset, seq_len);
+      |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+      |
+10075 |             let _ = higgs_models::progress::report_prefill_progress(offset, seq_len);
+      |             +++++++
+
+warning: unused `Result` that must be used
+     --> crates/higgs-engine/src/simple.rs:10095:9
+      |
+10095 | ...   higgs_models::progress::report_prefill_progress(seq_len, seq_len);
+      |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+      |
+10095 |         let _ = higgs_models::progress::report_prefill_progress(seq_len, seq_len);
+      |         +++++++
+
+warning: unused `Result` that must be used
+     --> crates/higgs-engine/src/simple.rs:10272:9
+      |
+10272 | ...   higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+      |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: this `Result` may be an `Err` variant, which should be handled
+help: use `let _ = ...` to ignore the resulting value
+      |
+10272 |         let _ = higgs_models::progress::report_prefill_progress(logical_next_pos, logical_next_pos);
+      |         +++++++
+
+warning: unused return value of `std::option::Option::<T>::map_or` that must be used
+     --> crates/higgs-engine/src/simple.rs:13284:13
+      |
+13284 | ...   crate::stop::generation_stop().map_or((), |stop| stop.note_progress());
+      |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      |
+      = note: if you don't need the returned value, use `if let` instead
+help: use `let _ = ...` to ignore the resulting value
+      |
+13284 |             let _ = crate::stop::generation_stop().map_or((), |stop| stop.note_progress());
+      |             +++++++
+
+warning: `higgs-engine` (lib test) generated 8 warnings (run `cargo fix --lib -p higgs-engine --tests` to apply 3 suggestions)
+    Finished `release` profile [optimized] target(s) in 54.99s
+     Running unittests src/lib.rs (/Users/peppi/Dev/higgs/target/release/deps/higgs_engine-b35ede6ed7a3f61e)
+
+running 647 tests
+test batch_engine::tests::abandoned_stale_control_wake_applies_the_latest_requested_revision ... ok
+test batch_engine::tests::acknowledged_shutdown_joins_the_worker_before_returning ... ok
+test batch_engine::tests::batch_session_prefill_omits_generation_suffix_without_changing_default ... ok
+test batch_engine::tests::batch_streaming_drains_to_worker_terminal_after_client_disconnect ... ok
+test batch_engine::tests::batched_path_disabled_with_constraints ... ok
+test batch_engine::tests::batched_path_enabled_when_all_conditions_met ... ok
+test batch_engine::tests::batched_path_requires_model_support ... ok
+test batch_engine::tests::batched_path_requires_multiple_requests ... ok
+test batch_engine::tests::cache_limit_update_is_acknowledged_by_worker_before_returning ... ok
+test batch_engine::tests::capture_vision_capabilities_extracts_vlm_metadata ... ok
+test batch_engine::tests::capture_vision_capabilities_reports_none_for_text_only_model ... ok
+test batch_engine::tests::idle_batch_worker_releases_mlx_gate_and_control_updates_serialize ... ok
+test batch_engine::tests::materialize_decode_step_eos_returns_true ... ok
+test batch_engine::tests::materialize_decode_step_max_tokens_returns_true ... ok
+test batch_engine::tests::materialize_decode_step_normal_token_returns_false ... ok
+test batch_engine::tests::multimodal_batch_request_flows_through_worker_vision_preprocessing ... ok
+test batch_engine::tests::multimodal_prefill_dispatches_to_forward_multimodal_and_skips_cache_store ... ok
+test batch_engine::tests::non_streaming_removal_without_terminal_is_a_typed_failure ... ok
+test batch_engine::tests::prefill_chunk_ranges_cover_each_token_once ... ok
+test batch_engine::tests::request_is_dead_covers_stop_reason_and_closed_channel ... ok
+test batch_engine::tests::saturated_cache_control_queue_yields_instead_of_blocking_runtime ... ok
+test batch_engine::tests::send_prefill_error_carries_message_and_vision_marker ... ok
+test batch_engine::tests::streaming_disconnect_signals_the_worker_stop ... ok
+test batch_engine::tests::sweep_removes_stopped_or_disconnected_requests_and_notes_progress ... ok
+test batch_engine::tests::worker_error_chunk_round_trips_into_engine_error ... ok
+test batch_engine::tests::worker_preprocess_produces_batch_and_expands_markers ... ok
+test batch_engine::tests::worker_preprocess_returns_none_without_images ... ok
+test cache::allocator::tests::test_alloc_exhaustion ... ok
+test cache::allocator::tests::test_alloc_free_roundtrip ... ok
+test cache::allocator::tests::test_alloc_n_is_atomic ... ok
+test cache::allocator::tests::test_alloc_n_succeeds ... ok
+test cache::allocator::tests::test_double_free_errors ... ok
+test cache::allocator::tests::test_invalid_block_id_errors ... ok
+test cache::disk_prefix_cache::tests::block_prefix_hashes_match_legacy_hashes ... ok
+test cache::disk_prefix_cache::tests::deeper_disk_target_never_replaces_or_combines_with_shorter_memory_pair ... ok
+test cache::disk_prefix_cache::tests::disk_cache_restores_into_empty_memory_cache ... ok
+test cache::disk_prefix_cache::tests::disk_prefix_candidates_respect_min_prefix_len ... ok
+test cache::disk_prefix_cache::tests::disk_wrapper_exposes_and_clears_paired_memory_stats ... ok
+test cache::disk_prefix_cache::tests::disk_wrapper_ttl_evicts_only_whole_memory_pairs ... ok
+test cache::disk_prefix_cache::tests::named_checkpoint_validates_prompt_hash ... ok
+test cache::disk_prefix_cache::tests::paired_memory_selection_returns_an_owned_post_lock_plan ... ok
+test cache::disk_prefix_cache::tests::paired_state_is_memory_only_while_ordinary_target_store_survives_reopen ... ok
+test cache::disk_prefix_cache::tests::paired_store_is_available_from_same_process_memory ... ok
+test cache::disk_prefix_cache::tests::same_key_disk_refresh_preserves_the_original_whole_memory_pair ... ok
+test cache::disk_prefix_cache::tests::target_refresh_demotes_pair_even_when_disk_persistence_fails ... ok
+test cache::disk_storage::tests::latest_entry_wins ... ok
+test cache::disk_storage::tests::save_and_load_blocks_roundtrips ... ok
+test cache::paged::tests::test_paged_cache_block_allocation ... ok
+test cache::paged::tests::test_paged_cache_gather ... ok
+test cache::paged::tests::test_paged_cache_out_of_blocks ... ok
+test cache::paged::tests::test_paged_cache_session_lifecycle ... ok
+test cache::pagetable::tests::test_pagetable_has_session ... ok
+test cache::pagetable::tests::test_pagetable_remove_not_found ... ok
+test cache::pagetable::tests::test_pagetable_session_blocks ... ok
+test cache::pagetable::tests::test_pagetable_session_count ... ok
+test cache::paired::tests::consuming_live_reuse_moves_both_caches_together ... ok
+test cache::paired::tests::consuming_live_reuse_rechecks_the_exact_prefix ... ok
+test cache::paired::tests::decode_finish_rejects_a_target_boundary_shorter_than_the_proof ... ok
+test cache::paired::tests::decode_lease_cannot_change_the_expected_tap_count ... ok
+test cache::paired::tests::deterministic_session_tap_mismatch_demotes_the_validated_target ... ok
+test cache::paired::tests::effectful_session_seal_failure_returns_no_publication ... ok
+test cache::paired::tests::exact_prefix_identity_rejects_a_simulated_hash_collision ... ok
+test cache::paired::tests::failed_cache_only_forward_returns_neither_lease_nor_paired_proof ... ok
+test cache::paired::tests::known_advance_callback_receives_the_captured_exact_suffix ... ok
+test cache::paired::tests::known_advance_cannot_change_the_expected_tap_count ... ok
+test cache::paired::tests::known_advance_error_cannot_return_a_publishable_pair ... ok
+test cache::paired::tests::known_prefill_derives_nonzero_boundaries_from_pair_owned_tokens ... ok
+test cache::paired::tests::known_prefill_rejects_a_target_ahead_frontier_before_model_work ... ok
+test cache::paired::tests::known_prefill_rejects_an_empty_suffix_before_model_work ... ok
+test cache::paired::tests::legacy_radix_snapshot_cannot_materialize_a_proven_live_pair ... ok
+test cache::paired::tests::legacy_unproven_pair_cannot_resume_as_live_pair ... ok
+test cache::paired::tests::live_pair_accepts_target_ahead_frontiers_across_tile_boundaries ... ok
+test cache::paired::tests::live_pair_branch_counter_rejects_wraparound ... ok
+test cache::paired::tests::live_pair_direct_seal_consumes_frontier_without_a_publication_label ... ok
+test cache::paired::tests::live_pair_rejects_a_same_length_dflash_half_from_another_branch ... ok
+test cache::paired::tests::live_pair_rejects_a_same_length_frontier_half_from_another_branch ... ok
+test cache::paired::tests::live_pair_rejects_a_same_length_target_half_from_another_branch ... ok
+test cache::paired::tests::live_pair_target_only_checkpoint_does_not_consume_pair ... ok
+test cache::paired::tests::paired_cache_accepts_one_exact_shared_boundary ... ok
+test cache::paired::tests::paired_cache_rejects_drafter_boundary_mismatch ... ok
+test cache::paired::tests::paired_cache_rejects_target_boundary_mismatch ... ok
+test cache::paired::tests::prefix_length_must_fit_the_model_boundary_type ... ok
+test cache::paired::tests::proven_resume_moves_stored_tokens_and_mints_a_fresh_epoch ... ok
+test cache::paired::tests::proven_resume_rejects_a_same_length_different_prefix ... ok
+test cache::paired::tests::radix_checkpoint_owns_the_live_pairs_authoritative_tokens ... ok
+test cache::paired::tests::radix_checkpoint_preparation_failure_preserves_the_continued_pair ... ok
+test cache::paired::tests::radix_checkpoint_rejects_a_same_length_relabel ... ok
+test cache::paired::tests::radix_checkpoint_seal_and_fork_failures_expose_no_checkpoint ... ok
+test cache::paired::tests::radix_snapshot_forks_independent_proven_live_pairs ... ok
+test cache::paired::tests::retained_pair_can_only_be_demoted_by_consuming_the_whole_pair ... ok
+test cache::paired::tests::retained_reuse_moves_a_matching_pair_together ... ok
+test cache::paired::tests::retained_reuse_returns_nonmatching_state_intact ... ok
+test cache::paired::tests::same_length_cross_pair_decode_proof_is_rejected ... ok
+test cache::paired::tests::same_length_different_prefix_does_not_match ... ok
+test cache::paired::tests::same_pair_decode_finish_accepts_the_exact_forwarded_suffix ... ok
+test cache::paired::tests::session_publication_derives_tokens_only_from_the_live_pair ... ok
+test cache::paired::tests::target_only_state_demotes_without_special_cases ... ok
+test cache::paired::tests::visible_eos_is_excluded_before_live_pair_finish_and_session_seal ... ok
+test cache::storage::tests::test_kv_storage_bounds_checking ... ok
+test cache::storage::tests::test_kv_storage_gather_f16 ... ok
+test cache::storage::tests::test_kv_storage_gather_f32 ... ok
+test cache::storage::tests::test_kv_storage_write_read_f16 ... ok
+test cache::storage::tests::test_kv_storage_write_read_f32 ... ok
+test chat_template::tests::apply_delegates_to_apply_with_thinking_false ... ok
+test chat_template::tests::apply_with_thinking_and_tools ... ok
+test chat_template::tests::apply_with_thinking_false_omits_think_tag ... ok
+test chat_template::tests::apply_with_thinking_true_emits_think_tag ... ok
+test chat_template::tests::arguments_coerced_to_empty_object_when_not_mapping ... ok
+test chat_template::tests::normalize_handles_qwen_rebind_to_function ... ok
+test chat_template::tests::normalize_non_object_is_noop ... ok
+test chat_template::tests::normalize_openai_shape_to_qwen_flat ... ok
+test chat_template::tests::normalize_qwen_flat_shape_is_noop ... ok
+test chat_template::tests::normalize_unparseable_string_arguments_coerced_to_empty_object ... ok
+test chat_template::tests::test_apply_empty_messages ... ok
+test chat_template::tests::test_apply_with_assistant_role ... ok
+test chat_template::tests::test_apply_with_tool_calls_field ... ok
+test chat_template::tests::test_apply_with_tools ... ok
+test chat_template::tests::test_apply_without_generation_prompt ... ok
+test chat_template::tests::test_from_model_dir_array_of_templates_falls_back_to_first ... ok
+test chat_template::tests::test_from_model_dir_array_of_templates_uses_default ... ok
+test chat_template::tests::test_from_model_dir_array_template_empty_array_errors ... ok
+test chat_template::tests::test_from_model_dir_fallback_to_tokenizer_config ... ok
+test chat_template::tests::test_from_model_dir_jinja_takes_priority_over_tokenizer_config ... ok
+test chat_template::tests::test_from_model_dir_malformed_tokenizer_config_json ... ok
+test chat_template::tests::test_from_model_dir_no_template_returns_error ... ok
+test chat_template::tests::test_from_model_dir_standalone_jinja_file ... ok
+test chat_template::tests::test_from_model_dir_tokenizer_config_no_chat_template_field ... ok
+test chat_template::tests::test_hf_reverse_message_slice_finds_real_user_query ... ok
+test chat_template::tests::test_hf_reverse_message_slice_still_rejects_missing_user_query ... ok
+test chat_template::tests::test_invalid_template_syntax_returns_error ... ok
+test chat_template::tests::test_raise_exception_function_is_available_but_lazy ... ok
+test chat_template::tests::test_raise_exception_function_returns_template_error ... ok
+test chat_template::tests::test_simple_chatml_template ... ok
+test chat_template::tests::test_template_rendering_error_undefined_variable ... ok
+test chat_template::tests::test_tojson_filter ... ok
+test chat_template::tests::test_tojson_filter_accepts_ensure_ascii_kwarg ... ok
+test chat_template::tests::test_tojson_filter_with_arrays ... ok
+test chat_template::tests::test_tojson_filter_with_nested_objects ... ok
+test chat_template::tests::test_tojson_filter_with_special_characters ... ok
+test chat_template::tests::try_from_model_dir_config_without_template_returns_none ... ok
+test chat_template::tests::try_from_model_dir_empty_directory_returns_none ... ok
+test chat_template::tests::try_from_model_dir_malformed_json_returns_err ... ok
+test chat_template::tests::try_from_model_dir_with_config_template_returns_some ... ok
+test chat_template::tests::try_from_model_dir_with_jinja_returns_some ... ok
+test constrained::tests::apply_mask_allowed_token_beyond_vocab_is_ignored ... ok
+test constrained::tests::apply_mask_no_allowed_tokens_returns_unchanged ... ok
+test constrained::tests::apply_mask_shapes_are_correct ... ok
+test constrained::tests::apply_mask_uses_logit_vocab_dimension ... ok
+test constrained::tests::build_vocabulary_from_tokenizer_succeeds ... ok
+test constrained::tests::constrained_generator_initial_state ... ok
+test constrained::tests::tagged_json_schema_accepts_a_parser_visible_tool_call ... ok
+test decode::token_ledger::tests::boundary_overflow_is_reported_without_exposing_a_key ... ok
+test decode::token_ledger::tests::cache_only_token_enters_paired_proof_only_after_ticket_completion ... ok
+test decode::token_ledger::tests::emitted_eos_is_visible_but_excluded_from_the_cache_key ... ok
+test decode::token_ledger::tests::eos_exclusion_rejects_a_non_eos_pending_token ... ok
+test decode::token_ledger::tests::excluded_eos_is_terminal_for_the_ledger ... ok
+test decode::token_ledger::tests::forward_tickets_are_bound_to_their_originating_ledger ... ok
+test decode::token_ledger::tests::ledger_identity_counter_rejects_wraparound ... ok
+test decode::token_ledger::tests::no_key_can_include_a_pending_or_in_flight_token ... ok
+test decode::token_ledger::tests::only_one_trailing_pending_token_is_permitted ... ok
+test decode::token_ledger::tests::ordinary_ledger_cannot_mint_a_paired_proof ... ok
+test decode::token_ledger::tests::paired_ledger_rejects_unverified_direct_forward_claims ... ok
+test decode::token_ledger::tests::paired_proof_contains_only_the_forwarded_speculative_prefix ... ok
+test decode::token_ledger::tests::paired_proof_excludes_a_terminal_eos ... ok
+test decode::token_ledger::tests::paired_proof_mismatch_consumes_identity_without_returning_a_key ... ok
+test decode::token_ledger::tests::paired_proof_rejects_a_pending_tail ... ok
+test decode::token_ledger::tests::paired_proof_rejects_an_in_flight_tail ... ok
+test decode::token_ledger::tests::pending_non_eos_requires_cache_only_forward_before_retention ... ok
+test decode::token_ledger::tests::speculative_round_atomically_forwards_anchor_and_leaves_one_pending_successor ... ok
+test decode::token_ledger::tests::speculative_round_rejects_an_empty_successor_set_without_publishing_a_boundary ... ok
+test decode::token_ledger::tests::speculative_ticket_is_bound_to_the_exact_pending_anchor ... ok
+test disk_prefix_store::tests::absurd_payload_len_is_a_clean_miss_not_a_panic ... ok
+test disk_prefix_store::tests::eviction_removes_least_recently_touched_file ... ok
+test disk_prefix_store::tests::flipped_byte_in_tensor_payload_is_a_clean_miss ... ok
+test disk_prefix_store::tests::invalid_headers_are_clean_misses ... ok
+test disk_prefix_store::tests::leftover_temporary_file_is_ignored_and_cleaned ... ok
+test disk_prefix_store::tests::longest_stored_prefix_is_selected_deterministically ... ok
+test disk_prefix_store::tests::restart_restores_an_unaligned_prompt_into_the_paged_prefix_cache ... ok
+test disk_prefix_store::tests::round_trip_preserves_dense_kv_arrays ... ok
+test disk_prefix_store::tests::round_trip_preserves_dense_payload ... ok
+test disk_prefix_store::tests::round_trip_preserves_f16_dtype_and_bits ... ok
+test disk_prefix_store::tests::sha256_digest_bytes_and_lowercase_hex_are_stable ... ok
+test engine::tests::generation_output_clone ... ok
+test engine::tests::generation_output_construction_and_field_access ... ok
+test engine::tests::generation_output_debug_format ... ok
+test engine::tests::generation_output_empty_defaults ... ok
+test engine::tests::generation_output_with_logprobs ... ok
+test engine::tests::out_of_order_nested_capture_drop_cannot_restore_stale_state ... ok
+test engine::tests::request_allocation_capture_is_cleared_before_worker_thread_reuse ... ok
+test engine::tests::request_allocation_capture_requires_complete_prefill_and_uses_actual_cache_bytes ... ok
+test engine::tests::streaming_output_clone ... ok
+test engine::tests::streaming_output_debug_format ... ok
+test engine::tests::streaming_output_empty_text_zero_tokens ... ok
+test engine::tests::streaming_output_finished_false ... ok
+test engine::tests::streaming_output_finished_true ... ok
+test error::tests::test_engine_error_display_cancelled ... ok
+test error::tests::test_engine_error_display_generation ... ok
+test error::tests::test_engine_error_display_mlx ... ok
+test error::tests::test_engine_error_display_model ... ok
+test error::tests::test_engine_error_display_template ... ok
+test error::tests::test_engine_error_display_tokenization ... ok
+test error::tests::test_error_message_content_preserved_through_exception_conversion ... ok
+test error::tests::test_error_message_content_preserved_through_model_conversion ... ok
+test error::tests::test_from_exception_to_engine_error ... ok
+test error::tests::test_from_model_error_to_engine_error ... ok
+test mlx_tuning::tests::engine_memory_cost_rejects_overflow_and_out_of_domain_prefill ... ok
+test mlx_tuning::tests::engine_memory_cost_rejects_zero_cache_geometry ... ok
+test mlx_tuning::tests::escha_memory_geometry_is_20480_dense_kv_bytes_per_token ... ok
+test mlx_tuning::tests::memory_snapshot_normalizes_zero_mlx_limit ... ok
+test mlx_tuning::tests::memory_snapshot_preserves_allocator_and_working_set_measurements ... ok
+test mlx_tuning::tests::memory_snapshot_propagates_each_raw_query_failure ... ok
+test mlx_tuning::tests::memory_snapshot_rejects_each_u64_conversion_overflow ... ok
+test mlx_tuning::tests::model_load_estimate_accepts_hf_style_file_symlink ... ok
+test mlx_tuning::tests::model_load_estimate_bonsai_uses_actual_consolidated_file ... ok
+test mlx_tuning::tests::model_load_estimate_gemma_text_charges_full_artifact_workspace ... ok
+test mlx_tuning::tests::model_load_estimate_overflow_fails_closed ... ok
+test mlx_tuning::tests::model_load_estimate_q1_wrong_group_uses_generic_index_files ... ok
+test mlx_tuning::tests::model_load_estimate_rejects_corrupt_artifact ... ok
+test mlx_tuning::tests::model_load_estimate_rejects_index_missing_mandatory_metadata ... ok
+test mlx_tuning::tests::model_load_estimate_rejects_non_string_safetensors_metadata ... ok
+test mlx_tuning::tests::model_load_estimate_rejects_oversized_declared_header_before_allocation ... ok
+test mlx_tuning::tests::model_load_estimate_rejects_structurally_invalid_safetensors ... ok
+test mlx_tuning::tests::model_load_estimate_rejects_unsafe_index_path_even_with_unrelated_weights ... ok
+test mlx_tuning::tests::model_load_estimate_standard_uses_largest_shard ... ok
+test mlx_tuning::tests::model_load_estimate_uses_nonstandard_indexed_weight_filename ... ok
+test mlx_tuning::tests::model_load_estimate_vlm_charges_full_artifact_workspace ... ok
+test mlx_tuning::tests::model_load_estimate_vlm_escha_uses_native_resident_and_one_shard ... ok
+test mlx_tuning::tests::model_memory_footprint_counts_symlinked_safetensors_file ... ok
+test mlx_tuning::tests::model_memory_footprint_fails_closed_on_artifact_io_errors ... ok
+test mlx_tuning::tests::model_memory_footprint_fails_closed_on_directory_symlink ... ok
+test mlx_tuning::tests::model_memory_footprint_rejects_artifact_sum_overflow ... ok
+test mlx_tuning::tests::model_memory_footprint_uses_artifact_bytes_and_checked_active_delta ... ok
+test mlx_tuning::tests::native_escha_estimate_fallback_charges_artifact_plus_workspace ... ok
+test mlx_tuning::tests::nested_request_memory_sample_invalidates_outer_window ... ok
+test mlx_tuning::tests::reacquiring_mlx_gate_invalidates_old_sample_window ... ok
+test mlx_tuning::tests::request_memory_sampler_allows_sequential_phases_on_one_gate ... ok
+test mlx_tuning::tests::request_memory_sampler_propagates_reset_failure ... ok
+test mlx_tuning::tests::request_memory_sampler_records_content_free_prefill_high_water ... ok
+test mlx_tuning::tests::request_memory_sampler_records_decode_and_never_understates_baseline ... ok
+test mlx_tuning::tests::runtime_native_escha_charges_fp32_cache_and_allocation_slack ... ok
+test mlx_tuning::tests::test_auto_profile_resolves_to_balanced_for_small_models ... ok
+test mlx_tuning::tests::test_auto_profile_resolves_to_throughput_for_large_models ... ok
+test mlx_tuning::tests::test_default_mtp_draft_depth_uses_two_only_for_huge_models ... ok
+test mlx_tuning::tests::test_from_model_dir_defaults_when_config_and_weights_missing ... ok
+test mlx_tuning::tests::test_from_model_dir_handles_unreadable_config_gracefully ... ok
+test mlx_tuning::tests::test_from_model_dir_reads_config_and_resolves_large_auto_to_throughput ... ok
+test mlx_tuning::tests::test_model_weight_bytes_follows_hf_snapshot_symlinks ... ok
+test mlx_tuning::tests::test_paged_kv_target_respects_configured_working_set_cap ... ok
+test mlx_tuning::tests::test_parse_enabled_flag_ignores_unknown_values ... ok
+test mlx_tuning::tests::test_parse_mtp_draft_n_max_clamps_invalid_and_large_values ... ok
+test mlx_tuning::tests::test_parse_positive_chunked_prefill_value_defaults_on_invalid_input ... ok
+test mlx_tuning::tests::test_qwen35_low_bit_affine_clears_prefill_allocator_cache_by_default ... ok
+test mlx_tuning::tests::test_requested_profile_env_aliases_parse ... ok
+test mlx_tuning::tests::test_requested_profile_invalid_env_fails ... ok
+test mlx_tuning::tests::test_resolve_effective_profile_auto_classification_via_model_fixture ... ok
+test mlx_tuning::tests::test_resolve_runtime_tuning_applies_requested_latency_profile ... ok
+test mlx_tuning::tests::unknown_loader_uses_fail_closed_double_artifact_workspace ... ok
+test model_loader::tests::is_bonsai_q1_requires_qwen3_model_type_and_group_size ... ok
+test model_loader::tests::load_model_routes_bonsai_q1_to_packed_engine ... ok
+test model_loader::tests::load_tokenizer_missing_tokenizer_json ... ok
+test model_loader::tests::model_config_from_dir_deepseek_v2 ... ok
+test model_loader::tests::model_config_from_dir_gemma2 ... ok
+test model_loader::tests::model_config_from_dir_gemma3 ... ok
+test model_loader::tests::model_config_from_dir_gemma3_text ... ok
+test model_loader::tests::model_config_from_dir_gemma4 ... ok
+test model_loader::tests::model_config_from_dir_gemma4_text ... ok
+test model_loader::tests::model_config_from_dir_invalid_json ... ok
+test model_loader::tests::model_config_from_dir_llama ... ok
+test model_loader::tests::model_config_from_dir_missing_config_json ... ok
+test model_loader::tests::model_config_from_dir_missing_model_type_field ... ok
+test model_loader::tests::model_config_from_dir_mistral ... ok
+test model_loader::tests::model_config_from_dir_nanbeige ... ok
+test model_loader::tests::model_config_from_dir_phi3 ... ok
+test model_loader::tests::model_config_from_dir_qwen2 ... ok
+test model_loader::tests::model_config_from_dir_qwen3 ... ok
+test model_loader::tests::model_config_from_dir_qwen3_5 ... ok
+test model_loader::tests::model_config_from_dir_qwen3_5_moe ... ok
+test model_loader::tests::model_config_from_dir_qwen3_moe ... ok
+test model_loader::tests::model_config_from_dir_qwen3_next ... ok
+test model_loader::tests::model_config_from_dir_starcoder2 ... ok
+test model_loader::tests::model_config_from_dir_unsupported_model_type ... ok
+test mtp::tests::accepted_draft_prefix_len_accepts_full_prefix ... ok
+test mtp::tests::accepted_draft_prefix_len_stops_at_first_mismatch ... ok
+test mtp::tests::adaptive_draft_depth_grows_on_full_acceptance_and_backs_off_on_rejection ... ok
+test mtp::tests::bench_production_mtp_cycle_real_model ... ignored, requires model files on disk
+test mtp::tests::benchmark_model_path_allows_an_absent_default_path ... ok
+test mtp::tests::benchmark_model_path_rejects_an_invalid_explicit_path ... ok
+test mtp::tests::benchmark_token_accounting_includes_warmup_in_whole_trajectory_only ... ok
+test mtp::tests::draft_match_helper_accepts_identical_tokens ... ok
+test mtp::tests::draft_match_helper_rejects_different_tokens ... ok
+test mtp::tests::emitted_token_digest_is_stable ... ok
+test mtp::tests::emitted_tokens_includes_confirmed_and_accepted_drafts ... ok
+test mtp::tests::mtp_stats_tracks_explicit_accepted_draft_count ... ok
+test mtp::tests::prompt_lookup_caps_drafts ... ok
+test mtp::tests::prompt_lookup_drafts_from_longest_prior_suffix_match ... ok
+test mtp::tests::prompt_lookup_ignores_current_tail_self_match ... ok
+test mtp::tests::prompt_lookup_respects_search_window ... ok
+test paged_prefix_cache::tests::byte_budget_charges_cloned_endpoint_payload ... ok
+test paged_prefix_cache::tests::byte_budget_charges_paged_hybrid_gdn_payload ... ok
+test paged_prefix_cache::tests::byte_budget_charges_paired_dflash_sidecar ... ok
+test paged_prefix_cache::tests::clear_rejects_stale_prepared_pair_and_stale_lookup_touch ... ok
+test paged_prefix_cache::tests::cloned_target_materialization_failure_returns_a_cache_miss ... ok
+test paged_prefix_cache::tests::concurrent_owned_forks_advance_without_cross_commit ... ok
+test paged_prefix_cache::tests::dense_cache_longer_than_stripped_key_pages_to_key_floor ... ok
+test paged_prefix_cache::tests::dense_paired_store_uses_the_existing_block_aligned_target_path ... ok
+test paged_prefix_cache::tests::failed_materialization_does_not_refresh_paired_lru ... ok
+test paged_prefix_cache::tests::failed_paired_preparation_leaves_populated_trie_and_stats_unchanged ... ok
+test paged_prefix_cache::tests::first_competing_prepared_pair_commit_wins_the_revision ... ok
+test paged_prefix_cache::tests::fuzz_radix_random_ops_reconstruct_and_stay_bounded ... ok
+test paged_prefix_cache::tests::hybrid_block_aligned_store_pages_and_round_trips_byte_identical ... ok
+test paged_prefix_cache::tests::hybrid_misaligned_store_falls_back_to_cloned_and_round_trips_byte_identical ... ok
+test paged_prefix_cache::tests::hybrid_mismatched_gdn_offset_falls_back_to_cloned ... ok
+test paged_prefix_cache::tests::hybrid_overlapping_prefixes_share_kv_blocks ... ok
+test paged_prefix_cache::tests::hybrid_partial_edge_match_never_materializes ... ok
+test paged_prefix_cache::tests::hybrid_store_skips_clone_when_cache_offset_exceeds_key_len ... ok
+test paged_prefix_cache::tests::hybrid_store_succeeds_when_boundary_matches ... ok
+test paged_prefix_cache::tests::live_hybrid_tail_mutation_cannot_change_frozen_paired_target ... ok
+test paged_prefix_cache::tests::live_zero_limit_disables_and_nonzero_restores_configured_count ... ok
+test paged_prefix_cache::tests::lru_eviction_and_clear_drop_whole_paired_endpoints ... ok
+test paged_prefix_cache::tests::mid_block_split_then_target_refresh_demotes_pair ... ok
+test paged_prefix_cache::tests::non_block_aligned_target_refresh_replaces_the_same_floored_pair_boundary ... ok
+test paged_prefix_cache::tests::paired_lookup_forks_independent_live_dflash_branches ... ok
+test paged_prefix_cache::tests::paired_lookup_never_uses_partial_edge_match ... ok
+test paged_prefix_cache::tests::paired_lookup_selection_is_owned_and_mlx_free ... ok
+test paged_prefix_cache::tests::paired_lookup_selects_deepest_qualifying_exact_endpoint ... ok
+test paged_prefix_cache::tests::paired_prepare_and_commit_separate_mlx_from_trie_mutation ... ok
+test paged_prefix_cache::tests::paired_prepare_ticket_is_branded_to_one_cache_instance ... ok
+test paged_prefix_cache::tests::paired_prepare_ticket_uses_its_captured_block_layout_for_dense_boundaries ... ok
+test paged_prefix_cache::tests::paired_radix_cap_evicts_oldest_pair_and_memory_plateaus ... ok
+test paged_prefix_cache::tests::paired_radix_ttl_evicts_whole_endpoint_and_invalidates_prepared_publication ... ok
+test paged_prefix_cache::tests::paired_stats_clear_to_zero ... ok
+test paged_prefix_cache::tests::paired_store_rejects_snapshot_boundary_different_from_prepared_boundary ... ok
+test paged_prefix_cache::tests::paired_touch_token_cannot_refresh_another_cache_instance ... ok
+test paged_prefix_cache::tests::paired_ttl_prunes_exact_endpoint_without_damaging_shared_target_descendant ... ok
+test paged_prefix_cache::tests::production_checkpoint_derives_identity_and_returns_one_proven_live_pair ... ok
+test paged_prefix_cache::tests::production_checkpoint_rejects_paged_floor_relabelling ... ok
+test paged_prefix_cache::tests::proven_radix_snapshot_forks_independent_live_pairs ... ok
+test paged_prefix_cache::tests::radix_blocks_reconstruct_serialized_across_threads ... ok
+test paged_prefix_cache::tests::radix_byte_stats_expose_block_sharing ... ok
+test paged_prefix_cache::tests::successful_paired_touch_renews_ttl_without_reviving_an_idle_peer ... ok
+test paged_prefix_cache::tests::target_only_refresh_demotes_same_key_pair ... ok
+test paged_prefix_cache::tests::target_refresh_rejects_a_prepared_pair_from_an_earlier_revision ... ok
+test paged_prefix_cache::tests::test_block_aligned_prefix_len ... ok
+test paged_prefix_cache::tests::test_clear ... ok
+test paged_prefix_cache::tests::test_deepest_match_mid_block_divergence ... ok
+test paged_prefix_cache::tests::test_empty_cache_returns_none ... ok
+test paged_prefix_cache::tests::test_eviction_frees_only_unshared_blocks ... ok
+test paged_prefix_cache::tests::test_extension_reuses_shared_block_arcs ... ok
+test paged_prefix_cache::tests::test_from_arrays_enables_decode ... ok
+test paged_prefix_cache::tests::test_hybrid_cache_roundtrip ... ok
+test paged_prefix_cache::tests::test_longest_prefix_wins ... ok
+test paged_prefix_cache::tests::test_lru_eviction ... ok
+test paged_prefix_cache::tests::test_materialize_correct_shapes ... ok
+test paged_prefix_cache::tests::test_overwrite_same_prefix ... ok
+test paged_prefix_cache::tests::test_prefix_shorter_than_block_ignored ... ok
+test paged_prefix_cache::tests::test_shared_block_reconstruction_byte_identical ... ok
+test paged_prefix_cache::tests::test_shared_prefix_dedups_blocks ... ok
+test paged_prefix_cache::tests::test_shared_prefix_partial_match ... ok
+test paged_prefix_cache::tests::test_size_aware_eviction_disabled_by_default ... ok
+test paged_prefix_cache::tests::test_size_aware_eviction_under_budget ... ok
+test paged_prefix_cache::tests::test_store_and_find_exact_match ... ok
+test paged_prefix_cache::tests::test_zero_capacity_never_stores ... ok
+test paged_prefix_cache::tests::unchanged_capacity_sample_preserves_a_prepared_pair_revision ... ok
+test paged_prefix_cache::tests::unrelated_publication_does_not_invalidate_a_materialized_pair_touch ... ok
+test prompt_cache::tests::live_zero_limit_disables_only_this_cache_and_nonzero_restores_it ... ok
+test prompt_cache::tests::test_clear ... ok
+test prompt_cache::tests::test_collision_guard_skips_different_tokens_same_hash ... ok
+test prompt_cache::tests::test_diverging_prefixes_both_stored ... ok
+test prompt_cache::tests::test_edge_split_preserves_existing_cache ... ok
+test prompt_cache::tests::test_empty_cache_returns_none ... ok
+test prompt_cache::tests::test_eviction_only_when_new_key ... ok
+test prompt_cache::tests::test_find_longest_prefix_exactly_at_minimum_length ... ok
+test prompt_cache::tests::test_find_longest_prefix_just_under_minimum_length ... ok
+test prompt_cache::tests::test_len_and_is_empty_after_operations ... ok
+test prompt_cache::tests::test_longest_prefix_wins ... ok
+test prompt_cache::tests::test_lru_eviction ... ok
+test prompt_cache::tests::test_multiple_overlapping_prefixes_correct_longest ... ok
+test prompt_cache::tests::test_no_budget_keeps_all_entries ... ok
+test prompt_cache::tests::test_no_match_for_different_prefix ... ok
+test prompt_cache::tests::test_overwrite_and_clear_keep_byte_ledger_coherent ... ok
+test prompt_cache::tests::test_overwrite_does_not_trigger_eviction ... ok
+test prompt_cache::tests::test_prefix_too_short_ignored ... ok
+test prompt_cache::tests::test_shared_prefix_partial_match ... ok
+test prompt_cache::tests::test_size_aware_eviction_drops_lru_over_budget ... ok
+test prompt_cache::tests::test_store_and_find_exact_match ... ok
+test prompt_cache::tests::test_store_same_tokens_overwrites ... ok
+test prompt_cache::tests::test_zero_capacity_never_stores ... ok
+test prune::tests::below_budget_is_noop ... ok
+test prune::tests::disabled_never_prunes ... ok
+test prune::tests::prunes_oldest_nonsink_to_budget ... ok
+test prune::tests::respects_min_window_floor ... ok
+test prune::tests::structural_noop_when_under_target ... ok
+test prune::tests::structural_skips_protected_facts ... ok
+test prune::tests::structural_spills_across_protected_runs ... ok
+test prune_eval::tests::extract_number_carries_state ... ok
+test prune_eval::tests::grade_numeric_formats ... ok
+test prune_eval::tests::grade_picks_answer_region_over_scratch ... ok
+test prune_eval::tests::grade_word_answers ... ok
+test prune_eval::tests::problem_set_is_diverse_and_sized ... ok
+test reasoning_parser::tests::empty_think_block ... ok
+test reasoning_parser::tests::multiple_thinking_blocks ... ok
+test reasoning_parser::tests::no_thinking_tags ... ok
+test reasoning_parser::tests::only_think_block_no_visible ... ok
+test reasoning_parser::tests::simple_thinking_block ... ok
+test reasoning_parser::tests::streaming_tracker_basic ... ok
+test reasoning_parser::tests::streaming_tracker_double_close_does_not_leak ... ok
+test reasoning_parser::tests::streaming_tracker_flush_while_thinking ... ok
+test reasoning_parser::tests::streaming_tracker_new_inside_think ... ok
+test reasoning_parser::tests::streaming_tracker_no_thinking ... ok
+test reasoning_parser::tests::thinking_with_text_before_and_after ... ok
+test reasoning_parser::tests::unclosed_think_tag ... ok
+test runtime_identity::tests::escha_identity_describes_the_executing_kernel_default ... ok
+test runtime_identity::tests::identity_serializes_the_typed_selection_without_auto_placeholders ... ok
+test scheduler::round_robin::tests::test_round_robin_rotates ... ok
+test scheduler::round_robin::tests::test_scheduler_add_duplicate ... ok
+test scheduler::round_robin::tests::test_scheduler_empty_next ... ok
+test scheduler::round_robin::tests::test_scheduler_is_empty ... ok
+test scheduler::round_robin::tests::test_scheduler_remove_works ... ok
+test scheduler::round_robin::tests::test_scheduler_sessions ... ok
+test simple::tests::accepted_required_stream_survives_concurrent_session_deletion ... ok
+test simple::tests::active_lease_survives_idle_until_expiry_and_expiry_is_reported ... ok
+test simple::tests::adaptive_draft_depth_respects_configured_cap ... ok
+test simple::tests::admission_reclamation_evicts_only_unleased_retained_entries ... ok
+test simple::tests::blocking_required_one_token_prefill_rejects_post_admission_hard_eviction ... ok
+test simple::tests::blocking_required_one_token_prefill_uses_retained_zero_prefix ... ok
+test simple::tests::boundary_delta_accepts_equivalent_tool_call_replay ... ok
+test simple::tests::boundary_delta_accepts_literal_im_end_in_covered_user_content ... ok
+test simple::tests::boundary_delta_accepts_literal_im_end_in_new_tool_result ... ok
+test simple::tests::boundary_delta_rejects_late_system_prompt_mutation ... ok
+test simple::tests::boundary_delta_rejects_mutated_first_message ... ok
+test simple::tests::boundary_delta_rejects_mutated_middle_message ... ok
+test simple::tests::boundary_delta_rejects_non_assistant_role_mismatch ... ok
+test simple::tests::boundary_delta_rejects_partial_non_assistant_boundary ... ok
+test simple::tests::boundary_delta_rejects_render_with_fewer_messages ... ok
+test simple::tests::boundary_delta_rejects_template_marker_inside_message_content ... ok
+test simple::tests::boundary_delta_skips_closer_when_retained_has_it ... ok
+test simple::tests::boundary_delta_splices_after_covered_messages ... ok
+test simple::tests::boundary_delta_treats_closed_assistant_segments_as_retained_truth ... ok
+test simple::tests::boundary_delta_treats_generated_assistant_as_retained_source_of_truth ... ok
+test simple::tests::boundary_delta_uses_second_of_adjacent_im_end_markers ... ok
+test simple::tests::cache_bypass_disables_prefix_cache ... ok
+test simple::tests::cache_memory_residency_uses_retained_and_radix_estimates_with_checked_total ... ok
+test simple::tests::canonical_driver_never_commits_after_backend_validation_failure ... ok
+test simple::tests::canonical_round_can_only_replace_its_final_pending_successor ... ok
+test simple::tests::canonical_round_commit_is_shared_by_stateless_and_session_outputs ... ok
+test simple::tests::canonical_round_splits_frontier_before_output_publication ... ok
+test simple::tests::capacity_limit_decrease_evicts_unleased_before_preserving_live_leases ... ok
+test simple::tests::cold_long_session_with_pflash_uses_degraded_bootstrap ... ok
+test simple::tests::cold_long_session_without_pflash_bootstraps_exact_retained_cache ... ok
+test simple::tests::cold_short_session_still_seeds_retained_cache ... ok
+test simple::tests::constrained_load_policy_suppresses_explicit_and_environment_dflash ... ok
+test simple::tests::continuation_prior_len_guard ... ok
+test simple::tests::continued_dspark_retry_is_forbidden_after_stream_output ... ok
+test simple::tests::continued_generation_exposes_request_scoped_thinking_control ... ok
+test simple::tests::continued_generation_honors_zero_token_budget_without_sampling ... ok
+test simple::tests::critical_capacity_policy_explicitly_evicts_active_retained_leases ... ok
+test simple::tests::detect_thinking_from_model_type ... ok
+test simple::tests::detect_thinking_from_template_marker ... ok
+test simple::tests::dflash_accepts_pflash_plan_only_when_sparse_taps_were_captured ... ok
+test simple::tests::dflash_entropy_sweep ... ignored, loads real DFlash target + drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR
+test simple::tests::dflash_matches_ar_greedy_and_reports_accept_len ... ignored, loads real Bonsai target + full-Q4 dSpark drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR
+test simple::tests::dflash_prefill_outcome_accepts_sparse_resident_boundary ... ok
+test simple::tests::dflash_streaming_matches_nonstreaming ... ignored, loads real DFlash target + drafter; set HIGGS_DFLASH_TARGET_DIR + HIGGS_DFLASH_DRAFTER_DIR
+test simple::tests::dspark_accept_fraction_excludes_correction_or_bonus_token ... ok
+test simple::tests::dspark_canonical_stops_before_advancing_past_natural_think_close ... ok
+test simple::tests::dspark_metric_commit_counts_warm_success_once_and_ignores_cold_retry ... ok
+test simple::tests::dspark_radix_partition_rejects_a_full_hit_without_generation_tail ... ok
+test simple::tests::dspark_radix_partition_uses_the_request_specific_generation_suffix ... ok
+test simple::tests::dspark_resolves_target_barrier_before_proposal_host_read ... ok
+test simple::tests::dspark_stop_boundary_detects_only_newly_completed_stops ... ok
+test simple::tests::dspark_tail_cap_never_verifies_unemittable_rows ... ok
+test simple::tests::dspark_verify_mode_fails_closed ... ok
+test simple::tests::empty_generation_does_not_delete_same_session_or_lease ... ok
+test simple::tests::exact_token_prompt_extension_bypasses_text_splice ... ok
+test simple::tests::extract_eos_tokens_adds_gemma_end_of_turn ... ok
+test simple::tests::extract_eos_tokens_harvests_eos_token_field ... ok
+test simple::tests::extract_eos_tokens_non_gemma_ignores_end_of_turn ... ok
+test simple::tests::extract_eos_tokens_scans_added_tokens_for_eos_signature ... ok
+test simple::tests::extract_eos_tokens_unions_generation_config ... ok
+test simple::tests::find_stop_in_tail_earliest_of_multiple ... ok
+test simple::tests::find_stop_in_tail_empty_stops_returns_none ... ok
+test simple::tests::find_stop_in_tail_finds_stop_in_new_text ... ok
+test simple::tests::find_stop_in_tail_finds_stop_spanning_boundary ... ok
+test simple::tests::find_stop_in_tail_first_token_prefix_and_stop ... ok
+test simple::tests::find_stop_in_tail_handles_multibyte_boundary ... ok
+test simple::tests::find_stop_in_tail_ignores_stop_fully_in_old_text ... ok
+test simple::tests::hard_limits_evict_unleased_then_earliest_expiring_lease ... ok
+test simple::tests::hybrid_checkpoint_boundary_skips_short_unaligned_bodies ... ok
+test simple::tests::idle_eviction_preserves_an_active_session_fallback ... ok
+test simple::tests::image_request_disables_mtp ... ok
+test simple::tests::incremental_detok_emits_per_token_diffs ... ok
+test simple::tests::incremental_detok_first_token_partial_utf8_held_back ... ok
+test simple::tests::incremental_detok_flush_emits_pending ... ok
+test simple::tests::incremental_detok_flush_without_pending_is_empty ... ok
+test simple::tests::lease_confirms_existing_session_and_explicit_deletion_wins ... ok
+test simple::tests::mtp_allowed_keeps_existing_preconditions ... ok
+test simple::tests::no_thinking_for_plain_llama ... ok
+test simple::tests::normal_capacity_decrease_breaks_only_the_minimum_leases_when_required ... ok
+test simple::tests::numeric_runtime_knobs_use_exact_untrimmed_parsing ... ok
+test simple::tests::one_token_prefill_publishes_zero_prefix_without_breaking_lease ... ok
+test simple::tests::optional_model_gate_rechecks_pressure_before_construction ... ok
+test simple::tests::optional_prefill_capacity_error_is_not_fallback_eligible ... ok
+test simple::tests::oversized_prompt_checkpoint_preserves_prior_retained_boundary ... ok
+test simple::tests::oversized_retention_drop_reports_actual_bytes_tokens_and_live_ceiling ... ok
+test simple::tests::paired_retention_does_not_inherit_target_only_cap_exemption ... ok
+test simple::tests::paired_session_bytes_plateau_at_count_cap_plus_one ... ok
+test simple::tests::paired_session_ttl_evicts_the_whole_pair ... ok
+test simple::tests::penalties_disable_stateless_mtp_family_but_not_session_mtp ... ok
+test simple::tests::pflash_actual_keep_ratio_handles_empty_sources ... ok
+test simple::tests::pflash_auto_executes_only_when_survivor_ratio_is_low ... ok
+test simple::tests::pflash_cache_source_boundary_accepts_empty_tail ... ok
+test simple::tests::pflash_cache_source_prefers_rendered_body_boundary ... ok
+test simple::tests::pflash_cache_source_strips_request_generation_suffix ... ok
+test simple::tests::pflash_full_score_budget_only_limits_full_scorer ... ok
+test simple::tests::pflash_large_full_prompt_uses_scoreless_recency_fallback ... ok
+test simple::tests::pflash_load_settings_reject_unsafe_raw_constructor_values ... ok
+test simple::tests::pflash_lossy_plan_routes_to_dspark_only_on_sparse_tap_path ... ok
+test simple::tests::pflash_plan_cache_prunes_superseded_linear_prefix ... ok
+test simple::tests::pflash_plan_cache_rejects_config_mismatch ... ok
+test simple::tests::pflash_plan_cache_returns_longest_matching_prefix ... ok
+test simple::tests::pflash_real_user_query_ignores_wrapped_tool_responses ... ok
+test simple::tests::prefill_only_metrics_use_retained_run_prompt_length ... ok
+test simple::tests::public_load_with_dflash_rejects_invalid_pflash_before_model_io ... ok
+test simple::tests::required_continuation_miss_returns_before_cold_prefill ... ok
+test simple::tests::required_one_token_prefill_accepts_only_existing_zero_prefix ... ok
+test simple::tests::required_one_token_prefill_materialization_failure_is_never_accepted ... ok
+test simple::tests::required_one_token_prefill_rejects_hard_evicted_zero_prefix_without_mutation ... ok
+test simple::tests::required_prefill_accepts_already_retained_run_boundary ... ok
+test simple::tests::required_stream_reports_rejection_before_generation ... ok
+test simple::tests::retained_byte_limit_evicts_and_rejects_oversized_entries ... ok
+test simple::tests::retained_kv_stays_dense_below_both_exactness_boundaries ... ok
+test simple::tests::retained_prompt_continuation_keeps_new_tool_result ... ok
+test simple::tests::retained_state_total_bytes_cover_target_only_and_paired_state ... ok
+test simple::tests::retention_caps_bound_the_retained_map ... ok
+test simple::tests::session_dspark_decode_state_keeps_visible_eos_out_of_the_pair_boundary ... ok
+test simple::tests::session_prefill_boundary_reuses_canonical_expansion_without_sampling ... ok
+test simple::tests::session_prefill_prompt_omits_only_generation_suffix ... ok
+test simple::tests::session_prompt_metrics_distinguish_pflash_from_exact_bootstrap ... ok
+test simple::tests::session_prompt_trace_reports_boundary_splice_and_tool_payload ... ok
+test simple::tests::session_prompt_trace_reports_prefix_mismatch ... ok
+test simple::tests::session_speculation_eligibility_keeps_dspark_independent_of_mtp ... ok
+test simple::tests::simple_engine_drop_retained_session_reports_and_clears ... ok
+test simple::tests::simple_engine_drop_retained_session_waits_for_session_lock ... ok
+test simple::tests::simple_engine_fork_paired_continuable_keeps_target_only_state_for_cold_prefill ... ok
+test simple::tests::simple_engine_fork_paired_continuable_preserves_retained_session ... ok
+test simple::tests::simple_engine_fork_target_continuable_drops_diverged_retained_session ... ok
+test simple::tests::simple_engine_fork_target_continuable_preserves_retained_session ... ok
+test simple::tests::simple_engine_session_effectful_seal_failure_preserves_prior_retained_pair ... ok
+test simple::tests::skip_ids_strip_control_but_keep_content_special_tokens ... ok
+test simple::tests::speculation_route_truth_table_is_exhaustive ... ok
+test simple::tests::stateless_zero_token_budget_is_tokenize_only ... ok
+test simple::tests::streaming_prefill_boundary_preserves_external_stops_and_disconnects ... ok
+test simple::tests::streaming_prefill_cancellation_without_recorded_reason_is_cancelled ... ok
+test simple::tests::streaming_prefill_error_mapper_does_not_mask_unrelated_mlx_error ... ok
+test simple::tests::streaming_prefill_mlx_cancellation_recovers_typed_pressure_reason ... ok
+test simple::tests::streaming_prefill_progress_renews_watchdog ... ok
+test simple::tests::streaming_prefill_stall_still_fires_watchdog ... ok
+test simple::tests::target_qwen_canonical_prefill_never_invokes_generated_replay_rendering ... ignored, requires HIGGS_MODEL_PATH tokenizer/template; does not load model weights
+test simple::tests::test_derive_model_name_hf_cache_no_org ... ok
+test simple::tests::test_derive_model_name_hf_cache_path ... ok
+test simple::tests::test_derive_model_name_plain_directory ... ok
+test simple::tests::test_derive_model_name_relative_path ... ok
+test simple::tests::test_empty_stop_sequences_list ... ok
+test simple::tests::test_empty_text ... ok
+test simple::tests::test_estimate_paged_kv_blocks_clamps_to_maximum ... ok
+test simple::tests::test_estimate_paged_kv_blocks_clamps_to_minimum ... ok
+test simple::tests::test_estimate_paged_kv_blocks_scales_with_geometry ... ok
+test simple::tests::test_extract_eos_tokens_array ... ok
+test simple::tests::test_extract_eos_tokens_empty_array ... ok
+test simple::tests::test_extract_eos_tokens_float_value ... ok
+test simple::tests::test_extract_eos_tokens_missing_config_file ... ok
+test simple::tests::test_extract_eos_tokens_missing_field ... ok
+test simple::tests::test_extract_eos_tokens_mixed_types_in_array ... ok
+test simple::tests::test_extract_eos_tokens_negative_number ... ok
+test simple::tests::test_extract_eos_tokens_nested_array ... ok
+test simple::tests::test_extract_eos_tokens_single_number ... ok
+test simple::tests::test_extract_eos_tokens_string_value ... ok
+test simple::tests::test_extract_eos_tokens_unexpected_type ... ok
+test simple::tests::test_extract_eos_tokens_very_large_number ... ok
+test simple::tests::test_multiple_stop_sequences_earliest_wins ... ok
+test simple::tests::test_multiple_stop_sequences_earliest_wins_reverse_order ... ok
+test simple::tests::test_no_stop_sequence_match ... ok
+test simple::tests::test_overlapping_stop_sequences_prefix ... ok
+test simple::tests::test_parse_enabled_flag_accepts_common_truthy_values ... ok
+test simple::tests::test_single_stop_sequence_found ... ok
+test simple::tests::test_stop_sequence_appears_multiple_times ... ok
+test simple::tests::test_stop_sequence_at_beginning ... ok
+test simple::tests::test_stop_sequence_at_end ... ok
+test simple::tests::test_stop_sequence_is_entire_text ... ok
+test simple::tests::test_stop_sequence_substring_of_another ... ok
+test simple::tests::test_stop_sequence_unicode ... ok
+test simple::tests::test_stop_sequence_unicode_multibyte ... ok
+test simple::tests::test_stop_sequence_very_long_text_short_stop ... ok
+test simple::tests::test_stop_sequence_with_newlines ... ok
+test simple::tests::test_with_chat_terminator ... ok
+test simple::tests::warm_session_with_diverged_candidate_bootstraps_exact_retained_cache ... ok
+test simple::tests::warm_session_with_large_suffix_bootstraps_exact_retained_cache ... ok
+test simple::tests::warm_session_with_not_growing_candidate_bootstraps_exact_retained_cache ... ok
+test simple::tests::warm_session_with_small_exact_suffix_continues ... ok
+test stop::tests::first_external_reason_wins ... ok
+test stop::tests::stop_reason_is_visible_across_threads ... ok
+test stop::tests::thread_local_is_scoped_by_the_guard ... ok
+test stop::tests::watchdog_trips_only_without_progress ... ok
+test stop::tests::zero_watchdog_disables_the_check ... ok
+test tool_parser::tests::minicpm_cdata_value_with_literal_close_tag ... ok
+test tool_parser::tests::minicpm_function_without_name_is_not_parsed ... ok
+test tool_parser::tests::minicpm_multiple_calls_with_text ... ok
+test tool_parser::tests::minicpm_no_param_function ... ok
+test tool_parser::tests::minicpm_schema_driven_coercion ... ok
+test tool_parser::tests::minicpm_single_call_one_param ... ok
+test tool_parser::tests::mixed_json_and_xml_tool_calls_both_parse ... ok
+test tool_parser::tests::streaming_inactive_is_passthrough ... ok
+test tool_parser::tests::streaming_invalid_json_preserved_as_visible ... ok
+test tool_parser::tests::streaming_minicpm_split_across_chunks ... ok
+test tool_parser::tests::streaming_multiple_calls_with_text_between ... ok
+test tool_parser::tests::streaming_single_call_one_chunk ... ok
+test tool_parser::tests::streaming_tag_split_across_chunks ... ok
+test tool_parser::tests::streaming_text_before_and_after ... ok
+test tool_parser::tests::streaming_unbounded_buffer_capped_and_recovers ... ok
+test tool_parser::tests::streaming_unclosed_tag_flushed_as_visible ... ok
+test tool_parser::tests::streaming_utf8_char_boundary_safety ... ok
+test tool_parser::tests::streaming_xml_split_across_chunks ... ok
+test tool_parser::tests::test_arguments_as_json_array ... ok
+test tool_parser::tests::test_arguments_with_special_chars_and_unicode ... ok
+test tool_parser::tests::test_empty_text ... ok
+test tool_parser::tests::test_invalid_json_in_tool_call ... ok
+test tool_parser::tests::test_invalid_json_preserves_original_tags ... ok
+test tool_parser::tests::test_mix_of_valid_and_invalid_tool_calls ... ok
+test tool_parser::tests::test_multiple_tool_calls ... ok
+test tool_parser::tests::test_nested_tool_call_tags ... ok
+test tool_parser::tests::test_no_tool_calls ... ok
+test tool_parser::tests::test_single_tool_call ... ok
+test tool_parser::tests::test_text_between_multiple_tool_calls ... ok
+test tool_parser::tests::test_tool_call_missing_arguments ... ok
+test tool_parser::tests::test_tool_call_missing_name ... ok
+test tool_parser::tests::test_tool_call_with_surrounding_text ... ok
+test tool_parser::tests::test_unclosed_tool_call_tag ... ok
+test tool_parser::tests::test_valid_json_array_not_object_preserved_as_raw ... ok
+test tool_parser::tests::test_valid_json_but_missing_name_preserved_as_raw ... ok
+test tool_parser::tests::test_valid_json_name_is_not_string_preserved_as_raw ... ok
+test tool_parser::tests::test_whitespace_only_content_between_tags ... ok
+test tool_parser::tests::xml_integer_rejects_fractional ... ok
+test tool_parser::tests::xml_multi_param_multiline_value ... ok
+test tool_parser::tests::xml_no_schema_best_effort_coercion ... ok
+test tool_parser::tests::xml_schema_driven_coercion ... ok
+test tool_parser::tests::xml_single_call_one_param ... ok
+test tool_parser::tests::xml_tool_call_after_think_block_is_extracted ... ok
+
+test result: ok. 642 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 2.37s
+

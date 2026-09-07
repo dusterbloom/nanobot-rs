@@ -1,0 +1,22 @@
+[
+  {
+    "gemm": 0,
+    "seconds": 307.8128627910046,
+    "ttft_seconds": 304.45084195799427,
+    "answer": "Launch key: LANTERN-4729-QZ\nRecovery key: COPPER-8163-VX\nCurrent project owner: Neri",
+    "continuation_seconds": 1.377953791001346,
+    "cached_tokens": 45037,
+    "peak_physical_gib": 17.94347456842661,
+    "swapouts_delta": 0
+  },
+  {
+    "gemm": 1,
+    "seconds": 286.65945254199323,
+    "ttft_seconds": 283.2553437089955,
+    "answer": "Launch key: LANTERN-4729-QZ\nRecovery key: COPPER-8163-VX\nCurrent project owner: Neri",
+    "continuation_seconds": 1.1644178749993443,
+    "cached_tokens": 45037,
+    "peak_physical_gib": 18.636696815490723,
+    "swapouts_delta": 0
+  }
+]

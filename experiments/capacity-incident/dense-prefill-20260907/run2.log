@@ -1,0 +1,64 @@
+Now drawing from 'Battery Power'
+ -InternalBattery-0 (id=22872163)	66%; discharging; (no estimate) present: true
+
+SHAPE 32 1024
+{"nq":32,"nk":1024,"causal":0,"max_abs":4.17233e-07,"relative_l2":8.30144e-07}
+{"nq":32,"nk":1024,"causal":1,"max_abs":4.17233e-07,"relative_l2":8.30144e-07}
+{"nq":32,"nk":1024,"arm":0,"median_ms":2.202}
+{"nq":32,"nk":1024,"arm":1,"median_ms":1.18829}
+{"nq":32,"nk":1024,"arm":2,"median_ms":1.01733}
+{"nq":32,"nk":1024,"arm":2,"median_ms":1.06383}
+{"nq":32,"nk":1024,"arm":1,"median_ms":0.730958}
+{"nq":32,"nk":1024,"arm":0,"median_ms":0.746917}
+
+SHAPE 31 1055
+{"nq":31,"nk":1055,"causal":0,"max_abs":4.76837e-07,"relative_l2":8.45032e-07}
+{"nq":31,"nk":1055,"causal":1,"max_abs":4.76837e-07,"relative_l2":8.45032e-07}
+{"nq":31,"nk":1055,"arm":0,"median_ms":1.33596}
+{"nq":31,"nk":1055,"arm":1,"median_ms":0.983792}
+{"nq":31,"nk":1055,"arm":2,"median_ms":1.86417}
+{"nq":31,"nk":1055,"arm":2,"median_ms":1.16967}
+{"nq":31,"nk":1055,"arm":1,"median_ms":0.733625}
+{"nq":31,"nk":1055,"arm":0,"median_ms":0.788125}
+
+SHAPE 1024 1024
+{"nq":1024,"nk":1024,"causal":0,"max_abs":7.7486e-07,"relative_l2":3.55246e-07}
+{"nq":1024,"nk":1024,"causal":1,"max_abs":7.7486e-07,"relative_l2":3.55246e-07}
+{"nq":1024,"nk":1024,"arm":0,"median_ms":9.15554}
+{"nq":1024,"nk":1024,"arm":1,"median_ms":9.1325}
+{"nq":1024,"nk":1024,"arm":2,"median_ms":9.91667}
+{"nq":1024,"nk":1024,"arm":2,"median_ms":10.0892}
+{"nq":1024,"nk":1024,"arm":1,"median_ms":9.04408}
+{"nq":1024,"nk":1024,"arm":0,"median_ms":8.90008}
+
+SHAPE 1024 8192
+{"nq":1024,"nk":8192,"causal":0,"max_abs":5.73695e-07,"relative_l2":2.23439e-06}
+{"nq":1024,"nk":8192,"causal":1,"max_abs":5.73695e-07,"relative_l2":2.23439e-06}
+{"nq":1024,"nk":8192,"arm":0,"median_ms":83.4829}
+{"nq":1024,"nk":8192,"arm":1,"median_ms":84.5782}
+{"nq":1024,"nk":8192,"arm":2,"median_ms":117.397}
+{"nq":1024,"nk":8192,"arm":2,"median_ms":113.861}
+{"nq":1024,"nk":8192,"arm":1,"median_ms":84.7747}
+{"nq":1024,"nk":8192,"arm":0,"median_ms":76.0868}
+
+SHAPE 1024 32768
+{"nq":1024,"nk":32768,"causal":0,"max_abs":5.99772e-07,"relative_l2":4.66543e-06}
+{"nq":1024,"nk":32768,"causal":1,"max_abs":5.99772e-07,"relative_l2":4.66543e-06}
+{"nq":1024,"nk":32768,"arm":0,"median_ms":427.289}
+{"nq":1024,"nk":32768,"arm":1,"median_ms":404.471}
+{"nq":1024,"nk":32768,"arm":2,"median_ms":438.151}
+{"nq":1024,"nk":32768,"arm":2,"median_ms":410.953}
+{"nq":1024,"nk":32768,"arm":1,"median_ms":379.812}
+{"nq":1024,"nk":32768,"arm":0,"median_ms":374.052}
+
+SHAPE 1024 45056
+{"nq":1024,"nk":45056,"causal":0,"max_abs":5.73695e-07,"relative_l2":5.45041e-06}
+{"nq":1024,"nk":45056,"causal":1,"max_abs":5.73695e-07,"relative_l2":5.45041e-06}
+{"nq":1024,"nk":45056,"arm":0,"median_ms":526.788}
+{"nq":1024,"nk":45056,"arm":1,"median_ms":540.042}
+{"nq":1024,"nk":45056,"arm":2,"median_ms":580.587}
+{"nq":1024,"nk":45056,"arm":2,"median_ms":618.782}
+{"nq":1024,"nk":45056,"arm":1,"median_ms":589.107}
+{"nq":1024,"nk":45056,"arm":0,"median_ms":605.634}
+
+COMPLETE

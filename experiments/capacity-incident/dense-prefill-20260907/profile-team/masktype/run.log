@@ -1,0 +1,21 @@
+/private/tmp/higgs-masktype/attention.cpp:76:21: error: use of undeclared identifier 'variant'
+   76 |       (bd == 256 && variant == "regbool" && !has_mask ? std::string("bool_") : type_to_name(has_mask ? *mask : q)));
+      |                     ^
+1 error generated.
+Traceback (most recent call last):
+  File "/private/tmp/higgs-masktype/build.py", line 6, in <module>
+    subprocess.run(cmd+[str(p/'probe.cpp'),str(p/'attention.cpp'),str(b/'lib/libmlx.a'),'-framework','Metal','-framework','Foundation','-framework','Accelerate','-o',str(p/'probe')],check=True)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 577, in run
+    raise CalledProcessError(retcode, process.args,
+                             output=stdout, stderr=stderr)
+subprocess.CalledProcessError: Command '['/usr/bin/clang++', '-std=c++20', '-O3', '-DNDEBUG', '-DMLX_STATIC', '-DMLX_METAL_NO_NAX', '-DFMT_HEADER_ONLY=1', '-mmacosx-version-min=26.0', '-I/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src', '-I/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/metal_cpp-src', '-I/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/fmt-src/include', '-I/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/json-src/single_include/nlohmann', '/private/tmp/higgs-masktype/probe.cpp', '/private/tmp/higgs-masktype/attention.cpp', '/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/lib/libmlx.a', '-framework', 'Metal', '-framework', 'Foundation', '-framework', 'Accelerate', '-o', '/private/tmp/higgs-masktype/probe']' returned non-zero exit status 1.
+RESTORED {"bootId": "7048b143-7e28-48eb-8cf0-255af709cefe", "activeReservations": 0, "activeReservationBytes": 0, "oldestReservationAgeMs": null, "queuedWaiters": 0, "pressure": "normal", "rawPressure": "normal", "mlxActiveBytes": 12377847584, "mlxPeakBytes": 13254650144, "mlxCachedBytes": 0, "mlxMeasuredAtUnixMs": 1788780206426, "swapOutDelta": 0, "compressorDelta": 0, "swapOutsTotal": 3943526, "compressionsTotal": 152491060, "pressureSampledAtUnixMs": 1788780206412, "pressureSampleEpoch": 12, "nonNormalPressureEventEpoch": 0, "allocationObservations": 0, "cleanAllocationObservations": 0, "skippedAllocationObservations": 0, "lastObservedPrefillPeakBytes": null, "lastObservedDecodePeakBytes": null, "lastObservedRetainedBytes": null, "downshifts": 0, "rejections": {"exceeded": 0, "unavailable": 0}, "stopOutcomes": {}, "models": [{"model": "escha-35b-a3b", "generation": 2, "available": true, "basis": "conservative", "pressure": "normal", "safeTotalTokens": 51200, "recommendedOutputTokens": 4096, "maxPromptTokens": 47104, "usableBytes": 21440482509, "qualifiedColdBands": 0}]}
+Traceback (most recent call last):
+  File "/private/tmp/higgs-masktype/supervise.py", line 8, in <module>
+    subprocess.run(['python3','build.py'],cwd=p,check=True)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/homebrew/Cellar/python@3.14/3.14.3_1/Frameworks/Python.framework/Versions/3.14/lib/python3.14/subprocess.py", line 577, in run
+    raise CalledProcessError(retcode, process.args,
+                             output=stdout, stderr=stderr)
+subprocess.CalledProcessError: Command '['python3', 'build.py']' returned non-zero exit status 1.

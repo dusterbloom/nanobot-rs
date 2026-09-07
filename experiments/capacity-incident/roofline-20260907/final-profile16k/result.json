@@ -1,0 +1,118 @@
+{
+  "label": "profile16k",
+  "seconds": 84.86865420799586,
+  "ttft_seconds": 76.53282116600894,
+  "last_token_seconds": 84.86845545799588,
+  "usage": {
+    "prompt_tokens": 16008,
+    "completion_tokens": 128,
+    "total_tokens": 16136
+  },
+  "finish": "length",
+  "progress": [
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 13
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 1024,
+      "time_ms": 4356
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 2048,
+      "time_ms": 8582
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 3072,
+      "time_ms": 12911
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 4096,
+      "time_ms": 17346
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 5120,
+      "time_ms": 21805
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 6144,
+      "time_ms": 26325
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 7168,
+      "time_ms": 30958
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 8192,
+      "time_ms": 35686
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 9216,
+      "time_ms": 40516
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 10240,
+      "time_ms": 45404
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 11264,
+      "time_ms": 50518
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 12288,
+      "time_ms": 55632
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 13312,
+      "time_ms": 60787
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 14336,
+      "time_ms": 66131
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 15360,
+      "time_ms": 71461
+    },
+    {
+      "total": 16008,
+      "cache": 0,
+      "processed": 16000,
+      "time_ms": 75187
+    }
+  ],
+  "answer": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46",
+  "native_user_tokens": 15997
+}

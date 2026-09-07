@@ -1,0 +1,22 @@
+{
+  "label": "dense-prefill45k",
+  "seconds": 292.69760020897957,
+  "ttft_seconds": 289.46596987498924,
+  "last_token_seconds": 292.69735354199656,
+  "usage": {
+    "prompt_tokens": 45003,
+    "completion_tokens": 35,
+    "total_tokens": 45038
+  },
+  "finish": "stop",
+  "progress": [
+    {
+      "total": 45003,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 15
+    }
+  ],
+  "answer": "Launch key: LANTERN-4729-QZ\nRecovery key: COPPER-8163-VX\nCurrent project owner: Neri",
+  "native_user_tokens": 44992
+}

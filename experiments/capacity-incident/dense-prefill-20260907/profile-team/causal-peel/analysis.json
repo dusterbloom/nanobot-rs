@@ -1,0 +1,32 @@
+{
+  "fallback": {
+    "rounds": 6,
+    "median_ms": 377.47,
+    "min_round_ms": 366.64,
+    "max_round_ms": 391.134
+  },
+  "query128": {
+    "rounds": 6,
+    "median_ms": 287.95849999999996,
+    "min_round_ms": 286.723,
+    "max_round_ms": 290.663
+  },
+  "reg": {
+    "rounds": 6,
+    "median_ms": 380.53700000000003,
+    "min_round_ms": 362.456,
+    "max_round_ms": 401.953
+  },
+  "reg_causal": {
+    "rounds": 6,
+    "median_ms": 1092.46,
+    "min_round_ms": 1040,
+    "max_round_ms": 1155.43
+  },
+  "peel_causal": {
+    "rounds": 6,
+    "median_ms": 1135.4499999999998,
+    "min_round_ms": 1093.53,
+    "max_round_ms": 1183.88
+  }
+}

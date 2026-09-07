@@ -16,7 +16,6 @@ Updated: 2026-09-06. Keep precision, reset timing and recovery correctness separ
 | Frozen revision-3 OFF/ON/OFF/ON | OFF 0/2 correct, 185.3s/139.9s; ON 2/2 correct, 43.1s/44.0s | Pointer-only instruction fixes this repeated recovery fixture; not an LCM speed comparison |
 | New autonomous notes/reset arm | 6/6 correct of 20 planned; 1 reset/handoff, 1 LCM boundary, 1 rejected duplicate, then capacity suspension; no forced retry | Correct recovery after autonomous reset; endurance goal not completed |
 | Matched LCM arm on new binaries | 6/6 correct of 20, 193.6s, 1 LCM boundary, zero duplicates, capacity suspension | Faster than B (295.8s) here; neither passed endurance |
-
 | Scheduled feasibility control | 20/20 submitted, 20 resets, 13/20 exact; no compaction, rejection or downshift | Execution feasible; exact recovery gate failed. See FEASIBILITY-RESULTS.md |
 
 ## Runtime restored

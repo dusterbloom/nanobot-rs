@@ -1,0 +1,13 @@
+{
+  "hardware": "Apple M4 base,32GiB",
+  "higgs_sha256": "81385258b48b2fd736f9a3864e97e0eeea19dc2c1b65d370c89997f09dcbb4f7",
+  "prefill_processed_tokens": 44992,
+  "prefill_seconds": 467.32,
+  "prefill_tokens_per_second": 96.27664127364547,
+  "prompt_cache_tokens": 0,
+  "peak_sampled_footprint_gib": 17.959832191467285,
+  "new_swapouts": 0,
+  "pressure_values": [
+    "normal"
+  ]
+}

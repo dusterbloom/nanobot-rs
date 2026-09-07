@@ -1,0 +1,61 @@
+In file included from /private/tmp/higgs-causal-peel/peel.metal:2:
+In file included from /private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:3:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/attn.h:6:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/mma.h:11:
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/utils/integral_constant.h:108:6: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+  if constexpr (start < stop) {
+     ^
+In file included from /private/tmp/higgs-causal-peel/peel.metal:2:
+In file included from /private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:261:
+/private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_kv_block.h:57:8: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+    if constexpr (STEEL_APPLY_CAUSAL_MASK) {
+       ^
+/private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_kv_block.h:112:16: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+            if constexpr (is_bool) {
+               ^
+/private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_kv_block.h:182:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+/private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_kv_block.h:192:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+In file included from /private/tmp/higgs-causal-peel/peel.metal:2:
+In file included from /private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:267:
+/private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_kv_block.h:57:8: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+    if constexpr (STEEL_APPLY_CAUSAL_MASK) {
+       ^
+/private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_kv_block.h:112:16: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+            if constexpr (is_bool) {
+               ^
+/private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_kv_block.h:182:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+/private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_kv_block.h:192:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+In file included from /private/tmp/higgs-causal-peel/peel.metal:2:
+In file included from /private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:274:
+/private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_kv_block.h:57:8: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+    if constexpr (STEEL_APPLY_CAUSAL_MASK) {
+       ^
+/private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_kv_block.h:112:16: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+            if constexpr (is_bool) {
+               ^
+/private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_kv_block.h:182:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+/private/tmp/higgs-causal-peel/peel/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_kv_block.h:192:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+13 warnings generated.
+BUILD PASSED
+SHAPE 31 1055
+SHAPE EXIT 31 1055 0
+SHAPE 1024 32768
+SHAPE EXIT 1024 32768 0
+COMPLETE
+Traceback (most recent call last):
+  File "/private/tmp/higgs-causal-peel/supervise.py", line 31, in <module>
+    else:raise RuntimeError('Restored server did not become ready')
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Restored server did not become ready

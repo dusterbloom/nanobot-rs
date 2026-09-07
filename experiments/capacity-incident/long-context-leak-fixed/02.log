@@ -1,0 +1,12 @@
+2026-09-06T15:57:51.355567Z  INFO nanobot::repl: startup_phase phase="web_autostart_spawned" phase_ms=0 total_ms=0
+2026-09-06T15:57:51.362456Z  INFO nanobot::repl: startup_phase phase="local_discovery_done" phase_ms=6 total_ms=6
+2026-09-06T15:57:51.362482Z  INFO nanobot::repl: local inference: using http://127.0.0.1:9000/v1 serving escha-35b-a3b (discovered) endpoint=http://127.0.0.1:9000/v1 model=escha-35b-a3b
+2026-09-06T15:57:51.362501Z  INFO nanobot::repl: startup_phase phase="local_backend_ready" phase_ms=0 total_ms=6
+2026-09-06T15:57:51.362510Z  INFO nanobot::repl: delegation_config_at_core_build delegation_mode=Inline(DelegationStrictPolicy { strict_no_tools_main: false, strict_router_schema: false, strict_local_only: false, strict_toolplan_validation: true }) strict_no_tools_main=false strict_router_schema=false is_local=true
+2026-09-06T15:57:51.362524Z  INFO nanobot::repl: startup_phase phase="endpoint_probe_done" phase_ms=0 total_ms=6
+2026-09-06T15:57:51.366007Z  INFO nanobot::repl: startup_phase phase="core_and_agent_built" phase_ms=3 total_ms=10
+
+[K[2mBATCH_2_OK[0m[2K[1m[36m▞▞▞[0m BATCH_2_OK
+
+[2m⧗ 30.5s  ttft 30.53s  6 tok[0m
+

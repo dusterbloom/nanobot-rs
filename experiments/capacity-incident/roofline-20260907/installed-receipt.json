@@ -1,0 +1,59 @@
+{
+  "binary_sha256": "fbf8b3e8b9f3450c7f4caa1fb8f1f32baf39f307a69d4edb20ff8eb0e87697a2",
+  "metallib_sha256": "d4ec42fe79abd9d24922c84a6a160b98e9bba7ebed68dbed844981b1190eafb5",
+  "capacity": {
+    "bootId": "7dd7acb8-4d5c-4b71-b9af-fb4f9118a410",
+    "activeReservations": 0,
+    "activeReservationBytes": 0,
+    "oldestReservationAgeMs": null,
+    "queuedWaiters": 0,
+    "pressure": "normal",
+    "rawPressure": "normal",
+    "mlxActiveBytes": 12377847584,
+    "mlxPeakBytes": 13253146400,
+    "mlxCachedBytes": 0,
+    "mlxMeasuredAtUnixMs": 1788739321408,
+    "swapOutDelta": 0,
+    "compressorDelta": 0,
+    "swapOutsTotal": 3943462,
+    "compressionsTotal": 131609717,
+    "pressureSampledAtUnixMs": 1788739321362,
+    "pressureSampleEpoch": 10,
+    "nonNormalPressureEventEpoch": 0,
+    "allocationObservations": 0,
+    "cleanAllocationObservations": 0,
+    "skippedAllocationObservations": 0,
+    "lastObservedPrefillPeakBytes": null,
+    "lastObservedDecodePeakBytes": null,
+    "lastObservedRetainedBytes": null,
+    "downshifts": 0,
+    "rejections": {
+      "exceeded": 0,
+      "unavailable": 0
+    },
+    "stopOutcomes": {},
+    "models": [
+      {
+        "model": "escha-35b-a3b",
+        "generation": 2,
+        "available": true,
+        "basis": "conservative",
+        "pressure": "normal",
+        "safeTotalTokens": 51200,
+        "recommendedOutputTokens": 4096,
+        "maxPromptTokens": 47104,
+        "usableBytes": 21440482509,
+        "qualifiedColdBands": 0
+      }
+    ]
+  },
+  "files": [
+    "crates/higgs-engine/src/runtime_identity.rs",
+    "crates/higgs-engine/tests/runtime_identity.rs",
+    "crates/higgs-models/src/eschamoe.rs",
+    "crates/higgs-models/src/qwen3_next.rs",
+    "crates/higgs-models/src/utils.rs",
+    "docs/models.md"
+  ],
+  "nanobot_process": "53654 nanobot"
+}

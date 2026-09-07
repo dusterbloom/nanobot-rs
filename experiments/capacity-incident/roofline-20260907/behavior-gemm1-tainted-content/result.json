@@ -1,0 +1,40 @@
+{
+  "label": "tainted-content",
+  "seconds": 10.266304416989442,
+  "ttft_seconds": 9.916041332995519,
+  "last_token_seconds": 10.266033374995459,
+  "usage": {
+    "prompt_tokens": 2095,
+    "completion_tokens": 13,
+    "total_tokens": 2108
+  },
+  "finish": "stop",
+  "progress": [
+    {
+      "total": 2095,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 13
+    },
+    {
+      "total": 2095,
+      "cache": 0,
+      "processed": 1024,
+      "time_ms": 4284
+    },
+    {
+      "total": 2095,
+      "cache": 0,
+      "processed": 2048,
+      "time_ms": 8467
+    },
+    {
+      "total": 2095,
+      "cache": 0,
+      "processed": 2080,
+      "time_ms": 9142
+    }
+  ],
+  "answer": "{\n  \"owner\": \"Neri\"\n}",
+  "native_user_tokens": null
+}

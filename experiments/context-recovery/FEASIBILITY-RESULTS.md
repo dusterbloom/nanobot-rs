@@ -28,7 +28,7 @@ The fixture JSON is identical to the prior autonomous 20-update run. Same 12288 
 
 Zero-based revision 8 (the ninth update) required carrying checksum `7aF07-bC9x-00Q` forward. The preceding revision-7 checkpoint contained that value. The model read the checkpoint; the actual next provider request contained the correct value and did not contain the later invented `8bR29-mD7y-01P`. The model nevertheless submitted the invented value and then wrote it into notes. No compaction, admission failure or missing notes read explains this first error.
 
-Wrong revisions: 8, 9, 10, 14, 16, 17, 18. Six are checksum errors; revision 10 added an extra `result` JSON nesting level. The scorer records these unchanged, provides no correctness feedback, and never repairs them. A later authoritative checksum restores correctness temporarily. Valid tool-call syntax and durable writes do not guarantee semantic preservation.
+Wrong revisions: 8, 9, 10, 14, 16, 17, 18. All seven contain checksum errors; revision 10 additionally added an extra `result` JSON nesting level. Removing that wrapper alone would not make revision 10 correct. The scorer records these unchanged, provides no correctness feedback, and never repairs them. A later authoritative checksum restores correctness temporarily. Valid tool-call syntax and durable writes do not guarantee semantic preservation.
 
 ## Memory interpretation
 
@@ -40,12 +40,14 @@ The system already had about 2429.62 MiB swap occupied at startup; sampled swap-
 
 Execution feasibility: **PASS for this schedule/run**. Exact recovery feasibility: **FAIL**. Autonomous comparison was not rerun because the correctness prerequisite failed. Next work should isolate checksum copying and checkpoint representation, including strict output-shape validation, before using this control as a reliability baseline. Do not compare 16.4-minute completed work against the earlier truncated runs as if completion coverage were matched.
 
-Harness commit `fdb4ebf`; production nanobot remains corrected `7b8b24a`, Higgs `dd6730133`. Release harness validation: 3004 passed, 0 failed, 31 ignored. Existing optional/decision prompt strings verified unchanged. Installed Higgs defaults restored; binary/library mappings and hashes verified; READY smoke passed. Runtime evidence: `BINARY-PROVENANCE-AFTER.json`.
+Run-time HEAD was `0be0e65` with uncommitted harness changes subsequently committed as `fdb4ebf`; recorded hashes of `endurance_eval.rs` and `endurance.py` match that commit. Production nanobot remains corrected `7b8b24a`, Higgs `dd6730133`. Release harness validation: 3004 passed, 0 failed, 31 ignored. Existing optional/decision prompt strings verified unchanged. Installed Higgs defaults restored; binary/library mappings and hashes verified; READY smoke passed. Runtime evidence: `BINARY-PROVENANCE-AFTER.json`.
 
 Run from the repository in tmux, using a new output directory:
 
 ```sh
 ENDURANCE_LONG_FORM_MIN_TOKENS=2048 ENDURANCE_RESET_HANDOFF=1 python3 experiments/context-recovery/endurance.py experiments/context-recovery/endurance-feasibility-new --updates 20 --ceiling 12288 --minutes 30 --arms B --policy scheduled
 ```
+
+Counter limitation: `delivered_update_bytes` and `delivered_update_estimated_window_equivalents` count `next_task` tool deliveries, while this driver supplies updates directly. Their zero values do not mean zero delivered updates and must not be used as workload measurements.
 
 Compact evidence: `feasibility-evidence.json`, `feasibility-first-error.json`. Raw immutable replay, fixtures, receipts and telemetry: `endurance-feasibility-scheduled/`. Driver log: `/private/tmp/feasibility-control.log`; tmux run exited 0 with valid measurement and explicit failed correctness score.

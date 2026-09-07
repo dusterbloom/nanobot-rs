@@ -1,0 +1,57 @@
+{
+  "before": {
+    "vm": {
+      "Pages free": 219970,
+      "Pages active": 834512,
+      "Pages inactive": 769247,
+      "Pages speculative": 156,
+      "Pages throttled": 0,
+      "Pages wired down": 167076,
+      "Pages purgeable": 3350,
+      "\"Translation faults\"": 866010777,
+      "Pages copy-on-write": 37626986,
+      "Pages zero filled": 3997742010,
+      "Pages reactivated": 28141494,
+      "Pages purged": 9549819,
+      "File-backed pages": 639981,
+      "Anonymous pages": 963934,
+      "Pages stored in compressor": 176430,
+      "Pages occupied by compressor": 65705,
+      "Decompressions": 108603300,
+      "Compressions": 131240981,
+      "Pageins": 128183712,
+      "Pageouts": 26664,
+      "Swapins": 1735954,
+      "Swapouts": 3943462
+    },
+    "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22872163)\t95%; charging; (no estimate) present: true\n",
+    "settings": "Battery Power:\n Sleep On Power Button 1\n lowpowermode         1\n standby              1\n ttyskeepawake        1\n hibernatemode        3\n powernap             1\n hibernatefile        /var/vm/sleepimage\n displaysleep         60\n womp                 0\n networkoversleep     0\n sleep                1\n lessbright           1\n tcpkeepalive         1\n disksleep            10\nAC Power:\n Sleep On Power Button 1\n lowpowermode         0\n standby              1\n ttyskeepawake        1\n hibernatemode        3\n powernap             1\n hibernatefile        /var/vm/sleepimage\n displaysleep         0\n womp                 1\n networkoversleep     0\n sleep                1\n tcpkeepalive         1\n disksleep            10\n"
+  },
+  "after": {
+    "vm": {
+      "Pages free": 171114,
+      "Pages active": 810286,
+      "Pages inactive": 805634,
+      "Pages speculative": 3942,
+      "Pages throttled": 0,
+      "Pages wired down": 199994,
+      "Pages purgeable": 1819,
+      "\"Translation faults\"": 866061593,
+      "Pages copy-on-write": 37628188,
+      "Pages zero filled": 3997782849,
+      "Pages reactivated": 28141494,
+      "Pages purged": 9549907,
+      "File-backed pages": 655889,
+      "Anonymous pages": 963973,
+      "Pages stored in compressor": 176354,
+      "Pages occupied by compressor": 65696,
+      "Decompressions": 108603377,
+      "Compressions": 131240981,
+      "Pageins": 128196651,
+      "Pageouts": 26664,
+      "Swapins": 1735954,
+      "Swapouts": 3943462
+    },
+    "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=22872163)\t95%; charging; (no estimate) present: true\n"
+  }
+}

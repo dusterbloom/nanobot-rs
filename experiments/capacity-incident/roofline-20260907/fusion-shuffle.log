@@ -1,0 +1,43 @@
+   Compiling higgs-models v1.7.0 (/private/tmp/higgs-m4-roofline/crates/higgs-models)
+warning: unused import: `async_eval`
+   --> crates/higgs-models/src/mlx_exec.rs:164:26
+    |
+164 |     use super::{acquire, async_eval, eval, held};
+    |                          ^^^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `mlx_rs::ops::indexing::IndexOp`
+  --> crates/higgs-models/src/metal_kernel.rs:25:5
+   |
+25 | use mlx_rs::ops::indexing::IndexOp;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused variable: `row_count_pad`
+    --> crates/higgs-models/src/metal_kernel.rs:1398:9
+     |
+1398 |     let row_count_pad = u32::try_from(rows_pad)
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_row_count_pad`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `higgs-models` (lib test) generated 3 warnings (run `cargo fix --lib -p higgs-models --tests` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 1m 56s
+     Running unittests src/lib.rs (/Users/peppi/Dev/higgs/target/release/deps/higgs_models-c3e54f692729b75f)
+
+running 2 tests
+test eschamoe::tests::bench_fused_output_hadamard ... rows=8 width=1024 baseline_ms=0.349792 fused_ms=0.304500 speedup=1.149
+rows=8 width=2048 baseline_ms=0.300709 fused_ms=0.318500 speedup=0.944
+rows=4096 width=1024 baseline_ms=1.395833 fused_ms=0.687125 speedup=2.031
+rows=4096 width=2048 baseline_ms=2.959750 fused_ms=1.272167 speedup=2.327
+rows=8192 width=1024 baseline_ms=2.614667 fused_ms=1.085041 speedup=2.410
+rows=8192 width=2048 baseline_ms=4.595791 fused_ms=1.869333 speedup=2.459
+ok
+test eschamoe::tests::fused_output_hadamard_matches_mlx_for_production_shapes ... gate_up/QMV: differing=0/6144 max_error=0 scale=1356.2596
+down/scratch: differing=0/81920 max_error=0 scale=1763.2378
+down/QMV: differing=0/12288 max_error=0 scale=1420.4113
+gate_up/scratch: differing=0/40960 max_error=0 scale=1785.8805
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 814 filtered out; finished in 1.16s
+

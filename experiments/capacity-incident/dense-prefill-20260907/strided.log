@@ -1,0 +1,34 @@
+In file included from /private/tmp/higgs-dense-prefill/d256.metal:1:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.metal:6:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:3:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/attn.h:6:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/mma.h:11:
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/utils/integral_constant.h:108:6: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+  if constexpr (start < stop) {
+     ^
+In file included from /private/tmp/higgs-dense-prefill/d256.metal:1:
+In file included from /Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.metal:6:
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:356:16: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+            if constexpr (is_bool) {
+               ^
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:426:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+/Users/peppi/Dev/higgs/target/release/build/mlx-sys-e955ea9cb0a9ee5d/out/build/_deps/mlx-src/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h:436:14: warning: constexpr if is a C++17 extension [-Wc++17-extensions]
+          if constexpr (BD == 128) {
+             ^
+4 warnings generated.
+Now drawing from 'Battery Power'
+ -InternalBattery-0 (id=22872163)	46%; discharging; (no estimate) present: true
+
+SHAPE 1024 32768
+{"tile":-128,"max_abs":0,"relative_l2":0}
+{"tile":128,"max_abs":0,"relative_l2":0}
+{"nq":1024,"nk":32768,"tile":-1024,"median_ms":392.021}
+{"nq":1024,"nk":32768,"tile":-128,"median_ms":296.456}
+{"nq":1024,"nk":32768,"tile":128,"median_ms":321.952}
+{"nq":1024,"nk":32768,"tile":128,"median_ms":317.669}
+{"nq":1024,"nk":32768,"tile":-128,"median_ms":288.808}
+{"nq":1024,"nk":32768,"tile":-1024,"median_ms":449.633}
+
+COMPLETE

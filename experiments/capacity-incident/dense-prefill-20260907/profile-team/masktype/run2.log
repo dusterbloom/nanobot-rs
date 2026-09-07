@@ -1,0 +1,7 @@
+BUILD PASSED
+SHAPE 31 1055
+SHAPE EXIT 31 1055 0
+SHAPE 1024 32768
+SHAPE EXIT 1024 32768 0
+COMPLETE
+RESTORED {"bootId": "f9320f0f-913f-46aa-a572-7ba231d3adc9", "activeReservations": 0, "activeReservationBytes": 0, "oldestReservationAgeMs": null, "queuedWaiters": 0, "pressure": "normal", "rawPressure": "normal", "mlxActiveBytes": 12377847584, "mlxPeakBytes": 13254650144, "mlxCachedBytes": 0, "mlxMeasuredAtUnixMs": 1788780353920, "swapOutDelta": 0, "compressorDelta": 0, "swapOutsTotal": 3943526, "compressionsTotal": 153162962, "pressureSampledAtUnixMs": 1788780353907, "pressureSampleEpoch": 12, "nonNormalPressureEventEpoch": 0, "allocationObservations": 0, "cleanAllocationObservations": 0, "skippedAllocationObservations": 0, "lastObservedPrefillPeakBytes": null, "lastObservedDecodePeakBytes": null, "lastObservedRetainedBytes": null, "downshifts": 0, "rejections": {"exceeded": 0, "unavailable": 0}, "stopOutcomes": {}, "models": [{"model": "escha-35b-a3b", "generation": 2, "available": true, "basis": "conservative", "pressure": "normal", "safeTotalTokens": 51200, "recommendedOutputTokens": 4096, "maxPromptTokens": 47104, "usableBytes": 21440482509, "qualifiedColdBands": 0}]}

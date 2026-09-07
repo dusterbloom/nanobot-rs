@@ -1,0 +1,214 @@
+{
+  "label": "dense-prefill32k",
+  "seconds": 195.27770741700078,
+  "ttft_seconds": 186.04723283299245,
+  "last_token_seconds": 195.27742316701915,
+  "usage": {
+    "prompt_tokens": 31995,
+    "completion_tokens": 128,
+    "total_tokens": 32123
+  },
+  "finish": "length",
+  "progress": [
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 0,
+      "time_ms": 14
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 1024,
+      "time_ms": 4373
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 2048,
+      "time_ms": 8676
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 3072,
+      "time_ms": 13108
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 4096,
+      "time_ms": 17704
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 5120,
+      "time_ms": 22405
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 6144,
+      "time_ms": 27177
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 7168,
+      "time_ms": 32105
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 8192,
+      "time_ms": 37098
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 9216,
+      "time_ms": 42190
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 10240,
+      "time_ms": 47489
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 11264,
+      "time_ms": 52804
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 12288,
+      "time_ms": 58306
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 13312,
+      "time_ms": 63900
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 14336,
+      "time_ms": 69578
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 15360,
+      "time_ms": 75340
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 16384,
+      "time_ms": 81296
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 17408,
+      "time_ms": 87326
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 18432,
+      "time_ms": 93425
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 19456,
+      "time_ms": 99638
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 20480,
+      "time_ms": 105943
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 21504,
+      "time_ms": 112402
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 22528,
+      "time_ms": 118954
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 23552,
+      "time_ms": 125590
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 24576,
+      "time_ms": 132277
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 25600,
+      "time_ms": 139136
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 26624,
+      "time_ms": 146044
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 27648,
+      "time_ms": 153120
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 28672,
+      "time_ms": 160197
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 29696,
+      "time_ms": 167367
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 30720,
+      "time_ms": 174625
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 31744,
+      "time_ms": 182015
+    },
+    {
+      "total": 31995,
+      "cache": 0,
+      "processed": 31968,
+      "time_ms": 184258
+    }
+  ],
+  "answer": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46",
+  "native_user_tokens": 31984
+}

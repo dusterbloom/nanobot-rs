@@ -1,0 +1,5 @@
+{
+  "power": "Now drawing from 'Battery Power'",
+  "battery": "Now drawing from 'Battery Power'\n -InternalBattery-0 (id=22872163)\t72%; discharging; (no estimate) present: true\n",
+  "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded\n"
+}

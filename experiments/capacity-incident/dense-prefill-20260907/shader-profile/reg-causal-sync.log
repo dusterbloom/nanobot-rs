@@ -1,0 +1,2 @@
+RESOURCE steel_attention_float32_bq16_bk16_bd256_wm2_wn1_maskfloat32_align_Q_t_align_K_t_has_mask_n_do_causal_t_has_sinks_n_reg shared_bytes=20480 max_threads=64 simd_width=32
+CAPTURE COMPLETE reg_causal
