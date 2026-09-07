@@ -1700,28 +1700,6 @@ fn resolve_memory_provider(
 }
 
 // ---------------------------------------------------------------------------
-// History limit scaling
-// ---------------------------------------------------------------------------
-
-/// History message limit before LCM's overflow backstop trims raw history.
-///
-/// The trim ceiling (limit · 150 tokens, enforced by filter_history Stage 6)
-/// MUST sit comfortably ABOVE LCM's soft compaction threshold
-/// (~tau_soft · (C − reserve − tool_defs) ≈ 0.375–0.5·C), otherwise trimming
-/// caps conversation tokens just below the trigger and compaction never
-/// fires. That is exactly what happened with the 0.4·C / 600-message limits:
-/// at C=200K the ceiling was 600·150 = 90K tokens vs a ~97K soft limit.
-///
-/// LCM therefore allows ~0.7·C of history and raises the upper clamp so it
-/// doesn't bite at large contexts (0.7·200000/150 ≈ 933 > 600). Long-session
-/// hygiene is compaction's job here; trim is only the overflow backstop.
-pub(crate) fn history_limit_lcm(max_context_tokens: usize) -> usize {
-    let max_history_tokens = max_context_tokens * 7 / 10;
-    let limit = max_history_tokens / 150;
-    limit.clamp(6, 2000)
-}
-
-// ---------------------------------------------------------------------------
 // Background compaction helpers
 // ---------------------------------------------------------------------------
 
@@ -2889,27 +2867,6 @@ mod tests {
                 "{terminal_path} must queue the old session for deletion"
             );
         }
-    }
-
-    #[test]
-    fn test_history_limits_lcm_ceiling_clears_soft_threshold() {
-        // Invariant: with LCM enabled, the filter_history token ceiling
-        // (limit * 150) must exceed LCM's soft compaction threshold —
-        // tau_soft(0.5) * (C - ~25% worst-case reserve/tool overhead) —
-        // by at least a ~2-turn (600 token) margin. Otherwise trimming caps
-        // conversation tokens below the trigger and compaction never fires.
-        for c in [3200usize, 8192, 32768, 131072, 200000] {
-            let ceiling = history_limit_lcm(c) * 150;
-            let soft_threshold = (c - c / 4) / 2; // 0.5 * (C - C/4)
-            assert!(
-                ceiling > soft_threshold + 600,
-                "C={c}: ceiling {ceiling} must exceed soft threshold {soft_threshold} + 600"
-            );
-        }
-
-        // LCM mode keeps the lower clamp and scales past the old 600 cap.
-        assert_eq!(history_limit_lcm(1000), 6);
-        assert_eq!(history_limit_lcm(200000), 933);
     }
 
     #[test]

@@ -413,9 +413,9 @@ pub(super) async fn execute_lcm_compaction(
     lcm: Arc<tokio::sync::Mutex<LcmEngine>>,
     messages: Vec<Value>,
     session_turn: u64,
-    // Effective (live-capacity) budget for this turn — the compactor's own
-    // request and the deterministic fit-guard are admitted against the same
-    // envelope the main request uses, never the wider configured ceiling.
+    // Effective live-capacity budget for this turn. Prefix selection, summary
+    // generation, and any length retry all use this envelope instead of the
+    // wider configured model ceiling.
     compaction_budget: TokenBudget,
     failure_mode: CompactionFailureMode,
     cancellation: tokio_util::sync::CancellationToken,

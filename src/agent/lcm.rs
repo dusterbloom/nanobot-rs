@@ -16,11 +16,9 @@
 //! - **Active Context**: Window sent to LLM = recent raw messages + summary nodes.
 //! - **Summary DAG**: Hierarchical summaries with lossless pointers to originals.
 //! - **Two-threshold control loop**: τ_soft (async) / τ_hard (blocking).
-//! - **Escalating summarization**: preserve_details → bullet_points. No
-//!   deterministic-truncation fallback for a missing/failing compactor or a
-//!   babble/degenerate summary — those leave the context uncompacted this
-//!   round instead. Deterministic truncation still fires as an instant path
-//!   for oversized blocks, where an LLM call would be prohibitively slow.
+//! - **Escalating summarization**: preserve_details → bullet_points. Missing,
+//!   failed, or oversized requests leave raw context intact. Oversized blocks
+//!   compact only the largest complete prefix that fits the model request.
 //!
 //! SQLite message rows and summary nodes provide restart-safe storage. This
 //! module manages the in-memory DAG and active context assembly.
@@ -464,7 +462,8 @@ pub struct LcmConfig {
     /// Hard threshold as fraction of available context (0.0-1.0).
     /// Triggers blocking compaction. Default: 0.85 (85%).
     pub tau_hard: f64,
-    /// Target tokens for Level 3 deterministic truncation.
+    /// Legacy schema field retained for configuration compatibility.
+    /// Model-backed compaction does not use it as a fallback target.
     pub deterministic_target: usize,
 }
 
@@ -698,13 +697,11 @@ impl LcmEngine {
         }
     }
 
-    /// Perform compaction using the three-level escalation protocol.
+    /// Perform compaction using the model-backed escalation protocol.
     ///
     /// Algorithm 3 from the paper:
     /// - Level 1: LLM summarize with mode="preserve_details", target T tokens
     /// - Level 2: LLM summarize with mode="bullet_points", target T/2 tokens
-    /// - Level 3: Deterministic truncation to 512 tokens (no LLM)
-    ///
     /// Returns a `Turn::Summary` if compaction occurred. The caller persists
     /// its DAG node in SQLite so the active hierarchy can be rebuilt on restart.
     pub async fn compact(
@@ -712,9 +709,8 @@ impl LcmEngine {
         compactor: Option<&ContextCompactor>,
         budget: &TokenBudget,
         tool_def_tokens: usize,
-        // Retained for call-site intent (soft vs blocking). Since huge blocks
-        // in BOTH modes now take deterministic truncation (the >80 guard no
-        // longer refuses soft blocks), the mode no longer branches here.
+        // Retained for call-site intent and API compatibility. Every failure
+        // now preserves raw context; capacity retry is owned by the caller.
         _failure_mode: CompactionFailureMode,
     ) -> Option<Turn> {
         let available = budget.available_budget(tool_def_tokens);
@@ -730,7 +726,7 @@ impl LcmEngine {
         let selection = self.block_selection(available);
 
         // Find the oldest contiguous block of raw messages to compact.
-        let (block_start, block_end) =
+        let (block_start, mut block_end) =
             match self.find_oldest_raw_block_impl(protect_tokens, selection) {
                 Some(range) => range,
                 None => {
@@ -739,6 +735,42 @@ impl LcmEngine {
                     return None;
                 }
             };
+
+        let Some(compactor) = compactor else {
+            debug!("LCM: no compactor available, leaving context uncompacted");
+            self.async_compaction_pending = false;
+            return None;
+        };
+        // The live runtime may narrow capacity below the configured model
+        // ceiling. Bind both preflight and the actual summary/retry to that
+        // total context size; the compactor accounts for its own output, so
+        // subtracting the main turn's response reserve here would count output
+        // capacity twice.
+        let bounded_compactor =
+            compactor.with_runtime_limits(budget.max_context(), budget.available_budget(0));
+        let compactor = &bounded_compactor;
+
+        let candidate_end = block_end;
+        block_end = match self.largest_fitting_compaction_end(block_start, candidate_end, compactor)
+        {
+            Some(end) => end,
+            None => {
+                debug!(
+                    block_start,
+                    candidate_end,
+                    "LCM: no complete summary prefix fits, leaving context uncompacted"
+                );
+                self.async_compaction_pending = false;
+                return None;
+            }
+        };
+        if block_end < candidate_end {
+            info!(
+                selected_messages = block_end - block_start,
+                candidate_messages = candidate_end - block_start,
+                "LCM: compacting the largest complete prefix that fits"
+            );
+        }
 
         // Collect messages and source ids from the block. Merge mode may
         // include prior Summary entries; append mode never does. When present,
@@ -758,18 +790,9 @@ impl LcmEngine {
                 ContextEntry::Summary { node_id, .. } => {
                     // Fold the node's TEXT into the summarization input — not
                     // the wire message, whose "[Summary … IDs: …]" header is ID
-                    // noise. Feeding the header made deterministic truncation
-                    // keep the ID list as the "first sentence", producing
-                    // summaries that were literally ID spam with content lost.
-                    let text = self
-                        .dag
-                        .get(*node_id)
-                        .map(|n| n.text.clone())
-                        .unwrap_or_default();
-                    block_messages.push(json!({
-                        "role": "user",
-                        "content": format!("[Earlier summary]\n{text}")
-                    }));
+                    // noise. Feeding the header makes the model spend summary
+                    // capacity repeating identifiers instead of state.
+                    block_messages.push(self.compaction_input_message(entry));
                     for sid in self.dag.all_source_ids(*node_id) {
                         if !source_ids.contains(&sid) {
                             source_ids.push(sid);
@@ -818,64 +841,28 @@ impl LcmEngine {
             block_end
         );
 
-        // Guard: if the block is enormous, skip LLM summarization entirely.
-        // The historical rationale (a 0.8B summarizer doing 60-75+ sequential
-        // chunk+merge calls) is dead — summarize_with_prompt makes ONE call.
-        // What matters now: a huge block exceeds the summarizer's transcript
-        // band, and REFUSING to compact it (the old PreserveContext behavior)
-        // left the store in async-band limbo — every turn re-fired Async, hit
-        // this guard, and installed nothing while the prompt grew to the
-        // server's cap (session 20260828_142425: 0 summaries in 83 messages,
-        // then a 16K-token raw re-prefill after the overflow). Large blocks in
-        // soft mode now take the same deterministic truncation the blocking
-        // path uses.
-        const MAX_COMPACTION_BLOCK_MESSAGES: usize = 80;
-        // Capacity fit-guard (Task 4): a model-authored summary is itself a
-        // provider request. When the block cannot fit the effective budget,
-        // the summarizer call would be rejected (or would evict the main
-        // turn), so the escalation skips straight to deterministic level-3
-        // reduction — zero provider calls, durable source handles.
-        let summarizer_request_fits = block_tokens <= budget.available_budget(0);
-        let (summary_text, fresh_manifest, level) = if block_messages.len()
-            > MAX_COMPACTION_BLOCK_MESSAGES
+        // A missing compactor, failed generation, or rejected model output
+        // never becomes a lossy success. Leave the selected originals active
+        // so the normal capacity path can wait/retry without semantic loss.
+        let (summary_text, fresh_manifest, level) = match escalated_summary(
+            &block_messages,
+            target,
+            Some(compactor),
+        )
+        .await
         {
-            info!(
-                "LCM: block too large ({} msgs > {}) for LLM summarization, using deterministic truncation",
-                block_messages.len(),
-                MAX_COMPACTION_BLOCK_MESSAGES
-            );
-            let truncated =
-                deterministic_truncate(&block_messages, self.config.deterministic_target);
-            (truncated, SummaryManifest::default(), 3)
-        } else if !summarizer_request_fits {
-            info!(
-                block_tokens,
-                available = budget.available_budget(0),
-                "LCM: block exceeds the effective budget, using deterministic truncation without a provider call"
-            );
-            let truncated =
-                deterministic_truncate(&block_messages, self.config.deterministic_target);
-            (truncated, SummaryManifest::default(), 3)
-        } else {
-            // Escalating LLM summarization (Algorithm 3, levels 1-2). There is
-            // no deterministic-truncation fallback here: a missing compactor,
-            // a failed LLM call, or a babble/degenerate summary all leave the
-            // active context uncompacted this round rather than installing a
-            // lossy truncation silently. Compaction simply retries next turn.
-            match escalated_summary(&block_messages, target, compactor).await {
-                Ok(Some(summary)) => summary,
-                Ok(None) => {
-                    self.async_compaction_pending = false;
-                    return None;
-                }
-                Err(error) => {
-                    warn!(
-                        %error,
-                        "LCM: compaction summarization failed, leaving context uncompacted this round"
-                    );
-                    self.async_compaction_pending = false;
-                    return None;
-                }
+            Ok(Some(summary)) => summary,
+            Ok(None) => {
+                self.async_compaction_pending = false;
+                return None;
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    "LCM: compaction summarization failed, leaving context uncompacted this round"
+                );
+                self.async_compaction_pending = false;
+                return None;
             }
         };
 
@@ -948,6 +935,96 @@ impl LcmEngine {
             source_ids,
             level,
         })
+    }
+
+    /// Render one active entry as inert transcript input for the compactor.
+    /// Prior summaries contribute only their semantic text; their source IDs
+    /// are carried separately when the selected span is committed.
+    fn compaction_input_message(&self, entry: &ContextEntry) -> Value {
+        match entry {
+            ContextEntry::Raw { message, .. } => message.clone(),
+            ContextEntry::Summary { node_id, .. } => {
+                let text = self
+                    .dag
+                    .get(*node_id)
+                    .map(|node| node.text.clone())
+                    .unwrap_or_default();
+                json!({
+                    "role": "user",
+                    "content": format!("[Earlier summary]\n{text}")
+                })
+            }
+        }
+    }
+
+    /// Select the largest oldest prefix whose complete model request fits.
+    /// A prefix never ends between an assistant tool call and its recorded
+    /// results. If no useful complete prefix fits, the caller preserves all
+    /// raw entries and lets typed capacity recovery decide when to retry.
+    fn largest_fitting_compaction_end(
+        &self,
+        block_start: usize,
+        block_end: usize,
+        compactor: &ContextCompactor,
+    ) -> Option<usize> {
+        let mut messages = Vec::with_capacity(block_end.saturating_sub(block_start));
+        let mut complete_boundaries = Vec::new();
+        let mut pending_tool_calls = std::collections::HashSet::new();
+
+        for index in block_start..block_end {
+            let message = self.compaction_input_message(&self.active[index]);
+            let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+
+            // A new user message after an unfulfilled historical tool call is
+            // evidence that the attempt ended without a result. Treat that
+            // abandoned call as a complete failed state rather than making
+            // every later compaction boundary impossible.
+            if role == "user" && !pending_tool_calls.is_empty() {
+                pending_tool_calls.clear();
+            }
+            if role == "assistant" {
+                if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                    for tool_call in tool_calls {
+                        if let Some(call_id) = tool_call.get("id").and_then(Value::as_str) {
+                            pending_tool_calls.insert(call_id.to_string());
+                        }
+                    }
+                }
+            } else if role == "tool" {
+                if let Some(call_id) = message.get("tool_call_id").and_then(Value::as_str) {
+                    pending_tool_calls.remove(call_id);
+                }
+            }
+
+            messages.push(message);
+            if pending_tool_calls.is_empty() {
+                complete_boundaries.push(messages.len());
+            }
+        }
+
+        let &last_complete = complete_boundaries.last()?;
+        if last_complete == messages.len()
+            && compactor.lcm_request_fits(&messages, "preserve_details")
+        {
+            return Some(block_end);
+        }
+
+        // Request cost is monotonic as messages are appended. Binary-search
+        // the complete boundaries so a large block needs O(log n) transcript
+        // tokenizations instead of rebuilding every growing prefix.
+        let mut low = 0usize;
+        let mut high = complete_boundaries.len();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let boundary = complete_boundaries[mid];
+            if compactor.lcm_request_fits(&messages[..boundary], "preserve_details") {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+
+        (low > 0).then(|| block_start + complete_boundaries[low - 1])
     }
 
     fn block_selection(&self, available: usize) -> BlockSelection {
@@ -1541,8 +1618,8 @@ pub enum CompactionAction {
     Blocking,
 }
 
-/// What to do when model-backed summarization cannot produce a valid smaller
-/// summary. Soft pressure preserves context; hard pressure must converge.
+/// Caller pressure mode retained for API compatibility. Compaction itself
+/// preserves raw context on every model failure in both modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionFailureMode {
     PreserveContext,
@@ -1550,61 +1627,8 @@ pub enum CompactionFailureMode {
 }
 
 // ---------------------------------------------------------------------------
-// Three-Level Escalation (Algorithm 3)
+// Model-backed escalation
 // ---------------------------------------------------------------------------
-
-/// Extract one mechanical headline line per message in the eviction span.
-/// No LLM calls — deterministic, zero-latency. Returns (text, manifest).
-/// The manifest is default (no structured extraction) — open_loops and
-/// decisions require model comprehension that this path deliberately avoids.
-fn mechanical_headlines(messages: &[Value]) -> (String, SummaryManifest) {
-    const HANDLE_HEADLINE_MAX_CHARS: usize = 512;
-    let handle_marker = crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER;
-
-    let mut lines = Vec::new();
-    for msg in messages {
-        let role = msg.get("role").and_then(Value::as_str).unwrap_or("");
-        let content = msg.get("content").and_then(Value::as_str).unwrap_or("");
-        if content.trim().is_empty() || role == "system" {
-            continue;
-        }
-        // Prefer a separate body line when one exists. Canonical handles are
-        // deliberately one line, so retain a bounded copy of that line rather
-        // than dropping the only durable lookup key from the summary.
-        let first_line = if role == "tool" {
-            let separate_body_line = content
-                .lines()
-                .find(|line| !line.trim().is_empty() && !line.starts_with(handle_marker))
-                .map(str::trim);
-            separate_body_line
-                .or_else(|| {
-                    content
-                        .lines()
-                        .find(|line| !line.trim().is_empty())
-                        .map(str::trim)
-                })
-                .unwrap_or("")
-        } else {
-            content.lines().next().unwrap_or("").trim()
-        };
-        if first_line.is_empty() {
-            continue;
-        }
-        let headline_max = if first_line.starts_with(handle_marker) {
-            HANDLE_HEADLINE_MAX_CHARS
-        } else {
-            150
-        };
-        let boundary = crate::utils::helpers::floor_char_boundary(first_line, headline_max);
-        let headline = &first_line[..boundary];
-        match role {
-            "user" => lines.push(format!("· user: {headline}")),
-            "assistant" => lines.push(format!("· assistant: {headline}")),
-            _ => lines.push(format!("· {role}: {headline}")),
-        }
-    }
-    (lines.join("\n"), SummaryManifest::default())
-}
 
 /// Escalated summarization: tries increasingly aggressive LLM strategies.
 ///
@@ -1626,28 +1650,6 @@ async fn escalated_summary(
         debug!("LCM escalation: no compactor available, leaving context uncompacted");
         return Ok(None);
     };
-
-    // Level 0: Mechanical headlines — one line per message from the eviction
-    // span. Zero LLM calls, zero latency. Scroll (arXiv:2608.21690 §4.3)
-    // shows lossy LLM summarization degrades accuracy 73→20 while
-    // recoverable eviction (originals in SQLite, lcm_expand) stays ≥86.
-    // Mechanical headlines preserve the same recoverability invariant.
-    // Mechanical headlines only when the eviction span contains tool
-    // results (large stashed outputs — the paging-loop pain point). Pure
-    // conversation messages go through the LLM path for richer summaries.
-    let has_tool_results = messages
-        .iter()
-        .any(|m| m.get("role").and_then(Value::as_str) == Some("tool"));
-    if has_tool_results {
-        let (mech_summary, mech_manifest) = mechanical_headlines(messages);
-        if mech_summary.chars().count() >= 200 {
-            info!(
-                chars = mech_summary.chars().count(),
-                "LCM Level 0: mechanical headlines (zero LLM calls)"
-            );
-            return Ok(Some((mech_summary, mech_manifest, 0)));
-        }
-    }
 
     // Level 1: Preserve details. Only a completed but insufficient summary may
     // escalate. A transport or fidelity-gate error is indeterminate and must
@@ -1712,82 +1714,6 @@ fn summary_is_acceptable(summary: &str, original_tokens: usize, level: u8) -> Re
         level, original_tokens, tokens
     );
     Ok(true)
-}
-
-/// Deterministic truncation: extract key facts without any LLM call.
-///
-/// Strategy: Keep first sentence of each user message, skip tool results,
-/// keep first sentence of assistant responses. Guaranteed to produce
-/// output ≤ target_tokens.
-fn deterministic_truncate(messages: &[Value], target_tokens: usize) -> String {
-    let mut lines = Vec::new();
-
-    for msg in messages {
-        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
-
-        match role {
-            "user" => {
-                // Keep first sentence.
-                let first = first_sentence(content);
-                if !first.is_empty() {
-                    lines.push(format!("User: {}", first));
-                }
-            }
-            "assistant" => {
-                // Keep first sentence, skip if tool-call-only.
-                if !content.is_empty() {
-                    let first = first_sentence(content);
-                    if !first.is_empty() {
-                        lines.push(format!("Assistant: {}", first));
-                    }
-                }
-            }
-            "tool" => {
-                // Just note the tool name and result length.
-                let name = msg.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
-                let len = content.len();
-                lines.push(format!("[Tool {}: {} chars]", name, len));
-            }
-            _ => {}
-        }
-
-        // Check token budget after each message.
-        let current = lines.join("\n");
-        if TokenBudget::estimate_str_tokens(&current) >= target_tokens {
-            break;
-        }
-    }
-
-    let result = lines.join("\n");
-    // Final clamp: if still over budget, hard-truncate by characters.
-    let target_chars = target_tokens * 4; // ~4 chars per token
-    if result.len() > target_chars {
-        result.chars().take(target_chars).collect()
-    } else {
-        result
-    }
-}
-
-/// Extract the first sentence from text.
-fn first_sentence(text: &str) -> &str {
-    let trimmed = text.trim();
-    // Find first sentence boundary (. ! ? followed by space or end).
-    for (i, c) in trimmed.char_indices() {
-        if (c == '.' || c == '!' || c == '?') && i > 0 {
-            let next = trimmed[i + c.len_utf8()..].chars().next();
-            if next.is_none() || next == Some(' ') || next == Some('\n') {
-                return &trimmed[..=i];
-            }
-        }
-    }
-    // No sentence boundary found — take first 200 chars.
-    let end = trimmed
-        .char_indices()
-        .nth(200)
-        .map(|(i, _)| i)
-        .unwrap_or(trimmed.len());
-    &trimmed[..end]
 }
 
 /// Check if text contains an LLM refusal pattern.
@@ -2063,7 +1989,7 @@ mod tests {
         }
     }
 
-    /// Mock LLM that returns an error — forces Level 3 deterministic fallback.
+    /// Mock LLM that returns an error so compaction must preserve raw context.
     struct FailingMock;
 
     #[async_trait]
@@ -2090,8 +2016,42 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct RecordingSummarizerMock {
+        requests: Arc<std::sync::Mutex<Vec<Vec<Value>>>>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for RecordingSummarizerMock {
+        async fn chat(
+            &self,
+            messages: &[Value],
+            tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<LLMResponse> {
+            assert!(tools.is_none(), "compaction must not expose tools");
+            self.requests.lock().unwrap().push(messages.to_vec());
+            Ok(LLMResponse {
+                content: Some(
+                    "- Preserve the latest corrected state and the failed SearX edit outcome."
+                        .to_string(),
+                ),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "mock-recording-summarizer"
+        }
+    }
+
     #[tokio::test]
-    async fn mechanical_headlines_keeps_one_line_tool_result_handle() {
+    async fn model_summary_input_keeps_one_line_tool_result_handle() {
         let temp = tempfile::tempdir().unwrap();
         let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
         let session = sessions.create_session("cli:lcm-handle-headline").await;
@@ -2115,12 +2075,31 @@ mod tests {
             "the regression requires the real one-line handle shape"
         );
 
-        let messages = vec![json!({"role": "tool", "content": handle})];
-        let (summary, _) = mechanical_headlines(&messages);
+        let messages = vec![
+            json!({"role": "user", "content": "Preserve the exact failed tool evidence."}),
+            json!({"role": "tool", "name": "exec", "tool_call_id": call_id, "content": handle}),
+        ];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let compactor = ContextCompactor::new(
+            Arc::new(RecordingSummarizerMock {
+                requests: Arc::clone(&requests),
+            }),
+            "mock".to_string(),
+            8_192,
+        );
 
-        assert!(summary.contains("TOOL_RESULT_HANDLE"), "{summary}");
-        assert!(summary.contains(call_id), "{summary}");
-        assert!(summary.contains("bounded evidence excerpt"), "{summary}");
+        let summary = escalated_summary(&messages, 64, Some(&compactor))
+            .await
+            .unwrap()
+            .expect("tool evidence must use a model-authored summary");
+
+        assert!(matches!(summary.2, 1 | 2));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let wire = serde_json::to_string(&requests[0]).unwrap();
+        assert!(wire.contains("TOOL_RESULT_HANDLE"), "{wire}");
+        assert!(wire.contains(call_id), "{wire}");
+        assert!(wire.contains("bounded evidence excerpt"), "{wire}");
     }
 
     #[async_trait]
@@ -2264,29 +2243,6 @@ mod tests {
 
         fn get_default_model(&self) -> &str {
             "mock-babble"
-        }
-    }
-
-    /// Mock LLM that panics if called — proves the LLM was never invoked.
-    struct PanickingMock;
-
-    #[async_trait]
-    impl LLMProvider for PanickingMock {
-        async fn chat(
-            &self,
-            _messages: &[Value],
-            _tools: Option<&[Value]>,
-            _model: Option<&str>,
-            _max_tokens: u32,
-            _temperature: f64,
-            _thinking_budget: Option<u32>,
-            _top_p: Option<f64>,
-        ) -> anyhow::Result<LLMResponse> {
-            panic!("LLM should not be called for huge compaction blocks")
-        }
-
-        fn get_default_model(&self) -> &str {
-            "mock-panicking"
         }
     }
 
@@ -2793,63 +2749,288 @@ mod tests {
         );
     }
 
-    /// When a block has more messages than MAX_COMPACTION_BLOCK_MESSAGES,
-    /// compact() should skip LLM summarization and use deterministic
-    /// truncation directly. This prevents a 0.8B model from making 75+
-    /// sequential LLM calls to summarize a massive block.
     #[tokio::test]
-    async fn test_huge_block_skips_llm_uses_deterministic() {
+    async fn tool_rich_block_over_eighty_messages_uses_model_and_covers_late_correction() {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.1,
             tau_hard: 0.3,
             deterministic_target: 64,
         });
 
-        ingest(&mut engine, 1, "system", "System");
-        // Add 200 messages — way more than any sane compaction block
-        for i in 0..100 {
-            ingest(
-                &mut engine,
-                2 + 2 * i,
-                "user",
-                &format!("Question {} about topic {}", i, i * 7),
+        ingest(&mut engine, 1, "system", "System prompt.");
+        let mut next_id = 2usize;
+        let mut correction_id = 0usize;
+        let mut failure_id = 0usize;
+        for i in 0..30 {
+            let correction = if i == 21 {
+                correction_id = next_id;
+                " CORRECTION: edit only the SearX endpoint; keep the timeout unchanged."
+            } else {
+                ""
+            };
+            assert_eq!(
+                engine.ingest(json!({
+                    "role": "user",
+                    "content": format!(
+                        "Iteration {i} keeps deployment goals, constraints, and evidence.{} {}",
+                        correction,
+                        "durable context ".repeat(80),
+                    ),
+                    "_db_id": next_id,
+                })),
+                Some(next_id),
             );
+            next_id += 1;
+
+            let call_id = format!("call_searx_{i}");
+            assert_eq!(
+                engine.ingest(json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": format!("{{\"path\":\"searx-{i}.toml\"}}"),
+                        },
+                    }],
+                    "_db_id": next_id,
+                })),
+                Some(next_id),
+            );
+            next_id += 1;
+
+            if i == 21 {
+                failure_id = next_id;
+            }
+            assert_eq!(
+                engine.ingest(json!({
+                    "role": "tool",
+                    "name": "write_file",
+                    "tool_call_id": format!("call_searx_{i}"),
+                    "content": if i == 21 {
+                        "FAILED: SearX endpoint edit did not apply; retry remains open."
+                    } else {
+                        "write completed and was verified"
+                    },
+                    "_db_id": next_id,
+                })),
+                Some(next_id),
+            );
+            next_id += 1;
+
             ingest(
                 &mut engine,
-                3 + 2 * i,
+                next_id,
                 "assistant",
-                &format!("Answer {} with details about {}", i, i * 3),
+                if i == 21 {
+                    "The SearX edit failed and is still unresolved."
+                } else {
+                    "Recorded the verified outcome and next step."
+                },
             );
+            next_id += 1;
         }
 
-        // Use a mock that PANICS if called — proving LLM was never invoked.
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let compactor = ContextCompactor::new(
-            Arc::new(PanickingMock) as Arc<dyn LLMProvider>,
+            Arc::new(RecordingSummarizerMock {
+                requests: Arc::clone(&requests),
+            }) as Arc<dyn LLMProvider>,
             "mock".to_string(),
-            4096,
+            32_768,
         );
         let budget = TokenBudget::new(32_768, 2048);
 
-        // compact() should succeed via deterministic truncation (level 3),
-        // never calling the LLM.
-        let result = engine
+        let summary = engine
             .compact(
                 Some(&compactor),
                 &budget,
                 0,
                 CompactionFailureMode::Deterministic,
             )
-            .await;
+            .await
+            .expect("large tool-rich history must receive a model-authored summary");
+        let Turn::Summary {
+            source_ids, level, ..
+        } = summary
+        else {
+            panic!("expected summary turn");
+        };
+
+        assert!(matches!(level, 1 | 2), "model summary level, got {level}");
         assert!(
-            result.is_some(),
-            "Should produce a summary via deterministic truncation"
+            source_ids.len() > 80,
+            "regression needs >80 covered messages"
         );
-        if let Some(Turn::Summary { level, .. }) = &result {
+        assert!(source_ids.contains(&correction_id));
+        assert!(source_ids.contains(&failure_id));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "one model summary request");
+        let wire = serde_json::to_string(&requests[0]).unwrap();
+        assert!(wire.contains("CORRECTION: edit only the SearX endpoint"));
+        assert!(wire.contains("FAILED: SearX endpoint edit did not apply"));
+    }
+
+    #[tokio::test]
+    async fn oversized_block_summarizes_only_complete_prefix_that_fits() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.1,
+            tau_hard: 0.3,
+            deterministic_target: 64,
+        });
+        ingest(&mut engine, 1, "system", "System prompt.");
+
+        let mut tool_pairs = Vec::new();
+        let mut next_id = 2usize;
+        for i in 0..12 {
+            ingest(
+                &mut engine,
+                next_id,
+                "user",
+                &format!("Goal {i}: {}", "preserve detailed evidence ".repeat(120)),
+            );
+            next_id += 1;
+
+            let call_id = next_id;
             assert_eq!(
-                *level, 3,
-                "Should use level 3 (deterministic), not LLM levels 1-2"
+                engine.ingest(json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": format!("call_{i}"),
+                        "type": "function",
+                        "function": {"name": "exec", "arguments": "{\"cmd\":\"check\"}"},
+                    }],
+                    "_db_id": call_id,
+                })),
+                Some(call_id),
+            );
+            next_id += 1;
+
+            let result_id = next_id;
+            assert_eq!(
+                engine.ingest(json!({
+                    "role": "tool",
+                    "name": "exec",
+                    "tool_call_id": format!("call_{i}"),
+                    "content": format!("observed result {i}: {}", "verified output ".repeat(12)),
+                    "_db_id": result_id,
+                })),
+                Some(result_id),
+            );
+            next_id += 1;
+            tool_pairs.push((call_id, result_id));
+
+            ingest(
+                &mut engine,
+                next_id,
+                "assistant",
+                &format!("Outcome {i} recorded; unresolved failures remain explicit."),
+            );
+            next_id += 1;
+        }
+
+        let compactible = engine
+            .find_oldest_raw_block_with_tokens(512)
+            .expect("fixture must have a compactible block");
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let compactor = ContextCompactor::new(
+            Arc::new(RecordingSummarizerMock {
+                requests: Arc::clone(&requests),
+            }),
+            "mock".to_string(),
+            4_096,
+        );
+
+        let summary = engine
+            .compact(
+                Some(&compactor),
+                &TokenBudget::new(4_096, 512),
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await
+            .expect("an old prefix should fit even when the full block does not");
+        let Turn::Summary {
+            source_ids, level, ..
+        } = summary
+        else {
+            panic!("expected summary turn");
+        };
+
+        assert!(matches!(level, 1 | 2));
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(
+            source_ids.len() < compactible.1 - compactible.0,
+            "only the model-covered prefix may be retired"
+        );
+        assert!(
+            engine.active_context().len() > 1,
+            "unsummarized suffix must remain raw"
+        );
+        for (call_id, result_id) in tool_pairs {
+            assert_eq!(
+                source_ids.contains(&call_id),
+                source_ids.contains(&result_id),
+                "a compacted tool call must keep its result in the same source span"
             );
         }
+        for source_id in &source_ids {
+            assert_eq!(engine.expand(&[*source_id]).len(), 1);
+            assert!(engine.active_context().iter().all(|message| {
+                message.get("_db_id").and_then(Value::as_u64) != Some(*source_id as u64)
+            }));
+        }
+        let first_unsummarized = source_ids.last().copied().unwrap_or_default() + 1;
+        assert!(
+            engine.active_context().iter().any(|message| {
+                message.get("_db_id").and_then(Value::as_u64) == Some(first_unsummarized as u64)
+            }),
+            "the raw message immediately after the covered prefix must stay active"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_model_summary_prefix_fit_preserves_raw_history() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.1,
+            tau_hard: 0.3,
+            deterministic_target: 64,
+        });
+        ingest(&mut engine, 1, "system", "System prompt.");
+        for id in 2..=5 {
+            ingest(
+                &mut engine,
+                id,
+                "user",
+                &format!("oversized state {id} {}", "evidence ".repeat(1_000)),
+            );
+        }
+        let active_before = engine.active_context();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let compactor = ContextCompactor::new(
+            Arc::new(RecordingSummarizerMock {
+                requests: Arc::clone(&requests),
+            }),
+            "mock".to_string(),
+            1_024,
+        );
+
+        let summary = engine
+            .compact(
+                Some(&compactor),
+                &TokenBudget::new(1_024, 256),
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
+
+        assert!(summary.is_none());
+        assert!(requests.lock().unwrap().is_empty());
+        assert_eq!(engine.active_context(), active_before);
+        assert!(engine.dag().is_empty());
     }
 
     /// `conversation_tokens()` should return 0 when only a system prompt exists.
@@ -2862,27 +3043,33 @@ mod tests {
         assert_eq!(engine.conversation_tokens(), 0);
     }
 
-    #[test]
-    fn test_deterministic_truncate_basic() {
+    #[tokio::test]
+    async fn model_summary_receives_full_tool_evidence_instead_of_length_placeholder() {
         let messages = vec![
             json!({"role": "user", "content": "Please read the file and analyze it."}),
-            json!({"role": "tool", "name": "read_file", "content": "x".repeat(5000)}),
+            json!({"role": "tool", "name": "read_file", "tool_call_id": "call_read", "content": "x".repeat(5000)}),
             json!({"role": "assistant", "content": "I found several issues in the code. Let me explain."}),
         ];
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let compactor = ContextCompactor::new(
+            Arc::new(RecordingSummarizerMock {
+                requests: Arc::clone(&requests),
+            }),
+            "mock".to_string(),
+            8_192,
+        );
 
-        let result = deterministic_truncate(&messages, 100);
-        assert!(result.contains("User:"));
-        assert!(result.contains("[Tool read_file:"));
-        assert!(result.contains("Assistant:"));
-        assert!(TokenBudget::estimate_str_tokens(&result) <= 100);
-    }
+        let result = escalated_summary(&messages, 100, Some(&compactor))
+            .await
+            .unwrap()
+            .expect("complete tool evidence must be summarized by the model");
 
-    #[test]
-    fn test_first_sentence() {
-        assert_eq!(first_sentence("Hello world. More text."), "Hello world.");
-        assert_eq!(first_sentence("No period here"), "No period here");
-        assert_eq!(first_sentence("Question? Yes."), "Question?");
-        assert_eq!(first_sentence(""), "");
+        assert!(matches!(result.2, 1 | 2));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let wire = serde_json::to_string(&requests[0]).unwrap();
+        assert!(wire.contains(&"x".repeat(5_000)));
+        assert!(!wire.contains("[Tool read_file: 5000 chars]"));
     }
 
     // -----------------------------------------------------------------------
@@ -3328,13 +3515,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn soft_compaction_huge_block_installs_deterministic_truncation() {
-        // Regression pin for the async-band limbo: PreserveContext used to
-        // REFUSE blocks >80 messages outright, so a store sitting in the
-        // soft band re-fired Async every turn and installed nothing while
-        // the prompt grew to the server cap (session 20260828_142425: zero
-        // summaries in 83 messages). Soft mode now takes the same
-        // deterministic truncation the blocking path uses.
+    async fn soft_compaction_huge_block_without_model_preserves_and_stays_retryable() {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.1,
             tau_hard: 0.3,
@@ -3356,6 +3537,7 @@ mod tests {
                 &format!("Answer {i}: {detail}"),
             );
         }
+        let active_before = engine.active_context();
         engine.request_async_compaction();
 
         let result = engine
@@ -3367,27 +3549,13 @@ mod tests {
             )
             .await;
 
-        let summary = result.expect("huge soft block must install deterministic truncation");
-        let Turn::Summary { text, level, .. } = summary else {
-            panic!("expected a Turn::Summary, got {summary:?}");
-        };
-        assert_eq!(level, 3, "huge block must take the deterministic path");
-        assert!(
-            !text.is_empty(),
-            "deterministic truncation must produce summary text"
-        );
-        assert!(
-            engine.active_context().len() < 201,
-            "block must be replaced by the summary entry"
-        );
-        assert!(
-            !engine.dag().is_empty(),
-            "summary node must be committed to the DAG"
-        );
-        assert_eq!(
+        assert!(result.is_none());
+        assert_eq!(engine.active_context(), active_before);
+        assert!(engine.dag().is_empty());
+        assert_ne!(
             engine.check_thresholds(&TokenBudget::new(32_768, 2048), 0),
             CompactionAction::None,
-            "installed truncation must bring the store back under thresholds"
+            "failed soft compaction must clear pending so a later model can retry"
         );
     }
 
@@ -3396,8 +3564,7 @@ mod tests {
         // With no compactor at all, hard pressure can no longer converge via
         // deterministic truncation — that fallback was deleted (silent
         // truncation is never acceptable). It leaves the context uncompacted
-        // and retryable, same as a soft failure; a separate hard trim
-        // elsewhere in the pipeline is what actually protects the request.
+        // and retryable so typed capacity handling can suspend the turn.
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,

@@ -1606,17 +1606,19 @@ impl SessionDb {
         sender: &str,
         content: &str,
         is_voice: bool,
+        retry_count: u32,
         next_retry_at_epoch_ms: u64,
-    ) -> Result<(), ReplayError> {
-        let conn = self.conn.lock().await;
-        conn.execute(
-            "DELETE FROM pending_capacity_turns WHERE chat_id = ?1",
-            params![chat_id],
+    ) -> Result<i64, ReplayError> {
+        let mut conn = self.conn.lock().await;
+        let transaction = conn.transaction()?;
+        transaction.execute(
+            "DELETE FROM pending_capacity_turns WHERE channel = ?1 AND chat_id = ?2",
+            params![channel, chat_id],
         )?;
-        conn.execute(
+        transaction.execute(
             "INSERT INTO pending_capacity_turns \
              (session_id, channel, chat_id, sender, content, is_voice, retry_count, next_retry_at, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 session_id,
                 channel,
@@ -1624,12 +1626,15 @@ impl SessionDb {
                 sender,
                 content,
                 i64::from(is_voice),
+                i64::from(retry_count),
                 i64::try_from(next_retry_at_epoch_ms)
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?,
                 Utc::now().to_rfc3339()
             ],
         )?;
-        Ok(())
+        let id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        Ok(id)
     }
 
     /// Pending turns whose retry deadline has passed.
@@ -1670,9 +1675,9 @@ impl SessionDb {
         id: i64,
         retry_count: u32,
         next_retry_at_epoch_ms: u64,
-    ) -> Result<(), ReplayError> {
+    ) -> Result<bool, ReplayError> {
         let conn = self.conn.lock().await;
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE pending_capacity_turns SET retry_count = ?2, next_retry_at = ?3 WHERE id = ?1",
             params![
                 id,
@@ -1681,15 +1686,49 @@ impl SessionDb {
                     .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?
             ],
         )?;
-        Ok(())
+        Ok(changed != 0)
     }
 
     /// Remove a pending turn (resumed or cancelled).
-    pub(crate) async fn delete_pending_capacity_turn(&self, id: i64) -> Result<(), ReplayError> {
+    pub(crate) async fn delete_pending_capacity_turn(&self, id: i64) -> Result<bool, ReplayError> {
         let conn = self.conn.lock().await;
-        conn.execute(
+        let changed = conn.execute(
             "DELETE FROM pending_capacity_turns WHERE id = ?1",
             params![id],
+        )?;
+        Ok(changed != 0)
+    }
+
+    /// Confirm that a resume handoff still owns the row selected by the
+    /// poller. A newer inbound may have superseded it while capacity was read.
+    pub(crate) async fn pending_capacity_turn_exists(
+        &self,
+        id: i64,
+        channel: &str,
+        chat_id: &str,
+        session_key: &str,
+    ) -> Result<bool, ReplayError> {
+        let conn = self.conn.lock().await;
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pending_capacity_turns p \
+             JOIN sessions s ON s.id = p.session_id \
+             WHERE p.id = ?1 AND p.channel = ?2 AND p.chat_id = ?3 AND s.session_key = ?4",
+            params![id, channel, chat_id, session_key],
+            |row| row.get(0),
+        )?;
+        Ok(count != 0)
+    }
+
+    /// A newer inbound turn supersedes any suspended work for the same chat.
+    pub(crate) async fn delete_pending_capacity_turn_for_chat(
+        &self,
+        channel: &str,
+        chat_id: &str,
+    ) -> Result<(), ReplayError> {
+        let conn = self.conn.lock().await;
+        conn.execute(
+            "DELETE FROM pending_capacity_turns WHERE channel = ?1 AND chat_id = ?2",
+            params![channel, chat_id],
         )?;
         Ok(())
     }

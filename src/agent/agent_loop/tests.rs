@@ -3345,6 +3345,72 @@ async fn cross_session_command_seen_during_coalescing_uses_gateway_dispatch() {
 }
 
 #[tokio::test]
+async fn capacity_resume_wakes_never_coalesce_with_user_steering() {
+    for wake_first in [true, false] {
+        let provider = Arc::new(WireRecordingProvider::new(
+            "local-capacity-coalescing-test",
+            vec![WireRecordingProvider::text_response("steering received")],
+        ));
+        let (mut gateway_loop, inbound_tx, mut outbound_rx, workspace) =
+            build_gateway_harness(provider.clone() as Arc<dyn LLMProvider>);
+        let core = gateway_loop.shared.core_handle.swappable();
+        let session_key = format!("capacity-coalescing-{wake_first}");
+        let session = core.sessions.create_session(&session_key).await;
+        let running = gateway_loop.running.clone();
+        let mut user = InboundMessage::new("test", "user", "resume-chat", "fresh steering marker");
+        user.metadata
+            .insert("session_key".into(), json!(session_key));
+        let mut wake = InboundMessage::new("test", "user", "resume-chat", "old suspended work");
+        wake.metadata
+            .insert("session_key".into(), json!(session_key));
+        // A queued wake can become stale before dispatch. It must not infect a
+        // fresh user turn with its control metadata in either arrival order.
+        wake.metadata
+            .insert(CAPACITY_RESUME_PENDING_ID.into(), json!(99_999_i64));
+        let ordered = if wake_first {
+            [wake, user]
+        } else {
+            [user, wake]
+        };
+        for message in ordered {
+            inbound_tx.send(message).unwrap();
+        }
+        let runner = tokio::spawn(async move { gateway_loop.run().await });
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(5), outbound_rx.recv()).await;
+        running.store(false, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(5), runner)
+            .await
+            .expect("gateway must stop")
+            .unwrap();
+        let calls = provider.calls();
+        let messages = core.sessions.get_all_messages(&session.id).await;
+        let _ = std::fs::remove_dir_all(&workspace);
+        assert_eq!(
+            response
+                .expect("fresh steering must not disappear behind a stale wake")
+                .expect("outbound remains open")
+                .content,
+            "steering received"
+        );
+        assert_eq!(calls.len(), 1, "the stale wake must not call the model");
+        assert!(serde_json::to_string(&calls[0])
+            .unwrap()
+            .contains("fresh steering marker"));
+        assert!(
+            messages
+                .iter()
+                .any(
+                    |message| message.get("role").and_then(Value::as_str) == Some("user")
+                        && message.get("content").and_then(Value::as_str)
+                            == Some("fresh steering marker")
+                ),
+            "fresh steering must remain durable, wake_first={wake_first}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn rapid_same_session_user_messages_still_coalesce() {
     let provider = Arc::new(WireRecordingProvider::new(
         "local-coalescing-test",
@@ -3452,6 +3518,7 @@ async fn system_announcement_after_user_message_does_not_coalesce() {
 
 #[tokio::test]
 async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
+    const EARLIEST_FAILED_ACTION: &str = "EARLIEST_FAILED_ACTION_EX_7041_PERMISSION_DENIED";
     let provider = Arc::new(WireRecordingProvider::new(
         "local-hard-lcm-test",
         vec![
@@ -3478,9 +3545,16 @@ async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
     let session_key = format!("hard-lcm-barrier-{}", uuid::Uuid::new_v4());
     let core = agent_loop.shared.core_handle.swappable();
     let session = core.sessions.get_or_resume(&session_key).await;
+    // Forty small rows exceed the former context-derived 38-row cap. LCM must
+    // receive the oldest failed action before any token-driven reduction.
     for turn in 0..20_u64 {
+        let failed_action = if turn == 0 {
+            EARLIEST_FAILED_ACTION
+        } else {
+            "ordinary retained state"
+        };
         let detail = format!(
-            "turn {turn}: {}",
+            "turn {turn}: {failed_action}; {}",
             "persistent project detail with enough context to require lossless compaction "
                 .repeat(12)
         );
@@ -3513,6 +3587,11 @@ async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
         calls.len(),
         2,
         "expected one compaction call followed by one foreground call"
+    );
+    let compaction_wire = serde_json::to_string(&calls[0]).unwrap();
+    assert!(
+        compaction_wire.contains(EARLIEST_FAILED_ACTION),
+        "pre-call retention must not discard old persisted evidence before LCM sees it"
     );
     // Internal fields like `_lcm_summary` are stripped before messages hit
     // the wire, so `calls[0]` can't be checked via that tag. Match the
@@ -13748,12 +13827,11 @@ mod capacity_preflight {
     }
 
     #[tokio::test]
-    async fn compact_skips_llm_when_its_own_request_would_not_fit() {
+    async fn compact_summarizes_only_the_complete_prefix_that_fits() {
         // ~60 messages x ~380 tokens ~= a 19K-token block against a 3.5K
-        // effective budget: the model-authored summary request itself cannot
-        // fit, so the escalation must go straight to deterministic level 3 —
-        // zero provider calls — while keeping every compacted source id
-        // recallable.
+        // effective budget. The whole block cannot fit the summarizer request,
+        // but a complete old prefix can; only model-covered source IDs may be
+        // retired and the uncovered suffix must remain raw.
         let summarizer = Arc::new(CountingSummarizer {
             calls: AtomicU64::new(0),
         });
@@ -13763,6 +13841,9 @@ mod capacity_preflight {
             4096,
         );
         let mut engine = engine_with_block(60, 2_600);
+        let compactible = engine
+            .find_oldest_raw_block_with_tokens(512)
+            .expect("fixture must have an old raw block");
         let mut mutation = LcmCompactionMutation::new(&mut engine);
         let summary = mutation
             .engine_mut()
@@ -13774,21 +13855,27 @@ mod capacity_preflight {
             )
             .await;
 
-        let summary = summary.expect("deterministic reduction must compact");
+        let summary = summary.expect("a complete old prefix should fit");
         let crate::agent::turn::Turn::Summary {
             level, source_ids, ..
         } = &summary
         else {
             panic!("expected a summary turn");
         };
-        assert_eq!(*level, 3, "deterministic level 3, not LLM escalation");
+        assert!(matches!(level, 1 | 2), "model summary level, got {level}");
         assert_eq!(
             summarizer.calls.load(Ordering::SeqCst),
-            0,
-            "a summary request that cannot fit must make zero provider calls"
+            1,
+            "the largest fitting prefix should use one summarizer call"
         );
-        // Every source id of the compacted block resolves in the engine's
-        // store: durable recall, not a raw drop.
+        assert!(
+            source_ids.len() < compactible.1 - compactible.0,
+            "the uncovered suffix must not be retired"
+        );
+        assert!(
+            mutation.engine().active_context().len() > 1,
+            "uncovered raw messages remain active beside the summary"
+        );
         let node_sources = &mutation.engine().dag().newest().unwrap().source_ids;
         assert!(!node_sources.is_empty());
         for id in node_sources {
@@ -14510,27 +14597,752 @@ mod interrupted {
         let sessions = crate::session::db::SessionDb::new(&db_path);
         let session_id = sessions.create_session("pending-chat").await.id;
         sessions
-            .record_pending_capacity_turn(&session_id, "test", "chat-1", "u", "first", false, 0)
+            .record_pending_capacity_turn(&session_id, "test", "chat-1", "u", "first", false, 0, 0)
             .await
             .unwrap();
         sessions
-            .record_pending_capacity_turn(&session_id, "test", "chat-1", "u", "second", false, 0)
+            .record_pending_capacity_turn(&session_id, "test", "chat-1", "u", "second", false, 0, 0)
             .await
             .unwrap();
+        assert!(
+            sessions
+                .record_pending_capacity_turn(
+                    "missing-session",
+                    "test",
+                    "chat-1",
+                    "u",
+                    "lost",
+                    false,
+                    0,
+                    0
+                )
+                .await
+                .is_err(),
+            "replacement insert must fail its foreign-key check"
+        );
         sessions
-            .record_pending_capacity_turn(&session_id, "test", "chat-2", "u", "other", false, 0)
+            .record_pending_capacity_turn(
+                &session_id,
+                "other-channel",
+                "chat-1",
+                "u",
+                "other",
+                false,
+                0,
+                0,
+            )
             .await
             .unwrap();
         let due = sessions
             .due_pending_capacity_turns(4_102_444_800_000) // 2100-01-01
             .await
             .unwrap();
-        assert_eq!(due.len(), 2, "one pending per chat");
+        assert_eq!(due.len(), 2, "one pending per channel/chat identity");
+        assert!(
+            due.iter()
+                .any(|turn| turn.channel == "test" && turn.content == "second"),
+            "failed replacement must roll back and retain the prior row"
+        );
         assert!(due
             .iter()
-            .any(|turn| turn.chat_id == "chat-1" && turn.content == "second"));
-        assert!(due
+            .any(|turn| turn.channel == "other-channel" && turn.content == "other"));
+    }
+
+    #[derive(Clone, Copy)]
+    enum InteractiveCapacityPlan {
+        Recover,
+        Stall,
+    }
+
+    struct InteractiveCapacityProvider {
+        calls: AtomicU64,
+        capacity_fetches: AtomicU64,
+        plan: InteractiveCapacityPlan,
+        stalled_fetch_started: tokio::sync::Notify,
+        side_effect_working_dir: std::sync::Mutex<Option<String>>,
+    }
+
+    impl InteractiveCapacityProvider {
+        fn new(plan: InteractiveCapacityPlan) -> Self {
+            Self {
+                calls: AtomicU64::new(0),
+                capacity_fetches: AtomicU64::new(0),
+                plan,
+                stalled_fetch_started: tokio::sync::Notify::new(),
+                side_effect_working_dir: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn set_side_effect_working_dir(&self, path: &std::path::Path) {
+            *self.side_effect_working_dir.lock().unwrap() =
+                Some(path.to_string_lossy().into_owned());
+        }
+
+        fn available_profile() -> crate::agent::capacity::HiggsCapacityFetch {
+            crate::agent::capacity::HiggsCapacityFetch::Profile(
+                serde_json::from_value(json!({
+                    "schemaVersion": 1,
+                    "model": "local-qwen-test",
+                    "modelFingerprint": "interactive-capacity-test",
+                    "bootId": "interactive-capacity-boot",
+                    "generation": 1,
+                    "availability": "available",
+                    "pressure": "normal",
+                    "safeTotalTokens": 4096,
+                    "recommendedOutputTokens": 512,
+                    "maxPromptTokens": 3584,
+                    "retainedSessionTokens": 0,
+                    "retainedBytes": 0,
+                    "prefixCacheBytes": 0,
+                    "basis": "conservative"
+                }))
+                .expect("valid interactive capacity profile"),
+            )
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for InteractiveCapacityProvider {
+        async fn chat(
+            &self,
+            messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 1 {
+                return Err(crate::errors::ProviderError::HiggsCapacityUnavailable {
+                    boot_id: "interactive-capacity-boot".to_string(),
+                    generation: 1,
+                    retry_after_ms: 5_000,
+                }
+                .into());
+            }
+
+            let original_user_rows = messages
+                .iter()
+                .filter(|message| {
+                    message.get("role").and_then(Value::as_str) == Some("user")
+                        && message.get("content").and_then(Value::as_str)
+                            == Some("append exactly once, then finish")
+                })
+                .count();
+            if call == 0 || original_user_rows > 1 {
+                let mut arguments = std::collections::HashMap::new();
+                arguments.insert(
+                    "command".to_string(),
+                    json!("printf x >> capacity-once.txt"),
+                );
+                arguments.insert(
+                    "working_dir".to_string(),
+                    json!(self
+                        .side_effect_working_dir
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| ".".to_string())),
+                );
+                return Ok(crate::providers::base::LLMResponse {
+                    content: Some(String::new()),
+                    tool_calls: vec![crate::providers::base::ToolCallRequest {
+                        id: format!("tc_capacity_side_effect_{call}"),
+                        name: "exec".to_string(),
+                        arguments,
+                    }],
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: std::collections::HashMap::new(),
+                });
+            }
+
+            Ok(crate::providers::base::LLMResponse {
+                content: Some("resumed from completed tool result".to_string()),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn fetch_higgs_capacity<'a>(
+            &'a self,
+            _model: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Option<crate::agent::capacity::HiggsCapacityFetch>,
+                            crate::errors::ProviderError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let fetch = self.capacity_fetches.fetch_add(1, Ordering::SeqCst);
+                if fetch > 0 && matches!(self.plan, InteractiveCapacityPlan::Stall) {
+                    self.stalled_fetch_started.notify_waiters();
+                    return std::future::pending().await;
+                }
+                Ok(Some(Self::available_profile()))
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "local-qwen-test"
+        }
+
+        fn get_api_base(&self) -> Option<&str> {
+            Some("http://127.0.0.1:9000")
+        }
+
+        fn supports_higgs_session_cache(&self) -> bool {
+            true
+        }
+    }
+
+    struct GatedCapacityProvider {
+        fetch_started: tokio::sync::Notify,
+        release_fetch: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl LLMProvider for GatedCapacityProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            panic!("superseded pending work must not reach inference")
+        }
+
+        fn fetch_higgs_capacity<'a>(
+            &'a self,
+            _model: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Option<crate::agent::capacity::HiggsCapacityFetch>,
+                            crate::errors::ProviderError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                self.fetch_started.notify_one();
+                self.release_fetch.notified().await;
+                Ok(Some(InteractiveCapacityProvider::available_profile()))
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "local-qwen-test"
+        }
+
+        fn get_api_base(&self) -> Option<&str> {
+            Some("http://127.0.0.1:9000")
+        }
+
+        fn supports_higgs_session_cache(&self) -> bool {
+            true
+        }
+    }
+
+    /// Break caught: the TUI path finalized capacity-unavailable immediately,
+    /// so its only durable retry mechanism targeted an unread gateway bus.
+    /// Rebuilding the turn from the original prompt would also duplicate the
+    /// user row and execute an already-completed side-effect tool again.
+    #[tokio::test]
+    async fn spawned_interactive_turn_resumes_same_context_after_capacity_recovers() {
+        let provider = Arc::new(InteractiveCapacityProvider::new(
+            InteractiveCapacityPlan::Recover,
+        ));
+        let (agent_loop, workspace) =
+            build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+        provider.set_side_effect_working_dir(&workspace);
+        let session_key = format!("interactive-capacity-{}", uuid::Uuid::new_v4());
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+
+        let handle = agent_loop.spawn_direct_streaming(
+            "append exactly once, then finish".to_string(),
+            session_key.clone(),
+            "test".to_string(),
+            "interactive-capacity".to_string(),
+            None,
+            delta_tx,
+            None,
+            Some(cancellation),
+            None,
+        );
+        let response = tokio::time::timeout(std::time::Duration::from_secs(8), handle)
+            .await
+            .expect("interactive retry should finish after the 5s capacity backoff")
+            .expect("interactive task should join");
+
+        assert_eq!(response, "resumed from completed tool result");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("capacity-once.txt")).unwrap(),
+            "x",
+            "completed side-effect tool must not execute again on capacity resume"
+        );
+
+        let core = agent_loop.shared.core_handle.swappable();
+        let session = core
+            .sessions
+            .get_latest_session(&session_key)
+            .await
+            .expect("interactive session");
+        let messages = core.sessions.get_all_messages(&session.id).await;
+        let durable_users = messages
             .iter()
-            .any(|turn| turn.chat_id == "chat-2" && turn.content == "other"));
+            .filter(|message| {
+                message.get("role").and_then(Value::as_str) == Some("user")
+                    && !crate::agent::markers::is_synthetic(message)
+            })
+            .count();
+        assert_eq!(durable_users, 1, "resume must not append the prompt again");
+        let events = core
+            .sessions
+            .load_session_events(&session.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.payload.kind() == "tool_execute")
+                .count(),
+            1,
+            "one durable execution for the completed side effect"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.payload.kind() == "turn_started")
+                .count(),
+            1,
+            "capacity recovery remains one logical turn"
+        );
+        assert_eq!(
+            core.sessions
+                .due_pending_capacity_turns(4_102_444_800_000)
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "successful foreground resume clears its durable pending row"
+        );
+
+        let mut capacity_actions = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            if let Some(crate::turn_stream::ControlMarker::Capacity(status)) =
+                crate::turn_stream::parse_control_marker(&delta)
+            {
+                capacity_actions.push(status.action);
+            }
+        }
+        assert!(
+            capacity_actions.contains(&crate::turn_stream::CapacityAction::Wait),
+            "interactive surface must show capacity wait status: {capacity_actions:?}"
+        );
+        assert!(
+            capacity_actions.contains(&crate::turn_stream::CapacityAction::Recovery),
+            "interactive surface must show capacity recovery status: {capacity_actions:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// Break caught: Esc cancellation had no foreground wait to interrupt;
+    /// a future retry loop must also select cancellation against a stalled
+    /// capacity GET rather than waiting for its network timeout.
+    #[tokio::test]
+    async fn spawned_interactive_capacity_wait_cancels_stalled_fetch_promptly() {
+        let provider = Arc::new(InteractiveCapacityProvider::new(
+            InteractiveCapacityPlan::Stall,
+        ));
+        let (agent_loop, workspace) =
+            build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+        provider.set_side_effect_working_dir(&workspace);
+        let session_key = format!("interactive-capacity-cancel-{}", uuid::Uuid::new_v4());
+        let (delta_tx, _delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let handle = agent_loop.spawn_direct_streaming(
+            "append exactly once, then finish".to_string(),
+            session_key.clone(),
+            "test".to_string(),
+            "interactive-capacity-cancel".to_string(),
+            None,
+            delta_tx,
+            None,
+            Some(cancellation.clone()),
+            None,
+        );
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(7),
+            provider.stalled_fetch_started.notified(),
+        )
+        .await
+        .expect("capacity retry should enter the stalled discovery fetch");
+        cancellation.cancel();
+        let response = tokio::time::timeout(std::time::Duration::from_millis(250), handle)
+            .await
+            .expect("cancellation must interrupt a stalled capacity fetch")
+            .expect("cancelled interactive task should join");
+        assert!(response.is_empty());
+
+        let core = agent_loop.shared.core_handle.swappable();
+        let session = core
+            .sessions
+            .get_latest_session(&session_key)
+            .await
+            .expect("cancelled interactive session");
+        assert_eq!(
+            persisted_turn_outcome(&core.sessions, &session.id).await,
+            "cancelled"
+        );
+        assert!(
+            core.sessions
+                .due_pending_capacity_turns(4_102_444_800_000)
+                .await
+                .unwrap()
+                .is_empty(),
+            "cancelled foreground wait must remove its stale pending row"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// Break caught: the gateway poller deleted durable work even when the
+    /// inbound channel had closed and re-injection failed.
+    #[tokio::test]
+    async fn gateway_resume_send_failure_keeps_pending_turn() {
+        let provider = Arc::new(InteractiveCapacityProvider::new(
+            InteractiveCapacityPlan::Recover,
+        ));
+        let (agent_loop, workspace) =
+            build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+        let core = agent_loop.shared.core_handle.swappable();
+        let session = core.sessions.create_session("gateway-send-failure").await;
+        core.sessions
+            .record_pending_capacity_turn(
+                &session.id,
+                "test",
+                "closed-inbound",
+                "user",
+                "keep me",
+                false,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        drop(closed_rx);
+        let poller = tokio::spawn(super::super::shared::capacity_resume_poller(
+            Arc::downgrade(&agent_loop.shared),
+            closed_tx,
+        ));
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while provider.capacity_fetches.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("poller should inspect the due pending turn");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        poller.abort();
+        let _ = poller.await;
+
+        let due = core
+            .sessions
+            .due_pending_capacity_turns(4_102_444_800_000)
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].content, "keep me");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn gateway_resume_reuses_durable_user_and_tool_rows() {
+        let provider: Arc<dyn LLMProvider> =
+            Arc::new(StaticResponseLLM::new("cloud-test", "continued answer"));
+        let (agent_loop, workspace) = build_local_inline_harness(provider);
+        let core = agent_loop.shared.core_handle.swappable();
+        let session_key = "custom-gateway-session";
+        let session = core.sessions.create_session(session_key).await;
+        core.sessions
+            .add_message(
+                &session.id,
+                &json!({"role": "user", "content": "continue durable work"}),
+            )
+            .await
+            .unwrap();
+        core.sessions
+            .add_message(
+                &session.id,
+                &json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "durable-tool-call",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{\"path\":\"done\"}"}
+                    }]
+                }),
+            )
+            .await
+            .unwrap();
+        core.sessions
+            .add_message(
+                &session.id,
+                &json!({
+                    "role": "tool",
+                    "name": "read_file",
+                    "tool_call_id": "durable-tool-call",
+                    "content": "completed receipt"
+                }),
+            )
+            .await
+            .unwrap();
+        core.sessions
+            .record_pending_capacity_turn(
+                &session.id,
+                "test",
+                "gateway-resume",
+                "original-sender",
+                "continue durable work",
+                true,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+
+        let (resume_tx, mut resume_rx) = tokio::sync::mpsc::unbounded_channel();
+        let poller = tokio::spawn(super::super::shared::capacity_resume_poller(
+            Arc::downgrade(&agent_loop.shared),
+            resume_tx,
+        ));
+        let resumed = tokio::time::timeout(std::time::Duration::from_secs(2), resume_rx.recv())
+            .await
+            .expect("poller should enqueue the durable resume")
+            .expect("resume channel remains open");
+        poller.abort();
+        let _ = poller.await;
+        assert_eq!(resumed.sender_id, "original-sender");
+        assert!(resumed
+            .metadata
+            .contains_key(super::super::shared::CAPACITY_RESUME_PENDING_ID));
+        assert_eq!(resumed.metadata.get("voice_message"), Some(&json!(true)));
+
+        let response = agent_loop
+            .shared
+            .process_message(
+                &resumed,
+                None,
+                None,
+                None,
+                None,
+                super::super::shared::CapacityRetryMode::Defer,
+            )
+            .await
+            .expect("resume should produce an answer");
+        assert_eq!(response.content, "continued answer");
+
+        let messages = core.sessions.get_all_messages(&session.id).await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+                .count(),
+            1,
+            "wake signal must not append the original user row again"
+        );
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+                .count(),
+            1,
+            "the completed tool receipt remains one durable row"
+        );
+        assert!(core
+            .sessions
+            .due_pending_capacity_turns(4_102_444_800_000)
+            .await
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn stale_gateway_resume_is_rejected_before_context_creation() {
+        let provider: Arc<dyn LLMProvider> =
+            Arc::new(StaticResponseLLM::new("cloud-test", "must not run"));
+        let (agent_loop, workspace) = build_local_inline_harness(provider);
+        let mut stale = InboundMessage::new("test", "user", "stale-consumer", "old work");
+        stale.metadata.insert(
+            super::super::shared::CAPACITY_RESUME_PENDING_ID.to_string(),
+            json!(99_999_i64),
+        );
+        stale
+            .metadata
+            .insert("session_key".to_string(), json!("custom-stale-session"));
+
+        assert!(agent_loop
+            .shared
+            .process_message(
+                &stale,
+                None,
+                None,
+                None,
+                None,
+                super::super::shared::CapacityRetryMode::Defer,
+            )
+            .await
+            .is_none());
+        assert!(
+            agent_loop
+                .shared
+                .core_handle
+                .swappable()
+                .sessions
+                .get_latest_session("custom-stale-session")
+                .await
+                .is_none(),
+            "stale wake must be rejected before prepare_context creates state"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn gateway_poller_drops_fetch_result_after_pending_is_superseded() {
+        let provider = Arc::new(GatedCapacityProvider {
+            fetch_started: tokio::sync::Notify::new(),
+            release_fetch: tokio::sync::Notify::new(),
+        });
+        let (agent_loop, workspace) =
+            build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+        let core = agent_loop.shared.core_handle.swappable();
+        let session = core.sessions.create_session("gateway-stale-fetch").await;
+        let old_id = core
+            .sessions
+            .record_pending_capacity_turn(
+                &session.id,
+                "test",
+                "stale-fetch",
+                "user",
+                "old request",
+                false,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+        let (resume_tx, mut resume_rx) = tokio::sync::mpsc::unbounded_channel();
+        let poller = tokio::spawn(super::super::shared::capacity_resume_poller(
+            Arc::downgrade(&agent_loop.shared),
+            resume_tx,
+        ));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            provider.fetch_started.notified(),
+        )
+        .await
+        .expect("poller should enter the gated capacity fetch");
+        let replacement_id = core
+            .sessions
+            .record_pending_capacity_turn(
+                &session.id,
+                "test",
+                "stale-fetch",
+                "user",
+                "new steering",
+                false,
+                0,
+                crate::agent::agent_core::RuntimeCounters::now_epoch_ms().saturating_add(60_000),
+            )
+            .await
+            .unwrap();
+        assert_ne!(old_id, replacement_id);
+        provider.release_fetch.notify_one();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), resume_rx.recv())
+                .await
+                .is_err(),
+            "superseded fetch result must not enqueue stale work"
+        );
+        poller.abort();
+        let _ = poller.await;
+
+        let due = core
+            .sessions
+            .due_pending_capacity_turns(4_102_444_800_000)
+            .await
+            .unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, replacement_id);
+        assert_eq!(due[0].content, "new steering");
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// Break caught: an older suspended turn remained queued after the user
+    /// submitted newer steering that completed successfully in the same chat.
+    #[tokio::test]
+    async fn new_direct_user_turn_cancels_stale_pending_capacity_work() {
+        let provider: Arc<dyn LLMProvider> =
+            Arc::new(StaticResponseLLM::new("local-qwen-test", "new answer"));
+        let (agent_loop, workspace) = build_local_inline_harness(provider);
+        let core = agent_loop.shared.core_handle.swappable();
+        let session_key = format!("capacity-new-steering-{}", uuid::Uuid::new_v4());
+        let session = core.sessions.create_session(&session_key).await;
+        core.sessions
+            .record_pending_capacity_turn(
+                &session.id,
+                "test",
+                "same-chat",
+                "user",
+                "obsolete request",
+                false,
+                0,
+                0,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            agent_loop
+                .process_direct("new steering", &session_key, "test", "same-chat")
+                .await,
+            "new answer"
+        );
+        assert!(
+            core.sessions
+                .due_pending_capacity_turns(4_102_444_800_000)
+                .await
+                .unwrap()
+                .is_empty(),
+            "new steering must cancel older pending work for the chat"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }

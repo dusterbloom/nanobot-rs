@@ -818,7 +818,10 @@ async fn run_turn(
     let initial_tokens = state.lock().used;
     let started = Instant::now();
     ctx.persist_pending_protocol_messages().await.unwrap();
-    agent.shared.run_agent_loop(&mut ctx).await;
+    agent
+        .shared
+        .run_agent_loop(&mut ctx, CapacityRetryMode::Defer)
+        .await;
     ACTIVE.lock().remove(&ctx.request_id);
     let outcome = format!("{:?}", ctx.turn_outcome);
     let session_id = ctx.session_id.clone();
@@ -933,7 +936,10 @@ async fn context_reset_announcement_recovery_live() {
         if boundary_ready(&ctx).await {
             ctx.turn_outcome = TurnOutcome::Finished;
         } else {
-            agent.shared.run_agent_loop(&mut ctx).await;
+            agent
+                .shared
+                .run_agent_loop(&mut ctx, CapacityRetryMode::Defer)
+                .await;
         }
     }
     ACTIVE.lock().remove(&ctx.request_id);

@@ -397,14 +397,13 @@ impl AgentLoopShared {
             }
         }
 
-        // Get session history. Track count so we know where new messages start.
-        // The trim ceiling must stay above LCM's soft
-        // compaction threshold, or compaction never fires (see history_limit_lcm).
-        let max_messages =
-            crate::agent::agent_core::history_limit_lcm(core.token_budget.max_context());
+        // LCM owns token-driven history reduction. A context-derived row cap
+        // would discard old persisted evidence before the summarizer could
+        // cover it. `max_messages=0` keeps the configured turn limit and all
+        // other replay filters while disabling only that implicit row limit.
         let history = core
             .sessions
-            .get_history(&session_id, max_messages, core.max_history_turns)
+            .get_history(&session_id, 0, core.max_history_turns)
             .await;
         // The fingerprint deliberately SURVIVES the reload so the first call of
         // each new user turn is compared against the last call of the previous
@@ -495,6 +494,10 @@ impl AgentLoopShared {
             .get("detected_language")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let capacity_resume_pending_id = msg
+            .metadata
+            .get(crate::agent::agent_loop::CAPACITY_RESUME_PENDING_ID)
+            .and_then(Value::as_i64);
         // /no_think is handled at the provider level (system prompt via native
         // LMS API for Nemotron) — never inject it into user content where the
         // model treats it as literal text and leaks it into tool arguments.
@@ -513,6 +516,13 @@ impl AgentLoopShared {
             is_voice_message,
             detected_language.as_deref(),
         );
+        if capacity_resume_pending_id.is_some() {
+            // The original user row was persisted before suspension and is
+            // already in `history`. The poller message is a wake signal, not
+            // another user turn; retain its content only in `user_content`
+            // so a second suspension can refresh the same durable work item.
+            let _ = messages.pop();
+        }
         let build_msgs_ms = lap_ms();
 
         // Local prompts receive only the fixed LCM guide at runtime. Volatile
@@ -579,7 +589,11 @@ impl AgentLoopShared {
         // The just-pushed user message is the last element; everything before
         // it (the prompt prefix plus history) is already persisted or static.
         // Local split-system insertion happens above, so compute this here.
-        let new_start = messages.len() - 1;
+        let new_start = if capacity_resume_pending_id.is_some() {
+            messages.len()
+        } else {
+            messages.len() - 1
+        };
 
         // Stale lease receipts from PRIOR turns say "your per-turn tool
         // budget is used up" — true then, false now (the lease is per-turn).
@@ -684,6 +698,7 @@ impl AgentLoopShared {
             user_content,
             channel: msg.channel.clone(),
             chat_id: msg.chat_id.clone(),
+            sender_id: msg.sender_id.clone(),
             is_voice_message,
             detected_language,
             text_delta_tx,
@@ -739,6 +754,8 @@ impl AgentLoopShared {
                 provider_call_mode: ProviderCallMode::Normal,
                 terminal_attempted: false,
                 infra_error: None,
+                capacity_retry_after_ms: None,
+                pending_capacity_id: None,
             },
             health_registry: self.health_registry.clone(),
             taint_state: TaintState::new(),

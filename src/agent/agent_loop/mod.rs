@@ -99,6 +99,16 @@ fn is_system_message(msg: &InboundMessage) -> bool {
         .unwrap_or(false)
 }
 
+/// Keep control metadata out of batches of user text. A capacity wake may be
+/// stale by dispatch time; merging it with steering would discard that steering
+/// when the wake is rejected or removed during context preparation.
+fn is_coalescible_user_message(msg: &InboundMessage) -> bool {
+    !is_system_message(msg)
+        && !msg.content.trim_start().starts_with('/')
+        && !crate::agent::idle::is_idle_message(msg)
+        && !msg.metadata.contains_key(CAPACITY_RESUME_PENDING_ID)
+}
+
 impl AgentLoop {
     /// Create a new `AgentLoop`.
     #[allow(clippy::too_many_arguments)]
@@ -314,12 +324,10 @@ impl AgentLoop {
 
             // Coalesce rapid messages from the same session (Telegram, WhatsApp).
             // Waits up to 400ms for follow-up messages before processing.
-            // System announcements, commands, and idle turns never coalesce:
+            // System announcements, commands, idle turns, and capacity wakes never coalesce:
             // their behavior and metadata must remain isolated from user turns.
             let msg = if crate::bus::events::should_coalesce(&msg.channel)
-                && !is_system_message(&msg)
-                && !msg.content.trim_start().starts_with('/')
-                && !crate::agent::idle::is_idle_message(&msg)
+                && is_coalescible_user_message(&msg)
             {
                 let session = msg.session_key();
                 let mut batch = vec![msg];
@@ -328,9 +336,7 @@ impl AgentLoop {
                     match tokio::time::timeout_at(deadline, self.bus_inbound_rx.recv()).await {
                         Ok(Some(next))
                             if next.session_key() == session
-                                && !is_system_message(&next)
-                                && !next.content.trim_start().starts_with('/')
-                                && !crate::agent::idle::is_idle_message(&next) =>
+                                && is_coalescible_user_message(&next) =>
                         {
                             batch.push(next);
                         }
@@ -463,7 +469,7 @@ impl AgentLoop {
                 let stream_is_telegram = stream_tx.is_some();
 
                 let response = shared
-                    .process_message(&msg, stream_tx, None, None, None)
+                    .process_message(&msg, stream_tx, None, None, None, CapacityRetryMode::Defer)
                     .await;
 
                 // Quiet by default for idle turns: the final reply is logged
@@ -491,6 +497,11 @@ impl AgentLoop {
                         outbound
                     }
                     None => {
+                        if msg.metadata.contains_key(CAPACITY_RESUME_PENDING_ID) {
+                            debug!(chat_id = %msg.chat_id, "stale_capacity_resume_ignored");
+                            drop(permit);
+                            return;
+                        }
                         error!(
                             channel = %msg.channel,
                             chat_id = %msg.chat_id,
@@ -671,7 +682,7 @@ impl AgentLoop {
 
         match self
             .shared
-            .process_message(&msg, None, None, None, None)
+            .process_message(&msg, None, None, None, None, CapacityRetryMode::Defer)
             .await
         {
             Some(response) => response.content,
@@ -715,6 +726,7 @@ impl AgentLoop {
                 tool_event_tx,
                 cancellation_token,
                 priority_rx,
+                CapacityRetryMode::Wait,
             )
             .await
         {
@@ -785,6 +797,7 @@ impl AgentLoop {
                     tool_event_tx,
                     cancellation_token,
                     None,
+                    CapacityRetryMode::Wait,
                 )
                 .await
             {

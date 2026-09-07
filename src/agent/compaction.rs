@@ -140,6 +140,8 @@ pub struct ContextCompactor {
     summary_max_tokens: u32,
     /// Maximum context accepted by the compaction model (tokens).
     compaction_context_size: usize,
+    /// Maximum prompt accepted by the current runtime (tokens).
+    compaction_prompt_size: usize,
 }
 
 impl ContextCompactor {
@@ -158,6 +160,7 @@ impl ContextCompactor {
             model,
             summary_max_tokens: 512,
             compaction_context_size,
+            compaction_prompt_size: compaction_context_size,
         }
     }
 
@@ -167,6 +170,23 @@ impl ContextCompactor {
             model: self.model.clone(),
             summary_max_tokens: self.summary_max_tokens,
             compaction_context_size: self.compaction_context_size,
+            compaction_prompt_size: self.compaction_prompt_size,
+        }
+    }
+
+    /// Narrow this compactor to the live runtime's total and prompt ceilings.
+    /// Both preflight fitting and actual generation/retry enforce the result.
+    pub(crate) fn with_runtime_limits(&self, context_size: usize, prompt_size: usize) -> Self {
+        let context_size = self.compaction_context_size.min(context_size);
+        Self {
+            provider: Arc::clone(&self.provider),
+            model: self.model.clone(),
+            summary_max_tokens: self.summary_max_tokens,
+            compaction_context_size: context_size,
+            compaction_prompt_size: self
+                .compaction_prompt_size
+                .min(prompt_size)
+                .min(context_size),
         }
     }
 
@@ -187,13 +207,25 @@ impl ContextCompactor {
             .unwrap_or(MAX_SUMMARY_TOKENS)
     }
 
-    fn required_context_tokens(&self, input: &str, prompt: &str, ratio: usize) -> usize {
-        TokenBudget::estimate_str_tokens(input)
+    fn request_token_usage(&self, input: &str, prompt: &str, ratio: usize) -> (usize, usize) {
+        let prompt_tokens = TokenBudget::estimate_str_tokens(input)
             .saturating_add(TokenBudget::estimate_str_tokens(prompt))
             .saturating_add(TokenBudget::estimate_str_tokens(COMPACTION_SYSTEM_PROMPT))
-            .saturating_add(self.summary_token_limit(input, ratio) as usize)
             .saturating_add(CHAT_TEMPLATE_TOKEN_ALLOWANCE)
-            .saturating_add(COMPACTION_CONTEXT_SAFETY_MARGIN)
+            .saturating_add(COMPACTION_CONTEXT_SAFETY_MARGIN);
+        let output_tokens = self.summary_token_limit(input, ratio) as usize;
+        (prompt_tokens, output_tokens)
+    }
+
+    fn required_context_tokens(&self, input: &str, prompt: &str, ratio: usize) -> usize {
+        let (prompt_tokens, output_tokens) = self.request_token_usage(input, prompt, ratio);
+        prompt_tokens.saturating_add(output_tokens)
+    }
+
+    fn request_fits(&self, input: &str, prompt: &str, ratio: usize) -> bool {
+        let (prompt_tokens, output_tokens) = self.request_token_usage(input, prompt, ratio);
+        prompt_tokens <= self.compaction_prompt_size
+            && prompt_tokens.saturating_add(output_tokens) <= self.compaction_context_size
     }
 
     /// Collect a streamed summary while treating every received SSE item as
@@ -279,12 +311,25 @@ impl ContextCompactor {
         )
     }
 
-    #[cfg(test)]
     pub(crate) fn required_context_for_lcm(&self, messages: &[Value], mode: &str) -> usize {
         let transcript = build_transcript(messages);
         let prompt = Self::prompt_with_manifest_for_mode(mode);
         let ratio = compression_ratio_for_mode(mode);
         self.required_context_tokens(&transcript, &prompt, ratio)
+    }
+
+    /// Whether one LCM summary request fits this compactor's bound context.
+    /// This reuses the exact request accounting used
+    /// by `summarize_text`: transcript, instructions, response allowance,
+    /// chat-template allowance, and safety margin.
+    pub(crate) fn lcm_request_fits(&self, messages: &[Value], mode: &str) -> bool {
+        if messages.is_empty() {
+            return false;
+        }
+        let transcript = build_transcript(messages);
+        let prompt = Self::prompt_with_manifest_for_mode(mode);
+        let ratio = compression_ratio_for_mode(mode);
+        !transcript.is_empty() && self.request_fits(&transcript, &prompt, ratio)
     }
 
     /// Summarize messages with a custom prompt.
@@ -306,11 +351,13 @@ impl ContextCompactor {
 
     async fn summarize_text(&self, input: &str, prompt: &str, ratio: usize) -> Result<String> {
         let max_tokens = self.summary_token_limit(input, ratio);
-        let required = self.required_context_tokens(input, prompt, ratio);
-        if required > self.compaction_context_size {
+        let (prompt_tokens, output_tokens) = self.request_token_usage(input, prompt, ratio);
+        let required = prompt_tokens.saturating_add(output_tokens);
+        if prompt_tokens > self.compaction_prompt_size || required > self.compaction_context_size {
             anyhow::bail!(
-                "Summarization required context {required} tokens exceeds available {} tokens",
-                self.compaction_context_size
+                "Summarization required context is {prompt_tokens} prompt and {required} total tokens; available {} total and {} prompt tokens",
+                self.compaction_context_size,
+                self.compaction_prompt_size,
             );
         }
 
@@ -353,12 +400,7 @@ impl ContextCompactor {
         // that defeat the purpose of durability."
         if response.finish_reason == FinishReason::Length {
             let retry_max = (max_tokens.saturating_mul(2)).min(MAX_SUMMARY_TOKENS);
-            let retry_required = TokenBudget::estimate_str_tokens(input)
-                .saturating_add(TokenBudget::estimate_str_tokens(prompt))
-                .saturating_add(TokenBudget::estimate_str_tokens(COMPACTION_SYSTEM_PROMPT))
-                .saturating_add(retry_max as usize)
-                .saturating_add(CHAT_TEMPLATE_TOKEN_ALLOWANCE)
-                .saturating_add(COMPACTION_CONTEXT_SAFETY_MARGIN);
+            let retry_required = prompt_tokens.saturating_add(retry_max as usize);
             if retry_required > self.compaction_context_size {
                 anyhow::bail!(
                     "Summarization retry with {retry_max} max_tokens would require \
@@ -1119,6 +1161,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lcm_fit_uses_exact_request_assembly_and_bound_context() {
+        let provider = Arc::new(RecordingProvider::responding("- alpha retained."));
+        let configured = ContextCompactor::new(provider, "qwen".into(), 262_144);
+        let messages = vec![json!({
+            "role": "user",
+            "content": "alpha state and its exact outcome must survive compaction"
+        })];
+        let required = configured.required_context_for_lcm(&messages, "preserve_details");
+
+        assert!(configured
+            .with_runtime_limits(required, required)
+            .lcm_request_fits(&messages, "preserve_details"));
+        assert!(!configured
+            .with_runtime_limits(required - 1, required - 1)
+            .lcm_request_fits(&messages, "preserve_details"));
+        assert!(
+            required > TokenBudget::estimate_tokens(&messages) + 512,
+            "fit must include prompt, output allowance, template, and safety margin"
+        );
+    }
+
+    #[test]
+    fn lcm_fit_honors_prompt_ceiling_separately_from_total_context() {
+        let provider = Arc::new(RecordingProvider::responding("- state retained."));
+        let configured = ContextCompactor::new(provider, "qwen".into(), 8_192);
+        let messages = vec![json!({
+            "role": "user",
+            "content": "state ".repeat(5_000)
+        })];
+
+        assert!(
+            configured
+                .with_runtime_limits(8_192, 8_192)
+                .lcm_request_fits(&messages, "preserve_details"),
+            "fixture must fit total context when prompt is unrestricted"
+        );
+        assert!(
+            !configured
+                .with_runtime_limits(8_192, 4_096)
+                .lcm_request_fits(&messages, "preserve_details"),
+            "unused output room cannot enlarge the runtime's prompt ceiling"
+        );
+    }
+
     #[tokio::test]
     async fn compaction_stream_progress_resets_inactivity_deadline() {
         let provider = Arc::new(ProgressStreamProvider {
@@ -1198,6 +1285,53 @@ mod tests {
         assert!(
             !text.contains("Partial summary"),
             "should NOT contain the discarded first-attempt output"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_context_limit_blocks_length_retry_that_only_configured_limit_can_fit() {
+        let provider = Arc::new(SequentialProvider::new(vec![
+            LLMResponse {
+                content: Some("Partial summary".to_string()),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Length,
+                usage: HashMap::new(),
+            },
+            LLMResponse {
+                content: Some("retry must not be sent".to_string()),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: HashMap::new(),
+            },
+        ]));
+        let compactor = ContextCompactor::new(provider.clone(), "test".into(), 8_192)
+            .with_runtime_limits(2_048, 2_048);
+        let input = "A factual source. ".repeat(200);
+        let initial_required = compactor.required_context_tokens(
+            &input,
+            SUMMARIZE_PROMPT,
+            SUMMARY_COMPRESSION_RATIO_PRESERVE_DETAILS,
+        );
+        assert!(
+            initial_required <= 2_048,
+            "fixture initial={initial_required}"
+        );
+
+        let error = compactor
+            .summarize_text(
+                &input,
+                SUMMARIZE_PROMPT,
+                SUMMARY_COMPRESSION_RATIO_PRESERVE_DETAILS,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("cannot retry"), "{error}");
+        assert_eq!(
+            provider.responses.lock().unwrap().len(),
+            1,
+            "retry must be rejected before a second provider request"
         );
     }
 

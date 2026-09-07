@@ -65,7 +65,10 @@ use super::{last_user_message, render_via_protocol, should_strip_tools_for_trio}
 // `response` is a sibling module declared in `mod.rs`. RetryState is re-exported
 // from there; we just need a local alias for the field type below.
 use super::response::RetryState;
-use crate::turn_stream::{BackendActivity, CacheResetReason, CacheStatus, ControlMarker};
+use crate::turn_stream::{
+    BackendActivity, CacheResetReason, CacheStatus, CapacityAction, CapacityBasisLabel,
+    CapacityPressureLabel, CapacityStatus, ControlMarker,
+};
 
 use super::budget::{
     advertised_tool_names, attach_higgs_session_control, clear_prompt_cache_state,
@@ -82,6 +85,8 @@ use super::local_stream::{
     local_no_stream_progress_error, local_stream_no_progress_timeout, BackendActivityHeartbeat,
     LocalStreamProgress,
 };
+
+pub(crate) const CAPACITY_RESUME_PENDING_ID: &str = "capacity_resume_pending_id";
 
 // `CompactionHandle` moved to the `compaction` submodule; re-exported here so
 // the `agent_loop::CompactionHandle` path used by `prepare_context.rs` keeps
@@ -143,7 +148,7 @@ pub(crate) async fn capacity_resume_poller(
         };
         for pending in due {
             let core = shared.core_handle.swappable();
-            if core.provider.supports_higgs_session_cache() {
+            let resume_ready = if core.provider.supports_higgs_session_cache() {
                 match core.provider.fetch_higgs_capacity(&core.model).await {
                     Ok(Some(crate::agent::capacity::HiggsCapacityFetch::Profile(profile)))
                         if profile.availability()
@@ -154,35 +159,88 @@ pub(crate) async fn capacity_resume_poller(
                             chat_id = %pending.chat_id,
                             "pending_capacity_turn_resumed"
                         );
+                        true
                     }
-                    _ => {
-                        // Still unavailable (or fetch failed): exponential
-                        // backoff, no model request issued.
-                        let attempt = pending.retry_count.saturating_add(1);
-                        let delay = crate::session::db::capacity_retry_delay_ms(None, attempt);
-                        let next = RuntimeCounters::now_epoch_ms().saturating_add(delay);
-                        let _ = core
-                            .sessions
-                            .update_pending_capacity_retry(pending.id, attempt, next)
-                            .await;
-                        continue;
-                    }
+                    Ok(Some(crate::agent::capacity::HiggsCapacityFetch::Legacy)) => true,
+                    _ => false,
+                }
+            } else {
+                true
+            };
+            let attempt = pending.retry_count.saturating_add(1);
+            let delay = crate::session::db::capacity_retry_delay_ms(None, attempt);
+            let next = RuntimeCounters::now_epoch_ms().saturating_add(delay);
+            if !resume_ready {
+                // Still unavailable (or fetch failed): exponential backoff,
+                // no model request issued.
+                let _ = core
+                    .sessions
+                    .update_pending_capacity_retry(pending.id, attempt, next)
+                    .await;
+                continue;
+            }
+            // Re-check ownership after the capacity GET. A newer inbound may
+            // have superseded this row while the provider was answering.
+            // Advancing the deadline also prevents duplicate enqueue while
+            // the serialized gateway consumer owns the handoff.
+            match core
+                .sessions
+                .update_pending_capacity_retry(pending.id, attempt, next)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(error) => {
+                    warn!(error = %error, "pending_capacity_turn_claim_failed");
+                    continue;
                 }
             }
+            let Some(session) = core.sessions.get_session(&pending.session_id).await else {
+                warn!(session_id = %pending.session_id, "pending_capacity_turn_session_missing");
+                continue;
+            };
             // Cloud takeover or recovered capacity: re-inject the durable
-            // user turn through the bus and drop the pending row.
-            let _ = inbound_tx.send(crate::bus::events::InboundMessage {
+            // turn through the bus. The row stays durable until the consumer
+            // records a terminal outcome; enqueue alone is not a durable ack.
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert(
+                CAPACITY_RESUME_PENDING_ID.to_string(),
+                serde_json::json!(pending.id),
+            );
+            metadata.insert(
+                "session_key".to_string(),
+                serde_json::json!(session.session_key),
+            );
+            if pending.is_voice {
+                metadata.insert("voice_message".to_string(), serde_json::json!(true));
+            }
+            let inbound = crate::bus::events::InboundMessage {
                 channel: pending.channel.clone(),
                 sender_id: pending.sender.clone(),
                 chat_id: pending.chat_id.clone(),
                 content: pending.content.clone(),
                 timestamp: chrono::Local::now(),
                 media: Vec::new(),
-                metadata: Default::default(),
-            });
-            let _ = core.sessions.delete_pending_capacity_turn(pending.id).await;
+                metadata,
+            };
+            if inbound_tx.send(inbound).is_err() {
+                warn!(chat_id = %pending.chat_id, "pending_capacity_turn_resume_send_failed");
+            }
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct SuspendedCapacityTurn {
+    id: Option<i64>,
+    retry_count: u32,
+    next_retry_at: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapacityWaitOutcome {
+    Recovered,
+    Cancelled,
 }
 
 pub(crate) struct AgentLoopShared {
@@ -462,6 +520,7 @@ pub(crate) struct TurnContext {
     pub(crate) user_content: String,
     pub(crate) channel: String,
     pub(crate) chat_id: String,
+    pub(crate) sender_id: String,
     pub(crate) is_voice_message: bool,
     pub(crate) detected_language: Option<String>,
 
@@ -1307,6 +1366,15 @@ pub(crate) enum ProviderCallMode {
     TerminalNoTools,
 }
 
+/// Capacity suspension behavior at the outer transport boundary. Gateway
+/// turns return so their bus poller can re-inject them; interactive callers
+/// retain this exact `TurnContext` and wait, preserving completed tool results.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CapacityRetryMode {
+    Defer,
+    Wait,
+}
+
 /// Per-turn flow control flags.
 ///
 /// These are orthogonal fields (not a linear state machine):
@@ -1392,6 +1460,12 @@ pub(crate) struct FlowControl {
     /// so the user sees the abort reason and the body is NEVER shown raw.
     /// See `abort_turn_on_stash_failure` in `tool_engine.rs`.
     pub(crate) infra_error: Option<String>,
+    /// Server hint captured at the provider-error boundary and consumed by
+    /// the outer loop's capacity suspension path.
+    pub(crate) capacity_retry_after_ms: Option<u64>,
+    /// Exact durable pending row owned by a foreground capacity wait. It is
+    /// cleared only after `finalize_response` records the terminal event.
+    pub(crate) pending_capacity_id: Option<i64>,
 }
 
 impl FlowControl {
@@ -1812,6 +1886,36 @@ fn reset_recovery_failure(
     response
 }
 
+fn install_higgs_capacity_fetch(
+    capacity: &std::sync::Arc<crate::agent::capacity::CapacityRuntime>,
+    fetch: crate::agent::capacity::HiggsCapacityFetch,
+    endpoint: &str,
+    model: &str,
+    counters: &std::sync::Arc<RuntimeCounters>,
+    session_key: &str,
+) -> crate::agent::capacity::CapacityAvailability {
+    use crate::agent::capacity::{CapacityAvailability, CapacityRefresh, HiggsCapacityFetch};
+
+    match fetch {
+        HiggsCapacityFetch::Profile(profile) => {
+            let availability = profile.availability();
+            if capacity.install_profile(endpoint, model, profile) == CapacityRefresh::BootChanged {
+                counters.reset_session_prompt_state(session_key);
+                counters.retire_higgs_session(
+                    session_key,
+                    crate::agent::agent_core::SessionRetirement::Drop,
+                );
+                warn!(session = %session_key, "higgs_boot_changed_rotated_retained_session");
+            }
+            availability
+        }
+        HiggsCapacityFetch::Legacy => {
+            capacity.install_legacy(endpoint, model);
+            CapacityAvailability::Available
+        }
+    }
+}
+
 /// Resolve the effective request budget against the live Higgs snapshot
 /// (Task 3). Free function so the refresh contract is testable without a
 /// full loop: cloud bypass, fetch-once, boot-change epoch rotation, legacy
@@ -1824,8 +1928,6 @@ pub(crate) async fn resolve_live_capacity(
     counters: &std::sync::Arc<RuntimeCounters>,
     session_key: &str,
 ) -> TokenBudget {
-    use crate::agent::capacity::{CapacityRefresh, HiggsCapacityFetch};
-
     if !provider.supports_higgs_session_cache() {
         // Cloud provider (or higgs backend off): any installed snapshot is
         // stale. Invalidate is a no-op when nothing was installed.
@@ -1841,26 +1943,15 @@ pub(crate) async fn resolve_live_capacity(
         // continuations within the turn reuse the installed snapshot while
         // the next turn still observes a server reboot.
         match provider.fetch_higgs_capacity(model).await {
-            Ok(Some(HiggsCapacityFetch::Profile(profile))) => {
-                let refresh = capacity.install_profile(&endpoint, model, profile);
-                if refresh == CapacityRefresh::BootChanged {
-                    // Server restarted underneath this session: every
-                    // retained session from the old boot is garbage. Rotate
-                    // through the existing epoch path — watermark reset plus
-                    // retained-session drop — so the next request starts a
-                    // fresh server-side session.
-                    counters.reset_session_prompt_state(session_key);
-                    counters.retire_higgs_session(
-                        session_key,
-                        crate::agent::agent_core::SessionRetirement::Drop,
-                    );
-                    warn!(session = %session_key, "higgs_boot_changed_rotated_retained_session");
-                }
-            }
-            Ok(Some(HiggsCapacityFetch::Legacy)) => {
-                // Old Higgs without /v1/capacity: freeze the documented
-                // conservative 16K/4K fallback keyed to this tuple.
-                capacity.install_legacy(&endpoint, model);
+            Ok(Some(fetch)) => {
+                let _ = install_higgs_capacity_fetch(
+                    capacity,
+                    fetch,
+                    &endpoint,
+                    model,
+                    counters,
+                    session_key,
+                );
             }
             Ok(None) => {
                 capacity.invalidate();
@@ -1929,7 +2020,32 @@ impl AgentLoopShared {
         tool_event_tx: Option<tokio::sync::mpsc::UnboundedSender<ToolEvent>>,
         cancellation_token: Option<tokio_util::sync::CancellationToken>,
         priority_rx: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+        capacity_retry_mode: CapacityRetryMode,
     ) -> Option<OutboundMessage> {
+        let resume_pending_id = msg
+            .metadata
+            .get(CAPACITY_RESUME_PENDING_ID)
+            .and_then(Value::as_i64);
+        if let Some(id) = resume_pending_id {
+            let Some(session_key) = msg.metadata.get("session_key").and_then(Value::as_str) else {
+                warn!(id, "pending_capacity_turn_resume_missing_session_key");
+                return None;
+            };
+            match self
+                .core_handle
+                .swappable()
+                .sessions
+                .pending_capacity_turn_exists(id, &msg.channel, &msg.chat_id, session_key)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(error) => {
+                    warn!(error = %error, "pending_capacity_turn_claim_check_failed");
+                    return None;
+                }
+            }
+        }
         let mut ctx = self
             .prepare_context(
                 msg,
@@ -1954,16 +2070,67 @@ impl AgentLoopShared {
         // Make the inbound user turn durable before the first provider call.
         // An undurable user prefix has no replay-safe provider request, so the
         // turn stops here instead of asking the model to act on lost input.
+        let mut resume_claimed = false;
         if let Err(error) = ctx.persist_pending_protocol_messages().await {
             ctx.turn_outcome = TurnOutcome::Error;
             ctx.final_content = format!(
                 "[Session Error] I could not durably record the inbound message, so no model or tool call was made: {error}"
             );
         } else {
-            self.run_agent_loop(&mut ctx).await;
+            if resume_pending_id.is_some() {
+                resume_claimed = true;
+            } else if let Err(error) = ctx
+                .core
+                .sessions
+                .delete_pending_capacity_turn_for_chat(&msg.channel, &msg.chat_id)
+                .await
+            {
+                warn!(error = %error, chat_id = %msg.chat_id, "pending_capacity_turn_supersede_failed");
+            }
+            self.run_agent_loop(&mut ctx, capacity_retry_mode).await;
         }
+        let terminal = ctx.turn_outcome != TurnOutcome::CapacityUnavailable;
+        let mut pending_cleanup_ids = Vec::new();
+        if terminal {
+            if resume_claimed {
+                pending_cleanup_ids.extend(resume_pending_id);
+            }
+            pending_cleanup_ids.extend(ctx.flow.pending_capacity_id);
+        }
+        pending_cleanup_ids.sort_unstable();
+        pending_cleanup_ids.dedup();
+        let pending_cleanup = (!pending_cleanup_ids.is_empty()).then(|| {
+            (
+                Arc::clone(&ctx.core.sessions),
+                ctx.session_id.clone(),
+                ctx.request_id.clone(),
+                pending_cleanup_ids,
+            )
+        });
         let soft_compaction = SoftCompactionRequest::take(&mut ctx);
         let response = self.finalize_response(ctx).await;
+        if let Some((sessions, session_id, request_id, pending_ids)) = pending_cleanup {
+            match sessions.load_session_events(&session_id).await {
+                Ok(events)
+                    if events.iter().any(|event| {
+                        event.turn_request_id == request_id
+                            && event.payload.kind() == "turn_finished"
+                    }) =>
+                {
+                    for id in pending_ids {
+                        if let Err(error) = sessions.delete_pending_capacity_turn(id).await {
+                            warn!(error = %error, "pending_capacity_turn_resume_cleanup_failed");
+                        }
+                    }
+                }
+                Ok(_) => {
+                    warn!(%request_id, "pending_capacity_turn_terminal_not_durable");
+                }
+                Err(error) => {
+                    warn!(error = %error, "pending_capacity_turn_terminal_check_failed");
+                }
+            }
+        }
         if let Some(request) = soft_compaction {
             self.spawn_requested_soft_compaction(request).await;
         }
@@ -1985,19 +2152,30 @@ impl AgentLoopShared {
     /// the effective budget is derived per turn and may shrink per
     /// boot/generation without a config rewrite or core rebuild.
     async fn resolve_effective_budget(&self, ctx: &mut TurnContext) {
-        let budget = resolve_live_capacity(
-            &ctx.capacity,
-            ctx.core.provider.as_ref(),
-            &ctx.core.model,
-            &ctx.core.token_budget,
-            &ctx.counters,
-            &ctx.session_key,
-        )
-        .await;
-        ctx.effective_budget = budget;
+        let resolved = tokio::select! {
+            biased;
+            () = async {
+                if let Some(token) = &ctx.cancellation_token {
+                    token.cancelled().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => None,
+            budget = resolve_live_capacity(
+                &ctx.capacity,
+                ctx.core.provider.as_ref(),
+                &ctx.core.model,
+                &ctx.core.token_budget,
+                &ctx.counters,
+                &ctx.session_key,
+            ) => Some(budget),
+        };
+        if let Some(budget) = resolved {
+            ctx.effective_budget = budget;
+        }
     }
 
-    async fn run_agent_loop(&self, ctx: &mut TurnContext) {
+    async fn run_agent_loop(&self, ctx: &mut TurnContext, capacity_retry_mode: CapacityRetryMode) {
         ctx.turn_outcome = TurnOutcome::LimitExhausted;
         // Live Higgs capacity resolves before the first budget consumer of
         // the turn (prepare/pre-call/compaction all read
@@ -2044,6 +2222,7 @@ impl AgentLoopShared {
         // the previous round. The model is firing tools without consuming their
         // results; two in a row means it never "sees" the output that came back.
         const MAX_CONSECUTIVE_REPEAT_ROUNDS: u32 = 2;
+        let mut capacity_retry_count = 0_u32;
         'agent: while iteration < ctx.core.max_iterations {
             // Early exit if cancelled (e.g. user pressed Esc/Enter in REPL).
             if ctx.is_cancelled() {
@@ -2281,6 +2460,34 @@ impl AgentLoopShared {
                     continue;
                 }
                 IterationOutcome::Complete { content, outcome } => {
+                    if outcome == TurnOutcome::CapacityUnavailable {
+                        let hint = ctx.flow.capacity_retry_after_ms.take();
+                        let suspended = self
+                            .suspend_capacity_turn(ctx, hint, capacity_retry_count)
+                            .await;
+                        if suspended.id.is_none() {
+                            ctx.turn_outcome = TurnOutcome::Error;
+                            ctx.final_content = "[Session Error] Capacity retry could not be saved durably, so this turn was not queued for automatic resume.".to_string();
+                            break;
+                        }
+                        ctx.flow.pending_capacity_id = suspended.id;
+                        if capacity_retry_mode == CapacityRetryMode::Defer {
+                            ctx.turn_outcome = outcome;
+                            ctx.final_content = content;
+                            break;
+                        }
+                        match self
+                            .wait_for_capacity(ctx, suspended, &mut capacity_retry_count)
+                            .await
+                        {
+                            CapacityWaitOutcome::Recovered => continue,
+                            CapacityWaitOutcome::Cancelled => {
+                                ctx.turn_outcome = TurnOutcome::Cancelled;
+                                ctx.final_content.clear();
+                                break;
+                            }
+                        }
+                    }
                     ctx.restore_thinking_budget();
                     consecutive_empty = 0;
                     ctx.flow.retries.validation = 0;
@@ -2542,12 +2749,7 @@ impl AgentLoopShared {
         let state = self.system_state.load_full();
         let allow_checkpoint =
             should_allow_checkpoint(state.context_pressure, self.lcm_config.tau_hard)
-                || history_window_near(
-                    ctx.messages.len(),
-                    ctx.turn_count,
-                    ctx.effective_budget.max_context(),
-                    ctx.core.max_history_turns,
-                );
+                || history_window_near(ctx.turn_count, ctx.core.max_history_turns);
         self.install_pending_compaction(ctx, allow_checkpoint).await;
 
         StepResult::Next(IterationPhase::PreCall)
@@ -2679,13 +2881,13 @@ impl AgentLoopShared {
                 }))
             }
             ProviderError::HiggsCapacityUnavailable { retry_after_ms, .. } => {
-                // The user message is already durable (persisted before the
-                // first provider call); defer the turn as resumable work.
-                let delay_ms = self.suspend_capacity_turn(ctx, Some(*retry_after_ms)).await;
+                // The outer loop owns suspension so interactive callers can
+                // keep this exact context alive across the wait.
+                ctx.flow.capacity_retry_after_ms = Some(*retry_after_ms);
 
                 warn!(
                     session = %ctx.session_key,
-                    retry_after_ms = delay_ms,
+                    retry_after_ms,
                     "higgs_capacity_unavailable_turn_suspended"
                 );
                 Some(StepResult::Done(IterationOutcome::Complete {
@@ -2700,8 +2902,13 @@ impl AgentLoopShared {
         }
     }
 
-    async fn suspend_capacity_turn(&self, ctx: &TurnContext, retry_after_ms: Option<u64>) -> u64 {
-        let delay_ms = crate::session::db::capacity_retry_delay_ms(retry_after_ms, 0);
+    async fn suspend_capacity_turn(
+        &self,
+        ctx: &TurnContext,
+        retry_after_ms: Option<u64>,
+        retry_count: u32,
+    ) -> SuspendedCapacityTurn {
+        let delay_ms = crate::session::db::capacity_retry_delay_ms(retry_after_ms, retry_count);
         if let Err(record_error) = ctx
             .core
             .sessions
@@ -2716,23 +2923,187 @@ impl AgentLoopShared {
             warn!(error = %record_error, "turn_suspended_persist_failed");
         }
         let next_retry_at = RuntimeCounters::now_epoch_ms().saturating_add(delay_ms);
-        if let Err(record_error) = ctx
+        let id = match ctx
             .core
             .sessions
             .record_pending_capacity_turn(
                 &ctx.session_id,
                 &ctx.channel,
                 &ctx.chat_id,
-                "",
+                &ctx.sender_id,
                 &ctx.user_content,
                 ctx.is_voice_message,
+                retry_count,
                 next_retry_at,
             )
             .await
         {
-            warn!(error = %record_error, "pending_capacity_turn_persist_failed");
+            Ok(id) => Some(id),
+            Err(record_error) => {
+                warn!(error = %record_error, "pending_capacity_turn_persist_failed");
+                None
+            }
+        };
+        SuspendedCapacityTurn {
+            id,
+            retry_count,
+            next_retry_at,
         }
-        delay_ms
+    }
+
+    fn emit_capacity_status(ctx: &TurnContext, action: CapacityAction) {
+        let configured = &ctx.core.token_budget;
+        let description = ctx.capacity.describe(configured, 0);
+        let current_total = description
+            .as_ref()
+            .map_or(configured.max_context(), |status| status.total_tokens);
+        let output_limit = description
+            .as_ref()
+            .map_or(configured.response_reserve(), |status| status.output_tokens);
+        let prompt_limit = ctx.effective_budget.available_budget(0);
+        let (pressure, basis, generation) = description.as_ref().map_or(
+            (
+                CapacityPressureLabel::Critical,
+                CapacityBasisLabel::Conservative,
+                0,
+            ),
+            |status| {
+                let pressure = match status.pressure {
+                    Some(crate::agent::capacity::CapacityPressure::Normal) => {
+                        CapacityPressureLabel::Normal
+                    }
+                    Some(crate::agent::capacity::CapacityPressure::Constrained) => {
+                        CapacityPressureLabel::Constrained
+                    }
+                    Some(crate::agent::capacity::CapacityPressure::Critical) | None => {
+                        CapacityPressureLabel::Critical
+                    }
+                };
+                let basis = match status.source {
+                    crate::agent::capacity::CapacitySource::Adaptive {
+                        basis: crate::agent::capacity::CapacityBasis::Learned,
+                    } => CapacityBasisLabel::Learned,
+                    crate::agent::capacity::CapacitySource::Legacy => CapacityBasisLabel::Legacy,
+                    crate::agent::capacity::CapacitySource::Adaptive { .. }
+                    | crate::agent::capacity::CapacitySource::Unavailable => {
+                        CapacityBasisLabel::Conservative
+                    }
+                };
+                (pressure, basis, status.generation)
+            },
+        );
+        let marker = ControlMarker::Capacity(CapacityStatus {
+            prior_total: u64::try_from(configured.max_context()).unwrap_or(u64::MAX),
+            current_total: u64::try_from(current_total).unwrap_or(u64::MAX),
+            prompt_limit: u64::try_from(prompt_limit).unwrap_or(u64::MAX),
+            output_limit: u64::try_from(output_limit).unwrap_or(u64::MAX),
+            pressure,
+            basis,
+            generation,
+            action,
+        });
+        if let Some(tx) = &ctx.text_delta_tx {
+            let _ = tx.send(marker.encode());
+        }
+    }
+
+    async fn wait_for_capacity(
+        &self,
+        ctx: &mut TurnContext,
+        mut suspended: SuspendedCapacityTurn,
+        retry_count: &mut u32,
+    ) -> CapacityWaitOutcome {
+        Self::emit_capacity_status(ctx, CapacityAction::Wait);
+        loop {
+            let wait_ms = suspended
+                .next_retry_at
+                .saturating_sub(RuntimeCounters::now_epoch_ms());
+            tokio::select! {
+                biased;
+                () = async {
+                    if let Some(token) = &ctx.cancellation_token {
+                        token.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => return CapacityWaitOutcome::Cancelled,
+                () = tokio::time::sleep(std::time::Duration::from_millis(wait_ms)) => {}
+            }
+
+            let fetched = tokio::select! {
+                biased;
+                () = async {
+                    if let Some(token) = &ctx.cancellation_token {
+                        token.cancelled().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => return CapacityWaitOutcome::Cancelled,
+                fetched = ctx.core.provider.fetch_higgs_capacity(&ctx.core.model) => fetched,
+            };
+            let available = match fetched {
+                Ok(Some(fetch)) => {
+                    if let Some(endpoint) = ctx.core.provider.get_api_base() {
+                        let availability = install_higgs_capacity_fetch(
+                            &ctx.capacity,
+                            fetch,
+                            endpoint,
+                            &ctx.core.model,
+                            &ctx.counters,
+                            &ctx.session_key,
+                        );
+                        ctx.effective_budget =
+                            ctx.capacity.effective_budget(&ctx.core.token_budget, 0);
+                        availability == crate::agent::capacity::CapacityAvailability::Available
+                    } else {
+                        warn!(session = %ctx.session_key, "higgs_capacity_retry_endpoint_missing");
+                        false
+                    }
+                }
+                Ok(None) => {
+                    ctx.capacity.invalidate();
+                    false
+                }
+                Err(error) => {
+                    warn!(session = %ctx.session_key, error = %error, "higgs_capacity_retry_fetch_failed");
+                    false
+                }
+            };
+
+            let attempt = suspended.retry_count.saturating_add(1);
+            *retry_count = attempt;
+            let delay = crate::session::db::capacity_retry_delay_ms(None, attempt);
+            let next_retry_at = RuntimeCounters::now_epoch_ms().saturating_add(delay);
+            if let Some(id) = suspended.id {
+                match ctx
+                    .core
+                    .sessions
+                    .update_pending_capacity_retry(id, attempt, next_retry_at)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return CapacityWaitOutcome::Cancelled,
+                    Err(error) => {
+                        warn!(error = %error, "pending_capacity_turn_retry_update_failed");
+                    }
+                }
+            }
+            if available {
+                // Reset only the capacity failure progression. Tool receipts,
+                // iteration/lease state, breaker state, and prompt bytes stay
+                // in this live context for the resumed provider call.
+                ctx.capacity_recovery = TurnCapacityRecovery::Idle;
+                ctx.flow.capacity_retry_after_ms = None;
+                ctx.turn_outcome = TurnOutcome::LimitExhausted;
+                ctx.final_content.clear();
+                Self::emit_capacity_status(ctx, CapacityAction::Recovery);
+                return CapacityWaitOutcome::Recovered;
+            }
+            Self::emit_capacity_status(ctx, CapacityAction::Unavailable);
+            suspended.retry_count = attempt;
+            suspended.next_retry_at = next_retry_at;
+            Self::emit_capacity_status(ctx, CapacityAction::Wait);
+        }
     }
 
     /// Typed Higgs 413 recovery (Task 5). The rejection carries the
@@ -2789,7 +3160,6 @@ impl AgentLoopShared {
             ctx.capacity_recovery = TurnCapacityRecovery::Terminal {
                 generation: generation.saturating_add(1),
             };
-            self.suspend_capacity_turn(ctx, None).await;
             // Earlier tool narration must not suppress the terminal failure notice.
             if ctx.flow.content_was_streamed {
                 send_retract_reply_marker(&ctx.text_delta_tx);
@@ -2959,47 +3329,12 @@ impl AgentLoopShared {
             Some(&tool_defs)
         };
 
-        // Trim messages to fit context budget.
+        // LCM must see every persisted message before any history reduction.
+        // Applying the normal retention budget here would silently discard
+        // old evidence before the model-authored checkpoint could cover it.
+        // If LCM cannot summarize a fitting prefix, provider admission below
+        // reports capacity pressure while the exact history remains retryable.
         let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
-        let frozen_prefix = ctx
-            .counters
-            .prompt_cache_watermark
-            .lock()
-            .get(&ctx.session_key)
-            .copied()
-            .unwrap_or(0);
-        let (trimmed_messages, trim_disposition) = ctx.core.retention.apply_budget(
-            &ctx.effective_budget,
-            &ctx.messages,
-            tool_def_tokens,
-            crate::agent::retention::BudgetMode::Normal {
-                turn_count: ctx.turn_count,
-            },
-            frozen_prefix,
-        );
-        let before_messages = ctx.messages.len();
-        let after_messages = trimmed_messages.len();
-        // One hatch for the whole rewrite: `rewrite_committed` pays the reset
-        // exactly when the trim rewrote warm bytes — a prefix-safe trim (or a
-        // cold session) pays nothing. The disposition no longer gates the
-        // ceremony by hand.
-        let rewrite = ctx.rewrite_committed(trimmed_messages, CacheResetReason::Trim);
-        if let PromptRewrite::Reset { rotated } = rewrite {
-            warn!(
-                session = %ctx.session_key,
-                frozen_prefix,
-                before_messages,
-                after_messages,
-                rotated,
-                "prompt_cache_watermark_invalidated_by_token_trim"
-            );
-        }
-        if matches!(
-            trim_disposition,
-            crate::agent::token_budget::PrefixTrimDisposition::ResetRequired
-        ) {
-            self.install_pending_compaction(ctx, true).await;
-        }
 
         // Account for compaction pressure; soft work is only requested here.
         self.manage_compaction(ctx, tool_def_tokens).await;
@@ -3120,11 +3455,11 @@ impl AgentLoopShared {
         // configured window. The estimate must include tool definitions: the
         // server renders them into the prompt and counts them.
         //
-        // Sanctioned reduction order (everything before this gate already
-        // ran inside `manage_compaction` against the same effective budget:
-        // completed checkpoint first, then blocking LCM whose own request
-        // must fit, then deterministic level-3 reduction with durable source
-        // handles and zero provider calls):
+        // Reduction before this gate already ran inside `manage_compaction`
+        // against the same effective budget: install a completed checkpoint,
+        // then ask LCM to summarize the largest complete prefix whose own
+        // model request fits. A no-fit or failed summary preserves the raw
+        // transcript for the typed capacity path below.
         //   1. install any completed checkpoint again — capacity pressure
         //      outranks cache-warmth deferral;
         //   2. if the IMMUTABLE prefix (system + tool definitions) alone
@@ -3504,16 +3839,13 @@ impl AgentLoopShared {
         if request.compaction.has_pending().await || request.compaction.has_job().await {
             return;
         }
-        let max_messages =
-            crate::agent::agent_core::history_limit_lcm(request.core.token_budget.max_context());
         let history = request
             .core
             .sessions
-            .get_history(
-                &request.session_id,
-                max_messages,
-                request.core.max_history_turns,
-            )
+            // Soft compaction must see the same un-windowed persisted rows as
+            // foreground LCM. Zero disables only filter_history's implicit
+            // message-count cap; the configured turn limit still applies.
+            .get_history(&request.session_id, 0, request.core.max_history_turns)
             .await;
         if request.is_cancelled() {
             return;
@@ -3655,21 +3987,12 @@ impl AgentLoopShared {
             // escalate to blocking compaction below when nothing is
             // installable (see `history_window_near` for the ordering
             // invariant).
-            let mut window_near = history_window_near(
-                ctx.messages.len(),
-                ctx.turn_count,
-                budget.max_context(),
-                budget_core.max_history_turns,
-            );
+            let mut window_near =
+                history_window_near(ctx.turn_count, budget_core.max_history_turns);
             if raw_hard || window_near {
                 self.install_pending_compaction(ctx, true).await;
                 raw_hard = conversation_token_count(&ctx.messages) > hard_limit;
-                window_near = history_window_near(
-                    ctx.messages.len(),
-                    ctx.turn_count,
-                    budget.max_context(),
-                    budget_core.max_history_turns,
-                );
+                window_near = history_window_near(ctx.turn_count, budget_core.max_history_turns);
                 action = {
                     let engine = lcm_engine.lock().await;
                     engine.check_thresholds_with_available(available)
@@ -3780,55 +4103,10 @@ impl AgentLoopShared {
                 );
             }
 
-            // LCM ingests only persisted rows (`_db_id`), so a single long
-            // turn grows entirely outside the engine's view: blocking
-            // compaction then summarizes the small pre-turn store and
-            // installs nothing. If we are still over the hard limit, trim
-            // deterministically instead of overflowing into a server 400
-            // (session 20260827_083227). Same rewrite contract as the
-            // pre-flight emergency trim, so rotate the cache identity too.
-            if conversation_token_count(&ctx.messages) > hard_limit {
-                let frozen_prefix = ctx
-                    .counters
-                    .prompt_cache_watermark
-                    .lock()
-                    .get(&ctx.session_key)
-                    .copied()
-                    .unwrap_or(0);
-                // apply_budget's Emergency mode hardcodes a zero tool-def
-                // reserve (target available_budget(0) > hard_limit — a no-op
-                // here), so call the trimmer directly with an offset that
-                // lands the trim at hard_limit.
-                let budget_overhead = ctx
-                    .core
-                    .token_budget
-                    .available_budget(0)
-                    .saturating_sub(hard_limit);
-                let (trimmed_messages, _trim_disposition) = ctx
-                    .core
-                    .token_budget
-                    .trim_to_fit_with_age_preserving_prefix(
-                        &ctx.messages,
-                        budget_overhead,
-                        0,
-                        0,
-                        frozen_prefix,
-                    );
-                let before_messages = ctx.messages.len();
-                let after_messages = trimmed_messages.len();
-                let rewrite =
-                    ctx.rewrite_committed(trimmed_messages, CacheResetReason::EmergencyTrim);
-                if let PromptRewrite::Reset { rotated } = rewrite {
-                    warn!(
-                        session = %ctx.session_key,
-                        frozen_prefix,
-                        before_messages,
-                        after_messages,
-                        rotated,
-                        "in_turn_overflow_trim_invalidated_prompt_cache"
-                    );
-                }
-            }
+            // A failed or no-fit model compaction leaves the raw transcript
+            // untouched. Provider admission turns the remaining hard pressure
+            // into a retryable capacity result; locally trimming here would
+            // retire evidence that no summary covers.
 
             if ctx.is_cancelled() {
                 return;
