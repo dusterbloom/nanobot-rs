@@ -276,9 +276,14 @@ fn render_char_page_with_budget(
 ) -> String {
     let max_chars = max_chars.min(MAX_OUTPUT_CHARS);
     let total = body.chars().count();
-    if start_char >= total {
+    // Cursors are half-open Unicode character offsets; EOF is a valid empty page.
+    if start_char > total {
+        return format!("[source={artifact_tool_call_id} chars {start_char} out of range (output has {total} chars); restart with start_char=0]")
+            .chars().take(max_chars).collect();
+    }
+    if start_char == total {
         return format!(
-            "[source={artifact_tool_call_id} chars {start_char} out of range (output has {total} chars)]"
+            "[source={artifact_tool_call_id} chars {total}..{total}/{total} end]\n[END OF SOURCE — no more stored output. Do not request further pages.]"
         )
         .chars()
         .take(max_chars)
@@ -365,7 +370,7 @@ fn render_slice_page_with_budget(
 ) -> String {
     let max_chars = max_chars.min(MAX_OUTPUT_CHARS);
     let total = lines.len();
-    let clamped_start = start.max(1);
+    let clamped_start = start.max(1).min(total.saturating_add(1));
     let clamped_end = end
         .max(clamped_start)
         .min(clamped_start.saturating_add(MAX_SLICE_LINES.saturating_sub(1)));
@@ -383,7 +388,7 @@ fn render_slice_page_with_budget(
 
     if clamped_start > total {
         return format!(
-            "[source={artifact_tool_call_id} lines {clamped_start}-{clamped_end} out of range (file has {total} lines)]"
+            "[source={artifact_tool_call_id} lines {clamped_start}-{total}/{total} end]\n[END OF SOURCE — no more stored output. Do not request further pages.]"
         )
         .chars()
         .take(max_chars)
@@ -530,8 +535,6 @@ fn render_query_results(
 pub struct SearchToolResultTool {
     db_path: PathBuf,
     session_id: String,
-    /// Auto-pagination cursor: tool_call_id → char offset of the next read.
-    read_cursors: std::sync::Mutex<HashMap<String, usize>>,
 }
 
 impl SearchToolResultTool {
@@ -539,7 +542,6 @@ impl SearchToolResultTool {
         Self {
             db_path,
             session_id,
-            read_cursors: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -581,7 +583,7 @@ impl Tool for SearchToolResultTool {
                 },
                 "start_char": {
                     "type": "integer",
-                    "description": "Continue a long-line page at this zero-based character offset. Use only after output gives next_char."
+                    "description": "Continue a long-line page at this zero-based character offset. Use next_char from a previous page. At the stored character count returns an empty end page; larger offsets are invalid."
                 },
                 "max_results": {
                     "type": "integer",
@@ -684,19 +686,10 @@ impl Tool for SearchToolResultTool {
                 && params.get("end_line").is_none()
                 && params.get("start_char").is_none()
             {
-                // Auto-pagination: no positioning args → continue from where
-                // the last read left off. The cursor advances automatically,
-                // so each call returns fresh content without the model
-                // needing to track offsets.
-                let cursor_key = format!("{id}");
-                let start_char = {
-                    let cursors = self.read_cursors.lock().unwrap();
-                    cursors.get(&cursor_key).copied().unwrap_or(0)
-                };
-                let result = render_char_page(&body, id, start_char, true);
-                let next = start_char + result.chars().count().max(1);
-                self.read_cursors.lock().unwrap().insert(cursor_key, next);
-                result
+                // Identical arguments must return identical source bytes. Advance
+                // only using the source offset advertised by the previous page,
+                // never the rendered length (which includes header/footer bytes).
+                render_char_page(&body, id, 0, true)
             } else {
                 let (start, end) = parse_range(&params)?;
                 render_slice_page(&body, &lines, id, start, end)
@@ -1212,6 +1205,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn character_pages_reconstruct_exact_unicode_source() {
+        let body = "aé🦀\n".repeat(2200);
+        let mut cursor = 0;
+        let mut recovered = String::new();
+        loop {
+            let page = render_char_page(&body, "source", cursor, true);
+            let (header, rest) = page.split_once('\n').unwrap();
+            let (text, _) = rest.rsplit_once("\n[").unwrap();
+            recovered.push_str(text);
+            if header.contains(" end]") {
+                break;
+            }
+            let next: usize = header
+                .split("next_char=")
+                .nth(1)
+                .unwrap()
+                .trim_end_matches(']')
+                .parse()
+                .unwrap();
+            assert_eq!(next, cursor + text.chars().count());
+            assert!(next > cursor);
+            cursor = next;
+        }
+        assert_eq!(recovered, body);
+    }
+
+    #[test]
+    fn character_cursor_at_eof_is_terminal() {
+        for body in ["", "aé🦀"] {
+            let total = body.chars().count();
+            for cursor in [total] {
+                let page = render_char_page(body, "original", cursor, true);
+                assert!(page.contains(&format!("chars {total}..{total}/{total} end]")));
+                assert!(page.contains("END OF SOURCE"));
+                assert!(!page.contains("next_char="));
+                assert!(!page.contains("out of range"));
+                assert!(page.chars().count() <= MAX_OUTPUT_CHARS);
+            }
+        }
+        let page = render_char_page("aé🦀", "original", 1, true);
+        assert!(page.contains("chars 1..3/3 end]\né🦀"));
+    }
+
+    #[test]
+    fn character_cursor_beyond_eof_is_invalid() {
+        for cursor in [4, usize::MAX] {
+            let page = render_char_page("aé🦀", "original", cursor, true);
+            assert!(page.contains("out of range"));
+            assert!(page.contains("start_char=0"));
+        }
+    }
+
+    #[test]
+    fn line_cursor_beyond_eof_is_terminal() {
+        let page = render_slice_page("", &[], "original", usize::MAX, usize::MAX);
+        assert!(page.contains(" end]"));
+        assert!(page.contains("END OF SOURCE"));
+        assert!(!page.contains("out of range"));
+    }
+
     #[tokio::test]
     async fn inspect_single_wide_line_pages_by_character_offset() {
         let (_dir, db_path, sid) = make_db().await;
@@ -1226,6 +1280,15 @@ mod tests {
             )
             .await,
         );
+
+        let repeated = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([("tool_call_id".to_string(), json!("wide_single_line"))]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
+        assert_eq!(first, repeated, "omitted cursor always starts at zero");
 
         assert!(
             first.starts_with("[source=wide_single_line chars 0.."),

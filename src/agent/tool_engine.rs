@@ -212,7 +212,7 @@ pub(crate) fn is_persisted_retrieval_excerpt(
 /// `token_mismatch` desync class).
 ///
 /// Built ONCE at ingestion from the exact stored bytes. The `sha256` is over
-/// those bytes; `chars` is the Unicode char count; `args` is a fixed-scalar
+/// those bytes; `total_chars` is the Unicode char count; `args` is a fixed-scalar
 /// allowlist (path/command/query) in a fixed order; `excerpt` is the first
 /// non-empty line, trimmed, whitespace-run-collapsed, char-capped at 160.
 /// Never LLM-summarized — summarization would make it non-stable.
@@ -234,7 +234,7 @@ fn render_tool_result_handle(
         .unwrap_or(stored_bytes.len());
     let excerpt = handle_excerpt(stored_bytes);
     format!(
-        r#"{MARKER} id:{id_j} | tool:{tool_j} | ok:{ok} | chars:{chars} | sha256:{digest} | args:{args_j} | excerpt:{excerpt_j} | fetch:"inspect_tool_result""#,
+        r#"{MARKER} id:{id_j} | tool:{tool_j} | ok:{ok} | total_chars:{chars} | sha256:{digest} | args:{args_j} | excerpt:{excerpt_j} | fetch:"inspect_tool_result" | first_read:{{"tool_call_id":{id_j},"start_char":0}}"#,
         MARKER = TOOL_RESULT_HANDLE_MARKER,
         id_j = serde_json::to_string(id).unwrap_or_else(|_| "\"\"".into()),
         tool_j = serde_json::to_string(tool).unwrap_or_else(|_| "\"\"".into()),
@@ -2629,6 +2629,8 @@ mod tests {
 
         let h1 = render_tool_result_handle("call_42", "read_file", true, body.as_bytes(), &args);
         let h2 = render_tool_result_handle("call_42", "read_file", true, body.as_bytes(), &args);
+        assert!(h1.contains("total_chars:"));
+        assert!(h1.contains(r#"first_read:{"tool_call_id":"call_42","start_char":0}"#));
 
         assert_eq!(h1, h2, "handle must be byte-identical across calls");
         assert!(
