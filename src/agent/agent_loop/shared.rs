@@ -3190,13 +3190,20 @@ impl AgentLoopShared {
             safe_total_tokens.max(1),
             safe_total_tokens.saturating_sub(safe_prompt_tokens).max(1),
         );
+        let issued_tool_tokens = ctx
+            .flow
+            .provider_request
+            .issued_contract()
+            .map_or(0, |contract| {
+                TokenBudget::estimate_tool_def_tokens(&contract.tool_defs)
+            });
         let (trimmed_messages, trim_disposition) = ctx.core.retention.apply_budget(
             &trim_budget,
             &ctx.messages,
-            // The caller re-selects tool definitions in pre-call; reserve
-            // nothing here — the preflight gate re-checks the full request
-            // against the refreshed budget before the retry flies.
-            0,
+            // Retry the exact contract that Higgs rejected. Reserving its tool
+            // catalog here makes the retained messages fit before re-entry;
+            // preflight remains a final check, not the first actual trim.
+            issued_tool_tokens,
             crate::agent::retention::BudgetMode::Normal {
                 turn_count: ctx.turn_count,
             },
@@ -4022,6 +4029,14 @@ impl AgentLoopShared {
                     ctx.effective_budget.max_context(),
                     ctx.effective_budget.response_reserve(),
                 );
+                let failure_mode = if matches!(
+                    ctx.capacity_recovery,
+                    TurnCapacityRecovery::RetryIssued { .. }
+                ) {
+                    CompactionFailureMode::Deterministic
+                } else {
+                    CompactionFailureMode::PreserveContext
+                };
                 // SQLite message_count is a durable, concrete-session sequence.
                 // The process-global learning counter remains telemetry only and
                 // must not order one session's working-memory checkpoints.
@@ -4052,7 +4067,7 @@ impl AgentLoopShared {
                             messages,
                             session_turn,
                             compaction_budget,
-                            CompactionFailureMode::Deterministic,
+                            failure_mode,
                             cancellation.clone(),
                             publication,
                         );

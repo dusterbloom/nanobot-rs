@@ -720,7 +720,7 @@ impl LcmEngine {
         compactor: Option<&ContextCompactor>,
         budget: &TokenBudget,
         tool_def_tokens: usize,
-        _failure_mode: CompactionFailureMode,
+        failure_mode: CompactionFailureMode,
     ) -> Option<Turn> {
         let available = budget.available_budget(tool_def_tokens);
         let target = (available as f64 * self.config.tau_soft * 0.8) as usize;
@@ -748,11 +748,14 @@ impl LcmEngine {
         let candidate_end = block_end;
         // The live runtime may narrow capacity below the configured model
         // ceiling. Bind preflight and the actual summary retry to that envelope.
-        // With no model compactor, deterministic recovery indexes do not need a
-        // model request, so they retain the complete, boundary-safe candidate.
-        let bounded_compactor = compactor.map(|compactor| {
-            compactor.with_runtime_limits(budget.max_context(), budget.available_budget(0))
-        });
+        // Deterministic recovery indexes do not need a model request, so they
+        // retain the complete, boundary-safe candidate.
+        let bounded_compactor = match failure_mode {
+            CompactionFailureMode::PreserveContext => compactor.map(|compactor| {
+                compactor.with_runtime_limits(budget.max_context(), budget.available_budget(0))
+            }),
+            CompactionFailureMode::Deterministic => None,
+        };
         block_end = match bounded_compactor.as_ref() {
             Some(compactor) => {
                 match self.largest_fitting_compaction_end(block_start, candidate_end, compactor) {
@@ -842,14 +845,15 @@ impl LcmEngine {
             block_end
         );
 
-        // A model summary is always preferred. Every failed model path has one
-        // deterministic, lossless backstop: a bounded recovery index whose
-        // source IDs can be expanded from SQLite with lcm_expand. This keeps a
-        // long session resumable even when no compactor is configured, the
-        // provider times out, or the model returns refusal/babble/oversize text.
-        let model_summary = match bounded_compactor.as_ref() {
-            Some(compactor) => escalated_summary(&block_messages, target, Some(compactor)).await,
-            None => Ok(None),
+        // Capacity recovery must not spend another provider timeout trying to
+        // summarize a request the backend already rejected. Deterministic mode
+        // installs the same lossless recovery index immediately; normal
+        // compaction remains model-first and falls back to that index on error.
+        let model_summary = match (failure_mode, bounded_compactor.as_ref()) {
+            (CompactionFailureMode::PreserveContext, Some(compactor)) => {
+                escalated_summary(&block_messages, target, Some(compactor)).await
+            }
+            _ => Ok(None),
         };
         let (summary_text, fresh_manifest, level) = match model_summary {
             Ok(Some(summary)) => summary,
@@ -1623,11 +1627,12 @@ pub enum CompactionAction {
     Blocking,
 }
 
-/// Caller pressure mode retained for API compatibility. Both modes share the
-/// same lossless recovery index when model compaction cannot complete.
+/// How a caller trades summary quality for recovery latency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionFailureMode {
+    /// Ask the model first, then install the lossless index if it fails.
     PreserveContext,
+    /// Install the lossless index immediately without a provider request.
     Deterministic,
 }
 
@@ -2100,29 +2105,6 @@ mod tests {
         }
     }
 
-    /// Mock LLM that returns an error so compaction must preserve raw context.
-    struct FailingMock;
-
-    #[async_trait]
-    impl LLMProvider for FailingMock {
-        async fn chat(
-            &self,
-            _messages: &[Value],
-            _tools: Option<&[Value]>,
-            _model: Option<&str>,
-            _max_tokens: u32,
-            _temperature: f64,
-            _thinking_budget: Option<u32>,
-            _top_p: Option<f64>,
-        ) -> anyhow::Result<LLMResponse> {
-            Err(anyhow::anyhow!("No LLM available"))
-        }
-
-        fn get_default_model(&self) -> &str {
-            "mock-failing"
-        }
-    }
-
     struct CountingFailingMock {
         calls: Arc<AtomicUsize>,
     }
@@ -2515,7 +2497,7 @@ mod tests {
                     Some(&compactor),
                     &budget,
                     0,
-                    CompactionFailureMode::Deterministic,
+                    CompactionFailureMode::PreserveContext,
                 )
                 .await;
             let after = summary_tokens(&engine);
@@ -2652,7 +2634,7 @@ mod tests {
                 Some(&compactor),
                 &TokenBudget::new(4096, 1024),
                 0,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await;
         assert!(result.is_some(), "live compaction must produce a summary");
@@ -3024,7 +3006,7 @@ mod tests {
                 Some(&compactor),
                 &budget,
                 0,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await
             .expect("large tool-rich history must receive a model-authored summary");
@@ -3125,7 +3107,7 @@ mod tests {
                 Some(&compactor),
                 &TokenBudget::new(4_096, 512),
                 0,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await
             .expect("an old prefix should fit even when the full block does not");
@@ -3199,7 +3181,7 @@ mod tests {
                 Some(&compactor),
                 &TokenBudget::new(1_024, 256),
                 0,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await;
 
@@ -3451,7 +3433,7 @@ mod tests {
                 Some(&compactor),
                 &budget,
                 100,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await;
         assert!(result.is_some(), "Compaction should produce a summary");
@@ -3517,11 +3499,11 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // E2E: compact with failing LLM → no deterministic fallback
+    // E2E: deterministic recovery never waits for the compactor
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn deterministic_compaction_error_installs_recoverable_index() {
+    async fn deterministic_compaction_bypasses_model_and_installs_recoverable_index() {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,
@@ -3547,11 +3529,11 @@ mod tests {
         let before_tokens = engine.active_tokens();
         let budget = TokenBudget::new(4096, 2048);
 
-        // Compact with a failing LLM: the summarization call errors, so
-        // compaction must NOT fall back to deterministic truncation — it
-        // leaves the context untouched and retryable next turn.
+        let calls = Arc::new(AtomicUsize::new(0));
         let compactor = ContextCompactor::new(
-            Arc::new(FailingMock) as Arc<dyn LLMProvider>,
+            Arc::new(CountingFailingMock {
+                calls: Arc::clone(&calls),
+            }) as Arc<dyn LLMProvider>,
             "mock".to_string(),
             4096,
         );
@@ -3564,11 +3546,17 @@ mod tests {
             )
             .await;
 
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "deterministic recovery must never wait for model capacity"
+        );
+
         let Turn::Summary {
             text,
             source_ids,
             level,
-        } = result.expect("a model error must install a bounded, lossless recovery index")
+        } = result.expect("deterministic mode must install a bounded, lossless recovery index")
         else {
             panic!("expected recovery summary");
         };
@@ -3636,7 +3624,7 @@ mod tests {
                 Some(&compactor),
                 &budget,
                 100,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await;
 
@@ -3894,7 +3882,7 @@ mod tests {
                 Some(&compactor),
                 &budget,
                 100,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await;
         assert!(r1.is_some(), "First compaction should succeed");
@@ -3906,7 +3894,7 @@ mod tests {
                 Some(&compactor),
                 &budget,
                 100,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await;
         if r2.is_some() {
@@ -3963,7 +3951,7 @@ mod tests {
                 Some(&compactor),
                 &budget,
                 0,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await
             .is_some());
@@ -3993,7 +3981,7 @@ mod tests {
                 Some(&compactor),
                 &budget,
                 0,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await
             .is_some());
@@ -4071,7 +4059,7 @@ mod tests {
                 Some(&compactor),
                 &budget,
                 0,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await;
         assert!(r1.is_some());
@@ -4102,7 +4090,7 @@ mod tests {
                 Some(&compactor),
                 &budget,
                 0,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await;
         assert!(r2.is_some());
@@ -4196,7 +4184,7 @@ mod tests {
                 Some(&compactor),
                 &budget,
                 0,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await;
         assert!(result.is_some(), "threshold-triggered merge must compact");
@@ -4506,7 +4494,7 @@ mod tests {
                     Some(&compactor),
                     &budget,
                     100,
-                    CompactionFailureMode::Deterministic,
+                    CompactionFailureMode::PreserveContext,
                 )
                 .await;
             let elapsed = start.elapsed().as_millis();
@@ -5041,7 +5029,7 @@ mod tests {
                 Some(&compactor),
                 &budget,
                 0,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await;
         assert!(compacted.is_some(), "compaction must succeed first");
@@ -5112,7 +5100,7 @@ mod tests {
                 Some(&compactor),
                 &budget,
                 0,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await;
 
@@ -5175,7 +5163,7 @@ mod tests {
                 Some(&compactor),
                 &budget,
                 0,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await;
         assert!(compacted.is_some(), "compaction must succeed first");
@@ -5598,7 +5586,7 @@ mod tests {
                 Some(&compactor),
                 &budget,
                 100,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await
             .expect("should compact");

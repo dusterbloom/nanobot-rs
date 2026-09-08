@@ -14072,13 +14072,17 @@ mod capacity_preflight {
 
 mod capacity_exceeded {
     use super::*;
+    use crate::agent::token_budget::TokenBudget;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     struct Capacity413Provider {
         requests: AtomicU64,
+        compaction_requests_after_rejection: AtomicU64,
+        capacity_rejected: std::sync::atomic::AtomicBool,
         typed_failures: u32,
         prompt_limits: std::sync::Mutex<Vec<u64>>,
         output_limits: std::sync::Mutex<Vec<u32>>,
+        request_tokens: std::sync::Mutex<Vec<usize>>,
     }
 
     #[async_trait]
@@ -14093,15 +14097,30 @@ mod capacity_exceeded {
             _thinking_budget: Option<u32>,
             _top_p: Option<f64>,
         ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            let Some(prompt_limit) = _messages[0]
+                [crate::providers::openai_compat::NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD]
+                .as_u64()
+            else {
+                if self.capacity_rejected.load(Ordering::SeqCst) {
+                    self.compaction_requests_after_rejection
+                        .fetch_add(1, Ordering::SeqCst);
+                }
+                return Ok(crate::providers::base::LLMResponse {
+                    content: Some("checkpoint summary".to_string()),
+                    tool_calls: vec![],
+                    finish_reason: FinishReason::Stop,
+                    usage: std::collections::HashMap::new(),
+                });
+            };
             self.output_limits.lock().unwrap().push(_max_tokens);
-            self.prompt_limits.lock().unwrap().push(
-                _messages[0]
-                    [crate::providers::openai_compat::NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD]
-                    .as_u64()
-                    .expect("Higgs request must carry its effective prompt limit"),
+            self.prompt_limits.lock().unwrap().push(prompt_limit);
+            self.request_tokens.lock().unwrap().push(
+                TokenBudget::estimate_tokens(_messages)
+                    + TokenBudget::estimate_tool_def_tokens(_tools.unwrap_or(&[])),
             );
             let n = self.requests.fetch_add(1, Ordering::SeqCst);
             if (n as u32) < self.typed_failures {
+                self.capacity_rejected.store(true, Ordering::SeqCst);
                 return Err(crate::errors::ProviderError::HiggsCapacityExceeded {
                     safe_prompt_tokens: 8_192,
                     safe_total_tokens: 12_288,
@@ -14158,8 +14177,10 @@ mod capacity_exceeded {
 
     struct TurnRecord {
         provider_calls: u64,
+        compaction_calls_after_rejection: u64,
         prompt_limits: Vec<u64>,
         output_limits: Vec<u32>,
+        request_tokens: Vec<usize>,
         event_kinds: Vec<&'static str>,
         outcome: String,
         reply: String,
@@ -14170,11 +14191,22 @@ mod capacity_exceeded {
     }
 
     async fn drive_typed_turn(typed_failures: u32, prompt: &str) -> TurnRecord {
+        drive_typed_turn_with_history(typed_failures, prompt, Vec::new()).await
+    }
+
+    async fn drive_typed_turn_with_history(
+        typed_failures: u32,
+        prompt: &str,
+        history: Vec<Value>,
+    ) -> TurnRecord {
         let provider = Arc::new(Capacity413Provider {
             requests: AtomicU64::new(0),
+            compaction_requests_after_rejection: AtomicU64::new(0),
+            capacity_rejected: std::sync::atomic::AtomicBool::new(false),
             typed_failures,
             prompt_limits: std::sync::Mutex::new(Vec::new()),
             output_limits: std::sync::Mutex::new(Vec::new()),
+            request_tokens: std::sync::Mutex::new(Vec::new()),
         });
         let workspace = tempfile::tempdir().unwrap().keep();
         let core = build_swappable_core(SwappableCoreConfig {
@@ -14214,6 +14246,11 @@ mod capacity_exceeded {
                 std::env::temp_dir().join(format!("nanobot-413-{}.sqlite", uuid::Uuid::new_v4())),
             ),
         });
+        let session_key = "cap-413";
+        if !history.is_empty() {
+            let session = core.sessions.get_or_resume(session_key).await;
+            core.sessions.add_messages(&session.id, &history).await;
+        }
         let counters = test_runtime_counters(16_384);
         let core_handle = AgentHandle::new(core, counters);
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
@@ -14232,7 +14269,6 @@ mod capacity_exceeded {
             LcmSchemaConfig::default(),
             None,
         );
-        let session_key = "cap-413";
         let reply = agent_loop
             .process_direct(prompt, session_key, "test", "capacity-413")
             .await;
@@ -14275,10 +14311,15 @@ mod capacity_exceeded {
             .unwrap();
         let prompt_limits = provider.prompt_limits.lock().unwrap().clone();
         let output_limits = provider.output_limits.lock().unwrap().clone();
+        let request_tokens = provider.request_tokens.lock().unwrap().clone();
         TurnRecord {
             provider_calls: provider.requests.load(Ordering::SeqCst),
+            compaction_calls_after_rejection: provider
+                .compaction_requests_after_rejection
+                .load(Ordering::SeqCst),
             prompt_limits,
             output_limits,
+            request_tokens,
             event_kinds,
             outcome,
             reply,
@@ -14328,6 +14369,53 @@ mod capacity_exceeded {
         let record = drive_typed_turn(1, "answer briefly").await;
         assert_eq!(record.prompt_limits, vec![11_776, 8_192]);
         assert_eq!(record.outcome, "finished");
+    }
+
+    #[tokio::test]
+    async fn typed_capacity_shrink_compacts_without_another_provider_call() {
+        let mut history = Vec::new();
+        let mut turn = 0_u64;
+        while TokenBudget::estimate_tokens(&history) < 6_500 {
+            history.push(json!({
+                "role": "user",
+                "content": format!(
+                    "retained project evidence {turn}: {}",
+                    "a concrete durable fact needed after recovery ".repeat(80)
+                ),
+                "_turn": turn,
+            }));
+            history.push(json!({
+                "role": "assistant",
+                "content": format!("acknowledged retained evidence {turn}"),
+                "_turn": turn,
+            }));
+            turn += 1;
+        }
+
+        let record = drive_typed_turn_with_history(
+            1,
+            "Use the retained evidence and answer after capacity recovery.",
+            history,
+        )
+        .await;
+
+        assert_eq!(record.provider_calls, 2, "one main-request retry only");
+        assert_eq!(
+            record.compaction_calls_after_rejection, 0,
+            "capacity recovery must not ask the constrained provider to summarize"
+        );
+        assert!(
+            record.request_tokens[0] > 8_192,
+            "fixture must exceed the typed safe prompt: {:?}",
+            record.request_tokens
+        );
+        assert!(
+            record.request_tokens[1] <= 8_192,
+            "retry prompt plus exact issued tool catalog must fit: {:?}",
+            record.request_tokens
+        );
+        assert_eq!(record.outcome, "finished");
+        assert!(record.reply.contains("recovered answer"));
     }
 
     #[tokio::test]
