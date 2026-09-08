@@ -16,9 +16,9 @@
 //! - **Active Context**: Window sent to LLM = recent raw messages + summary nodes.
 //! - **Summary DAG**: Hierarchical summaries with lossless pointers to originals.
 //! - **Two-threshold control loop**: τ_soft (async) / τ_hard (blocking).
-//! - **Escalating summarization**: preserve_details → bullet_points. Missing,
-//!   failed, or oversized requests leave raw context intact. Oversized blocks
-//!   compact only the largest complete prefix that fits the model request.
+//! - **Escalating summarization**: preserve_details → bullet_points. If model
+//!   compaction cannot produce an acceptable result, a bounded recovery index
+//!   points back to immutable SQLite rows via `lcm_expand`.
 //!
 //! SQLite message rows and summary nodes provide restart-safe storage. This
 //! module manages the in-memory DAG and active context assembly.
@@ -295,7 +295,19 @@ pub fn format_id_ranges(ids: &[MessageId]) -> String {
 /// context. Single source of truth for the header format (live compaction and
 /// restart rebuild must render byte-identically for the prompt prefix cache).
 fn summary_wire_message(source_ids: &[MessageId], text: &str, manifest: &SummaryManifest) -> Value {
-    let ranges = format_id_ranges(source_ids);
+    // A deterministic recovery index carries its full exact ID set in the
+    // durable node. Keep the wire pointer constant-size even for a session
+    // whose source row IDs are highly fragmented; lcm_expand is scoped to the
+    // current engine and ignores IDs outside this node's immutable store.
+    let ranges = if text.starts_with("[Recovery index") {
+        source_ids
+            .iter()
+            .min()
+            .zip(source_ids.iter().max())
+            .map_or_else(String::new, |(first, last)| format!("{first}-{last}"))
+    } else {
+        format_id_ranges(source_ids)
+    };
     let mut content = format!(
         "[Summary of messages {ranges}. To read the exact originals call \
          lcm_expand({{\"message_ids\": \"{ranges}\"}}).]\n\n{text}"
@@ -462,8 +474,7 @@ pub struct LcmConfig {
     /// Hard threshold as fraction of available context (0.0-1.0).
     /// Triggers blocking compaction. Default: 0.85 (85%).
     pub tau_hard: f64,
-    /// Legacy schema field retained for configuration compatibility.
-    /// Model-backed compaction does not use it as a fallback target.
+    /// Maximum target for the bounded deterministic recovery index.
     pub deterministic_target: usize,
 }
 
@@ -709,8 +720,6 @@ impl LcmEngine {
         compactor: Option<&ContextCompactor>,
         budget: &TokenBudget,
         tool_def_tokens: usize,
-        // Retained for call-site intent and API compatibility. Every failure
-        // now preserves raw context; capacity retry is owned by the caller.
         _failure_mode: CompactionFailureMode,
     ) -> Option<Turn> {
         let available = budget.available_budget(tool_def_tokens);
@@ -736,33 +745,25 @@ impl LcmEngine {
                 }
             };
 
-        let Some(compactor) = compactor else {
-            debug!("LCM: no compactor available, leaving context uncompacted");
-            self.async_compaction_pending = false;
-            return None;
-        };
-        // The live runtime may narrow capacity below the configured model
-        // ceiling. Bind both preflight and the actual summary/retry to that
-        // total context size; the compactor accounts for its own output, so
-        // subtracting the main turn's response reserve here would count output
-        // capacity twice.
-        let bounded_compactor =
-            compactor.with_runtime_limits(budget.max_context(), budget.available_budget(0));
-        let compactor = &bounded_compactor;
-
         let candidate_end = block_end;
-        block_end = match self.largest_fitting_compaction_end(block_start, candidate_end, compactor)
-        {
-            Some(end) => end,
-            None => {
-                debug!(
-                    block_start,
-                    candidate_end,
-                    "LCM: no complete summary prefix fits, leaving context uncompacted"
-                );
-                self.async_compaction_pending = false;
-                return None;
+        // The live runtime may narrow capacity below the configured model
+        // ceiling. Bind preflight and the actual summary retry to that envelope.
+        // With no model compactor, deterministic recovery indexes do not need a
+        // model request, so they retain the complete, boundary-safe candidate.
+        let bounded_compactor = compactor.map(|compactor| {
+            compactor.with_runtime_limits(budget.max_context(), budget.available_budget(0))
+        });
+        block_end = match bounded_compactor.as_ref() {
+            Some(compactor) => {
+                match self.largest_fitting_compaction_end(block_start, candidate_end, compactor) {
+                    Some(end) => end,
+                    // The model request itself cannot fit, but the durable index
+                    // does not need provider capacity. Keep complete turn/tool
+                    // boundaries and install that backstop below.
+                    None => candidate_end,
+                }
             }
+            None => candidate_end,
         };
         if block_end < candidate_end {
             info!(
@@ -841,28 +842,32 @@ impl LcmEngine {
             block_end
         );
 
-        // A missing compactor, failed generation, or rejected model output
-        // never becomes a lossy success. Leave the selected originals active
-        // so the normal capacity path can wait/retry without semantic loss.
-        let (summary_text, fresh_manifest, level) = match escalated_summary(
-            &block_messages,
-            target,
-            Some(compactor),
-        )
-        .await
-        {
+        // A model summary is always preferred. Every failed model path has one
+        // deterministic, lossless backstop: a bounded recovery index whose
+        // source IDs can be expanded from SQLite with lcm_expand. This keeps a
+        // long session resumable even when no compactor is configured, the
+        // provider times out, or the model returns refusal/babble/oversize text.
+        let model_summary = match bounded_compactor.as_ref() {
+            Some(compactor) => escalated_summary(&block_messages, target, Some(compactor)).await,
+            None => Ok(None),
+        };
+        let (summary_text, fresh_manifest, level) = match model_summary {
             Ok(Some(summary)) => summary,
-            Ok(None) => {
-                self.async_compaction_pending = false;
-                return None;
-            }
-            Err(error) => {
-                warn!(
-                    %error,
-                    "LCM: compaction summarization failed, leaving context uncompacted this round"
-                );
-                self.async_compaction_pending = false;
-                return None;
+            Ok(None) | Err(_) => {
+                let recovery_messages: Vec<(MessageId, Value)> = source_ids
+                    .iter()
+                    .filter_map(|id| self.store.get(id).cloned().map(|message| (*id, message)))
+                    .collect();
+                let Some(index) = deterministic_recovery_index(
+                    &source_ids,
+                    &recovery_messages,
+                    block_tokens,
+                    self.config.deterministic_target,
+                ) else {
+                    self.async_compaction_pending = false;
+                    return None;
+                };
+                (index, SummaryManifest::default(), 0)
             }
         };
 
@@ -1618,8 +1623,8 @@ pub enum CompactionAction {
     Blocking,
 }
 
-/// Caller pressure mode retained for API compatibility. Compaction itself
-/// preserves raw context on every model failure in both modes.
+/// Caller pressure mode retained for API compatibility. Both modes share the
+/// same lossless recovery index when model compaction cannot complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionFailureMode {
     PreserveContext,
@@ -1651,12 +1656,18 @@ async fn escalated_summary(
         return Ok(None);
     };
 
+    let mut capacity_retry_used = false;
+
     // Level 1: Preserve details. Only a completed but insufficient summary may
     // escalate. A transport or fidelity-gate error is indeterminate and must
     // not launch another generation behind work the backend may still own.
-    match compactor
-        .summarize_for_lcm(messages, "preserve_details")
-        .await
+    match summarize_with_capacity_retry(
+        compactor,
+        messages,
+        "preserve_details",
+        &mut capacity_retry_used,
+    )
+    .await
     {
         Ok(reply) => {
             let (summary, manifest) = extract_summary_manifest(reply);
@@ -1672,14 +1683,114 @@ async fn escalated_summary(
     // Level 2: Bullet points, more aggressive compression. This is the last
     // level — an error here has nowhere left to escalate to, so it
     // propagates as the caller-visible failure for this compaction attempt.
-    let reply = compactor
-        .summarize_for_lcm(messages, "bullet_points")
-        .await?;
+    let reply = summarize_with_capacity_retry(
+        compactor,
+        messages,
+        "bullet_points",
+        &mut capacity_retry_used,
+    )
+    .await?;
     let (summary, manifest) = extract_summary_manifest(reply);
     if summary_is_acceptable(&summary, original_tokens, 2)? {
         return Ok(Some((summary, manifest, 2)));
     }
     Ok(None)
+}
+
+/// Retry only one compaction request when Higgs supplies a typed, tighter
+/// admission ceiling. The retry uses the server's safe prompt limit rather
+/// than the client estimate; all other errors remain indeterminate and fall
+/// through to the deterministic recovery index.
+async fn summarize_with_capacity_retry(
+    compactor: &ContextCompactor,
+    messages: &[Value],
+    mode: &str,
+    capacity_retry_used: &mut bool,
+) -> Result<String> {
+    match compactor.summarize_for_lcm(messages, mode).await {
+        Ok(summary) => Ok(summary),
+        Err(error) if !*capacity_retry_used => {
+            let Some((safe_prompt, safe_total)) = capacity_retry_limits(&error) else {
+                return Err(error);
+            };
+            *capacity_retry_used = true;
+            let retry = compactor.with_runtime_limits(safe_total, safe_prompt);
+            if !retry.lcm_request_fits(messages, mode) {
+                return Err(error);
+            }
+            retry.summarize_for_lcm(messages, mode).await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn capacity_retry_limits(error: &anyhow::Error) -> Option<(usize, usize)> {
+    let crate::errors::ProviderError::HiggsCapacityExceeded {
+        safe_prompt_tokens,
+        safe_total_tokens,
+        ..
+    } = error.downcast_ref::<crate::errors::ProviderError>()?
+    else {
+        return None;
+    };
+    let safe_prompt = usize::try_from(*safe_prompt_tokens).ok()?;
+    let safe_total = usize::try_from(*safe_total_tokens).ok()?;
+    (safe_prompt > 0 && safe_prompt <= safe_total).then_some((safe_prompt, safe_total))
+}
+
+/// Produce the bounded, lossless recovery record used when model compaction is
+/// unavailable or rejects its own output. The immutable SQLite rows remain the
+/// source of truth; this index only preserves a small newest-first orientation
+/// and a copyable `lcm_expand` pointer back to those rows.
+fn deterministic_recovery_index(
+    source_ids: &[MessageId],
+    messages: &[(MessageId, Value)],
+    original_tokens: usize,
+    configured_target: usize,
+) -> Option<String> {
+    let first = *source_ids.iter().min()?;
+    let last = *source_ids.iter().max()?;
+    let full_ranges = format_id_ranges(source_ids);
+    let compact_range = format!("{first}-{last}");
+    let target = configured_target
+        .clamp(48, 256)
+        .min(original_tokens.saturating_sub(1));
+    if target == 0 {
+        return None;
+    }
+
+    let header = |ranges: &str| {
+        format!(
+            "[Recovery index — model compaction unavailable. Exact source messages: {ranges}. \
+             Recover them with lcm_expand({{\"message_ids\": \"{ranges}\"}}).]"
+        )
+    };
+    let mut text = header(&full_ranges);
+    if TokenBudget::estimate_str_tokens(&text) > target
+        || TokenBudget::estimate_str_tokens(&text) >= original_tokens
+    {
+        text = header(&compact_range);
+    }
+    if TokenBudget::estimate_str_tokens(&text) >= original_tokens {
+        return None;
+    }
+
+    // Keep only bounded, newest-first orientation. The complete transcript is
+    // deliberately not copied here: it is already durable and lcm_expand is
+    // the one recovery interface for exact evidence.
+    for (id, message) in messages.iter().rev() {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("?");
+        let content = message.get("content").and_then(Value::as_str).unwrap_or("");
+        let excerpt: String = content.chars().take(240).collect();
+        let line = format!("\n- newest [msg {id}] {role}: {excerpt}");
+        let candidate = format!("{text}{line}");
+        if TokenBudget::estimate_str_tokens(&candidate) > target {
+            break;
+        }
+        text = candidate;
+    }
+
+    (TokenBudget::estimate_str_tokens(&text) < original_tokens).then_some(text)
 }
 
 fn summary_is_acceptable(summary: &str, original_tokens: usize, level: u8) -> Result<bool> {
@@ -2016,6 +2127,10 @@ mod tests {
         calls: Arc<AtomicUsize>,
     }
 
+    struct CapacityThenSummaryMock {
+        calls: Arc<AtomicUsize>,
+    }
+
     struct RecordingSummarizerMock {
         requests: Arc<std::sync::Mutex<Vec<Vec<Value>>>>,
     }
@@ -2123,6 +2238,40 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl LLMProvider for CapacityThenSummaryMock {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<LLMResponse> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(crate::errors::ProviderError::HiggsCapacityExceeded {
+                    safe_prompt_tokens: 4_096,
+                    safe_total_tokens: 4_096,
+                    boot_id: "test-boot".to_string(),
+                    generation: 1,
+                }
+                .into());
+            }
+            Ok(LLMResponse {
+                content: Some("- Preserve the tested capacity recovery evidence.".to_string()),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "mock-capacity-then-summary"
+        }
+    }
+
     #[tokio::test]
     async fn transport_failure_does_not_launch_level_two_retry() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -2148,6 +2297,33 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "an indeterminate generation must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn typed_capacity_shrink_retries_once_with_server_ceiling() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let compactor = ContextCompactor::new(
+            Arc::new(CapacityThenSummaryMock {
+                calls: Arc::clone(&calls),
+            }),
+            "mock".to_string(),
+            8_192,
+        );
+        let messages = vec![
+            json!({"role": "user", "content": "Preserve the capacity recovery receipt."}),
+            json!({"role": "assistant", "content": "The original request is still pending."}),
+        ];
+
+        let summary = escalated_summary(&messages, 64, Some(&compactor))
+            .await
+            .expect("typed capacity retry must not become a terminal error")
+            .expect("retry response must be accepted");
+        assert_eq!(summary.2, 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "exactly one retry is allowed"
         );
     }
 
@@ -2993,7 +3169,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn no_model_summary_prefix_fit_preserves_raw_history() {
+    async fn no_model_summary_prefix_fit_installs_constant_recovery_pointer() {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.1,
             tau_hard: 0.3,
@@ -3008,7 +3184,7 @@ mod tests {
                 &format!("oversized state {id} {}", "evidence ".repeat(1_000)),
             );
         }
-        let active_before = engine.active_context();
+        let before_tokens = engine.active_tokens();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let compactor = ContextCompactor::new(
             Arc::new(RecordingSummarizerMock {
@@ -3027,10 +3203,14 @@ mod tests {
             )
             .await;
 
-        assert!(summary.is_none());
+        let Turn::Summary { text, level, .. } = summary.expect("fallback must compact") else {
+            panic!("expected recovery summary");
+        };
+        assert_eq!(level, 0);
+        assert!(text.contains("lcm_expand"));
         assert!(requests.lock().unwrap().is_empty());
-        assert_eq!(engine.active_context(), active_before);
-        assert!(engine.dag().is_empty());
+        assert!(engine.active_tokens() < before_tokens);
+        assert_eq!(engine.dag().len(), 1);
     }
 
     /// `conversation_tokens()` should return 0 when only a system prompt exists.
@@ -3341,7 +3521,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_e2e_compact_llm_error_leaves_context_uncompacted() {
+    async fn deterministic_compaction_error_installs_recoverable_index() {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,
@@ -3364,7 +3544,7 @@ mod tests {
             );
         }
 
-        let active_before = engine.active_context();
+        let before_tokens = engine.active_tokens();
         let budget = TokenBudget::new(4096, 2048);
 
         // Compact with a failing LLM: the summarization call errors, so
@@ -3384,18 +3564,27 @@ mod tests {
             )
             .await;
 
+        let Turn::Summary {
+            text,
+            source_ids,
+            level,
+        } = result.expect("a model error must install a bounded, lossless recovery index")
+        else {
+            panic!("expected recovery summary");
+        };
+        assert_eq!(level, 0, "fallback summaries must be visibly deterministic");
         assert!(
-            result.is_none(),
-            "an LLM error must never fall back to silent deterministic truncation"
+            text.contains("lcm_expand"),
+            "fallback must retain recovery pointer: {text}"
         );
-        assert_eq!(
-            engine.active_context(),
-            active_before,
-            "context must be preserved byte for byte on failure"
+        assert!(!source_ids.is_empty(), "fallback must retain source IDs");
+        assert!(
+            engine.active_tokens() < before_tokens,
+            "fallback must shrink the active context"
         );
-        assert_eq!(engine.dag.len(), 0, "no summary node created on failure");
+        assert_eq!(engine.dag.len(), 1, "fallback must create a durable node");
 
-        // Lossless: originals still directly retrievable from the store.
+        // Lossless: originals remain directly retrievable from the store.
         for id in engine.store_ids() {
             assert_eq!(engine.expand(&[id]).len(), 1);
         }
@@ -3406,7 +3595,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn test_e2e_compact_babble_summary_leaves_context_uncompacted() {
+    async fn babble_summary_installs_recoverable_index() {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,
@@ -3429,15 +3618,14 @@ mod tests {
             );
         }
 
-        let active_before = engine.active_context();
+        let before_tokens = engine.active_tokens();
         let budget = TokenBudget::new(4096, 2048);
 
         // The LLM returns a degenerate, filler-heavy, repetitive wall of
         // text — real-world motivation is a small local model producing
         // babble that used to get persisted verbatim as memory. The
-        // anti-drift babble gate must reject it before it is ever
-        // persisted, exactly like an LLM error: uncompacted this round, no
-        // retry ladder to a different level.
+        // anti-drift must reject the babble itself, then install the durable
+        // recovery index instead of leaving the session over capacity.
         let compactor = ContextCompactor::new(
             Arc::new(BabbleMock) as Arc<dyn LLMProvider>,
             "mock".to_string(),
@@ -3452,24 +3640,16 @@ mod tests {
             )
             .await;
 
-        assert!(
-            result.is_none(),
-            "a babble/degenerate summary must never be persisted"
-        );
-        assert_eq!(
-            engine.active_context(),
-            active_before,
-            "context must be preserved byte for byte when the summary is rejected"
-        );
-        assert_eq!(
-            engine.dag.len(),
-            0,
-            "no summary node created for a rejected babble summary"
-        );
+        let Turn::Summary { text, level, .. } = result.expect("babble must fall back") else {
+            panic!("expected recovery summary");
+        };
+        assert_eq!(level, 0);
+        assert!(text.contains("lcm_expand"));
+        assert!(engine.active_tokens() < before_tokens);
     }
 
     #[tokio::test]
-    async fn soft_compaction_without_model_preserves_active_context() {
+    async fn soft_compaction_without_model_installs_recoverable_index() {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,
@@ -3492,7 +3672,7 @@ mod tests {
                 &format!("Answer {i}: {detail}"),
             );
         }
-        let active_before = engine.active_context();
+        let before_tokens = engine.active_tokens();
         engine.request_async_compaction();
 
         let result = engine
@@ -3504,18 +3684,13 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_none());
-        assert_eq!(engine.active_context(), active_before);
-        assert_eq!(engine.dag.len(), 0);
-        assert_ne!(
-            engine.check_thresholds(&TokenBudget::new(4096, 2048), 100),
-            CompactionAction::None,
-            "a failed soft pass must clear the pending bit so it can retry"
-        );
+        assert!(matches!(result, Some(Turn::Summary { level: 0, .. })));
+        assert!(engine.active_tokens() < before_tokens);
+        assert_eq!(engine.dag.len(), 1);
     }
 
     #[tokio::test]
-    async fn soft_compaction_huge_block_without_model_preserves_and_stays_retryable() {
+    async fn huge_soft_compaction_without_model_installs_bounded_index() {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.1,
             tau_hard: 0.3,
@@ -3537,7 +3712,7 @@ mod tests {
                 &format!("Answer {i}: {detail}"),
             );
         }
-        let active_before = engine.active_context();
+        let before_tokens = engine.active_tokens();
         engine.request_async_compaction();
 
         let result = engine
@@ -3549,22 +3724,13 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_none());
-        assert_eq!(engine.active_context(), active_before);
-        assert!(engine.dag().is_empty());
-        assert_ne!(
-            engine.check_thresholds(&TokenBudget::new(32_768, 2048), 0),
-            CompactionAction::None,
-            "failed soft compaction must clear pending so a later model can retry"
-        );
+        assert!(matches!(result, Some(Turn::Summary { level: 0, .. })));
+        assert!(engine.active_tokens() < before_tokens);
+        assert_eq!(engine.dag().len(), 1);
     }
 
     #[tokio::test]
-    async fn hard_compaction_without_model_leaves_context_uncompacted() {
-        // With no compactor at all, hard pressure can no longer converge via
-        // deterministic truncation — that fallback was deleted (silent
-        // truncation is never acceptable). It leaves the context uncompacted
-        // and retryable so typed capacity handling can suspend the turn.
+    async fn hard_compaction_without_model_installs_recoverable_index() {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,
@@ -3587,7 +3753,7 @@ mod tests {
                 &format!("Answer {i}: {detail}"),
             );
         }
-        let active_before = engine.active_context();
+        let before_tokens = engine.active_tokens();
 
         let result = engine
             .compact(
@@ -3598,12 +3764,13 @@ mod tests {
             )
             .await;
 
-        assert!(
-            result.is_none(),
-            "no compactor means no compaction, never silent truncation"
-        );
-        assert_eq!(engine.active_context(), active_before);
-        assert_eq!(engine.dag.len(), 0);
+        let Turn::Summary { text, level, .. } = result.expect("no compactor must fall back") else {
+            panic!("expected recovery summary");
+        };
+        assert_eq!(level, 0);
+        assert!(text.contains("lcm_expand"));
+        assert!(engine.active_tokens() < before_tokens);
+        assert_eq!(engine.dag.len(), 1);
     }
 
     // -----------------------------------------------------------------------
