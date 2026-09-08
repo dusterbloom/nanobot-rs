@@ -981,9 +981,7 @@ fn route_tts(
 }
 
 /// Holds STT and TTS engines behind `Arc<Mutex<>>` for thread-safe access.
-/// Two construction modes:
-/// - `with_engine()` / `with_lang()` — mic+speaker mode for TUI/realtime
-/// - `for_channels()` — file I/O only, no audio hardware
+/// Construct with `with_voice_config` from a resolved `VoiceConfig`.
 pub struct VoicePipeline {
     stt: Arc<Mutex<SpeechToText>>,
     tts: Option<Arc<Mutex<TextToSpeech>>>,
@@ -999,38 +997,6 @@ impl VoicePipeline {
     // ----------------------------------------------------------------
     // Constructors
     // ----------------------------------------------------------------
-
-    /// Create a pipeline for channel use (file I/O, no mic/speaker).
-    /// Uses default voice. For config-driven voice selection, see
-    /// [`Self::for_channels_with_voice_config`].
-    pub async fn for_channels(engine: TtsEngineConfig) -> Result<Self, String> {
-        Self::init_pipeline(engine, None, None, &LogProgress).await
-    }
-
-    /// Create a channel-mode pipeline from a fully-resolved [`VoiceConfig`].
-    pub async fn for_channels_with_voice_config(
-        cfg: &crate::config::schema::VoiceConfig,
-    ) -> Result<Self, String> {
-        Self::init_pipeline(
-            cfg.tts_engine,
-            cfg.language.as_deref(),
-            cfg.tts_voice.as_deref(),
-            &LogProgress,
-        )
-        .await
-    }
-
-    /// Create a Supertonic pipeline with an optional initial language (mic mode).
-    pub async fn with_lang(lang: Option<&str>) -> Result<Self, String> {
-        Self::init_pipeline(TtsEngineConfig::Supertonic, lang, None, &TerminalProgress).await
-    }
-
-    /// Create a pipeline with a specific TTS engine (mic mode).
-    /// Uses default voice for the engine. For config-driven voice selection,
-    /// see [`Self::with_voice_config`].
-    pub async fn with_engine(engine: TtsEngineConfig) -> Result<Self, String> {
-        Self::init_pipeline(engine, None, None, &TerminalProgress).await
-    }
 
     /// Create a pipeline from a fully-resolved [`VoiceConfig`].
     ///
@@ -1160,14 +1126,6 @@ impl VoicePipeline {
             configured_voice: tts_voice.map(|s| s.to_string()),
             cancel: Arc::new(AtomicBool::new(false)),
         })
-    }
-
-    // ----------------------------------------------------------------
-    // Configuration
-    // ----------------------------------------------------------------
-
-    pub fn engine_config(&self) -> TtsEngineConfig {
-        self.engine_config
     }
 
     // ----------------------------------------------------------------
@@ -1704,21 +1662,6 @@ fn encode_samples_to_ogg(samples: &[f32], sample_rate: u32) -> Result<String, St
 // ============================================================================
 // Progress callbacks
 // ============================================================================
-
-struct LogProgress;
-
-impl ModelProgressCallback for LogProgress {
-    fn on_download_start(&self, model: &str, size_mb: u64) {
-        info!("Downloading voice model {} ({} MB)...", model, size_mb);
-    }
-    fn on_download_progress(&self, _model: &str, _progress_percent: u32, _downloaded_mb: u64) {}
-    fn on_download_complete(&self, model: &str) {
-        info!("Voice model {} downloaded", model);
-    }
-    fn on_extracting(&self, model: &str) {
-        info!("Extracting voice model {}...", model);
-    }
-}
 
 struct TerminalProgress;
 
