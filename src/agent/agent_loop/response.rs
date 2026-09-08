@@ -1621,7 +1621,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lease_renewal_persists_assistant_checkpoint() {
+    async fn exhausted_budget_returns_checkpoint_as_final_text() {
         const CHECKPOINT: &str =
             "findings: twelve files inspected\nnext: compare results\nwill: report differences";
 
@@ -1755,31 +1755,18 @@ mod tests {
         )
         .await
         .expect("scripted turn must terminate");
-        assert_eq!(answer, "final answer");
+        assert_eq!(answer, CHECKPOINT);
 
         let calls = provider.calls.lock().unwrap();
-        assert_eq!(calls.len(), 14, "12 reads + checkpoint + final answer");
-        let post_renewal = &calls[13];
-        let scaffold_index = post_renewal
-            .iter()
-            .position(|message| {
+        assert_eq!(calls.len(), 13, "12 reads + final checkpoint text");
+        assert!(
+            calls.iter().all(|request| request.iter().all(|message| {
                 message
                     .get("content")
                     .and_then(Value::as_str)
-                    .is_some_and(|content| content.contains("Lease renewed"))
-            })
-            .expect("first post-renewal request must contain the renewal scaffold");
-        let checkpoint = scaffold_index
-            .checked_sub(1)
-            .and_then(|index| post_renewal.get(index))
-            .expect("checkpoint must immediately precede the renewal scaffold");
-        assert_eq!(
-            checkpoint.get("role").and_then(Value::as_str),
-            Some("assistant")
-        );
-        assert_eq!(
-            checkpoint.get("content").and_then(Value::as_str),
-            Some(CHECKPOINT)
+                    .map_or(true, |content| !content.contains("Lease renewed"))
+            })),
+            "active turns must not inject historical lease renewal nudges"
         );
 
         let _ = std::fs::remove_dir_all(workspace);
