@@ -37,6 +37,16 @@ pub struct ToolGuard {
     pub had_blocked_calls: bool,
 }
 
+/// Disposition of a normalized tool call. A completed success is replayable
+/// and must never be sent back to the implementation; failures and rejected
+/// calls remain executable so the model can recover.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolGuardDecision {
+    Execute,
+    Replay(String),
+    Reject(String),
+}
+
 impl ToolGuard {
     pub fn new(max_same_call: u32) -> Self {
         let mut tool_limits = HashMap::new();
@@ -88,14 +98,16 @@ impl ToolGuard {
     }
 
     fn is_read_tool_key(key: &str) -> bool {
-        let Some((tool, _)) = key.split_once('|') else {
+        let Some((tool, _)) = key.split_once(':') else {
             return false;
         };
         READ_TOOLS.contains(&tool)
     }
 
     fn uses_cached_result(name: &str) -> bool {
-        READ_TOOLS.contains(&name) || WEB_TOOLS.contains(&name)
+        // Tool catalogs describe current capabilities and may legitimately
+        // change within a turn; replaying an old catalog would hide that.
+        name != "get_tools"
     }
 
     /// Retrieve a previously cached result for the given call signature.
@@ -103,36 +115,19 @@ impl ToolGuard {
         self.results.get(key).map(|s| s.as_str())
     }
 
-    /// How many times this (name, args) signature was blocked on the cache
-    /// path this turn. 1 = first duplicate, 2+ = the model keeps replaying
-    /// the same call despite the cached receipt.
-    pub fn cache_hits(&self, key: &str) -> u32 {
-        self.cache_hits.get(key).copied().unwrap_or(0)
-    }
-
-    pub fn key(name: &str, args: &HashMap<String, Value>) -> String {
-        let mut keys: Vec<&String> = args.keys().collect();
-        keys.sort();
-        let mut parts = Vec::with_capacity(keys.len());
-        for k in keys {
-            parts.push(format!(
-                "{}={}",
-                k,
-                args.get(k).cloned().unwrap_or(Value::Null)
-            ));
-        }
-        format!("{}|{}", name, parts.join("&"))
-    }
-
-    pub fn allow(&mut self, name: &str, args: &HashMap<String, Value>) -> Result<(), String> {
+    /// Classify a call without making duplicate success a blocking error.
+    /// `allow` remains as a compatibility wrapper for older callers/tests.
+    pub(crate) fn decide(
+        &mut self,
+        name: &str,
+        args: &HashMap<String, Value>,
+    ) -> ToolGuardDecision {
         let key = Self::key(name, args);
-        if Self::uses_cached_result(name) && self.results.contains_key(&key) {
-            self.had_blocked_calls = true;
-            *self.cache_hits.entry(key).or_insert(0) += 1;
-            return Err(format!(
-                "duplicate tool call blocked for '{}': cached result already exists in this turn",
-                name
-            ));
+        if Self::uses_cached_result(name) {
+            if let Some(result) = self.results.get(&key).cloned() {
+                *self.cache_hits.entry(key).or_insert(0) += 1;
+                return ToolGuardDecision::Replay(result);
+            }
         }
         let count = self.seen.entry(key).or_insert(0);
         *count += 1;
@@ -143,12 +138,34 @@ impl ToolGuard {
             .unwrap_or(self.max_same_call);
         if *count > limit {
             self.had_blocked_calls = true;
-            return Err(format!(
+            return ToolGuardDecision::Reject(format!(
                 "duplicate tool call blocked for '{}': exceeded {} identical calls in one turn",
                 name, limit
             ));
         }
-        Ok(())
+        ToolGuardDecision::Execute
+    }
+
+    /// How many times this (name, args) signature was blocked on the cache
+    /// path this turn. 1 = first duplicate, 2+ = the model keeps replaying
+    /// the same call despite the cached receipt.
+    pub fn cache_hits(&self, key: &str) -> u32 {
+        self.cache_hits.get(key).copied().unwrap_or(0)
+    }
+
+    pub fn key(name: &str, args: &HashMap<String, Value>) -> String {
+        crate::agent::tool_runner::normalize_call_key(name, args)
+    }
+
+    pub fn allow(&mut self, name: &str, args: &HashMap<String, Value>) -> Result<(), String> {
+        match self.decide(name, args) {
+            ToolGuardDecision::Execute => Ok(()),
+            ToolGuardDecision::Replay(_) => Err(format!(
+                "duplicate tool call replayed for '{}': cached result already exists in this turn",
+                name
+            )),
+            ToolGuardDecision::Reject(reason) => Err(reason),
+        }
     }
 }
 
@@ -269,6 +286,43 @@ mod tests {
         assert!(
             g.allow("search_files", &search_args).is_ok(),
             "search_files after a write should execute fresh"
+        );
+    }
+
+    #[test]
+    fn successful_write_is_replayed_without_execution_budget_or_block() {
+        let mut g = ToolGuard::new(1);
+        let write_args = args(&[("path", "/tmp/a.txt"), ("content", "new")]);
+        g.record_result_with_status("write_file", &write_args, "written".into(), true);
+        assert_eq!(
+            g.decide("write_file", &write_args),
+            ToolGuardDecision::Replay("written".into())
+        );
+        assert_eq!(g.cache_hits(&ToolGuard::key("write_file", &write_args)), 1);
+    }
+
+    #[test]
+    fn failed_and_rejected_calls_remain_retryable() {
+        let mut g = ToolGuard::new(1);
+        let call_args = args(&[("path", "/tmp/missing")]);
+        g.record_result_with_status("write_file", &call_args, "failed".into(), false);
+        assert_eq!(
+            g.decide("write_file", &call_args),
+            ToolGuardDecision::Execute
+        );
+        assert!(matches!(
+            g.decide("write_file", &call_args),
+            ToolGuardDecision::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn normalized_key_is_shared_with_router_for_reordered_arguments() {
+        let first = args(&[("z", "last"), ("a", "first")]);
+        let second = args(&[("a", "first"), ("z", "last")]);
+        assert_eq!(
+            ToolGuard::key("exec", &first),
+            ToolGuard::key("exec", &second)
         );
     }
 

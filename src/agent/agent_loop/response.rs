@@ -564,93 +564,10 @@ impl AgentLoopShared {
             }
 
             ResponseKind::Text(content) => {
-                // Tool-lease renewal: when the lease was exhausted and the model
-                // emitted a structured checkpoint (findings + next + will),
-                // renew the lease and continue with tools restored. The
-                // checkpoint text is left in the conversation so the user
-                // can see what the model committed to.
-                //
-                // Renewal is the only "synthetic injection" the lease
-                // design needs: it confirms to the model that tools are
-                // back, then loops back to step_pre_call where tool_defs
-                // are recomputed (no longer exhausted). No hidden state.
-                if ctx.flow.lease.is_exhausted() && !content.is_empty() {
-                    let renewal = ctx.flow.lease.try_renew(&content);
-                    if renewal.is_valid() {
-                        tracing::info!(
-                            session = %ctx.session_key,
-                            renewals_used = ctx.flow.lease.renewals_used(),
-                            "tool_lease_renewed"
-                        );
-                        ctx.flow.retries.lease_renewal_rejections = 0;
-                        // The model's checkpoint is part of the protocol history:
-                        // keep it immediately before the synthetic renewal nudge
-                        // so the next request can continue the stated plan.
-                        ctx.messages.push_draft(json!({
-                            "role": "assistant",
-                            "content": content
-                        }));
-                        // Nudge the model so it knows tools are available
-                        // again. Without this, a small local model may
-                        // emit another text answer instead of tool calls
-                        // even though tool_defs are back on the next call.
-                        ctx.messages
-                            .push_draft(crate::agent::markers::scaffold_user(format!(
-                                "[Lease renewed — {} more tool calls available. \
-                                 Proceed with the plan from your checkpoint.]",
-                                ctx.flow.lease.lease_size()
-                            )));
-                        return StepResult::Next(IterationPhase::PreCall);
-                    } else if renewal.was_attempted() && renewal.missing_field() != "out_of_leases"
-                    {
-                        // Renewal attempted but missing a field. Tell the
-                        // model exactly what's missing so the next attempt
-                        // can succeed — narrow, deterministic, visible. Bound
-                        // it: a model that keeps emitting partial checkpoints
-                        // gets only MAX_LEASE_RENEWAL_REJECTIONS nudges, then
-                        // the turn finishes with the text it produced. (The
-                        // constant lives with the other loop bounds in
-                        // agent_loop::shared — see its ordering invariant.)
-                        ctx.flow.retries.lease_renewal_rejections =
-                            ctx.flow.retries.lease_renewal_rejections.saturating_add(1);
-                        if ctx.flow.retries.lease_renewal_rejections
-                            > super::shared::MAX_LEASE_RENEWAL_REJECTIONS
-                        {
-                            tracing::info!(
-                                session = %ctx.session_key,
-                                rejections = ctx.flow.retries.lease_renewal_rejections,
-                                "tool_lease_renewal_rejection_cap_reached — finishing turn with model text"
-                            );
-                            // Fall through to finish: the model's text is its answer.
-                        } else {
-                            tracing::info!(
-                                session = %ctx.session_key,
-                                missing = renewal.missing_field(),
-                                rejection = ctx.flow.retries.lease_renewal_rejections,
-                                "tool_lease_renewal_rejected"
-                            );
-                            ctx.messages
-                                .push_draft(crate::agent::markers::scaffold_user(format!(
-                                    "[Lease renewal rejected — your checkpoint is missing \
-                                     '{}'. Either include all of findings:/next:/will: to \
-                                     renew, or write your final answer.]",
-                                    renewal.missing_field()
-                                )));
-                            return StepResult::Next(IterationPhase::PreCall);
-                        }
-                    }
-                    // Fall through: either out_of_leases, the renewal-rejection
-                    // cap was reached, or the model wrote plain text with no
-                    // checkpoint labels (try_renew returned not_attempted). All
-                    // mean "finish the turn" — log only a genuine out_of_leases,
-                    // not the cap/not_attempted cases it would otherwise mask.
-                    if renewal.was_attempted() && renewal.missing_field() == "out_of_leases" {
-                        tracing::info!(
-                            session = %ctx.session_key,
-                            "tool_lease_renewal_out_of_leases"
-                        );
-                    }
-                }
+                // An exhausted turn budget is terminal for tool execution.
+                // Historical checkpoint text remains ordinary assistant text;
+                // old receipts can still be replayed, but the hot path no
+                // longer injects renewal nudges or strips schemas dynamically.
                 // Provenance is observe-only here — it never retracts a
                 // completed response and never re-prompts.
                 //

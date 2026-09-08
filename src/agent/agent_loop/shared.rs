@@ -6062,6 +6062,18 @@ impl AgentLoopShared {
                 crate::agent::router::RoutedToolDisposition::Execute => {
                     routed_tool_calls.push(routed.call);
                 }
+                crate::agent::router::RoutedToolDisposition::Replay { receipt } => {
+                    // A cached success is a non-blocking, idempotent replay.
+                    // Keep it in the carrier's result slot so the provider
+                    // sees one result per call ID, but never send it through
+                    // the tool executor or lease accounting.
+                    router_rejections += 1;
+                    rejected_calls.push((
+                        routed.call,
+                        "tool_guard:cached_replay".to_string(),
+                        receipt,
+                    ));
+                }
                 crate::agent::router::RoutedToolDisposition::Reject { reason, receipt } => {
                     router_rejections += 1;
                     rejected_calls.push((routed.call, format!("tool_guard:{reason}"), receipt));
@@ -6089,63 +6101,6 @@ impl AgentLoopShared {
             // separately — record_tool_call is the single source of truth.
             let result = ctx.flow.lease.record_tool_call();
             if result.allowed {
-                allowed_calls.push(tc);
-            } else if crate::agent::tool_engine::is_read_only_tool(&tc.name)
-                && ctx.flow.lease.auto_renew_for_read_only()
-            {
-                // Read-only tools (read_file, list_dir, etc.) auto-renew
-                // without a checkpoint — they can't loop destructively and
-                // the rejection+renewal dance wastes 3 round-trips on
-                // legitimate multi-file exploration.
-                //
-                // Re-record after renewal: auto_renew_for_read_only resets
-                // iterations_used to 0 but the call that triggered the
-                // renewal is not yet counted against the new lease.
-                // Without this the first call after every auto-renewal is
-                // free, granting lease_size+1 per renewal.
-                let _ = ctx.flow.lease.record_tool_call();
-                tracing::info!(
-                    session = %ctx.session_key,
-                    tool = %tc.name,
-                    "tool_lease_auto_renewed_read_only"
-                );
-                allowed_calls.push(tc);
-            } else if tc.name == "exec"
-                && crate::agent::tool_engine::is_read_only_exec_command(
-                    tc.arguments.get("command").and_then(Value::as_str),
-                )
-                && ctx.flow.lease.auto_renew_for_read_only()
-            {
-                // Pure-read shell commands (cat/grep/find/sqlite3 SELECT…)
-                // renew like read-only tools. Models commonly read through
-                // `exec`; metering those as side-effect calls starves the
-                // lease so the turn's actual write gets rejected at the end
-                // (the "unable to finish the HTML file" failure). Commands
-                // with redirects or mutating binaries are classified as
-                // metered by `is_read_only_exec_command`.
-                let _ = ctx.flow.lease.record_tool_call();
-                tracing::info!(
-                    session = %ctx.session_key,
-                    tool = %tc.name,
-                    "tool_lease_auto_renewed_read_only_exec"
-                );
-                allowed_calls.push(tc);
-            } else if crate::agent::tool_engine::is_write_tool(&tc.name)
-                && !ctx.flow.emergency_write_used
-            {
-                // Guarantee the task's payoff: when the lease is exhausted
-                // and the model finally attempts a WRITE, rejecting it turns
-                // the whole turn into wasted research (reads happened, no
-                // artifact). Grant exactly one post-exhaustion write per
-                // turn AND reset the lease so the model can continue after
-                // the checkpoint/write without needing a second grant.
-                ctx.flow.emergency_write_used = true;
-                ctx.flow.lease.auto_renew_for_read_only();
-                tracing::info!(
-                    session = %ctx.session_key,
-                    tool = %tc.name,
-                    "tool_lease_emergency_write_granted"
-                );
                 allowed_calls.push(tc);
             } else {
                 let reason = result.reason.unwrap_or("lease_blocked");
@@ -6183,6 +6138,7 @@ impl AgentLoopShared {
             ctx.persist_pending_rejected_tool_messages().await
         };
         if let Err(error) = persistence {
+            ctx.flow.lease.release_pending(allowed_calls.len() as u32);
             ctx.emit_pending_request_metrics(0);
             let boundary = if router_rejections > 0 {
                 "router-rejected tool receipts"
@@ -6216,6 +6172,7 @@ impl AgentLoopShared {
                 )
                 .await
             {
+                ctx.flow.lease.release_pending(allowed_calls.len() as u32);
                 ctx.emit_pending_request_metrics(0);
                 return StepResult::Done(IterationOutcome::Error(format!(
                     "tool {} was rejected but its pre-execution decision could not be recorded: {error}",
@@ -6323,6 +6280,16 @@ impl AgentLoopShared {
             )
             .await
             {
+                let settled = ctx
+                    .turn_tool_entries
+                    .len()
+                    .saturating_sub(tool_entries_before);
+                for entry in ctx.turn_tool_entries.iter().skip(tool_entries_before) {
+                    ctx.flow.lease.record_tool_result(entry.ok);
+                }
+                ctx.flow
+                    .lease
+                    .release_pending(routed_tool_calls.len().saturating_sub(settled) as u32);
                 // Stash invariant violation (Hole 1): the immutable store
                 // rejected a write. Fail the turn with the infra error — never
                 // re-run a side-effect tool, never show a raw body.
@@ -6355,6 +6322,16 @@ impl AgentLoopShared {
 
         // Inline path (default, unchanged): execute tools directly.
         crate::agent::tool_engine::execute_tools_inline(ctx, &routed_tool_calls, &response).await;
+        let settled = ctx
+            .turn_tool_entries
+            .len()
+            .saturating_sub(tool_entries_before);
+        for entry in ctx.turn_tool_entries.iter().skip(tool_entries_before) {
+            ctx.flow.lease.record_tool_result(entry.ok);
+        }
+        ctx.flow
+            .lease
+            .release_pending(routed_tool_calls.len().saturating_sub(settled) as u32);
         // Stash invariant violation (Hole 1): the immutable store rejected a
         // write during inline execution. Fail the turn with the infra error —
         // never re-run a side-effect tool, never show a raw body.

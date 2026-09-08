@@ -29,7 +29,7 @@ use crate::agent::policy;
 use crate::agent::role_policy;
 use crate::agent::role_policy::{build_specialist_system_prompt, parse_specialist_response};
 use crate::agent::router_fallback;
-use crate::agent::tool_guard::ToolGuard;
+use crate::agent::tool_guard::{ToolGuard, ToolGuardDecision};
 use crate::agent::toolplan::{self, ToolPlanAction};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::providers::base::{LLMProvider, ToolCallRequest, ToolChoice};
@@ -1276,7 +1276,16 @@ pub(crate) enum RouteResult {
 
 pub(crate) enum RoutedToolDisposition {
     Execute,
-    Reject { reason: String, receipt: String },
+    /// A prior successful call is replayed as a receipt. This is deliberately
+    /// distinct from rejection: duplicate protection must not turn known data
+    /// into a dead end or consume the turn execution budget.
+    Replay {
+        receipt: String,
+    },
+    Reject {
+        reason: String,
+        receipt: String,
+    },
 }
 
 pub(crate) struct RoutedToolCall {
@@ -1645,45 +1654,64 @@ pub(crate) async fn route_tool_calls(
     let mut all_blocked_uncached = true;
     for tc in routed_tool_calls {
         let key = crate::agent::tool_runner::normalize_call_key(&tc.name, &tc.arguments);
-        let rejection = if !seen_in_batch.insert(key) {
+        let decision = if !seen_in_batch.insert(key) {
             ctx.flow.tool_guard.had_blocked_calls = true;
-            Some(format!(
+            ToolGuardDecision::Reject(format!(
                 "duplicate tool call blocked for '{}': repeated in one routed batch",
                 tc.name
             ))
         } else {
-            ctx.flow.tool_guard.allow(&tc.name, &tc.arguments).err()
+            ctx.flow.tool_guard.decide(&tc.name, &tc.arguments)
         };
-        if let Some(reason) = rejection {
-            warn!("{}", reason);
-            blocked_count += 1;
-            let guard_key = ToolGuard::key(&tc.name, &tc.arguments);
-            let cached = ctx.flow.tool_guard.get_cached_result(&guard_key);
-            all_blocked_uncached &= cached.is_none();
-            let receipt = if let Some(cached) = cached {
-                duplicate_receipt(
+        match decision {
+            ToolGuardDecision::Replay(cached) => {
+                let guard_key = ToolGuard::key(&tc.name, &tc.arguments);
+                let receipt = duplicate_receipt(
                     &tc.name,
                     ctx.flow.tool_guard.cache_hits(&guard_key),
-                    Some(cached),
+                    Some(&cached),
                     cached.chars().count(),
                     &ctx.flow.lease.progress_signal(),
-                )
-            } else {
-                format!(
-                    "tool guard rejected {} without execution: {}",
-                    tc.name, reason
-                )
-            };
-            calls.push(RoutedToolCall {
-                call: tc,
-                disposition: RoutedToolDisposition::Reject { reason, receipt },
-            });
-        } else {
-            allowed_count += 1;
-            calls.push(RoutedToolCall {
-                call: tc,
-                disposition: RoutedToolDisposition::Execute,
-            });
+                );
+                calls.push(RoutedToolCall {
+                    call: tc,
+                    disposition: RoutedToolDisposition::Replay { receipt },
+                });
+                blocked_count += 1;
+                all_blocked_uncached = false;
+            }
+            ToolGuardDecision::Reject(reason) => {
+                warn!("{}", reason);
+                blocked_count += 1;
+                let guard_key = ToolGuard::key(&tc.name, &tc.arguments);
+                let cached = ctx.flow.tool_guard.get_cached_result(&guard_key);
+                all_blocked_uncached &= cached.is_none();
+                let receipt = if let Some(cached) = cached {
+                    duplicate_receipt(
+                        &tc.name,
+                        ctx.flow.tool_guard.cache_hits(&guard_key),
+                        Some(cached),
+                        cached.chars().count(),
+                        &ctx.flow.lease.progress_signal(),
+                    )
+                } else {
+                    format!(
+                        "tool guard rejected {} without execution: {}",
+                        tc.name, reason
+                    )
+                };
+                calls.push(RoutedToolCall {
+                    call: tc,
+                    disposition: RoutedToolDisposition::Reject { reason, receipt },
+                });
+            }
+            ToolGuardDecision::Execute => {
+                allowed_count += 1;
+                calls.push(RoutedToolCall {
+                    call: tc,
+                    disposition: RoutedToolDisposition::Execute,
+                });
+            }
         }
     }
 

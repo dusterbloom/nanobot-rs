@@ -2,38 +2,26 @@
 //!
 //! See `docs/superpowers/specs/2026-07-27-tool-leases-design.md`.
 //!
-//! Each user turn starts with a tool lease of `TOOLS_PER_LEASE` tool
-//! iterations. After exhaustion, tool definitions are stripped from the
-//! request: the model must produce a final text answer OR emit a renewal
-//! checkpoint (findings + remaining question + next bounded actions). Together
-//! with `ToolGuard`'s per-key identical-call counter (which bounds the live
-//! 13-call identical-`exec grep` loop, session `20260727_161730_6e61a0`) and
-//! the no-progress hard stop, this makes runaway tool loops structurally
-//! impossible without a coarse-family cap (retired 2026-07-30 — it over-fired
-//! on legitimate exploration and busted the prefix cache).
+//! Each user turn has one 96-success execution budget. A call reserves a slot,
+//! and only a durably persisted successful result consumes it. Failed calls
+//! release their reservation so recovery can retry without lease ceremonies.
 
-/// Default per-lease tool budget. Tuned for coding tasks where the
-/// model needs to read multiple files, run searches, and exec commands
-/// in one turn. 12 is enough for a typical "explore 3-4 files +
-/// summarize" workflow without hitting the cap. The original 5 was
-/// too tight and suffocated legitimate exploration on 120K-context
-/// models.
-pub const DEFAULT_TOOLS_PER_LEASE: u32 = 12;
+/// One turn budget. This is deliberately a single number: a tool-heavy turn
+/// should not have to negotiate a sequence of subleases with the model.
+pub const DEFAULT_TOOLS_PER_LEASE: u32 = 96;
 
 /// Default cap on lease renewals per turn. Three leases × twelve tools
 /// = 36 tool calls per turn at maximum, each renewal gated by a
 /// validated checkpoint.
-pub const DEFAULT_MAX_LEASES_PER_TURN: u32 = 3;
+/// Kept for decoding and replaying historical turns. New turns do not renew
+/// leases; `Lease::new(DEFAULT_TOOLS_PER_LEASE, 0)` is the active policy.
+pub const DEFAULT_MAX_LEASES_PER_TURN: u32 = 0;
 
-// ---------------------------------------------------------------------------
 // Lease state machine
 // ---------------------------------------------------------------------------
-// Lease state machine
-// ---------------------------------------------------------------------------
 
-/// A per-turn tool lease. Counts tool iterations within the current
-/// lease; on exhaustion the caller must strip tool definitions and
-/// require the model to either answer or emit a renewal checkpoint.
+/// A per-turn tool budget. It retains checkpoint parsing solely so old session
+/// receipts remain decodable; active turns never renew this budget.
 ///
 /// Renewal checkpoints must contain all three of `findings`, `next`,
 /// `will` (any case, colon-terminated). Anything else is rejected with
@@ -44,7 +32,10 @@ pub const DEFAULT_MAX_LEASES_PER_TURN: u32 = 3;
 pub struct Lease {
     lease_size: u32,
     max_renewals: u32,
-    iterations_used: u32,
+    /// Calls accepted but whose durable result has not arrived yet. Reserving
+    /// here prevents a parallel batch from exceeding the cap.
+    in_flight: u32,
+    successful_executions: u32,
     renewals_used: u32,
     /// Checkpoint-free renewals spent on read-only tools. Separate from
     /// `renewals_used` so exploration can't starve the write path.
@@ -135,16 +126,17 @@ impl Lease {
         Self {
             lease_size: lease_size.max(1),
             max_renewals,
-            iterations_used: 0,
+            in_flight: 0,
+            successful_executions: 0,
             renewals_used: 0,
             read_only_renewals_used: 0,
         }
     }
 
-    /// Record one tool call against the per-lease budget. Returns whether the
-    /// call is allowed; once `lease_size` calls have been used this returns
-    /// `lease_exhausted` and the caller must strip tool_defs so the model
-    /// produces a final answer or a renewal checkpoint.
+    /// Reserve one tool call against the single successful-execution budget.
+    /// The reservation is settled with [`record_tool_result`]. Failed calls
+    /// release their reservation and can be retried; only successfully
+    /// persisted results consume the turn budget.
     ///
     /// There is NO consecutive-same-family cap anymore: it over-fired on
     /// legitimate exploration (N different greps) and busted the prompt-prefix
@@ -154,15 +146,34 @@ impl Lease {
     /// budget plus the no-progress hard stop. See
     /// docs/superpowers/plans/2026-07-30-reuse-not-rerun-tool-dedup.md.
     pub fn record_tool_call(&mut self) -> ToolCallResult {
-        if self.iterations_used >= self.lease_size {
+        if self.successful_executions.saturating_add(self.in_flight) >= self.lease_size {
             return ToolCallResult::blocked("lease_exhausted");
         }
-        self.iterations_used += 1;
+        self.in_flight += 1;
         ToolCallResult::allowed()
     }
 
+    /// Settle a previously reserved call after its result has been durably
+    /// persisted. A failed result is retryable and therefore does not count.
+    pub fn record_tool_result(&mut self, ok: bool) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if ok {
+            self.successful_executions = self.successful_executions.saturating_add(1);
+        }
+    }
+
+    /// Release reservations for calls that never entered the tool executor,
+    /// such as a protocol persistence failure.
+    pub fn release_pending(&mut self, count: u32) {
+        self.in_flight = self.in_flight.saturating_sub(count);
+    }
+
+    pub fn successful_executions(&self) -> u32 {
+        self.successful_executions
+    }
+
     pub fn is_exhausted(&self) -> bool {
-        self.iterations_used >= self.lease_size
+        self.successful_executions.saturating_add(self.in_flight) >= self.lease_size
     }
 
     pub fn renewals_used(&self) -> u32 {
@@ -212,7 +223,8 @@ impl Lease {
             return RenewalResult::rejected(missing);
         }
         self.renewals_used += 1;
-        self.iterations_used = 0;
+        self.in_flight = 0;
+        self.successful_executions = 0;
         RenewalResult::accepted()
     }
 
@@ -232,7 +244,8 @@ impl Lease {
             return false;
         }
         self.read_only_renewals_used += 1;
-        self.iterations_used = 0;
+        self.in_flight = 0;
+        self.successful_executions = 0;
         true
     }
 
@@ -247,7 +260,7 @@ impl Lease {
     /// (`record_tool_call` was already called by the time `tool_engine`
     /// adds the result). For the first call this is 1, etc.
     pub fn progress_signal(&self) -> String {
-        let current_call = self.iterations_used;
+        let current_call = self.successful_executions.saturating_add(self.in_flight);
         let checkpoint_remaining = self.max_renewals.saturating_sub(self.renewals_used);
         let read_only_remaining = self
             .max_renewals
@@ -500,6 +513,43 @@ mod tests {
             Some("lease_exhausted"),
             "the only block reason is lease_exhausted; no coarse_family_cap"
         );
+    }
+
+    #[test]
+    fn single_turn_budget_allows_96_successes_and_rejects_97th() {
+        let mut lease = Lease::new(96, 0);
+        for _ in 0..96 {
+            assert!(lease.record_tool_call().allowed);
+            lease.record_tool_result(true);
+        }
+        assert_eq!(lease.successful_executions(), 96);
+        let blocked = lease.record_tool_call();
+        assert_eq!(blocked.reason, Some("lease_exhausted"));
+    }
+
+    #[test]
+    fn failed_execution_releases_budget_and_can_be_retried() {
+        let mut lease = Lease::new(1, 0);
+        assert!(lease.record_tool_call().allowed);
+        lease.record_tool_result(false);
+        assert_eq!(lease.successful_executions(), 0);
+        assert!(lease.record_tool_call().allowed);
+        lease.record_tool_result(true);
+        assert!(!lease.record_tool_call().allowed);
+    }
+
+    #[test]
+    fn mixed_batch_reserves_only_the_successful_budget() {
+        let mut lease = Lease::new(2, 0);
+        assert!(lease.record_tool_call().allowed);
+        assert!(lease.record_tool_call().allowed);
+        assert!(!lease.record_tool_call().allowed);
+        lease.record_tool_result(false);
+        assert!(lease.record_tool_call().allowed);
+        lease.record_tool_result(true);
+        lease.record_tool_result(true);
+        assert_eq!(lease.successful_executions(), 2);
+        assert!(!lease.record_tool_call().allowed);
     }
 
     /// Tool results include the progress signal
