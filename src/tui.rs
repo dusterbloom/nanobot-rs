@@ -20,12 +20,12 @@
     clippy::format_push_string,
     clippy::string_add
 )]
-use parking_lot::Mutex;
-use std::io::{self, BufWriter, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 #[cfg(feature = "voice")]
+use std::io;
+#[cfg(feature = "voice")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::agent::agent_loop::SharedCoreHandle;
 use crate::config::loader::load_config;
@@ -58,65 +58,6 @@ pub const GREY: &str = "\x1b[90m";
 pub const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
 pub const HIDE_CURSOR: &str = "\x1b[?25l";
 pub const SHOW_CURSOR: &str = "\x1b[?25h";
-
-// ============================================================================
-// Terminal Writer (synchronized stdout)
-// ============================================================================
-
-/// Global terminal writer — all TUI output should go through this to prevent
-/// interleaved writes from concurrent tasks (streaming, tool events, channels).
-///
-/// Uses DEC private mode 2026 (synchronized output) brackets when available
-/// to batch writes and prevent flicker.
-pub struct TerminalWriter {
-    inner: Mutex<BufWriter<io::Stdout>>,
-}
-
-impl TerminalWriter {
-    fn new() -> Self {
-        Self {
-            inner: Mutex::new(BufWriter::new(io::stdout())),
-        }
-    }
-
-    /// Write a string to stdout under the lock, then flush.
-    pub fn write_str(&self, s: &str) {
-        {
-            let mut w = self.inner.lock();
-            let _ = w.write_all(s.as_bytes());
-            let _ = w.flush();
-        }
-    }
-
-    /// Write a string followed by newline.
-    pub fn writeln(&self, s: &str) {
-        {
-            let mut w = self.inner.lock();
-            let _ = w.write_all(s.as_bytes());
-            let _ = w.write_all(b"\n");
-            let _ = w.flush();
-        }
-    }
-
-    /// Execute a closure with exclusive access to the buffered writer.
-    /// The writer is flushed after the closure returns.
-    pub fn with_writer<F>(&self, f: F)
-    where
-        F: FnOnce(&mut BufWriter<io::Stdout>),
-    {
-        {
-            let mut w = self.inner.lock();
-            f(&mut w);
-            let _ = w.flush();
-        }
-    }
-}
-
-/// Get the global terminal writer singleton.
-pub fn terminal_writer() -> &'static TerminalWriter {
-    static WRITER: OnceLock<TerminalWriter> = OnceLock::new();
-    WRITER.get_or_init(TerminalWriter::new)
-}
 
 // ============================================================================
 // Raw Mode Guard
@@ -953,15 +894,5 @@ mod tests {
 
         assert_eq!(CACHED_WIDTH.load(Ordering::Relaxed), 0);
         assert_eq!(CACHED_HEIGHT.load(Ordering::Relaxed), 0);
-    }
-
-    // --- TerminalWriter ---
-
-    #[test]
-    fn test_terminal_writer_singleton() {
-        let w1 = terminal_writer();
-        let w2 = terminal_writer();
-        // Same address — singleton
-        assert!(std::ptr::eq(w1, w2));
     }
 }
