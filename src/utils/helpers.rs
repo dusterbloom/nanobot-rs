@@ -9,10 +9,8 @@
 //! Utility functions for nanobot.
 
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Result};
 use chrono::Local;
 
 /// Ensure a directory exists, creating it if necessary.
@@ -22,28 +20,6 @@ pub fn ensure_dir(path: impl AsRef<Path>) -> PathBuf {
         let _ = fs::create_dir_all(&path);
     }
     path
-}
-
-/// Move a file, falling back to copy+remove when rename cannot cross devices.
-pub fn move_file(src: &Path, dst: &Path) -> Result<()> {
-    if let Some(parent) = dst.parent() {
-        ensure_dir(parent);
-    }
-
-    match fs::rename(src, dst) {
-        Ok(()) => Ok(()),
-        Err(e) if is_cross_device_error(&e) => {
-            fs::copy(src, dst)?;
-            fs::remove_file(src)?;
-            Ok(())
-        }
-        Err(e) => Err(e.into()),
-    }
-}
-
-fn is_cross_device_error(err: &io::Error) -> bool {
-    // EXDEV on Unix-like systems (Linux/macOS).
-    err.raw_os_error() == Some(18)
 }
 
 /// Get the nanobot data directory (~/.nanobot).
@@ -150,26 +126,6 @@ pub fn truncate_lines_chars(data: &str, max_lines: usize, max_chars: usize) -> S
     out
 }
 
-/// Convert a string to a safe filename by replacing unsafe characters with underscores.
-pub fn safe_filename(name: &str) -> String {
-    const UNSAFE_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
-    let mut result = name.to_string();
-    for &ch in UNSAFE_CHARS {
-        result = result.replace(ch, "_");
-    }
-    result.trim().to_string()
-}
-
-/// Parse a session key into (channel, chat_id).
-///
-/// The key must be in the format `"channel:chat_id"`.
-pub fn parse_session_key(key: &str) -> Result<(String, String)> {
-    match key.split_once(':') {
-        Some((channel, chat_id)) => Ok((channel.to_string(), chat_id.to_string())),
-        None => Err(anyhow!("Invalid session key: {}", key)),
-    }
-}
-
 /// Check if bytes look like binary content (null byte in first 512 bytes).
 pub fn is_binary(bytes: &[u8]) -> bool {
     let check_len = bytes.len().min(512);
@@ -219,44 +175,6 @@ mod tests {
     #[test]
     fn test_truncate_long_string() {
         assert_eq!(truncate_string("hello world", 8), "hello...");
-    }
-
-    #[test]
-    fn test_safe_filename() {
-        assert_eq!(safe_filename("hello:world"), "hello_world");
-        assert_eq!(safe_filename("a<b>c"), "a_b_c");
-    }
-
-    #[test]
-    fn test_move_file_basic() {
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("a.txt");
-        let dst = dir.path().join("nested").join("b.txt");
-        fs::write(&src, "hello").unwrap();
-
-        move_file(&src, &dst).unwrap();
-        assert!(!src.exists());
-        assert!(dst.exists());
-        assert_eq!(fs::read_to_string(&dst).unwrap(), "hello");
-    }
-
-    #[test]
-    fn test_parse_session_key_valid() {
-        let (ch, id) = parse_session_key("telegram:12345").unwrap();
-        assert_eq!(ch, "telegram");
-        assert_eq!(id, "12345");
-    }
-
-    #[test]
-    fn test_parse_session_key_with_colons() {
-        let (ch, id) = parse_session_key("whatsapp:+1:234").unwrap();
-        assert_eq!(ch, "whatsapp");
-        assert_eq!(id, "+1:234");
-    }
-
-    #[test]
-    fn test_parse_session_key_invalid() {
-        assert!(parse_session_key("nodelimiter").is_err());
     }
 
     #[test]
