@@ -444,44 +444,6 @@ fn digest_tool_result(
     build_tool_result_preview(tool_name, args, data, prompt_cap, tool_call_id)
 }
 
-/// Head+tail preview builder retained as the reference for the truncation
-/// tests; production ingestion uses [`digest_tool_result`] (which adds
-/// lossless retrieval).
-#[allow(dead_code)]
-fn compact_inline_tool_result(
-    tool_name: &str,
-    _args: &std::collections::HashMap<String, Value>,
-    data: &str,
-    max_chars: usize,
-) -> String {
-    let total_chars = data.chars().count();
-    if total_chars <= max_chars {
-        return data.to_string();
-    }
-
-    let estimated_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(data);
-    let header = format!(
-        "[truncated: {tool_name}, ~{estimated_tokens} tokens; \
-         head+tail shown, re-request with a narrower range/query for the middle]\n"
-    );
-
-    let footer = "\n[...]\n";
-    let fixed_chars = header.chars().count() + footer.chars().count();
-    let preview_budget = max_chars.saturating_sub(fixed_chars).max(200);
-    let head_chars = preview_budget * 2 / 3;
-    let tail_chars = preview_budget.saturating_sub(head_chars);
-
-    let head: String = data.chars().take(head_chars).collect();
-    let tail_rev: Vec<char> = data.chars().rev().take(tail_chars).collect();
-    let tail: String = tail_rev.into_iter().rev().collect();
-
-    let mut out = format!("{header}{head}{footer}{tail}");
-    if out.chars().count() > max_chars {
-        out = out.chars().take(max_chars).collect();
-    }
-    out
-}
-
 pub(crate) fn local_model_key(model: &str) -> String {
     model
         .strip_prefix("local:")
@@ -2179,36 +2141,6 @@ mod tests {
             summary_threshold_tokens("unknown_tool"),
             LARGE_TOOL_RESULT_TOKEN_THRESHOLD
         );
-    }
-
-    #[test]
-    fn test_compact_inline_tool_result_keeps_short_data_raw() {
-        let args = HashMap::new();
-        let data = "short result";
-        assert_eq!(
-            compact_inline_tool_result("read_file", &args, data, 100),
-            data
-        );
-    }
-
-    #[test]
-    fn test_compact_inline_tool_result_caps_large_data() {
-        let mut args = HashMap::new();
-        args.insert("path".to_string(), serde_json::json!("src/lib.rs"));
-        args.insert("lines".to_string(), serde_json::json!("1:1000"));
-        let data = format!(
-            "{}MIDDLE_SHOULD_BE_OMITTED{}",
-            "head line\n".repeat(200),
-            "tail line\n".repeat(200)
-        );
-
-        let compacted = compact_inline_tool_result("read_file", &args, &data, 900);
-
-        assert!(compacted.chars().count() <= 900);
-        assert!(compacted.contains("[truncated: read_file"));
-        assert!(compacted.contains("re-request with a narrower range/query"));
-        assert!(compacted.contains("\n[...]\n"));
-        assert!(!compacted.contains("MIDDLE_SHOULD_BE_OMITTED"));
     }
 
     #[test]
