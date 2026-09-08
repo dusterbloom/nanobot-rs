@@ -1340,17 +1340,6 @@ impl ServerState {
         }
     }
 
-    /// Unload models from the current LMS-managed server.
-    #[cfg(test)]
-    pub async fn kill_current(&mut self, lms_port: u16, unload_timeout_secs: u64) {
-        if self.lms_managed {
-            crate::lms::unload_all("", lms_port, unload_timeout_secs)
-                .await
-                .ok();
-        }
-        self.engine = InferenceEngine::None;
-    }
-
     /// What [`Self::shutdown`] tears down. LM Studio is stopped only when nanobot
     /// manages it. Higgs is a resident sidecar — kept warm by the keepalive ping
     /// and reused across launches — so it is NEVER stopped on exit, neither the
@@ -2982,14 +2971,6 @@ mod tests {
         assert_eq!(state.local_port, "8080");
         assert!(!state.lms_managed);
         assert!(state.lms_binary.is_none());
-        assert_eq!(state.engine, InferenceEngine::None);
-    }
-
-    #[tokio::test]
-    async fn test_server_state_kill_current_when_empty() {
-        // Should not panic when there's no process to kill
-        let mut state = ServerState::new("8080".to_string());
-        state.kill_current(1234, 30).await;
         assert_eq!(state.engine, InferenceEngine::None);
     }
 
