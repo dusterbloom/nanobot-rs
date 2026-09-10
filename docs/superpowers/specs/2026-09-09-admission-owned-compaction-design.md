@@ -1,7 +1,7 @@
 # Admission-Owned Compaction and Memory Reclamation
 
-Date: 2026-09-09
-Status: Approved design; awaiting written-spec review
+Date: 2026-09-10
+Status: Approved for tasks 1-3
 Scope: Nanobot prompt admission and compaction; Higgs request lifetime,
 cancellation, and retained-session reclamation
 
@@ -125,6 +125,20 @@ unless bounded cancellation proves insufficient in measurement.
    before retry, preventing prefix reuse against different bytes.
 10. At most one foreground compaction job exists per session.
 
+The foreground representation is a deterministic fold, not a generated
+summary. It reuses the existing LCM summary node and `lcm_expand` interface:
+the active prompt receives a compact pointer while SQLite retains every source
+row. The pointer includes the exact source-ID ranges, the greatest covered
+message ID as its revision, and a SHA-256 over the canonical covered rows.
+Rendering the same rows therefore produces byte-identical output, and recall
+can verify that it returned the same evidence. Existing tool-result handle
+bytes are frozen; folding references them without changing their renderer.
+
+The fold unit is the existing complete LCM block. Selection may end before an
+assistant tool call or after its matching tool result, but never between them.
+The protected recent tail and newest user request remain raw. No classifier,
+new memory table, background service, or second compaction protocol is added.
+
 The target is p99 below 250 ms on the supported Mac and a measured end-to-end
 bound below one second. Correctness tests assert absence of model/network waits;
 performance tests report the wall-clock distribution without making ordinary
@@ -144,6 +158,43 @@ CI timing-sensitive.
    restart leaves the deterministic checkpoint intact.
 7. The refiner uses the existing OpenAI-compatible provider path and an optional
    model name. It does not introduce model-directory, port, or protocol modes.
+
+Semantic refinement is outside tasks 1-3. A later experiment may run merged
+`encoder_v0` on macOS 27 Core AI while the foreground lease is idle. Prior
+branches already prove small-Qwen and real-Escha operations can execute on ANE,
+but they also show that conversion, synchronization, and shared-memory costs can
+erase operator-level gains. Core AI adds stateful KV, preallocated/direct
+values, asynchronous compute streams, and ahead-of-time specialization; those
+features make a bounded batch refiner worth measuring without reviving the
+removed compactor sidecar. The experiment requires Xcode 27, which is not yet
+installed on the test Mac.
+
+Core AI's documented Neural Engine choice is a preference and may fall back to
+GPU. ANE is also a separate compute engine, not separate memory. Promotion
+therefore requires measured ANE placement with no GPU fallback, reference
+parity, bounded memory release, no loss of the 45K Higgs envelope, no swap-out,
+and no more than 3% Escha decode regression. If Core AI cannot exclude GPU, test
+the public Core ML `cpuAndNeuralEngine` path instead. Private ANE APIs and an
+HTTP sidecar remain excluded from production.
+
+### Constrained tool-call contract
+
+Nanobot's ordinary `tool_choice=auto` path remains model-selected. Required and
+named calls, including recovery and a future semantic refiner, are hard
+protocol contracts:
+
+1. An empty grammar mask is an error; logits are never returned unmasked.
+2. Rejecting a sampled token while advancing the grammar terminates generation.
+3. A required or named request succeeds only with exactly one parser-visible,
+   schema-valid tool call.
+4. Blocking and streaming routes enforce the same postcondition.
+5. A malformed required call is a typed terminal error and is never exposed as
+   a successful assistant response.
+
+Task 1 implements these guarantees in Higgs. Constraining ordinary automatic
+choice would require a tool-or-final response envelope or an extra routing
+inference and is deferred until matched evaluation justifies that protocol
+change.
 
 ## Production Flow
 
@@ -224,6 +275,33 @@ instruct models:
    GGUF plus a custom LoRA, not a native MLX artifact, and is unsuitable as the
    sole full-session compactor.
 
+The 2026 deterministic-memory search reinforces the foreground fold rather than
+replacing it. Zero-Mem keeps original traces as the source of record while
+using deterministic retrieval, but its public repository is still empty as of
+2026-09-10. The newer
+Compaction Cliff paper releases a classifier and reference implementation; its
+typed deterministic operators preserve safety rules far better than uniform
+LLM summaries. Those systems add retrieval and classification machinery that
+the pressure path does not need, but they support the same rule: exact evidence
+stays durable and compaction changes only the bounded working representation.
+
+Fidelity Before Structure likewise reports that verbatim chunks beat generated
+structured artifacts on LoCoMo and LongMemEval-S. LycheeMemory V2 and SimpleMem
+are released background-memory systems, but their learned extraction cannot
+guarantee complete tool bytes or bounded recovery. Parallel Context Compaction
+can hide some summarization latency, yet remains learned and lossy. Agent Zero
+Memory adds strong provenance and citation locks, but publishes no code artifact
+on its arXiv page. `paritok-4b-v1` is the strongest released tool-trajectory
+compressor found; it retains about 25.7% of input while preserving 86.5% of
+uncompressed SWE-bench solve quality, which is useful as an upper-bound control
+but is neither small nor lossless.
+
+Relevant artifacts:
+
+- `https://github.com/Zero-Mem/Zero-mem` (public placeholder; no files yet)
+- `https://github.com/searchsim-org/cikm26-knowledge-triage`
+- `https://huggingface.co/datasets/searchsim/AgentArtifactCorpus`
+
 `IAAR-Shanghai/MemReader-0.6B` would be the strongest specialized candidate on
 the published memory benchmarks: the MemReader card reports 79.56% LOCOMO,
 80.20% LongMemEval, and 93.76% HaluMem extraction F1 for the 0.6B variant.
@@ -235,14 +313,11 @@ Generic `mlx-community/Qwen3.5-0.8B-5bit` and
 `mlx-community/Qwen3-0.6B-4bit` remain untuned baselines. They are not described
 as compactor fine-tunes.
 
-Local inventory on 2026-09-09 found no usable small Qwen weights. The Hugging
-Face cache entry for `mlx-community/Qwen3-0.6B-4bit` is a 12 KB metadata record
-whose snapshot symlink points to the deleted LM Studio directory
-`~/.cache/lm-studio/models/mlx-community/Qwen3-0.6B-4bit`. The cached
-`Qwen/Qwen2-0.5B` contains only a tokenizer. `MiniCPM5-1B-4bit` is likewise an
-empty model directory. The benchmark therefore requires downloading a complete
-candidate artifact and must verify required files before advertising it as
-available.
+Local inventory on 2026-09-10 found no `encoder_v0` artifact. The ordinary
+Hugging Face cache link for `mlx-community/Qwen3-0.6B-4bit` is broken, but a
+complete 320 MB copy exists under `/Users/peppi/AI-Models/shared/huggingface/`
+and is the integration control. The benchmark must verify required files at the
+resolved path before advertising any candidate as available.
 
 No compactor is loaded concurrently automatically. A missing candidate leaves
 the deterministic checkpoint path fully operational.
@@ -252,12 +327,9 @@ the deterministic checkpoint path fully operational.
 The serialized form is versioned and bounded. A representative logical form is:
 
 ```text
-RECOVERY_CHECKPOINT v1
-session=<session key>
-covered=<first message id>..<last message id>
-source_sha256=<digest>
-objective=<bounded latest objective>
-resume=Use recall for exact prior messages and tool outputs.
+version=1 ranges=<exact compact ID ranges>
+revision=<greatest covered message ID> source_sha256=<digest>
+lcm_expand({"message_ids":"<the same exact ranges>"})
 ```
 
 The concrete implementation reuses the existing LCM recovery node and session

@@ -32,6 +32,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -294,27 +295,28 @@ pub fn format_id_ranges(ids: &[MessageId]) -> String {
 /// Build the wire message that represents a summary node in the active
 /// context. Single source of truth for the header format (live compaction and
 /// restart rebuild must render byte-identically for the prompt prefix cache).
-fn summary_wire_message(source_ids: &[MessageId], text: &str, manifest: &SummaryManifest) -> Value {
-    // A deterministic recovery index carries its full exact ID set in the
-    // durable node. Keep the wire pointer constant-size even for a session
-    // whose source row IDs are highly fragmented; lcm_expand is scoped to the
-    // current engine and ignores IDs outside this node's immutable store.
-    let ranges = if text.starts_with("[Recovery index") {
-        source_ids
-            .iter()
-            .min()
-            .zip(source_ids.iter().max())
-            .map_or_else(String::new, |(first, last)| format!("{first}-{last}"))
+fn summary_wire_message(
+    source_ids: &[MessageId],
+    text: &str,
+    manifest: &SummaryManifest,
+    level: u8,
+) -> Value {
+    // A deterministic recovery index already carries its exact pointer,
+    // revision, and digest. Emit it verbatim so the wire keeps exactly one
+    // copyable lcm_expand instruction instead of two repeated recall headers.
+    let mut content = if level == 0 {
+        text.to_string()
     } else {
-        format_id_ranges(source_ids)
+        let ranges = format_id_ranges(source_ids);
+        format!(
+            "[Summary of messages {ranges}. To read the exact originals call \
+             lcm_expand({{\"message_ids\": \"{ranges}\"}}).]\n\n{text}"
+        )
     };
-    let mut content = format!(
-        "[Summary of messages {ranges}. To read the exact originals call \
-         lcm_expand({{\"message_ids\": \"{ranges}\"}}).]\n\n{text}"
-    );
-    if !manifest.open_loops.is_empty()
-        || !manifest.failed_approaches.is_empty()
-        || !manifest.decisions.is_empty()
+    if level != 0
+        && (!manifest.open_loops.is_empty()
+            || !manifest.failed_approaches.is_empty()
+            || !manifest.decisions.is_empty())
     {
         content.push_str("\n\n[State manifest]");
         for (label, items) in [
@@ -735,7 +737,7 @@ impl LcmEngine {
         let selection = self.block_selection(available);
 
         // Find the oldest contiguous block of raw messages to compact.
-        let (block_start, mut block_end) =
+        let (mut block_start, mut block_end) =
             match self.find_oldest_raw_block_impl(protect_tokens, selection) {
                 Some(range) => range,
                 None => {
@@ -745,28 +747,60 @@ impl LcmEngine {
                 }
             };
 
+        // Never fold a leading raw tool result without its carrier: leave it
+        // raw alongside the carrier instead of retiring it alone.
+        while block_start < block_end {
+            let starts_with_tool = matches!(&self.active[block_start],
+                ContextEntry::Raw { message, .. }
+                    if message.get("role").and_then(Value::as_str) == Some("tool"));
+            if !starts_with_tool {
+                break;
+            }
+            block_start += 1;
+        }
+        if block_start >= block_end {
+            debug!("LCM: block starts mid-pair; leaving carrier and result raw");
+            self.async_compaction_pending = false;
+            return None;
+        }
+
         let candidate_end = block_end;
         // The live runtime may narrow capacity below the configured model
         // ceiling. Bind preflight and the actual summary retry to that envelope.
-        // Deterministic recovery indexes do not need a model request, so they
-        // retain the complete, boundary-safe candidate.
+        // Deterministic recovery needs no model request, but it still keeps
+        // complete turn/tool boundaries via the shared scan below.
         let bounded_compactor = match failure_mode {
             CompactionFailureMode::PreserveContext => compactor.map(|compactor| {
                 compactor.with_runtime_limits(budget.max_context(), budget.available_budget(0))
             }),
             CompactionFailureMode::Deterministic => None,
         };
+        let mut model_request_fits = false;
         block_end = match bounded_compactor.as_ref() {
             Some(compactor) => {
                 match self.largest_fitting_compaction_end(block_start, candidate_end, compactor) {
-                    Some(end) => end,
-                    // The model request itself cannot fit, but the durable index
-                    // does not need provider capacity. Keep complete turn/tool
-                    // boundaries and install that backstop below.
+                    Some(end) => {
+                        model_request_fits = true;
+                        end
+                    }
+                    // The model request itself cannot fit. Skip the provider;
+                    // the durable index below needs no provider capacity.
                     None => candidate_end,
                 }
             }
-            None => candidate_end,
+            // No provider preflight: longest complete prefix, so the edge never
+            // splits a tool-call carrier from its results.
+            None => match self
+                .complete_compaction_boundaries(block_start, candidate_end)
+                .last()
+            {
+                Some(&len) => block_start + len,
+                None => {
+                    debug!("LCM: no complete turn/tool boundary to compact");
+                    self.async_compaction_pending = false;
+                    return None;
+                }
+            },
         };
         if block_end < candidate_end {
             info!(
@@ -777,38 +811,20 @@ impl LcmEngine {
         }
 
         // Collect messages and source ids from the block. Merge mode may
-        // include prior Summary entries; append mode never does. When present,
-        // their text is folded into the summarization input and their source
-        // ids are unioned so lcm_expand stays lossless.
+        // include prior Summary entries; append mode never does. Entries are
+        // taken whole — never a partial child summary's row subset.
         let mut source_ids: Vec<MessageId> = Vec::new();
         let mut block_messages = Vec::new();
         let mut merged_node_ids: Vec<usize> = Vec::new();
         let mut raw_count = 0usize;
-        for entry in &self.active[block_start..block_end] {
-            match entry {
-                ContextEntry::Raw { msg_id, message } => {
-                    source_ids.push(*msg_id);
-                    block_messages.push(message.clone());
-                    raw_count += 1;
-                }
-                ContextEntry::Summary { node_id, .. } => {
-                    // Fold the node's TEXT into the summarization input — not
-                    // the wire message, whose "[Summary … IDs: …]" header is ID
-                    // noise. Feeding the header makes the model spend summary
-                    // capacity repeating identifiers instead of state.
-                    block_messages.push(self.compaction_input_message(entry));
-                    for sid in self.dag.all_source_ids(*node_id) {
-                        if !source_ids.contains(&sid) {
-                            source_ids.push(sid);
-                        }
-                    }
-                    // Track the subsumed node so it can be retired in the DAG
-                    // and DB (rebuild_from_db_nodes skips children), keeping the
-                    // merge durable across restarts instead of re-accumulating.
-                    merged_node_ids.push(*node_id);
-                }
-            }
-        }
+        self.collect_compaction_span(
+            block_start,
+            block_end,
+            &mut source_ids,
+            &mut block_messages,
+            &mut merged_node_ids,
+            &mut raw_count,
+        );
 
         // Need at least one RAW (new content) to merge — re-summarizing a lone
         // summary with no new raws is wasted work.
@@ -823,12 +839,16 @@ impl LcmEngine {
             return None;
         }
 
-        let block_tokens = TokenBudget::estimate_tokens(&block_messages);
+        let mut block_tokens = TokenBudget::estimate_tokens(&block_messages);
 
         // Skip compaction when the block is too small to be worth an LLM call.
         // An LLM summarization of <200 tokens wastes more GPU time than it saves.
+        // The floor gates only model-driven compaction; the deterministic
+        // fold needs no provider request and proceeds whenever its wire shrinks.
         const MIN_COMPACTION_TOKENS: usize = 200;
-        if block_tokens < MIN_COMPACTION_TOKENS {
+        if block_tokens < MIN_COMPACTION_TOKENS
+            && failure_mode == CompactionFailureMode::PreserveContext
+        {
             debug!(
                 "LCM: skipping compaction — block too small ({} tokens < {})",
                 block_tokens, MIN_COMPACTION_TOKENS
@@ -850,7 +870,7 @@ impl LcmEngine {
         // installs the same lossless recovery index immediately; normal
         // compaction remains model-first and falls back to that index on error.
         let model_summary = match (failure_mode, bounded_compactor.as_ref()) {
-            (CompactionFailureMode::PreserveContext, Some(compactor)) => {
+            (CompactionFailureMode::PreserveContext, Some(compactor)) if model_request_fits => {
                 escalated_summary(&block_messages, target, Some(compactor)).await
             }
             _ => Ok(None),
@@ -858,31 +878,80 @@ impl LcmEngine {
         let (summary_text, fresh_manifest, level) = match model_summary {
             Ok(Some(summary)) => summary,
             Ok(None) | Err(_) => {
-                let recovery_messages: Vec<(MessageId, Value)> = source_ids
-                    .iter()
-                    .filter_map(|id| self.store.get(id).cloned().map(|message| (*id, message)))
-                    .collect();
-                let Some(index) = deterministic_recovery_index(
-                    &source_ids,
-                    &recovery_messages,
-                    block_tokens,
-                    self.config.deterministic_target,
-                ) else {
+                // Boundary-safe shrink over the candidate: retry earlier
+                // complete boundaries with the entire active prefix
+                // recollected, never a partial child summary's row subset.
+                let mut installed = None;
+                for len in self
+                    .complete_compaction_boundaries(block_start, candidate_end)
+                    .into_iter()
+                    .rev()
+                {
+                    let end = block_start + len;
+                    let mut ids = Vec::new();
+                    let mut msgs = Vec::new();
+                    let mut merged = Vec::new();
+                    let mut raws = 0usize;
+                    self.collect_compaction_span(
+                        block_start,
+                        end,
+                        &mut ids,
+                        &mut msgs,
+                        &mut merged,
+                        &mut raws,
+                    );
+                    if raws == 0 || msgs.is_empty() {
+                        continue;
+                    }
+                    let tokens = TokenBudget::estimate_tokens(&msgs);
+                    let mut unique_ids = ids.clone();
+                    unique_ids.sort_unstable();
+                    unique_ids.dedup();
+                    let recovery: Option<Vec<(MessageId, Value)>> = unique_ids
+                        .iter()
+                        .map(|id| self.store.get(id).cloned().map(|message| (*id, message)))
+                        .collect();
+                    let Some(recovery) = recovery else {
+                        continue;
+                    };
+                    let retired_wire_tokens = self.active[block_start..end]
+                        .iter()
+                        .map(|entry| TokenBudget::estimate_message_tokens(entry.message()))
+                        .sum();
+                    if let Some(index) = deterministic_recovery_index(
+                        &ids,
+                        &recovery,
+                        retired_wire_tokens,
+                        self.config.deterministic_target,
+                    ) {
+                        block_end = end;
+                        block_tokens = tokens;
+                        source_ids = ids;
+                        merged_node_ids = merged;
+                        installed = Some((index, SummaryManifest::default(), 0));
+                        break;
+                    }
+                }
+                let Some(index) = installed else {
                     self.async_compaction_pending = false;
                     return None;
                 };
-                (index, SummaryManifest::default(), 0)
+                index
             }
         };
 
-        let child_manifests: Vec<SummaryManifest> = merged_node_ids
-            .iter()
-            .filter_map(|node_id| self.dag.get(*node_id))
-            .map(|node| node.manifest.clone())
-            .collect();
-        let mut manifest_parts: Vec<&SummaryManifest> = child_manifests.iter().collect();
-        manifest_parts.push(&fresh_manifest);
-        let manifest = SummaryManifest::merge(&manifest_parts);
+        let manifest = if level == 0 {
+            SummaryManifest::default()
+        } else {
+            let child_manifests: Vec<SummaryManifest> = merged_node_ids
+                .iter()
+                .filter_map(|node_id| self.dag.get(*node_id))
+                .map(|node| node.manifest.clone())
+                .collect();
+            let mut manifest_parts: Vec<&SummaryManifest> = child_manifests.iter().collect();
+            manifest_parts.push(&fresh_manifest);
+            SummaryManifest::merge(&manifest_parts)
+        };
         let summary_tokens = TokenBudget::estimate_str_tokens(&summary_text);
 
         // Only accept if summary is smaller than original.
@@ -923,8 +992,12 @@ impl LcmEngine {
             .stamp_node_creation_turn(node_id, self.current_turn);
 
         // Build the summary message with lossless pointers (compact ranges).
-        let summary_message =
-            summary_wire_message(&summary_source_ids, &summary_text_clone, &summary_manifest);
+        let summary_message = summary_wire_message(
+            &summary_source_ids,
+            &summary_text_clone,
+            &summary_manifest,
+            level,
+        );
 
         // Replace the block in active context with the summary.
         let mut new_active = Vec::with_capacity(self.active.len());
@@ -966,19 +1039,54 @@ impl LcmEngine {
         }
     }
 
-    /// Select the largest oldest prefix whose complete model request fits.
-    /// A prefix never ends between an assistant tool call and its recorded
-    /// results. If no useful complete prefix fits, the caller preserves all
-    /// raw entries and lets typed capacity recovery decide when to retry.
-    fn largest_fitting_compaction_end(
+    /// Collect one active span into compaction inputs. Summary entries
+    /// contribute text plus their full source-id union; entries are whole.
+    fn collect_compaction_span(
         &self,
         block_start: usize,
         block_end: usize,
-        compactor: &ContextCompactor,
-    ) -> Option<usize> {
-        let mut messages = Vec::with_capacity(block_end.saturating_sub(block_start));
+        source_ids: &mut Vec<MessageId>,
+        block_messages: &mut Vec<Value>,
+        merged_node_ids: &mut Vec<usize>,
+        raw_count: &mut usize,
+    ) {
+        for entry in &self.active[block_start..block_end] {
+            match entry {
+                ContextEntry::Raw { msg_id, message } => {
+                    source_ids.push(*msg_id);
+                    block_messages.push(message.clone());
+                    *raw_count += 1;
+                }
+                ContextEntry::Summary { node_id, .. } => {
+                    // Fold the node's TEXT into the summarization input — not
+                    // the wire message, whose "[Summary … IDs: …]" header is ID
+                    // noise. Feeding the header makes the model spend summary
+                    // capacity repeating identifiers instead of state.
+                    block_messages.push(self.compaction_input_message(entry));
+                    for sid in self.dag.all_source_ids(*node_id) {
+                        if !source_ids.contains(&sid) {
+                            source_ids.push(sid);
+                        }
+                    }
+                    // Track the subsumed node so it can be retired in the DAG
+                    // and DB (rebuild_from_db_nodes skips children), keeping the
+                    // merge durable across restarts instead of re-accumulating.
+                    merged_node_ids.push(*node_id);
+                }
+            }
+        }
+    }
+
+    /// Complete-prefix lengths (in messages) of `[block_start, block_end)`
+    /// ending on a turn/tool boundary. Shared by model preflight and the
+    /// deterministic fold.
+    fn complete_compaction_boundaries(&self, block_start: usize, block_end: usize) -> Vec<usize> {
         let mut complete_boundaries = Vec::new();
         let mut pending_tool_calls = std::collections::HashSet::new();
+        // A tool result whose carrier is outside this span taints every
+        // prefix containing it: retiring it alone would separate the pair.
+        let mut tainted = false;
+        let mut len = 0usize;
 
         for index in block_start..block_end {
             let message = self.compaction_input_message(&self.active[index]);
@@ -1000,16 +1108,40 @@ impl LcmEngine {
                     }
                 }
             } else if role == "tool" {
-                if let Some(call_id) = message.get("tool_call_id").and_then(Value::as_str) {
-                    pending_tool_calls.remove(call_id);
+                match message.get("tool_call_id").and_then(Value::as_str) {
+                    Some(call_id) if pending_tool_calls.contains(call_id) => {
+                        pending_tool_calls.remove(call_id);
+                    }
+                    // Orphan result: its carrier is outside this span.
+                    Some(_) => tainted = true,
+                    None => {}
                 }
             }
 
-            messages.push(message);
-            if pending_tool_calls.is_empty() {
-                complete_boundaries.push(messages.len());
+            len += 1;
+            if pending_tool_calls.is_empty() && !tainted {
+                complete_boundaries.push(len);
             }
         }
+
+        complete_boundaries
+    }
+
+    /// Select the largest oldest prefix whose complete model request fits.
+    /// A prefix never ends between an assistant tool call and its recorded
+    /// results. If no useful complete prefix fits, the caller preserves all
+    /// raw entries and lets typed capacity recovery decide when to retry.
+    fn largest_fitting_compaction_end(
+        &self,
+        block_start: usize,
+        block_end: usize,
+        compactor: &ContextCompactor,
+    ) -> Option<usize> {
+        let mut messages = Vec::with_capacity(block_end.saturating_sub(block_start));
+        for index in block_start..block_end {
+            messages.push(self.compaction_input_message(&self.active[index]));
+        }
+        let complete_boundaries = self.complete_compaction_boundaries(block_start, block_end);
 
         let &last_complete = complete_boundaries.last()?;
         if last_complete == messages.len()
@@ -1586,7 +1718,7 @@ impl LcmEngine {
         }
         for node in &engine.dag.nodes {
             let summary_message =
-                summary_wire_message(&node.source_ids, &node.text, &node.manifest);
+                summary_wire_message(&node.source_ids, &node.text, &node.manifest, node.level);
             engine.active.push(ContextEntry::Summary {
                 node_id: node.id,
                 message: summary_message,
@@ -1743,59 +1875,93 @@ fn capacity_retry_limits(error: &anyhow::Error) -> Option<(usize, usize)> {
     (safe_prompt > 0 && safe_prompt <= safe_total).then_some((safe_prompt, safe_total))
 }
 
+/// Canonical integrity digest over the exact covered rows: sort by ID, then
+/// SHA-256 each row's ID plus `serde_json::to_vec(message)` with length
+/// framing. Any change to role, content, tool-call id, or result bytes
+/// changes the digest; row order does not.
+fn canonical_source_digest(messages: &[(MessageId, Value)]) -> String {
+    let mut sorted: Vec<&(MessageId, Value)> = messages.iter().collect();
+    sorted.sort_by_key(|(id, _)| *id);
+    let mut hasher = Sha256::new();
+    for (id, message) in sorted {
+        let bytes = serde_json::to_vec(message).unwrap_or_default();
+        let id_u64 = u64::try_from(*id).unwrap_or(u64::MAX);
+        let len_u64 = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        hasher.update(id_u64.to_le_bytes());
+        hasher.update(len_u64.to_le_bytes());
+        hasher.update(&bytes);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// Wire cost of recovery content as a single user message (role/delimiter
+/// overhead plus content, matching `TokenBudget::estimate_message_tokens`).
+fn recovery_wire_tokens(content: &str) -> usize {
+    TokenBudget::estimate_str_tokens(content).saturating_add(4)
+}
+
 /// Produce the bounded, lossless recovery record used when model compaction is
-/// unavailable or rejects its own output. The immutable SQLite rows remain the
-/// source of truth; this index only preserves a small newest-first orientation
-/// and a copyable `lcm_expand` pointer back to those rows.
+/// unavailable or rejects its own output. The immutable rows stay the source
+/// of truth; this index contains only bounded integrity metadata and one
+/// copyable `lcm_expand` pointer. Raw message and manifest text stay out.
+///
+/// Deterministic: identical inputs produce byte-identical text. The pointer
+/// renders the exact `format_id_ranges` set (never min-max). The wire is
+/// bounded by the effective target; a mandatory header over that bound is
+/// rejected, never installed.
 fn deterministic_recovery_index(
     source_ids: &[MessageId],
     messages: &[(MessageId, Value)],
-    original_tokens: usize,
+    retired_wire_tokens: usize,
     configured_target: usize,
 ) -> Option<String> {
-    let first = *source_ids.iter().min()?;
-    let last = *source_ids.iter().max()?;
-    let full_ranges = format_id_ranges(source_ids);
-    let compact_range = format!("{first}-{last}");
-    let target = configured_target
-        .clamp(48, 256)
-        .min(original_tokens.saturating_sub(1));
-    if target == 0 {
+    if source_ids.is_empty() || messages.is_empty() {
+        return None;
+    }
+    let mut exact_source_ids = source_ids.to_vec();
+    exact_source_ids.sort_unstable();
+    exact_source_ids.dedup();
+    let mut recovered_ids: Vec<MessageId> = messages.iter().map(|(id, _)| *id).collect();
+    recovered_ids.sort_unstable();
+    if messages.len() != exact_source_ids.len() || recovered_ids != exact_source_ids {
+        return None;
+    }
+    let wire_budget = configured_target.min(retired_wire_tokens.saturating_sub(1));
+    if wire_budget == 0 {
+        return None;
+    }
+    let ranges = format_id_ranges(&exact_source_ids);
+    let revision = exact_source_ids.last().copied().unwrap_or(0);
+    let digest = canonical_source_digest(messages);
+    let mut text = format!(
+        "version=1 ranges={ranges} revision={revision} source_sha256={digest} \
+         lcm_expand({{\"message_ids\":\"{ranges}\"}})"
+    );
+    // The mandatory record is indivisible: an earlier complete source prefix
+    // must be tried when it cannot fit or cannot shrink the retired wire.
+    if recovery_wire_tokens(&text) > wire_budget {
         return None;
     }
 
-    let header = |ranges: &str| {
-        format!(
-            "[Recovery index — model compaction unavailable. Exact source messages: {ranges}. \
-             Recover them with lcm_expand({{\"message_ids\": \"{ranges}\"}}).]"
-        )
-    };
-    let mut text = header(&full_ranges);
-    if TokenBudget::estimate_str_tokens(&text) > target
-        || TokenBudget::estimate_str_tokens(&text) >= original_tokens
-    {
-        text = header(&compact_range);
-    }
-    if TokenBudget::estimate_str_tokens(&text) >= original_tokens {
-        return None;
-    }
-
-    // Keep only bounded, newest-first orientation. The complete transcript is
-    // deliberately not copied here: it is already durable and lcm_expand is
-    // the one recovery interface for exact evidence.
-    for (id, message) in messages.iter().rev() {
+    // Optional orientation is newest-first and bounded after the mandatory
+    // record. Tool rows remain exact-only behind lcm_expand; their raw bodies
+    // are never copied into the recovery wire.
+    let mut ordered: Vec<&(MessageId, Value)> = messages.iter().collect();
+    ordered.sort_by_key(|(id, _)| *id);
+    for (id, message) in ordered.into_iter().rev() {
         let role = message.get("role").and_then(Value::as_str).unwrap_or("?");
+        if role == "tool" {
+            continue;
+        }
         let content = message.get("content").and_then(Value::as_str).unwrap_or("");
         let excerpt: String = content.chars().take(240).collect();
-        let line = format!("\n- newest [msg {id}] {role}: {excerpt}");
-        let candidate = format!("{text}{line}");
-        if TokenBudget::estimate_str_tokens(&candidate) > target {
+        let candidate = format!("{text}\n[msg {id}] {role}: {excerpt}");
+        if recovery_wire_tokens(&candidate) > wire_budget {
             break;
         }
         text = candidate;
     }
-
-    (TokenBudget::estimate_str_tokens(&text) < original_tokens).then_some(text)
+    Some(text)
 }
 
 fn summary_is_acceptable(summary: &str, original_tokens: usize, level: u8) -> Result<bool> {
@@ -2413,6 +2579,18 @@ mod tests {
     /// Ingest a `_db_id`-tagged message, asserting it was accepted.
     fn ingest(engine: &mut LcmEngine, id: usize, role: &str, content: &str) {
         assert_eq!(engine.ingest(msg(id, role, content)), Some(id));
+    }
+
+    /// Ingest an assistant tool-call carrier plus its raw tool result.
+    fn ingest_tool_pair(engine: &mut LcmEngine, base: usize, call_id: &str, content: String) {
+        assert_eq!(
+            engine.ingest(json!({"role": "assistant", "content": null, "tool_calls": [{"id": call_id, "type": "function", "function": {"name": "exec", "arguments": "{}"}}], "_db_id": base + 1})),
+            Some(base + 1)
+        );
+        assert_eq!(
+            engine.ingest(json!({"role": "tool", "name": "exec", "tool_call_id": call_id, "content": content, "_db_id": base + 2})),
+            Some(base + 2)
+        );
     }
 
     fn plan_and_commit_auto_expansion(
@@ -3155,7 +3333,7 @@ mod tests {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.1,
             tau_hard: 0.3,
-            deterministic_target: 64,
+            deterministic_target: 128,
         });
         ingest(&mut engine, 1, "system", "System prompt.");
         for id in 2..=5 {
@@ -3507,7 +3685,7 @@ mod tests {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,
-            deterministic_target: 64,
+            deterministic_target: 128,
         });
 
         ingest(&mut engine, 1, "system", "System prompt.");
@@ -3578,6 +3756,227 @@ mod tests {
         }
     }
 
+    #[test]
+    fn deterministic_target_is_a_hard_wire_limit() {
+        let messages = vec![(2, msg(2, "user", &"evidence ".repeat(200)))];
+        let text = deterministic_recovery_index(&[2], &messages, 500, 128)
+            .expect("mandatory recovery record should fit 128 tokens");
+        let required = recovery_wire_tokens(
+            text.lines()
+                .next()
+                .expect("mandatory record is the first line"),
+        );
+
+        assert!(required < 128);
+        assert!(deterministic_recovery_index(&[2], &messages, 500, required).is_some());
+        assert!(deterministic_recovery_index(&[2], &messages, 500, required - 1).is_none());
+        assert!(recovery_wire_tokens(&text) < 500);
+        assert!(deterministic_recovery_index(&[2], &messages, 500, 64).is_none());
+        assert!(deterministic_recovery_index(&[2], &messages, 500, 16).is_none());
+    }
+
+    #[test]
+    fn summary_wire_does_not_infer_recovery_from_model_text() {
+        let text = "[Recovery index mentioned by the model]";
+        let wire = summary_wire_message(&[2], text, &SummaryManifest::default(), 1);
+        let content = wire["content"].as_str().unwrap();
+
+        assert!(content.starts_with("[Summary of messages 2."));
+        assert!(content.ends_with(text));
+    }
+
+    #[test]
+    fn deterministic_wire_never_appends_manifest_text() {
+        let text = "[Recovery index v1 ranges=2 revision=2 sha256=abc; lcm_expand({\"message_ids\": \"2\"})]";
+        let manifest = SummaryManifest {
+            open_loops: vec![ManifestItem {
+                text: "raw child manifest".to_string(),
+                sources: vec![2],
+            }],
+            ..SummaryManifest::default()
+        };
+        let wire = summary_wire_message(&[2], text, &manifest, 0);
+
+        assert_eq!(wire["content"], text);
+    }
+
+    #[test]
+    fn compaction_never_starts_on_a_raw_tool_result() {
+        let mut engine = LcmEngine::new(LcmConfig::default());
+        ingest(&mut engine, 1, "system", "System prompt.");
+        ingest(&mut engine, 2, "user", "Run the check.");
+        ingest_tool_pair(&mut engine, 2, "call_split", "ok".to_string());
+        ingest(&mut engine, 5, "user", "Newest request.");
+        // A span starting on the tool result is an orphan: no complete prefix.
+        assert!(engine.complete_compaction_boundaries(3, 4).is_empty());
+        // Carrier plus result together is complete.
+        assert_eq!(engine.complete_compaction_boundaries(2, 4), vec![2]);
+    }
+
+    /// Fragmented carriers/results plus newest request: the fold retires
+    /// complete pairs with no provider call, an exact pointer equal to node
+    /// coverage, and a digest over the covered rows; tool bodies stay out.
+    #[tokio::test]
+    async fn deterministic_fold_keeps_pairs_atomic_with_exact_pointer() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.3,
+            tau_hard: 0.6,
+            deterministic_target: 128,
+        });
+        ingest(&mut engine, 1, "system", "System prompt.");
+        // Non-contiguous rowids (gap 6-9): min-max "2-13" would over-claim.
+        for (i, base) in [(0usize, 2usize), (1, 10)] {
+            ingest(
+                &mut engine,
+                base,
+                "user",
+                &format!(
+                    "Fold question {i} {}",
+                    "durable context evidence ".repeat(30)
+                ),
+            );
+            ingest_tool_pair(
+                &mut engine,
+                base,
+                &format!("call_fold_{i}"),
+                format!("TOOL_BODY_{i} {}", "verified output payload ".repeat(40)),
+            );
+            ingest(
+                &mut engine,
+                base + 3,
+                "assistant",
+                &format!(
+                    "Conclusion {i} recorded. {}",
+                    "stable reasoning ".repeat(10)
+                ),
+            );
+        }
+        ingest(&mut engine, 14, "user", "NEWEST-PROTECTED-REQUEST: status?");
+        let snapshots: HashMap<MessageId, Vec<u8>> = engine
+            .store_ids()
+            .into_iter()
+            .map(|id| (id, serde_json::to_vec(engine.expand(&[id])[0].1).unwrap()))
+            .collect();
+        let before = engine.active_tokens();
+        let budget = TokenBudget::new(4096, 2048);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let compactor = ContextCompactor::new(
+            Arc::new(CountingFailingMock {
+                calls: Arc::clone(&calls),
+            }) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            4096,
+        );
+        let result = engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                100,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no provider call");
+        let Turn::Summary {
+            text,
+            source_ids,
+            level,
+        } = result.expect("fold must install")
+        else {
+            panic!("expected recovery summary")
+        };
+        assert_eq!(level, 0);
+        assert_eq!(engine.dag().len(), 1);
+        let node = engine.dag().newest().expect("one node").clone();
+        assert!(!source_ids.contains(&14), "newest stays raw");
+        for (carrier, result_id) in [(3usize, 4usize), (11, 12)] {
+            assert_eq!(
+                source_ids.contains(&carrier),
+                source_ids.contains(&result_id),
+                "pair {carrier}/{result_id} atomic"
+            );
+        }
+        assert!(engine.active_tokens() < before, "wire must shrink");
+        // Verbatim proof: the shared wire renderer must reproduce the index
+        // byte-identically (a second recall header would inflate the wire).
+        let wire = TokenBudget::estimate_message_tokens(&summary_wire_message(
+            &node.source_ids,
+            &text,
+            &node.manifest,
+            node.level,
+        ));
+        assert!(wire <= 128, "wire {wire} exceeds effective target");
+        assert_eq!(wire, recovery_wire_tokens(&text));
+        let ranges = format_id_ranges(&node.source_ids);
+        assert!(text.contains(&ranges), "exact ranges: {text}");
+        assert_eq!(text.matches("lcm_expand").count(), 1, "one recall: {text}");
+        assert!(text.contains("version=1") && text.contains("source_sha256="));
+        let pointer = parse_id_runs(
+            text.split("lcm_expand({\"message_ids\":\"")
+                .nth(1)
+                .and_then(|s| s.split("\"})").next())
+                .unwrap_or(""),
+        );
+        let (mut pointed, mut covered) = (pointer.clone(), node.source_ids.clone());
+        pointed.sort_unstable();
+        pointed.dedup();
+        covered.sort_unstable();
+        assert_eq!(pointed, covered, "pointer must equal covered set");
+        for id in &node.source_ids {
+            assert_eq!(
+                serde_json::to_vec(engine.expand(&[*id])[0].1).unwrap(),
+                snapshots[id]
+            );
+        }
+        let digest = text
+            .split("source_sha256=")
+            .nth(1)
+            .map(|s| s.chars().take(64).collect::<String>())
+            .unwrap_or_default();
+        let covered_rows: Vec<(MessageId, Value)> = node
+            .source_ids
+            .iter()
+            .map(|id| (*id, engine.expand(&[*id])[0].1.clone()))
+            .collect();
+        assert_eq!(canonical_source_digest(&covered_rows), digest);
+        assert!(!text.contains("TOOL_BODY_"), "no raw tool bodies");
+        assert_eq!(node.manifest, SummaryManifest::default());
+    }
+
+    #[tokio::test]
+    async fn deterministic_fold_requires_every_source_row() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.1,
+            tau_hard: 0.3,
+            deterministic_target: 128,
+        });
+        ingest(&mut engine, 1, "system", "System prompt.");
+        for id in 2..=8 {
+            ingest(
+                &mut engine,
+                id,
+                "user",
+                &format!("source {id} {}", "durable evidence ".repeat(80)),
+            );
+        }
+        engine.store.remove(&2);
+
+        let result = engine
+            .compact(
+                None,
+                &TokenBudget::new(4096, 1024),
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
+
+        assert!(result.is_none());
+        assert!(engine.dag().is_empty());
+        assert!(engine
+            .active_context()
+            .iter()
+            .any(|message| message["_db_id"] == 2));
+    }
+
     // -----------------------------------------------------------------------
     // E2E: compact with a babble-scoring summary → rejected, never persisted
     // -----------------------------------------------------------------------
@@ -3587,7 +3986,7 @@ mod tests {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,
-            deterministic_target: 64,
+            deterministic_target: 128,
         });
 
         ingest(&mut engine, 1, "system", "System prompt.");
@@ -3641,7 +4040,7 @@ mod tests {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,
-            deterministic_target: 64,
+            deterministic_target: 128,
         });
         ingest(&mut engine, 1, "system", "System prompt.");
         for i in 0..10 {
@@ -3682,7 +4081,7 @@ mod tests {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.1,
             tau_hard: 0.3,
-            deterministic_target: 64,
+            deterministic_target: 128,
         });
         ingest(&mut engine, 1, "system", "System prompt.");
         for i in 0..100 {
@@ -3722,7 +4121,7 @@ mod tests {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,
-            deterministic_target: 64,
+            deterministic_target: 128,
         });
         ingest(&mut engine, 1, "system", "System prompt.");
         for i in 0..10 {
