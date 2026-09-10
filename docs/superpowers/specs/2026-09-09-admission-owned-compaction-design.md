@@ -195,12 +195,45 @@ measurement on actual Nanobot sessions, including decision retention, open-loop
 retention, source-ID fidelity, malformed output rate, latency, peak MLX memory,
 and cancellation latency.
 
-Provisional candidates are:
+The first benchmark set uses task-specific fine-tunes rather than generic
+instruct models:
 
-1. `mlx-community/Qwen3.5-0.8B-5bit`, the same current model family and first
-   quality candidate.
-2. `mlx-community/Qwen3-0.6B-4bit`, the smaller latency and memory control.
-3. `mlx-community/LFM2-1.2B-4bit`, an independent edge-model challenger.
+1. `fuhao23/encoder_v0` is the best available task-fit candidate below 1B. It
+   is an 8.7 MB LoRA for Qwen2.5-0.5B-Instruct trained to turn conversation
+   segments into typed memory records with source spans. Its model card reports
+   a 519-segment held-out evaluation, 3.4-second p50 on its reference hardware,
+   and strong atomicity and self-containedness. It also documents weak entity
+   coverage and a fall from 100% to about 64% schema compliance without
+   constrained decoding. Evaluation therefore requires merging the adapter,
+   converting the merged model to MLX, and enforcing the Nanobot recovery
+   schema during decoding.
+2. `Harsha901/qwen2.5-0.5b-kd-merged-cnndm-50k` is the best evidence-backed
+   ordinary summarizer at this size. The merged 0.5B model publishes
+   cross-domain ROUGE and BERTScore results on XSum, SAMSum, and DialogSum. It
+   remains a news-trained model with a 1,536-token training sequence limit, so
+   it is a control rather than the assumed winner. Its F16 safetensors can be
+   converted and quantized for MLX.
+3. `wallster88888/Qwen2.5-1.5B-Instruct-Summarizer-4bit` is the ready-made MLX
+   integration control. It is an approximately 880 MB 4-bit artifact derived
+   from `agentlans/Qwen2.5-1.5B-Instruct-Summarizer`. Neither repository
+   publishes a meaningful summarization evaluation, so native format alone is
+   not evidence of quality.
+4. `ericflo/qwen3-0.6b-summarizer` is a useful technical-headline control. It
+   was distilled on 6,720 software and project summaries, but is trained for one
+   sentence and recommends only about 2,000 input characters. The release is
+   GGUF plus a custom LoRA, not a native MLX artifact, and is unsuitable as the
+   sole full-session compactor.
+
+`IAAR-Shanghai/MemReader-0.6B` would be the strongest specialized candidate on
+the published memory benchmarks: the MemReader card reports 79.56% LOCOMO,
+80.20% LongMemEval, and 93.76% HaluMem extraction F1 for the 0.6B variant.
+However, Hugging Face exposes no public 0.6B checkpoint as of 2026-09-10; only
+`IAAR-Shanghai/MemReader-4B-thinking` is downloadable. The 4B model is an
+upper-bound quality control, not a pressure-path dependency.
+
+Generic `mlx-community/Qwen3.5-0.8B-5bit` and
+`mlx-community/Qwen3-0.6B-4bit` remain untuned baselines. They are not described
+as compactor fine-tunes.
 
 Local inventory on 2026-09-09 found no usable small Qwen weights. The Hugging
 Face cache entry for `mlx-community/Qwen3-0.6B-4bit` is a 12 KB metadata record
