@@ -7008,6 +7008,129 @@ async fn pending_compaction_checkpoint_hides_unpublished_dag() {
 }
 
 #[tokio::test]
+async fn persisted_lcm_rebuild_expands_exact_durable_rows() {
+    let provider = MockLLM::named("persisted-lcm-replay-projection-test");
+    let (agent_loop, _workspace) = build_local_inline_harness(provider);
+    let session_key = format!("persisted-lcm-replay-projection-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+
+    core.sessions
+        .add_message(
+            &session.id,
+            &json!({"role": "user", "content": "durable source"}),
+        )
+        .await;
+    core.sessions
+        .add_message(
+            &session.id,
+            &json!({
+                "role": "user",
+                "content": "[System notice] You have 12 iteration(s) remaining.",
+                "_synthetic": true,
+                "_cache_replay": true,
+            }),
+        )
+        .await;
+    core.sessions
+        .add_message(
+            &session.id,
+            &json!({"role": "assistant", "content": "durable answer"}),
+        )
+        .await;
+
+    let exact_tool_body = format!(
+        "RAW_EXACT_TOOL_BODY:{}:RAW_EXACT_TOOL_TAIL",
+        "x".repeat(13_000)
+    );
+    core.sessions
+        .add_message(
+            &session.id,
+            &json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_exact",
+                    "type": "function",
+                    "function": {"name": "exec", "arguments": "{}"},
+                }],
+            }),
+        )
+        .await;
+    core.sessions
+        .add_message(
+            &session.id,
+            &json!({
+                "role": "tool",
+                "content": exact_tool_body,
+                "tool_call_id": "call_exact",
+                "name": "exec",
+            }),
+        )
+        .await;
+
+    let replay = core.sessions.get_history(&session.id, 0, 0).await;
+    let raw = core.sessions.get_all_messages(&session.id).await;
+    let replay_wire = serde_json::to_string(&replay).unwrap();
+    assert!(!replay_wire.contains("RAW_EXACT_TOOL_TAIL"));
+    assert!(replay_wire.contains("TOOL_RESULT_HANDLE v1"));
+    let source_ids = replay
+        .iter()
+        .take(3)
+        .map(|message| message["_db_id"].as_u64().unwrap() as usize)
+        .collect::<Vec<_>>();
+    assert_eq!(source_ids.len(), 3, "cache-replay scaffold stays foldable");
+    core.sessions
+        .save_summary_node(
+            &session.id,
+            0,
+            &source_ids,
+            &[],
+            "version=1 lcm_expand({\"message_ids\":\"1-3\"})",
+            10,
+            0,
+            &crate::agent::lcm::SummaryManifest::default(),
+        )
+        .await;
+
+    let mut inbound = InboundMessage::new("test", "user", "offline", "continue");
+    inbound
+        .metadata
+        .insert("session_key".to_string(), json!(session_key));
+    let _context = agent_loop
+        .shared
+        .prepare_context(&inbound, None, None, None, None)
+        .await;
+
+    let engine = agent_loop
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&session.id)
+        .cloned()
+        .unwrap();
+    let engine = engine.lock().await;
+    let expanded = engine.expand(&source_ids);
+    let active = serde_json::to_string(&engine.active_context()).unwrap();
+
+    let expected = raw
+        .iter()
+        .filter(|message| source_ids.contains(&(message["_db_id"].as_u64().unwrap() as usize)))
+        .collect::<Vec<_>>();
+    assert_eq!(expanded.len(), expected.len());
+    for ((id, actual), expected) in expanded.into_iter().zip(expected) {
+        assert_eq!(id, expected["_db_id"].as_u64().unwrap() as usize);
+        assert_eq!(
+            actual, expected,
+            "restart must preserve digest/expand bytes"
+        );
+    }
+    assert!(!active.contains("RAW_EXACT_TOOL_TAIL"));
+    assert!(active.contains("TOOL_RESULT_HANDLE v1"));
+}
+
+#[tokio::test]
 async fn idle_rollover_uses_a_new_session_scoped_lcm_engine() {
     let provider = Arc::new(WireRecordingProvider::new(
         "local-idle-lcm-test",

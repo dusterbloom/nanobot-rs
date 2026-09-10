@@ -643,6 +643,53 @@ impl LcmEngine {
         Some(msg_id)
     }
 
+    /// Replace already-ingested replay projections with their authoritative
+    /// SQLite rows without changing the provider-facing active window.
+    /// Deterministic checkpoints and `lcm_expand` therefore hash/return exact
+    /// durable bytes, while compaction still selects from the bounded replay.
+    pub(crate) fn hydrate_existing_store_from_durable(
+        &mut self,
+        durable_messages: &[Value],
+    ) -> usize {
+        let mut hydrated = 0;
+        for message in durable_messages {
+            let Some(msg_id) = message.get("_db_id").and_then(Value::as_u64) else {
+                continue;
+            };
+            let Ok(msg_id) = usize::try_from(msg_id) else {
+                continue;
+            };
+            let Some(stored) = self.store.get_mut(&msg_id) else {
+                continue;
+            };
+            if stored != message {
+                *stored = message.clone();
+                hydrated += 1;
+            }
+        }
+        hydrated
+    }
+
+    /// Refresh only provider-facing raw entries from the replay projection.
+    /// The immutable store remains exact SQLite data for digest/expansion.
+    pub(crate) fn sync_active_from_replay(&mut self, replay_messages: &[Value]) {
+        let replay_by_id: HashMap<MessageId, &Value> = replay_messages
+            .iter()
+            .filter_map(|message| {
+                let id = message.get("_db_id")?.as_u64()?;
+                usize::try_from(id).ok().map(|id| (id, message))
+            })
+            .collect();
+        for entry in &mut self.active {
+            let ContextEntry::Raw { msg_id, message } = entry else {
+                continue;
+            };
+            if let Some(replay) = replay_by_id.get(msg_id) {
+                *message = (*replay).clone();
+            }
+        }
+    }
+
     /// Get the active context as a message array for the LLM.
     pub fn active_context(&self) -> Vec<Value> {
         self.active.iter().map(|e| e.message().clone()).collect()
@@ -1598,14 +1645,17 @@ impl LcmEngine {
         };
 
         // Ingest raw messages keyed by rowid. Persisted `role: "summary"` rows
-        // reference store entries and never occupy store slots themselves;
-        // synthetic scaffolds are not originals. Rows without a `_db_id`
+        // reference store entries and never occupy store slots themselves.
+        // Cache-replay scaffolds are originals because live filtering retains
+        // their content; other synthetic scaffolds never enter live LCM.
+        // Rows without a `_db_id`
         // cannot be addressed losslessly and are skipped (get_all_messages
         // always supplies the rowid, so this is defensive only).
         for msg in raw_after_clear {
             let role = msg.get("role").and_then(|r| r.as_str());
             if matches!(role, Some("summary" | "clear"))
-                || crate::agent::markers::is_synthetic(msg)
+                || (crate::agent::markers::is_synthetic(msg)
+                    && !crate::session::filters::is_cache_replay_synthetic(msg))
                 || msg.get("_lcm_summary").is_some()
             {
                 continue;
@@ -3773,6 +3823,40 @@ mod tests {
         assert!(recovery_wire_tokens(&text) < 500);
         assert!(deterministic_recovery_index(&[2], &messages, 500, 64).is_none());
         assert!(deterministic_recovery_index(&[2], &messages, 500, 16).is_none());
+    }
+
+    #[test]
+    fn durable_hydration_changes_exact_store_without_changing_active_wire() {
+        let mut engine = LcmEngine::new(LcmConfig::default());
+        let projected = json!({
+            "_db_id": 42,
+            "role": "tool",
+            "content": "TOOL_RESULT_HANDLE v1 | id:call_42",
+            "tool_call_id": "call_42",
+            "name": "exec",
+        });
+        let durable = json!({
+            "_db_id": 42,
+            "role": "tool",
+            "content": "exact-tool-body ".repeat(1_000),
+            "tool_call_id": "call_42",
+            "name": "exec",
+            "timestamp": "2026-09-10T00:00:00Z",
+            "provenance": "sqlite",
+        });
+        engine.ingest(projected.clone());
+        let active_before = engine.active_context();
+
+        assert_eq!(
+            engine.hydrate_existing_store_from_durable(std::slice::from_ref(&durable)),
+            1
+        );
+        assert_eq!(engine.active_context(), active_before);
+        assert_eq!(engine.expand(&[42])[0].1, &durable);
+        assert_eq!(
+            canonical_source_digest(&[(42, durable)]),
+            canonical_source_digest(&[(42, engine.expand(&[42])[0].1.clone())])
+        );
     }
 
     #[test]

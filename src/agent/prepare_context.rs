@@ -446,6 +446,12 @@ impl AgentLoopShared {
             for msg in &history {
                 engine.ingest(msg.clone());
             }
+            // A restart rebuilds the immutable store from exact SQLite rows.
+            // Keep those bytes for lcm_expand/digests, but restore the active
+            // raw tail to the same bounded replay projection used live.
+            if !engine.dag().is_empty() {
+                engine.sync_active_from_replay(&history);
+            }
             // The background compactor mutates the shared DAG before it
             // publishes the checkpoint that rotates Higgs's session ID.
             // Keep raw SQLite history authoritative across that window;

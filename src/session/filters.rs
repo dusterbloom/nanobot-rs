@@ -37,7 +37,7 @@ fn is_non_replayable_synthetic(msg: &Value) -> bool {
         && !is_cache_replay_synthetic(msg)
 }
 
-fn is_cache_replay_synthetic(msg: &Value) -> bool {
+pub(crate) fn is_cache_replay_synthetic(msg: &Value) -> bool {
     if msg
         .get("_cache_replay")
         .and_then(|v| v.as_bool())

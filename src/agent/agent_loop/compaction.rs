@@ -421,6 +421,15 @@ pub(super) async fn execute_lcm_compaction(
     cancellation: tokio_util::sync::CancellationToken,
     publication: Arc<CompactionPublication>,
 ) -> Option<PendingCompaction> {
+    // The live engine selects its bounded active window from replay-projected
+    // messages. Hydrate only its existing IDs from SQLite at the moment a fold
+    // actually runs, so checkpoint hashes and lcm_expand use exact durable
+    // rows without loading the full session on ordinary turns.
+    let durable_messages = tokio::select! {
+        biased;
+        () = cancellation.cancelled() => return None,
+        messages = core.sessions.get_all_messages(&session_id) => messages,
+    };
     // Keep the engine locked through SQLite commit. A failed checkpoint rolls
     // back the DAG/active window before any other task can observe or extend
     // the non-durable state.
@@ -429,6 +438,12 @@ pub(super) async fn execute_lcm_compaction(
         () = cancellation.cancelled() => return None,
         engine = lcm.lock() => engine,
     };
+    let hydrated = engine.hydrate_existing_store_from_durable(&durable_messages);
+    tracing::debug!(
+        session_id,
+        hydrated,
+        "LCM hydrated exact durable source rows"
+    );
     // Stamp the session turn so the new summary node records its creation
     // turn. auto_expand's fresh-summary cooldown uses this to prevent the
     // just-compacted originals from being reinjected on the very next turn
