@@ -184,7 +184,7 @@ impl AgentLoop {
         let system_state = Arc::new(arc_swap::ArcSwap::from_pointee(SystemState::default()));
 
         let shared = Arc::new(AgentLoopShared {
-            core_handle,
+            core_handle: core_handle.clone(),
             subagents,
             bus_inbound_tx: bus_inbound_tx.clone(),
             capacity_resume_poller_started: std::sync::atomic::AtomicBool::new(false),
@@ -207,6 +207,28 @@ impl AgentLoop {
                 .ok()
                 .map(|ks| Arc::new(parking_lot::Mutex::new(ks))),
         });
+
+        // Eager higgs session-drop reclaim: right after a prompt-cache
+        // rotation queues a drop, fire a standalone drop request so the
+        // retired session's resident KV frees before the next prompt
+        // prefills (instead of riding that request). Always resolves the
+        // CURRENT core, so /model swaps are honored.
+        let flush_handle = core_handle.clone();
+        core_handle
+            .counters
+            .set_higgs_drop_flusher(std::sync::Arc::new(move |session_id| {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let core_handle = flush_handle.clone();
+                    handle.spawn(async move {
+                        let core = core_handle.swappable();
+                        let _ = core
+                            .provider
+                            .drop_higgs_sessions(&core.model, &[session_id])
+                            .await;
+                    });
+                }
+            }));
+
 
         Self {
             shared,

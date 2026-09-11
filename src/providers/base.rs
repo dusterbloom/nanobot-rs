@@ -355,6 +355,22 @@ pub trait LLMProvider: Send + Sync {
     > {
         Box::pin(std::future::ready(Ok(None)))
     }
+
+    /// Best-effort eager drop of retained higgs sessions, used right after a
+    /// prompt-cache rotation so the retired session's resident KV frees
+    /// before the next prompt prefills. Default: no-op (non-higgs
+    /// providers). Fire-and-forget callers treat errors as harmless — the
+    /// piggybacked `drop_session_ids` fields on the next chat request remain
+    /// the durable fallback.
+    fn drop_higgs_sessions<'a>(
+        &'a self,
+        _model: &'a str,
+        _session_ids: &'a [u64],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::errors::ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(std::future::ready(Ok(())))
+    }
 }
 
 #[cfg(test)]

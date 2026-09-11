@@ -1594,6 +1594,44 @@ impl LLMProvider for OpenAICompatProvider {
         // typed-error classification stay in exactly one place.
         Box::pin(OpenAICompatProvider::fetch_higgs_capacity(self, model))
     }
+
+    fn drop_higgs_sessions<'a>(
+        &'a self,
+        model: &'a str,
+        session_ids: &'a [u64],
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), crate::errors::ProviderError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            if !self.higgs_session_cache || session_ids.is_empty() {
+                return Ok(());
+            }
+            let model = strip_internal_local_model_prefix(model);
+            let url = format!(
+                "{}/v1/sessions/drop",
+                self.api_base.trim_end_matches('/')
+            );
+            let response = self
+                .client
+                .post(url)
+                .header("Authorization", format!("Bearer {}", self.api_key))
+                .json(&serde_json::json!({
+                    "model": model,
+                    "session_ids": session_ids,
+                }))
+                .send()
+                .await
+                .map_err(|error| crate::errors::ProviderError::HttpError(error.to_string()))?;
+            let status = response.status().as_u16();
+            if !(200..300).contains(&status) {
+                let text = response.text().await.unwrap_or_default();
+                return Err(crate::errors::ProviderError::HttpError(format!(
+                    "session drop failed: {status} {text}"
+                )));
+            }
+            Ok(())
+        })
+    }
 }
 
 /// Inject `cache_control` breakpoints into messages and tool definitions

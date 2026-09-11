@@ -406,6 +406,11 @@ pub struct RuntimeCounters {
     /// expansion lease/checkpoint, and pending drops must never be observed in
     /// partially updated combinations by concurrent requests or resets.
     higgs_sessions: parking_lot::Mutex<std::collections::HashMap<String, HiggsSessionState>>,
+    /// Eager-drop flusher, wired by the embedding loop with the active
+    /// provider: fires a standalone higgs session-drop right after a
+    /// rotation queues one, so the retired session's resident KV frees
+    /// before the next prompt prefills instead of riding that request.
+    higgs_drop_flusher: parking_lot::Mutex<Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>>,
     /// Per-session local artifact intent for short follow-up edit turns
     /// ("make it red", "also add a score") after an explicit local artifact
     /// request. Bounded by turn count, not persisted.
@@ -476,6 +481,7 @@ impl RuntimeCounters {
             prompt_cache_watermark: parking_lot::Mutex::new(std::collections::HashMap::new()),
             prompt_cache_transition: parking_lot::Mutex::new(()),
             higgs_sessions: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            higgs_drop_flusher: parking_lot::Mutex::new(None),
             local_artifact_intent: parking_lot::Mutex::new(std::collections::HashMap::new()),
             lcm_compaction_count: AtomicU64::new(0),
             lcm_tokens_before: AtomicU64::new(0),
@@ -1040,6 +1046,16 @@ impl RuntimeCounters {
         }
     }
 
+    /// Wire the eager higgs session-drop flusher. Called once by the
+    /// embedding loop with the live provider; fires fire-and-forget drops
+    /// on rotation. No-op until set (plain CLI/tests).
+    pub(crate) fn set_higgs_drop_flusher(
+        &self,
+        flusher: std::sync::Arc<dyn Fn(u64) + Send + Sync>,
+    ) {
+        *self.higgs_drop_flusher.lock() = Some(flusher);
+    }
+
     pub(crate) fn retire_higgs_session(
         &self,
         session_key: &str,
@@ -1079,6 +1095,16 @@ impl RuntimeCounters {
         match (retirement, active_id) {
             (SessionRetirement::Drop, Some(active_id)) => {
                 Self::queue_higgs_session_drop(state, active_id);
+                // Eager reclaim: POST the drop to higgs now instead of
+                // waiting for the next chat request, so the retired
+                // session's resident KV frees before the next (smaller)
+                // prompt prefills. Best-effort — the piggybacked drop fields
+                // remain the durable fallback, and a session still in flight
+                // reports dropped=false and is covered by that fallback.
+                let flush = self.higgs_drop_flusher.lock().clone();
+                if let Some(flush) = flush {
+                    flush(active_id);
+                }
             }
             (
                 SessionRetirement::LeaseForExpansion {
@@ -3295,5 +3321,42 @@ mod tests {
         );
         assert!(counters.clear_local_artifact_intent(session));
         assert_eq!(counters.local_artifact_intent_is_rich(session, 21), None);
+    }
+}
+
+#[cfg(test)]
+mod higgs_drop_flusher_tests {
+    use super::*;
+    use crate::config::schema::CircuitBreakerConfig;
+
+    #[test]
+    fn drop_retirement_fires_the_eager_flush_hook() {
+        let counters = RuntimeCounters::new_with_config(32_768, &CircuitBreakerConfig::default());
+        let flushed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let flushed_clone = std::sync::Arc::clone(&flushed);
+        counters.set_higgs_drop_flusher(std::sync::Arc::new(move |session_id| {
+            flushed_clone.lock().unwrap().push(session_id);
+        }));
+
+        // A live retained session (as the wire-lease flow would have left it).
+        assert!(counters.record_higgs_session_id("flush-hook", 777));
+
+        let epoch =
+            counters.retire_higgs_session("flush-hook", SessionRetirement::Drop);
+        assert!(epoch >= 1);
+        assert_eq!(
+            flushed.lock().unwrap().as_slice(),
+            &[777],
+            "the rotation must eagerly flush the retired session id"
+        );
+    }
+
+    #[test]
+    fn drop_retirement_without_flusher_is_a_clean_noop() {
+        let counters = RuntimeCounters::new_with_config(32_768, &CircuitBreakerConfig::default());
+        assert!(counters.record_higgs_session_id("no-flush", 555));
+        let epoch =
+            counters.retire_higgs_session("no-flush", SessionRetirement::Drop);
+        assert!(epoch >= 1, "rotation proceeds with no flusher wired");
     }
 }
