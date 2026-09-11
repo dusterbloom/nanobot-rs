@@ -161,6 +161,7 @@ fn test_clear_resets_lcm_engine() {
         tau_soft: 0.5,
         tau_hard: 0.85,
         deterministic_target: 512,
+        keep_prefix_fraction: 0.35,
     };
 
     let mut engine = LcmEngine::new(config.clone());
@@ -189,6 +190,7 @@ async fn test_compaction_creates_summary_node() {
         tau_soft: 0.3,
         tau_hard: 0.6,
         deterministic_target: 64,
+        keep_prefix_fraction: 0.35,
     });
 
     ingest(&mut engine, 1, "system", "System");
@@ -226,6 +228,7 @@ async fn test_second_compaction_summarizes_after_first_summary() {
         tau_soft: 0.2,
         tau_hard: 0.5,
         deterministic_target: 64,
+        keep_prefix_fraction: 0.35,
     });
 
     ingest(&mut engine, 1, "system", "System");
@@ -248,7 +251,7 @@ async fn test_second_compaction_summarizes_after_first_summary() {
             Some(&compactor),
             &budget,
             100,
-            CompactionFailureMode::Deterministic,
+            CompactionFailureMode::PreserveContext,
         )
         .await;
     assert!(r1.is_some(), "First compaction should succeed");
@@ -264,7 +267,7 @@ async fn test_second_compaction_summarizes_after_first_summary() {
             Some(&compactor),
             &budget,
             100,
-            CompactionFailureMode::Deterministic,
+            CompactionFailureMode::PreserveContext,
         )
         .await;
     if r2.is_some() {
@@ -391,6 +394,7 @@ async fn test_lossless_retrieval_after_multiple_compactions() {
         tau_soft: 0.2,
         tau_hard: 0.5,
         deterministic_target: 64,
+        keep_prefix_fraction: 0.35,
     });
 
     ingest(&mut engine, 1, "system", "System");
@@ -471,6 +475,7 @@ fn test_check_thresholds_below_soft() {
         tau_soft: 0.5,
         tau_hard: 0.85,
         deterministic_target: 512,
+        keep_prefix_fraction: 0.35,
     });
 
     ingest(&mut engine, 1, "system", "System");
@@ -489,6 +494,7 @@ fn test_check_thresholds_above_soft() {
         tau_soft: 0.3,
         tau_hard: 0.8,
         deterministic_target: 512,
+        keep_prefix_fraction: 0.35,
     });
 
     ingest(&mut engine, 1, "system", "System");
@@ -560,4 +566,112 @@ fn test_rebuild_from_db_nodes_preserves_summaries() {
     let expanded = engine.expand(&[1, 2]);
     assert_eq!(expanded.len(), 2);
     assert_eq!(expanded[0].1["content"], "First question");
+}
+
+// ─────────────────────────────────────────────────────────────
+// Prefix-preserving compaction: the kept verbatim head of the compacted
+// block stays byte-identical so the server-side prompt cache retains its
+// prefix, and the summary is inserted AT the cut point (not at the head).
+// ─────────────────────────────────────────────────────────────
+
+fn rendered_prefix_tokens(engine: &LcmEngine) -> (Vec<Value>, usize) {
+    let mut rendered = Vec::new();
+    let mut tokens = 0usize;
+    for entry in engine.active_entries() {
+        let message = entry.message().clone();
+        tokens += TokenBudget::estimate_message_tokens(&message);
+        rendered.push(message);
+    }
+    (rendered, tokens)
+}
+
+fn longest_common_prefix_len(a: &[Value], b: &[Value]) -> usize {
+    a.iter()
+        .zip(b.iter())
+        .take_while(|(x, y)| x == y)
+        .count()
+}
+
+#[tokio::test]
+async fn test_compaction_keeps_verbatim_prefix_head() {
+    let mut engine = LcmEngine::new(LcmConfig {
+        tau_soft: 0.3,
+        tau_hard: 0.6,
+        deterministic_target: 64,
+        keep_prefix_fraction: 0.35,
+    });
+
+    ingest(&mut engine, 1, "system", "System");
+    for i in 0..16 {
+        ingest(&mut engine, 2 + 2 * i, "user", &user_turn(i));
+        ingest(&mut engine, 3 + 2 * i, "assistant", &assistant_turn(i));
+    }
+
+    let (before, _before_tokens) = rendered_prefix_tokens(&engine);
+    let before_tokens = TokenBudget::estimate_tokens(&before);
+
+    let budget = TokenBudget::new(4096, 2048);
+    let compactor = ContextCompactor::new(
+        Arc::new(MockSummarizer) as Arc<dyn LLMProvider>,
+        "mock".to_string(),
+        4096,
+    );
+
+    let result = engine
+        .compact(
+            Some(&compactor),
+            &budget,
+            100,
+            CompactionFailureMode::Deterministic,
+        )
+        .await;
+    let summary_turn = result.expect("compaction should run on this fixture");
+    let summary_source_ids = match &summary_turn {
+        Turn::Summary { source_ids, .. } => source_ids.clone(),
+        _ => panic!("Expected Summary"),
+    };
+
+    let (after, _after_tokens) = rendered_prefix_tokens(&engine);
+
+    // 1. The summary must NOT sit at the head of history: the kept verbatim
+    //    head precedes it and is byte-identical to the original.
+    let common = longest_common_prefix_len(&before, &after);
+    assert!(
+        common >= 3,
+        "expected a multi-message verbatim prefix, common={common}"
+    );
+    assert!(
+        !after[common..].iter().any(|m| m == &before[common]),
+        "divergence expected at the cut point"
+    );
+
+    // 2. The divergence point is the summary message (summary at the cut,
+    //    not at the head of history).
+    let cut_message = &after[common];
+    let cut_is_summary = cut_message.get("_lcm_summary").is_some();
+    assert!(
+        cut_is_summary,
+        "expected the summary at the cut point, got {cut_message}"
+    );
+
+    // 3. The summarized span's sources exclude the kept head: source ids of
+    //    the summary must all be strictly greater than the last kept db id.
+    let kept_db_ids: Vec<usize> = before[..common]
+        .iter()
+        .filter_map(|m| m.get("_db_id").and_then(Value::as_u64))
+        .map(|v| v as usize)
+        .collect();
+    if let Some(&last_kept) = kept_db_ids.last() {
+        assert!(
+            summary_source_ids.iter().all(|id| *id > last_kept),
+            "summary must cover only the summarized tail, sources={summary_source_ids:?} last_kept={last_kept}"
+        );
+    }
+
+    // 4. Context actually shrank.
+    let after_tokens = TokenBudget::estimate_tokens(&after);
+    assert!(
+        after_tokens < before_tokens,
+        "compaction must shrink context: {before_tokens} -> {after_tokens}"
+    );
 }

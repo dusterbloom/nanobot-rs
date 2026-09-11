@@ -105,6 +105,7 @@ enum ProviderRequestRetryPolicy {
 
 enum ForcedToolRecoveryOutcome {
     Response(LLMResponse),
+    Step(StepResult),
     ProviderError {
         original: LLMResponse,
         error: anyhow::Error,
@@ -240,8 +241,28 @@ struct SuspendedCapacityTurn {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CapacityWaitOutcome {
     Recovered,
+    Deferred,
     Cancelled,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LiveCapacityAdmission {
+    Ready,
+    Unavailable { retry_after_ms: u64 },
+    Cancelled,
+}
+
+const FOREGROUND_CAPACITY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Absolute lower bound of the pressure-compaction trigger. The live
+/// threshold is `max(this, PRESSURE_TRIGGER_FRACTION_OF_ROOM × live prompt
+/// room)` — it moves with the envelope higgs publishes, so a downshifted
+/// wall compacts earlier without a discrete pressure vocabulary.
+const PRESSURE_COMPACTION_FLOOR_TOKENS: usize = 8_000;
+
+/// Fraction of the live prompt room at which a pressured endpoint escalates
+/// to a blocking LCM compaction (the ctx-pressure analog: conv/room ratio).
+const PRESSURE_TRIGGER_FRACTION_OF_ROOM: f64 = 0.6;
 
 pub(crate) struct AgentLoopShared {
     pub(crate) core_handle: SharedCoreHandle,
@@ -1600,6 +1621,7 @@ mod lcm_checkpoint_tests {
             tau_soft: 0.05,
             tau_hard: 0.8,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
         for id in 1..=12 {
             let role = if id % 2 == 0 { "assistant" } else { "user" };
@@ -1928,45 +1950,89 @@ pub(crate) async fn resolve_live_capacity(
     counters: &std::sync::Arc<RuntimeCounters>,
     session_key: &str,
 ) -> TokenBudget {
+    refresh_live_capacity(capacity, provider, model, configured, counters, session_key)
+        .await
+        .0
+}
+
+async fn refresh_live_capacity(
+    capacity: &std::sync::Arc<crate::agent::capacity::CapacityRuntime>,
+    provider: &dyn crate::providers::base::LLMProvider,
+    model: &str,
+    configured: &TokenBudget,
+    counters: &std::sync::Arc<RuntimeCounters>,
+    session_key: &str,
+) -> (TokenBudget, LiveCapacityAdmission) {
     if !provider.supports_higgs_session_cache() {
-        // Cloud provider (or higgs backend off): any installed snapshot is
+        // Cloud provider (or Higgs backend off): any installed snapshot is
         // stale. Invalidate is a no-op when nothing was installed.
         capacity.invalidate();
-        return TokenBudget::new(configured.max_context(), configured.response_reserve());
+        return (
+            TokenBudget::new(configured.max_context(), configured.response_reserve()),
+            LiveCapacityAdmission::Ready,
+        );
     }
     let Some(endpoint) = provider.get_api_base() else {
-        return TokenBudget::new(configured.max_context(), configured.response_reserve());
+        return (
+            TokenBudget::new(configured.max_context(), configured.response_reserve()),
+            LiveCapacityAdmission::Ready,
+        );
     };
     let endpoint = endpoint.to_owned();
-    {
-        // One fetch per resolve; the loop resolves once per turn, so tool
-        // continuations within the turn reuse the installed snapshot while
-        // the next turn still observes a server reboot.
-        match provider.fetch_higgs_capacity(model).await {
-            Ok(Some(fetch)) => {
-                let _ = install_higgs_capacity_fetch(
-                    capacity,
-                    fetch,
-                    &endpoint,
-                    model,
-                    counters,
-                    session_key,
-                );
-            }
-            Ok(None) => {
-                capacity.invalidate();
-            }
-            Err(error) => {
-                // Fail open: keep the configured ceiling and let the typed
-                // request path (413/503) surface real rejection.
-                warn!(session = %session_key, error = %error, "higgs_capacity_fetch_failed");
+    let admission = match provider.fetch_higgs_capacity(model).await {
+        Ok(Some(fetch)) => {
+            let availability = install_higgs_capacity_fetch(
+                capacity,
+                fetch,
+                &endpoint,
+                model,
+                counters,
+                session_key,
+            );
+            match availability {
+                crate::agent::capacity::CapacityAvailability::Available => {
+                    LiveCapacityAdmission::Ready
+                }
+                crate::agent::capacity::CapacityAvailability::Unavailable => {
+                    LiveCapacityAdmission::Unavailable {
+                        retry_after_ms: 5_000,
+                    }
+                }
             }
         }
-    }
-    capacity.effective_budget(configured, 0)
+        Ok(None) => {
+            // Trait-default compatibility for providers that advertise the
+            // retained-session extension without implementing capacity.
+            capacity.invalidate();
+            LiveCapacityAdmission::Ready
+        }
+        Err(error) => {
+            let retry_after_ms = match &error {
+                crate::errors::ProviderError::HiggsCapacityUnavailable {
+                    retry_after_ms, ..
+                } => *retry_after_ms,
+                _ => 5_000,
+            };
+            warn!(session = %session_key, error = %error, "higgs_capacity_fetch_failed_closed");
+            LiveCapacityAdmission::Unavailable { retry_after_ms }
+        }
+    };
+    (capacity.effective_budget(configured, 0), admission)
 }
 
 impl AgentLoopShared {
+    fn has_authoritative_live_capacity(ctx: &TurnContext) -> bool {
+        ctx.capacity
+            .describe(&ctx.core.token_budget, 0)
+            .is_some_and(|status| {
+                matches!(
+                    status.source,
+                    crate::agent::capacity::CapacitySource::Adaptive { .. }
+                        | crate::agent::capacity::CapacitySource::Unavailable
+                )
+            })
+    }
+
     /// Ensure exactly one resume poller runs for this loop. Spawned lazily
     /// when the first turn is capacity-suspended — not at construction, so
     /// `set_idle_runtime`'s `Arc::get_mut` precondition still holds.
@@ -2147,11 +2213,10 @@ impl AgentLoopShared {
         model = %ctx.core.model,
         streaming = ctx.streaming,
     ))]
-    /// Resolve `ctx.effective_budget` against the live Higgs snapshot
-    /// (Task 3). The immutable `SwappableCore.token_budget` is never mutated:
-    /// the effective budget is derived per turn and may shrink per
-    /// boot/generation without a config rewrite or core rebuild.
-    async fn resolve_effective_budget(&self, ctx: &mut TurnContext) {
+    /// Refresh the authoritative Higgs snapshot immediately before admission.
+    /// The immutable configured budget is only a ceiling; a typed 413 retry
+    /// may narrow the turn further and must never be widened by a later GET.
+    async fn refresh_capacity_admission(&self, ctx: &mut TurnContext) -> LiveCapacityAdmission {
         let resolved = tokio::select! {
             biased;
             () = async {
@@ -2160,28 +2225,34 @@ impl AgentLoopShared {
                 } else {
                     std::future::pending::<()>().await;
                 }
-            } => None,
-            budget = resolve_live_capacity(
+            } => return LiveCapacityAdmission::Cancelled,
+            resolution = refresh_live_capacity(
                 &ctx.capacity,
                 ctx.core.provider.as_ref(),
                 &ctx.core.model,
                 &ctx.core.token_budget,
                 &ctx.counters,
                 &ctx.session_key,
-            ) => Some(budget),
+            ) => resolution,
         };
-        if let Some(budget) = resolved {
-            ctx.effective_budget = budget;
+        let (mut budget, admission) = resolved;
+        if matches!(
+            ctx.capacity_recovery,
+            TurnCapacityRecovery::RetryIssued { .. }
+        ) {
+            let total = budget.max_context().min(ctx.effective_budget.max_context());
+            let prompt = budget
+                .available_budget(0)
+                .min(ctx.effective_budget.available_budget(0))
+                .min(total);
+            budget = TokenBudget::new(total, total.saturating_sub(prompt));
         }
+        ctx.effective_budget = budget;
+        admission
     }
 
     async fn run_agent_loop(&self, ctx: &mut TurnContext, capacity_retry_mode: CapacityRetryMode) {
         ctx.turn_outcome = TurnOutcome::LimitExhausted;
-        // Live Higgs capacity resolves before the first budget consumer of
-        // the turn (prepare/pre-call/compaction all read
-        // `ctx.effective_budget`). Cloud providers keep the configured
-        // ceiling; an unchanged endpoint+model tuple never refetches.
-        self.resolve_effective_budget(ctx).await;
         // Auto-decompose: detect numbered steps in user message and build a plan.
         // This helps small models that can't call the plan tool themselves.
         if ctx.core.reasoning_config.enabled && ctx.core.reasoning_config.auto_decompose {
@@ -2481,6 +2552,15 @@ impl AgentLoopShared {
                             .await
                         {
                             CapacityWaitOutcome::Recovered => continue,
+                            CapacityWaitOutcome::Deferred => {
+                                // The pending row is already durable. Return
+                                // the foreground after a bounded wait; the
+                                // one process-wide poller resumes this exact
+                                // turn when Higgs advertises capacity again.
+                                ctx.turn_outcome = outcome;
+                                ctx.final_content = content;
+                                break;
+                            }
                             CapacityWaitOutcome::Cancelled => {
                                 ctx.turn_outcome = TurnOutcome::Cancelled;
                                 ctx.final_content.clear();
@@ -2548,6 +2628,18 @@ impl AgentLoopShared {
                     IterationOutcome::Complete { content, outcome } => {
                         ctx.final_content = content;
                         ctx.turn_outcome = outcome;
+                        if outcome == TurnOutcome::CapacityUnavailable {
+                            let hint = ctx.flow.capacity_retry_after_ms.take();
+                            let suspended = self
+                                .suspend_capacity_turn(ctx, hint, capacity_retry_count)
+                                .await;
+                            ctx.flow.pending_capacity_id = suspended.id;
+                            if suspended.id.is_none() {
+                                ctx.turn_outcome = TurnOutcome::Error;
+                                ctx.final_content = "[Session Error] Capacity retry could not be saved durably, so this turn was not queued for automatic resume."
+                                    .to_owned();
+                            }
+                        }
                     }
                     IterationOutcome::Error(error) => {
                         ctx.final_content = error;
@@ -3014,6 +3106,7 @@ impl AgentLoopShared {
         retry_count: &mut u32,
     ) -> CapacityWaitOutcome {
         Self::emit_capacity_status(ctx, CapacityAction::Wait);
+        let foreground_deadline = tokio::time::Instant::now() + FOREGROUND_CAPACITY_WAIT;
         loop {
             let wait_ms = suspended
                 .next_retry_at
@@ -3027,6 +3120,9 @@ impl AgentLoopShared {
                         std::future::pending::<()>().await;
                     }
                 } => return CapacityWaitOutcome::Cancelled,
+                () = tokio::time::sleep_until(foreground_deadline) => {
+                    return CapacityWaitOutcome::Deferred;
+                }
                 () = tokio::time::sleep(std::time::Duration::from_millis(wait_ms)) => {}
             }
 
@@ -3039,6 +3135,9 @@ impl AgentLoopShared {
                         std::future::pending::<()>().await;
                     }
                 } => return CapacityWaitOutcome::Cancelled,
+                () = tokio::time::sleep_until(foreground_deadline) => {
+                    return CapacityWaitOutcome::Deferred;
+                }
                 fetched = ctx.core.provider.fetch_higgs_capacity(&ctx.core.model) => fetched,
             };
             let available = match fetched {
@@ -3234,7 +3333,19 @@ impl AgentLoopShared {
         // Re-render so the retry request is protocol-correct, and refresh
         // the effective budget from the live endpoint before the re-entry.
         ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
-        self.resolve_effective_budget(ctx).await;
+        match self.refresh_capacity_admission(ctx).await {
+            LiveCapacityAdmission::Ready => {}
+            LiveCapacityAdmission::Unavailable { retry_after_ms } => {
+                ctx.flow.capacity_retry_after_ms = Some(retry_after_ms);
+                ctx.capacity_recovery = TurnCapacityRecovery::Terminal {
+                    generation: generation.saturating_add(1),
+                };
+                return CapacityExceededRecovery::TurnPending;
+            }
+            LiveCapacityAdmission::Cancelled => {
+                return CapacityExceededRecovery::TurnPending;
+            }
+        }
         // A 413 can describe a tighter request-specific window than discovery
         // (e.g. retained growth). Refresh may shrink it further, never widen it.
         let total = ctx.effective_budget.max_context().min(safe_total_tokens);
@@ -3303,6 +3414,47 @@ impl AgentLoopShared {
         true
     }
 
+    async fn unavailable_capacity_step(
+        &self,
+        ctx: &mut TurnContext,
+        tool_def_tokens: usize,
+        retry_after_ms: u64,
+    ) -> StepResult {
+        ctx.flow.capacity_retry_after_ms = Some(retry_after_ms.max(1));
+        self.manage_compaction(ctx, tool_def_tokens, CompactionFailureMode::Deterministic)
+            .await;
+        if ctx.is_cancelled() {
+            return StepResult::Done(IterationOutcome::Complete {
+                content: String::new(),
+                outcome: TurnOutcome::Cancelled,
+            });
+        }
+        StepResult::Done(IterationOutcome::Complete {
+            content: "[Capacity Unavailable] The local model is out of capacity. Your message is saved and will resume automatically once capacity recovers.".to_owned(),
+            outcome: TurnOutcome::CapacityUnavailable,
+        })
+    }
+
+    async fn fresh_capacity_gate(
+        &self,
+        ctx: &mut TurnContext,
+        tool_def_tokens: usize,
+    ) -> Option<StepResult> {
+        match self.refresh_capacity_admission(ctx).await {
+            LiveCapacityAdmission::Ready => None,
+            LiveCapacityAdmission::Unavailable { retry_after_ms } => Some(
+                self.unavailable_capacity_step(ctx, tool_def_tokens, retry_after_ms)
+                    .await,
+            ),
+            LiveCapacityAdmission::Cancelled => {
+                Some(StepResult::Done(IterationOutcome::Complete {
+                    content: String::new(),
+                    outcome: TurnOutcome::Cancelled,
+                }))
+            }
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Step 2: PreCall — build tool defs, trim, compaction, repair, preflight
     // -----------------------------------------------------------------------
@@ -3343,8 +3495,14 @@ impl AgentLoopShared {
         // reports capacity pressure while the exact history remains retryable.
         let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
 
-        // Account for compaction pressure; soft work is only requested here.
-        self.manage_compaction(ctx, tool_def_tokens).await;
+        // One live gate owns every local request. Refresh before compaction so
+        // both the summarizer and foreground request use the same current
+        // envelope. When Higgs is unavailable, compaction must stay local.
+        if let Some(step) = self.fresh_capacity_gate(ctx, tool_def_tokens).await {
+            return step;
+        }
+        self.manage_compaction(ctx, tool_def_tokens, CompactionFailureMode::PreserveContext)
+            .await;
         if ctx.is_cancelled() {
             return StepResult::Done(IterationOutcome::Complete {
                 content: String::new(),
@@ -3483,7 +3641,8 @@ impl AgentLoopShared {
             .saturating_sub(effective_max_tokens as usize);
         let trim_threshold = overflow_trim_threshold(prompt_cap);
         let gate_tool_def_tokens = TokenBudget::estimate_tool_def_tokens(&tool_defs);
-        let estimated = TokenBudget::estimate_tokens(&ctx.rendered_messages) + gate_tool_def_tokens;
+        let mut estimated =
+            TokenBudget::estimate_tokens(&ctx.rendered_messages) + gate_tool_def_tokens;
         if trim_threshold > 0 && estimated > trim_threshold {
             warn!(
                 estimated_tokens = estimated,
@@ -3495,6 +3654,9 @@ impl AgentLoopShared {
             let installed = self.install_pending_compaction(ctx, true).await;
             if installed {
                 ctx.capacity_recovery = next_preflight_generation(ctx.capacity_recovery);
+                ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
+                estimated = TokenBudget::estimate_tokens(&ctx.rendered_messages)
+                    .saturating_add(gate_tool_def_tokens);
             }
             // Immutable-prefix check: system + tool definitions alone against
             // the exact prompt cap.
@@ -3518,6 +3680,18 @@ impl AgentLoopShared {
                 ctx.capacity_recovery = TurnCapacityRecovery::Terminal { generation: 1 };
                 return StepResult::Done(IterationOutcome::Complete {
                     content: "[Capacity Unavailable] The system prompt and tool                               definitions alone exceed the live capacity window.                               Reduce the tool surface or reconnect capacity."
+                        .to_owned(),
+                    outcome: TurnOutcome::CapacityUnavailable,
+                });
+            }
+            if Self::has_authoritative_live_capacity(ctx) && estimated > prompt_cap {
+                warn!(
+                    estimated_tokens = estimated,
+                    prompt_cap, "capacity_preflight_prompt_does_not_fit"
+                );
+                ctx.capacity_recovery = TurnCapacityRecovery::Terminal { generation: 1 };
+                return StepResult::Done(IterationOutcome::Complete {
+                    content: "[Capacity Unavailable] The live prompt does not fit the current local capacity window. Your message is saved and will resume automatically once capacity recovers."
                         .to_owned(),
                     outcome: TurnOutcome::CapacityUnavailable,
                 });
@@ -3917,7 +4091,12 @@ impl AgentLoopShared {
     }
 
     /// Apply hard pressure now or record soft pressure for post-loop execution.
-    async fn manage_compaction(&self, ctx: &mut TurnContext, tool_def_tokens: usize) {
+    async fn manage_compaction(
+        &self,
+        ctx: &mut TurnContext,
+        tool_def_tokens: usize,
+        admission_mode: CompactionFailureMode,
+    ) {
         let Some(admission) = ctx.compaction.admit().await else {
             return;
         };
@@ -3987,6 +4166,34 @@ impl AgentLoopShared {
                 )
             };
 
+            // Pressure-triggered compaction: memory pressure is answered by
+            // shrinking the context (the thing that actually relieves KV
+            // memory), never by stopping. The trigger is CONTINUOUS in the
+            // live wall higgs publishes: under pressure the conversation must
+            // stay under a fraction of the live prompt room — which itself
+            // downshifts under pressure — bounded below by the absolute
+            // worth-compacting floor. No discrete pressure vocabulary.
+            let live_pressure = ctx
+                .capacity
+                .describe(&ctx.core.token_budget, 0)
+                .and_then(|status| status.pressure);
+            let pressured = live_pressure
+                .is_some_and(|pressure| pressure != crate::agent::capacity::CapacityPressure::Normal);
+            let pressure_threshold = ((available as f64 * PRESSURE_TRIGGER_FRACTION_OF_ROOM)
+                as usize)
+                .max(PRESSURE_COMPACTION_FLOOR_TOKENS);
+            if pressured && conv_tokens > pressure_threshold {
+                action = crate::agent::lcm::CompactionAction::Blocking;
+                info!(
+                    conv_tokens,
+                    available,
+                    pressure_threshold,
+                    ratio = conv_tokens as f64 / available.max(1) as f64,
+                    ?live_pressure,
+                    "lcm: live-wall pressure compaction triggered"
+                );
+            }
+
             let mut raw_hard = conversation_token_count(&ctx.messages) > hard_limit;
             // The hard message/turn window binding at the next reload is the
             // same emergency as the token hard limit: whole turns would be
@@ -4029,10 +4236,11 @@ impl AgentLoopShared {
                     ctx.effective_budget.max_context(),
                     ctx.effective_budget.response_reserve(),
                 );
-                let failure_mode = if matches!(
-                    ctx.capacity_recovery,
-                    TurnCapacityRecovery::RetryIssued { .. }
-                ) {
+                let failure_mode = if admission_mode == CompactionFailureMode::Deterministic
+                    || matches!(
+                        ctx.capacity_recovery,
+                        TurnCapacityRecovery::RetryIssued { .. }
+                    ) {
                     CompactionFailureMode::Deterministic
                 } else {
                     CompactionFailureMode::PreserveContext
@@ -4425,27 +4633,31 @@ impl AgentLoopShared {
         ctx: &mut TurnContext,
         tool_defs_opt: Option<&[Value]>,
         max_tokens: u32,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<StepResult>> {
         if !ctx.core.provider.supports_higgs_session_cache()
             || !matches!(
                 ctx.higgs_session_route,
                 HiggsSessionRoute::ActiveCompacted { .. }
             )
         {
-            return Ok(());
+            return Ok(None);
         }
         let Some(plan) = ctx
             .staged_auto_expansion
             .as_ref()
             .and_then(AppliedAutoExpansion::retained_plan)
         else {
-            return Ok(());
+            return Ok(None);
         };
+        let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
+        if let Some(step) = self.fresh_capacity_gate(ctx, tool_def_tokens).await {
+            return Ok(Some(step));
+        }
         let max_prompt_tokens = ctx
-            .core
-            .token_budget
+            .effective_budget
             .max_context()
             .saturating_sub(max_tokens as usize)
+            .min(ctx.effective_budget.available_budget(0))
             .min(u32::MAX as usize) as u32;
         let frozen_tool_hash =
             crate::agent::prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
@@ -4462,7 +4674,7 @@ impl AgentLoopShared {
                 &plan.checkpoint,
                 RetainedExpansionFailure::Unavailable,
             );
-            return Ok(());
+            return Ok(None);
         };
         let sent_drop_ids = reservation.drop_ids().to_vec();
         let mut messages = ctx
@@ -4470,6 +4682,14 @@ impl AgentLoopShared {
             .as_ref()
             .map(|staged| staged.rendered_messages.clone())
             .unwrap_or_else(|| render_via_protocol(&*ctx.protocol, &ctx.messages));
+        let prompt_estimate =
+            TokenBudget::estimate_tokens(&messages).saturating_add(tool_def_tokens);
+        if Self::has_authoritative_live_capacity(ctx)
+            && prompt_estimate > max_prompt_tokens as usize
+        {
+            drop(reservation);
+            return Ok(Some(StepResult::Done(IterationOutcome::Continue)));
+        }
         attach_higgs_session_control(&mut messages, reservation.control());
         let recorded_request = RecordedProviderRequest {
             messages: messages.clone(),
@@ -4568,7 +4788,7 @@ impl AgentLoopShared {
                 "retained_expansion_preflight_failed"
             );
             Self::discard_selected_expansion_checkpoint(ctx, &plan.checkpoint, failure);
-            return Ok(());
+            return Ok(None);
         }
         if !sent_drop_ids.is_empty() {
             ctx.counters
@@ -4594,7 +4814,7 @@ impl AgentLoopShared {
             plan.checkpoint,
             active_prompt_cache,
         );
-        Ok(())
+        Ok(None)
     }
 
     async fn step_call_terminal_no_tools(
@@ -4607,7 +4827,29 @@ impl AgentLoopShared {
             ctx.flow.provider_call_mode,
             ProviderCallMode::TerminalNoTools
         );
+        let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs);
+        if let Some(step) = self.fresh_capacity_gate(ctx, tool_def_tokens).await {
+            return match step {
+                StepResult::Done(outcome) => outcome,
+                StepResult::Next(_) => unreachable!("capacity admission never advances a phase"),
+            };
+        }
         let messages_for_llm = render_via_protocol(&*ctx.protocol, &ctx.messages);
+        let prompt_cap = ctx
+            .effective_budget
+            .max_context()
+            .saturating_sub(max_tokens as usize);
+        if Self::has_authoritative_live_capacity(ctx)
+            && (max_tokens as usize > ctx.effective_budget.response_reserve()
+                || TokenBudget::estimate_tokens(&messages_for_llm).saturating_add(tool_def_tokens)
+                    > prompt_cap)
+        {
+            return IterationOutcome::Complete {
+                content: "[Capacity Unavailable] The terminal prompt does not fit the current local capacity window. Your message is saved and will resume automatically once capacity recovers."
+                    .to_owned(),
+                outcome: TurnOutcome::CapacityUnavailable,
+            };
+        }
         let tool_defs_opt = (!tool_defs.is_empty()).then_some(tool_defs);
         let request = RecordedProviderRequest {
             messages: messages_for_llm.clone(),
@@ -4775,6 +5017,7 @@ impl AgentLoopShared {
         } else {
             Some(&tool_defs)
         };
+        let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
         let thinking_budget = {
             let stored = counters.thinking_budget.load(Ordering::Relaxed);
             // Reasoning params are user-controlled via /think — any model can receive them.
@@ -4799,12 +5042,21 @@ impl AgentLoopShared {
                 None
             }
         };
-        if let Err(error) = self
+        match self
             .prepare_retained_expansion_route(ctx, tool_defs_opt, max_tokens)
             .await
         {
-            counters.mark_inference_finished();
-            return StepResult::Done(IterationOutcome::Error(error.to_string()));
+            Ok(Some(step)) => return step,
+            Ok(None) => {}
+            Err(error) => {
+                counters.mark_inference_finished();
+                return StepResult::Done(IterationOutcome::Error(error.to_string()));
+            }
+        }
+        // The foreground POST gets its own fresh admission after any retained
+        // expansion preflight POST completed.
+        if let Some(step) = self.fresh_capacity_gate(ctx, tool_def_tokens).await {
+            return step;
         }
         // Expansion materialization is request-local until this call succeeds;
         // retries continue from the unchanged compacted logical conversation.
@@ -4842,10 +5094,29 @@ impl AgentLoopShared {
             &counters.prompt_head_hashes,
         );
         let prompt_msg_count = messages_for_llm.len();
-        let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
         let prompt_total_estimate =
             TokenBudget::estimate_tokens(&messages_for_llm).saturating_add(tool_def_tokens);
         ctx.flow.provider_prompt_estimate = Some(prompt_total_estimate);
+        let prompt_cap = ctx
+            .effective_budget
+            .max_context()
+            .saturating_sub(max_tokens as usize);
+        if Self::has_authoritative_live_capacity(ctx)
+            && (max_tokens as usize > ctx.effective_budget.response_reserve()
+                || prompt_total_estimate > prompt_cap)
+        {
+            // Capacity changed after pre-call planning. Re-enter PreCall so
+            // one coherent compaction path recomputes both prompt and output
+            // budgets before any provider request is persisted or sent.
+            warn!(
+                prompt_total_estimate,
+                prompt_cap,
+                max_tokens,
+                output_cap = ctx.effective_budget.response_reserve(),
+                "fresh_capacity_requires_replan"
+            );
+            return StepResult::Done(IterationOutcome::Continue);
+        }
         // Hoisted so the divergence-rotation below the block can read the
         // verdict (`PromptDelta` is Copy; the fingerprint guard is not — it
         // must be dropped before `invalidate_prompt_cache` re-locks).
@@ -5492,7 +5763,16 @@ impl AgentLoopShared {
                                 // Receiving this branch restarts the per-loop
                                 // no-progress sleep. It proves transport
                                 // liveness only: do not mark TTFT, decoding, or
-                                // artifact tool-payload progress.
+                                // artifact tool-payload progress. It DOES keep
+                                // the status-line heartbeat honest — hold the
+                                // last known phase and reset idle so a long
+                                // tool-payload generation (higgs sends SSE
+                                // comments while a `<tool_call>` block is
+                                // open) does not read as a dead stream.
+                                if let Some(activity) = backend_activity.as_ref() {
+                                    let phase = stream_progress.on_transport_progress();
+                                    activity.mark_progress(phase);
+                                }
                             }
                             Some(StreamChunk::ThinkingDelta(delta)) => {
                                 if let Some(activity) = backend_activity.as_ref() {
@@ -5748,6 +6028,7 @@ impl AgentLoopShared {
             .await;
         let response = match recovery {
             ForcedToolRecoveryOutcome::Response(response) => response,
+            ForcedToolRecoveryOutcome::Step(step) => return step,
             ForcedToolRecoveryOutcome::PersistenceError(error) => {
                 if ctx.flow.content_was_streamed {
                     send_retract_reply_marker(&ctx.text_delta_tx);
@@ -5883,6 +6164,23 @@ impl AgentLoopShared {
             context_reset = reset_tools.is_some(),
             "forced_tool_recovery: botched tool intent — re-issuing with tool_choice=required"
         );
+        let recovery_tool_tokens =
+            TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
+        if let Some(step) = self.fresh_capacity_gate(ctx, recovery_tool_tokens).await {
+            return ForcedToolRecoveryOutcome::Step(step);
+        }
+        let prompt_estimate =
+            TokenBudget::estimate_tokens(messages_for_llm).saturating_add(recovery_tool_tokens);
+        let prompt_cap = ctx
+            .effective_budget
+            .max_context()
+            .saturating_sub(max_tokens as usize);
+        if Self::has_authoritative_live_capacity(ctx)
+            && (max_tokens as usize > ctx.effective_budget.response_reserve()
+                || prompt_estimate > prompt_cap)
+        {
+            return ForcedToolRecoveryOutcome::Step(StepResult::Done(IterationOutcome::Continue));
+        }
         let request = RecordedProviderRequest {
             messages: messages_for_llm.to_vec(),
             tools: tool_defs_opt.map(<[Value]>::to_vec),
@@ -6004,7 +6302,7 @@ impl AgentLoopShared {
         delegation_enabled = ctx.core.tool_delegation_config.enabled,
         n_tool_calls = response.tool_calls.len(),
     ))]
-    async fn step_execute_tools(
+    pub(super) async fn step_execute_tools(
         &self,
         ctx: &mut TurnContext,
         response: LLMResponse,
@@ -6068,6 +6366,7 @@ impl AgentLoopShared {
         // one transaction before any decision event or allowed side effect.
         crate::agent::tool_engine::append_tool_call_carrier(ctx, &carrier_calls, &response);
         let return_after_router_rejections = routed_batch.return_after_rejections;
+        let post_rejection_instruction = routed_batch.post_rejection_instruction.take();
         let mut routed_tool_calls = Vec::new();
         let mut rejected_calls: Vec<(crate::providers::base::ToolCallRequest, String, String)> =
             Vec::new();
@@ -6146,6 +6445,10 @@ impl AgentLoopShared {
                     draft, &call.id, &call.name, receipt, false,
                 )
             });
+        }
+        if let Some(instruction) = post_rejection_instruction {
+            ctx.messages
+                .push_draft(crate::agent::markers::scaffold_user(instruction));
         }
         let persistence = if rejected_calls.is_empty() {
             ctx.persist_pending_protocol_messages().await

@@ -3550,6 +3550,9 @@ async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
         tau_soft: 0.05,
         tau_hard: 0.10,
         deterministic_target: 64,
+        // Lossless-handoff coverage test: exempt from prefix-preserving cuts
+        // (the kept head would remove the oldest marker from the summarizer wire).
+        keep_prefix_fraction: 0.0,
         ..Default::default()
     };
     let (agent_loop, _workspace) = build_local_inline_harness_with_memory_and_reflection(
@@ -3690,6 +3693,9 @@ async fn soft_lcm_uses_main_provider_and_preserves_foreground_context() {
         // effective budget cannot turn the soft case into hard pressure.
         tau_hard: 10.0,
         deterministic_target: 64,
+        // Lossless-handoff coverage test: exempt from prefix-preserving cuts
+        // (the kept head would remove the oldest marker from the summarizer wire).
+        keep_prefix_fraction: 0.0,
         ..Default::default()
     };
 
@@ -4673,6 +4679,10 @@ async fn confirmed_retained_route_harness(
         tau_soft: 0.0001,
         tau_hard: 10.0,
         deterministic_target: 64,
+        // Watermark accounting in these route tests is fixture-exact;
+        // exempt from prefix-preserving cuts (kept-head entries would
+        // shift the bounded-prompt indices).
+        keep_prefix_fraction: 0.0,
         ..Default::default()
     };
     let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
@@ -4748,6 +4758,10 @@ async fn retained_expansion_preflight_persists_old_route_through_tools_then_dele
         tau_soft: 0.0001,
         tau_hard: 10.0,
         deterministic_target: 64,
+        // Watermark accounting in these route tests is fixture-exact;
+        // exempt from prefix-preserving cuts (kept-head entries would
+        // shift the bounded-prompt indices).
+        keep_prefix_fraction: 0.0,
         ..Default::default()
     };
     let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
@@ -4905,6 +4919,9 @@ async fn retained_preflight_failures_fall_back_without_rotating_active_session()
             tau_soft: 0.0001,
             tau_hard: 10.0,
             deterministic_target: 64,
+        // Lossless-handoff coverage test: exempt from prefix-preserving cuts
+        // (the kept head would remove the oldest marker from the summarizer wire).
+        keep_prefix_fraction: 0.0,
             ..Default::default()
         };
         let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
@@ -5867,6 +5884,7 @@ async fn cancelled_before_engine_lock_keeps_soft_compaction_retryable() {
         tau_soft: 0.01,
         tau_hard: 10.0,
         deterministic_target: 64,
+        keep_prefix_fraction: 0.35,
     });
     engine.ingest(message);
     assert_eq!(
@@ -8255,6 +8273,52 @@ async fn test_wire_prefix_stable_across_turn_after_side_effect_boundary_nudge() 
 /// until the tool-loop circuit breaker forces a text response. The NEXT turn's
 /// reloaded wire must still be a byte-suffix extension of the previous turn's
 /// last wire (no mid-history shrink, no `prompt_prefix_diverged`).
+#[tokio::test]
+async fn duplicate_recovery_is_persisted_after_carrier_and_receipt() {
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-qwen-test",
+        vec![WireRecordingProvider::text_response("unused")],
+    ));
+    let (agent_loop, workspace) = build_local_inline_harness(provider as Arc<dyn LLMProvider>);
+    let msg = InboundMessage::new("test", "user", "offline", "inspect tools");
+    let mut ctx = agent_loop
+        .shared
+        .prepare_context(&msg, None, None, None, None)
+        .await;
+    let arguments = std::collections::HashMap::new();
+    ctx.flow.tool_guard = crate::agent::tool_guard::ToolGuard::new(1);
+    assert!(ctx.flow.tool_guard.allow("get_tools", &arguments).is_ok());
+    ctx.flow.consecutive_all_blocked = 1;
+    let before = ctx.messages.len();
+
+    let response = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![crate::providers::base::ToolCallRequest {
+            id: "tc_blocked_recovery".to_string(),
+            name: "get_tools".to_string(),
+            arguments,
+        }],
+        finish_reason: FinishReason::ToolCalls,
+        usage: std::collections::HashMap::new(),
+    };
+    let _ = agent_loop
+        .shared
+        .step_execute_tools(&mut ctx, response, ToolRouting::AlreadyRouted)
+        .await;
+
+    let appended = &ctx.messages[before..];
+    assert_eq!(appended.len(), 3, "carrier, receipt, recovery instruction");
+    assert_eq!(appended[0]["role"], "assistant");
+    assert_eq!(appended[1]["role"], "tool");
+    assert_eq!(appended[1]["tool_call_id"], "tc_blocked_recovery");
+    assert_eq!(appended[2]["role"], "user");
+    assert!(appended[2]["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("Write your final answer now")));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
 #[tokio::test]
 async fn test_wire_prefix_stable_after_duplicate_exec_circuit_breaker() {
     let exec_call = |id: usize| {
@@ -13963,6 +14027,7 @@ mod capacity_preflight {
             tau_soft: 0.3,
             tau_hard: 10.0,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
         for id in 0..messages {
             let _ = engine.ingest(json!({
@@ -13999,7 +14064,7 @@ mod capacity_preflight {
                 Some(&compactor),
                 &TokenBudget::new(4_096, 512),
                 0,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await;
 
@@ -14056,7 +14121,7 @@ mod capacity_preflight {
                 Some(&compactor),
                 &TokenBudget::new(8_192, 512),
                 0,
-                CompactionFailureMode::Deterministic,
+                CompactionFailureMode::PreserveContext,
             )
             .await;
         drop(mutation);
@@ -14187,6 +14252,186 @@ mod capacity_preflight {
             "expected capacity-unavailable reply, got: {body}"
         );
     }
+
+    struct ShrinkingCapacityProvider {
+        requests: AtomicU64,
+        fetches: AtomicU64,
+        unavailable_after_fetch: u64,
+    }
+
+    impl ShrinkingCapacityProvider {
+        fn profile(available: bool) -> crate::agent::capacity::HiggsCapacityFetch {
+            crate::agent::capacity::HiggsCapacityFetch::Profile(
+                serde_json::from_value(json!({
+                    "schemaVersion": 1,
+                    "model": "local-qwen-test",
+                    "modelFingerprint": "fresh-capacity-gate-test",
+                    "bootId": "fresh-capacity-gate-boot",
+                    "generation": if available { 1 } else { 2 },
+                    "availability": if available { "available" } else { "unavailable" },
+                    "pressure": if available { "normal" } else { "critical" },
+                    "safeTotalTokens": if available { 4096 } else { 0 },
+                    "recommendedOutputTokens": if available { 512 } else { 0 },
+                    "maxPromptTokens": if available { 3584 } else { 0 },
+                    "retainedSessionTokens": 0,
+                    "retainedBytes": 0,
+                    "prefixCacheBytes": 0,
+                    "basis": "conservative"
+                }))
+                .expect("valid capacity profile"),
+            )
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for ShrinkingCapacityProvider {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            let request = self.requests.fetch_add(1, Ordering::SeqCst);
+            if request == 0 {
+                return Ok(crate::providers::base::LLMResponse {
+                    content: Some(String::new()),
+                    tool_calls: vec![crate::providers::base::ToolCallRequest {
+                        id: "capacity-tool-round".to_string(),
+                        name: "get_tools".to_string(),
+                        arguments: std::collections::HashMap::new(),
+                    }],
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: std::collections::HashMap::new(),
+                });
+            }
+            Ok(crate::providers::base::LLMResponse {
+                content: Some("request should have been gated".to_string()),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn fetch_higgs_capacity<'a>(
+            &'a self,
+            _model: &'a str,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Option<crate::agent::capacity::HiggsCapacityFetch>,
+                            crate::errors::ProviderError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let fetch = self.fetches.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(Self::profile(fetch < self.unavailable_after_fetch)))
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "local-qwen-test"
+        }
+
+        fn get_api_base(&self) -> Option<&str> {
+            Some("http://127.0.0.1:9000")
+        }
+
+        fn supports_higgs_session_cache(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_initial_capacity_sends_zero_model_requests() {
+        let provider = Arc::new(ShrinkingCapacityProvider {
+            requests: AtomicU64::new(0),
+            fetches: AtomicU64::new(0),
+            unavailable_after_fetch: 0,
+        });
+        let (agent_loop, workspace) =
+            build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+
+        let reply = agent_loop
+            .process_direct(
+                "hello",
+                "fresh-capacity-zero",
+                "test",
+                "fresh-capacity-zero",
+            )
+            .await;
+
+        assert!(reply.contains("[Capacity Unavailable]"), "{reply}");
+        assert_eq!(provider.requests.load(Ordering::SeqCst), 0);
+        let core = agent_loop.shared.core_handle.swappable();
+        let session = core
+            .sessions
+            .get_latest_session("fresh-capacity-zero")
+            .await
+            .expect("session");
+        let events = core
+            .sessions
+            .load_session_events(&session.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.payload.kind() == "model_request")
+                .count(),
+            0,
+            "a capacity-rejected preflight is not a model request"
+        );
+        let pending = core
+            .sessions
+            .due_pending_capacity_turns(4_102_444_800_000)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "unposted work must remain durable");
+        assert_eq!(pending[0].content, "hello");
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    #[tokio::test]
+    async fn capacity_shrink_between_tool_rounds_blocks_the_continuation_post() {
+        let provider = Arc::new(ShrinkingCapacityProvider {
+            requests: AtomicU64::new(0),
+            fetches: AtomicU64::new(0),
+            unavailable_after_fetch: 2,
+        });
+        let (agent_loop, workspace) =
+            build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+
+        let reply = agent_loop
+            .process_direct(
+                "inspect the tools then answer",
+                "fresh-capacity-tool-round",
+                "test",
+                "fresh-capacity-tool-round",
+            )
+            .await;
+
+        assert!(reply.contains("[Capacity Unavailable]"), "{reply}");
+        assert_eq!(
+            provider.requests.load(Ordering::SeqCst),
+            1,
+            "the continuation must not POST after the live envelope collapses"
+        );
+        assert!(
+            provider.fetches.load(Ordering::SeqCst) >= 3,
+            "capacity must be refreshed around each admitted POST"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -14203,6 +14448,9 @@ mod capacity_exceeded {
         compaction_requests_after_rejection: AtomicU64,
         capacity_rejected: std::sync::atomic::AtomicBool,
         typed_failures: u32,
+        capacity_pressure: &'static str,
+        boot_id: &'static str,
+        safe_total_tokens: u64,
         prompt_limits: std::sync::Mutex<Vec<u64>>,
         output_limits: std::sync::Mutex<Vec<u32>>,
         request_tokens: std::sync::Mutex<Vec<usize>>,
@@ -14277,8 +14525,10 @@ mod capacity_exceeded {
                 // Discovery remains broader than the typed request-specific rejection.
                 let profile = serde_json::from_value(json!({
                     "schemaVersion":1,"model":"local-model","modelFingerprint":"test-model",
-                    "bootId":"boot-mock","generation":1,"availability":"available","pressure":"normal",
-                    "safeTotalTokens":12288,"recommendedOutputTokens":512,"maxPromptTokens":11776,
+                    "bootId":self.boot_id,"generation":1,"availability":"available",
+                    "pressure":self.capacity_pressure,
+                    "safeTotalTokens":self.safe_total_tokens,"recommendedOutputTokens":512,
+                    "maxPromptTokens":self.safe_total_tokens-512,
                     "retainedSessionTokens":0,"retainedBytes":0,"prefixCacheBytes":0,"basis":"conservative"
                 })).unwrap();
                 Ok(Some(crate::agent::capacity::HiggsCapacityFetch::Profile(
@@ -14300,7 +14550,7 @@ mod capacity_exceeded {
 
     struct TurnRecord {
         provider_calls: u64,
-        compaction_calls_after_rejection: u64,
+        compaction_requests_after_rejection: u64,
         prompt_limits: Vec<u64>,
         output_limits: Vec<u32>,
         request_tokens: Vec<usize>,
@@ -14322,11 +14572,52 @@ mod capacity_exceeded {
         prompt: &str,
         history: Vec<Value>,
     ) -> TurnRecord {
+        drive_typed_turn_with_history_and_pressure(
+            typed_failures,
+            prompt,
+            history,
+            "normal",
+            "boot-mock",
+        )
+        .await
+    }
+
+    async fn drive_typed_turn_with_history_and_pressure(
+        typed_failures: u32,
+        prompt: &str,
+        history: Vec<Value>,
+        capacity_pressure: &'static str,
+        boot_id: &'static str,
+    ) -> TurnRecord {
+        drive_typed_turn_full(
+            typed_failures,
+            prompt,
+            history,
+            capacity_pressure,
+            boot_id,
+            12_288,
+            16_384,
+        )
+        .await
+    }
+
+    async fn drive_typed_turn_full(
+        typed_failures: u32,
+        prompt: &str,
+        history: Vec<Value>,
+        capacity_pressure: &'static str,
+        boot_id: &'static str,
+        safe_total_tokens: u64,
+        configured_context: usize,
+    ) -> TurnRecord {
         let provider = Arc::new(Capacity413Provider {
             requests: AtomicU64::new(0),
             compaction_requests_after_rejection: AtomicU64::new(0),
             capacity_rejected: std::sync::atomic::AtomicBool::new(false),
             typed_failures,
+            capacity_pressure,
+            boot_id,
+            safe_total_tokens,
             prompt_limits: std::sync::Mutex::new(Vec::new()),
             output_limits: std::sync::Mutex::new(Vec::new()),
             request_tokens: std::sync::Mutex::new(Vec::new()),
@@ -14340,7 +14631,7 @@ mod capacity_exceeded {
             max_continuations: 1,
             max_tokens: 512,
             temperature: 0.0,
-            max_context_tokens: 16_384,
+            max_context_tokens: configured_context,
             brave_api_key: None,
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
@@ -14437,7 +14728,7 @@ mod capacity_exceeded {
         let request_tokens = provider.request_tokens.lock().unwrap().clone();
         TurnRecord {
             provider_calls: provider.requests.load(Ordering::SeqCst),
-            compaction_calls_after_rejection: provider
+            compaction_requests_after_rejection: provider
                 .compaction_requests_after_rejection
                 .load(Ordering::SeqCst),
             prompt_limits,
@@ -14495,6 +14786,75 @@ mod capacity_exceeded {
     }
 
     #[tokio::test]
+    async fn live_pressure_compacts_large_context_before_the_first_request() {
+        // Continuous live-wall rule: under pressure the conversation must
+        // stay under max(8k floor, 0.6 x live prompt room). At this
+        // harness's 16k envelope the threshold lands ~8.7-9.8k, so a 10.5k
+        // history sits above it only when the endpoint reports pressure —
+        // with a Normal live profile no blocking compaction can run, so any
+        // pre-first-request shrink is attributable to pressure alone.
+        let mut history = Vec::new();
+        let mut turn = 0_u64;
+        while TokenBudget::estimate_tokens(&history) < 10_500 {
+            history.push(json!({
+                "role": "user",
+                "content": format!(
+                    "retained project evidence {turn}: {}",
+                    "a concrete durable fact needed after recovery ".repeat(80)
+                ),
+                "_turn": turn,
+            }));
+            history.push(json!({
+                "role": "assistant",
+                "content": format!("acknowledged retained evidence {turn}"),
+                "_turn": turn,
+            }));
+            turn += 1;
+        }
+        let raw_tokens = TokenBudget::estimate_tokens(&history);
+
+        let calm = drive_typed_turn_full(
+            0,
+            "report status",
+            history.clone(),
+            "normal",
+            "boot-calm",
+            16_384,
+            16_384,
+        )
+        .await;
+        assert_eq!(calm.request_tokens.len(), 1, "one main request");
+        assert!(
+            calm.request_tokens[0] >= raw_tokens,
+            "normal pressure must not compact before the request: {} vs {raw_tokens}",
+            calm.request_tokens[0]
+        );
+        assert_eq!(calm.outcome, "finished");
+
+        let pressured = drive_typed_turn_full(
+            0,
+            "report status",
+            history,
+            "constrained",
+            "boot-pressured",
+            16_384,
+            16_384,
+        )
+        .await;
+        assert_eq!(
+            pressured.request_tokens.len(),
+            1,
+            "still exactly one main request — pressure never blocks the turn"
+        );
+        assert!(
+            pressured.request_tokens[0] < raw_tokens - 2_000,
+            "pressure must compact the large context before the request: {} vs {raw_tokens}",
+            pressured.request_tokens[0]
+        );
+        assert_eq!(pressured.outcome, "finished");
+    }
+
+    #[tokio::test]
     async fn typed_capacity_shrink_compacts_without_another_provider_call() {
         let mut history = Vec::new();
         let mut turn = 0_u64;
@@ -14524,7 +14884,7 @@ mod capacity_exceeded {
 
         assert_eq!(record.provider_calls, 2, "one main-request retry only");
         assert_eq!(
-            record.compaction_calls_after_rejection, 0,
+            record.compaction_requests_after_rejection, 0,
             "capacity recovery must not ask the constrained provider to summarize"
         );
         assert!(
@@ -14887,6 +15247,7 @@ mod interrupted {
     #[derive(Clone, Copy)]
     enum InteractiveCapacityPlan {
         Recover,
+        StayUnavailable,
         Stall,
     }
 
@@ -14933,6 +15294,28 @@ mod interrupted {
                     "basis": "conservative"
                 }))
                 .expect("valid interactive capacity profile"),
+            )
+        }
+
+        fn unavailable_profile() -> crate::agent::capacity::HiggsCapacityFetch {
+            crate::agent::capacity::HiggsCapacityFetch::Profile(
+                serde_json::from_value(json!({
+                    "schemaVersion": 1,
+                    "model": "local-qwen-test",
+                    "modelFingerprint": "interactive-capacity-test",
+                    "bootId": "interactive-capacity-boot",
+                    "generation": 2,
+                    "availability": "unavailable",
+                    "pressure": "critical",
+                    "safeTotalTokens": 0,
+                    "recommendedOutputTokens": 0,
+                    "maxPromptTokens": 0,
+                    "retainedSessionTokens": 0,
+                    "retainedBytes": 0,
+                    "prefixCacheBytes": 0,
+                    "basis": "conservative"
+                }))
+                .expect("valid unavailable capacity profile"),
             )
         }
     }
@@ -15021,6 +15404,9 @@ mod interrupted {
                 if fetch > 0 && matches!(self.plan, InteractiveCapacityPlan::Stall) {
                     self.stalled_fetch_started.notify_waiters();
                     return std::future::pending().await;
+                }
+                if fetch >= 4 && matches!(self.plan, InteractiveCapacityPlan::StayUnavailable) {
+                    return Ok(Some(Self::unavailable_profile()));
                 }
                 Ok(Some(Self::available_profile()))
             })
@@ -15195,6 +15581,51 @@ mod interrupted {
             capacity_actions.contains(&crate::turn_stream::CapacityAction::Recovery),
             "interactive surface must show capacity recovery status: {capacity_actions:?}"
         );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[tokio::test]
+    async fn interactive_capacity_wait_defers_durably_after_ten_seconds() {
+        let provider = Arc::new(InteractiveCapacityProvider::new(
+            InteractiveCapacityPlan::StayUnavailable,
+        ));
+        let (agent_loop, workspace) =
+            build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+        provider.set_side_effect_working_dir(&workspace);
+        let session_key = format!("interactive-capacity-defer-{}", uuid::Uuid::new_v4());
+        let (delta_tx, _delta_rx) = tokio::sync::mpsc::unbounded_channel();
+        let started = std::time::Instant::now();
+        let handle = agent_loop.spawn_direct_streaming(
+            "append exactly once, then finish".to_string(),
+            session_key.clone(),
+            "test".to_string(),
+            "interactive-capacity-defer".to_string(),
+            None,
+            delta_tx,
+            None,
+            None,
+            None,
+        );
+        let response = tokio::time::timeout(std::time::Duration::from_secs(12), handle)
+            .await
+            .expect("foreground capacity wait is bounded")
+            .expect("interactive task should join");
+
+        assert!(response.contains("[Capacity Unavailable]"), "{response}");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(9_500),
+            "foreground should allow the advertised recovery window"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        let core = agent_loop.shared.core_handle.swappable();
+        let pending = core
+            .sessions
+            .due_pending_capacity_turns(4_102_444_800_000)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "deferred work remains durably pending");
+        assert_eq!(pending[0].content, "append exactly once, then finish");
 
         let _ = std::fs::remove_dir_all(&workspace);
     }

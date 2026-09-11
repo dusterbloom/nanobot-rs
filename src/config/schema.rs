@@ -2139,6 +2139,10 @@ fn default_lcm_deterministic_target() -> usize {
     512
 }
 
+fn default_lcm_keep_prefix_fraction() -> f64 {
+    0.35
+}
+
 /// Configuration for Lossless Context Management.
 ///
 /// LCM replaces destructive compaction with a dual-state memory:
@@ -2159,6 +2163,11 @@ pub struct LcmSchemaConfig {
     /// Target tokens for Level 3 deterministic truncation (default: 512).
     #[serde(default = "default_lcm_deterministic_target")]
     pub deterministic_target: usize,
+    /// Fraction of the oldest compactable block kept verbatim at the head of
+    /// history so the server-side prompt cache retains its prefix across
+    /// compactions (summary inserted at the cut point). Default: 0.35.
+    #[serde(default = "default_lcm_keep_prefix_fraction")]
+    pub keep_prefix_fraction: f64,
 }
 
 impl Default for LcmSchemaConfig {
@@ -2167,6 +2176,7 @@ impl Default for LcmSchemaConfig {
             tau_soft: default_lcm_tau_soft(),
             tau_hard: default_lcm_tau_hard(),
             deterministic_target: default_lcm_deterministic_target(),
+            keep_prefix_fraction: default_lcm_keep_prefix_fraction(),
         }
     }
 }

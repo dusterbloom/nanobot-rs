@@ -478,6 +478,12 @@ pub struct LcmConfig {
     pub tau_hard: f64,
     /// Maximum target for the bounded deterministic recovery index.
     pub deterministic_target: usize,
+    /// Fraction of the oldest compactable block kept verbatim at the head of
+    /// history, with the summary inserted at the cut point. The server-side
+    /// prompt cache then retains the longest common prefix and the next
+    /// request only re-prefills from the cut instead of the whole rewritten
+    /// context. 0.0 restores head-rewriting compaction. Default: 0.35.
+    pub keep_prefix_fraction: f64,
 }
 
 impl Default for LcmConfig {
@@ -486,6 +492,7 @@ impl Default for LcmConfig {
             tau_soft: 0.5,
             tau_hard: 0.85,
             deterministic_target: 512,
+            keep_prefix_fraction: 0.35,
         }
     }
 }
@@ -496,6 +503,7 @@ impl From<&LcmSchemaConfig> for LcmConfig {
             tau_soft: schema.tau_soft,
             tau_hard: schema.tau_hard,
             deterministic_target: schema.deterministic_target,
+            keep_prefix_fraction: schema.keep_prefix_fraction,
         }
     }
 }
@@ -568,6 +576,14 @@ pub struct LcmEngine {
     /// `set_current_turn`. Stamped onto every freshly-created summary node
     /// so `auto_expand` can apply `FRESH_SUMMARY_COOLDOWN_TURNS`.
     current_turn: u64,
+    /// Entries at the head of `active` pinned verbatim by the first
+    /// prefix-preserving cut. Compaction spans never start before this, so
+    /// the wire prefix stays byte-identical across all later compactions and
+    /// merges happen only in the unpinned tail. Derived on rebuild.
+    pinned_prefix_entries: usize,
+    /// Cut position computed during an in-flight compaction, committed to
+    /// `pinned_prefix_entries` only when that compaction succeeds.
+    pending_pinned_prefix: Option<usize>,
 }
 
 /// Mutable LCM state that must advance only after its SQLite checkpoint does.
@@ -587,6 +603,8 @@ impl LcmEngine {
             async_compaction_pending: false,
             auto_expanded: std::collections::HashSet::new(),
             current_turn: 0,
+            pinned_prefix_entries: 0,
+            pending_pinned_prefix: None,
         }
     }
 
@@ -783,16 +801,29 @@ impl LcmEngine {
             protect_tokens_for_budget(available).min(self.conversation_tokens().max(1) / 2);
         let selection = self.block_selection(available);
 
-        // Find the oldest contiguous block of raw messages to compact.
+        // Find the oldest contiguous block of raw messages to compact. The
+        // pinned head is exempt: keeping it byte-identical is what lets the
+        // server-side prompt cache retain the prefix across compactions.
         let (mut block_start, mut block_end) =
             match self.find_oldest_raw_block_impl(protect_tokens, selection) {
-                Some(range) => range,
-                None => {
-                    debug!("LCM: no raw block to compact");
-                    self.async_compaction_pending = false;
-                    return None;
-                }
+                Some((start, end)) => (start.max(self.pinned_prefix_entries), end),
+                None => (0, 0),
             };
+        // Inside AppendOnly selection a Summary entry is a span boundary:
+        // past the pin, the span starts at the first raw entry so a new
+        // summary APPENDS instead of dropping a prior one unmerged.
+        if selection == BlockSelection::AppendOnly {
+            while block_start < block_end
+                && matches!(&self.active[block_start], ContextEntry::Summary { .. })
+            {
+                block_start += 1;
+            }
+        }
+        if block_start >= block_end {
+            debug!("LCM: no compactable block outside the pinned prefix");
+            self.async_compaction_pending = false;
+            return None;
+        }
 
         // Never fold a leading raw tool result without its carrier: leave it
         // raw alongside the carrier instead of retiring it alone.
@@ -857,6 +888,66 @@ impl LcmEngine {
             );
         }
 
+        // Prefix-preserving cut: keep a verbatim head of the block so the
+        // server-side prompt cache retains the longest common prefix and the
+        // next request only re-prefills from the cut point (summary + recent
+        // tail) instead of the whole rewritten context. The cut snaps back
+        // to the largest complete-turn boundary at or before the target
+        // fraction, so no tool-call carrier is separated from its result;
+        // with no usable boundary the block compacts whole (the previous
+        // head-rewriting behavior).
+        let mut pre_cut_block_tokens = 0usize;
+        if block_end > block_start {
+            let mut prefix_tokens = Vec::with_capacity(block_end - block_start + 1);
+            prefix_tokens.push(0usize);
+            for entry in &self.active[block_start..block_end] {
+                let last = prefix_tokens.last().copied().unwrap_or(0);
+                prefix_tokens.push(last + TokenBudget::estimate_message_tokens(entry.message()));
+            }
+            let block_token_total = prefix_tokens.last().copied().unwrap_or(0);
+            pre_cut_block_tokens = block_token_total;
+            // A pinned head is exempt from further cuts: they would only
+            // churn the wire mid-span without deepening cache reuse.
+            let head_already_pinned = self.pinned_prefix_entries > 0;
+            if self.config.keep_prefix_fraction > 0.0 && !head_already_pinned {
+            let keep_target_tokens = (block_token_total as f64
+                * self.config.keep_prefix_fraction.clamp(0.0, 0.9)) as usize;
+            let mut cut = block_start;
+            for len in self.complete_compaction_boundaries(block_start, block_end) {
+                // The cut must leave a tail to summarize — a boundary covering
+                // the whole block defeats the purpose.
+                if len >= block_end - block_start {
+                    break;
+                }
+                if prefix_tokens[len] <= keep_target_tokens {
+                    cut = block_start + len;
+                } else {
+                    break;
+                }
+            }
+            // A Summary entry must never be kept verbatim in the head: it
+            // would never merge, and summary mass would grow unbounded across
+            // compactions. Collapse the cut to the first summary so it is
+            // folded (merged) with the tail.
+            if cut > block_start {
+                if let Some(first_summary) = (block_start..cut).find(|&i| {
+                    matches!(&self.active[i], ContextEntry::Summary { .. })
+                }) {
+                    cut = first_summary;
+                }
+            }
+            if cut > block_start {
+                debug!(
+                    kept_messages = cut - block_start,
+                    kept_tokens = prefix_tokens[cut - block_start],
+                    "LCM: keeping verbatim prefix head for cache reuse"
+                );
+                block_start = cut;
+                self.pending_pinned_prefix = Some(cut);
+            }
+            }
+        }
+
         // Collect messages and source ids from the block. Merge mode may
         // include prior Summary entries; append mode never does. Entries are
         // taken whole — never a partial child summary's row subset.
@@ -893,13 +984,9 @@ impl LcmEngine {
         // The floor gates only model-driven compaction; the deterministic
         // fold needs no provider request and proceeds whenever its wire shrinks.
         const MIN_COMPACTION_TOKENS: usize = 200;
-        if block_tokens < MIN_COMPACTION_TOKENS
+        if pre_cut_block_tokens.max(block_tokens) < MIN_COMPACTION_TOKENS
             && failure_mode == CompactionFailureMode::PreserveContext
         {
-            debug!(
-                "LCM: skipping compaction — block too small ({} tokens < {})",
-                block_tokens, MIN_COMPACTION_TOKENS
-            );
             self.async_compaction_pending = false;
             return None;
         }
@@ -1003,10 +1090,6 @@ impl LcmEngine {
 
         // Only accept if summary is smaller than original.
         if summary_tokens >= block_tokens {
-            warn!(
-                "LCM: summary ({} tokens) not smaller than original ({} tokens), skipping",
-                summary_tokens, block_tokens
-            );
             self.async_compaction_pending = false;
             return None;
         }
@@ -1058,6 +1141,9 @@ impl LcmEngine {
         }
         self.active = new_active;
         self.async_compaction_pending = false;
+        if let Some(pin) = self.pending_pinned_prefix.take() {
+            self.pinned_prefix_entries = self.pinned_prefix_entries.max(pin);
+        }
 
         Some(Turn::Summary {
             text: summary_text,
@@ -1755,33 +1841,60 @@ impl LcmEngine {
             .map(|(&id, message)| (id, message.clone()))
             .collect();
 
-        // Live compaction retains the leading system message, inserts summaries
-        // after it, then keeps the unsummarized conversational tail. Rebuild
-        // must use the same order or a restart changes the prompt bytes.
+        // Live compaction retains the leading system message, keeps a
+        // verbatim prefix head, then interleaves summaries at their cut
+        // points with the unsummarized conversational tail. Rebuild must use
+        // the same order or a restart changes the prompt bytes. Ordering
+        // key: raws by db_id, summaries by their max covered source id —
+        // which reproduces the live layout (a summary sits after every raw
+        // it precedes live, and all of those have smaller rowids).
+        enum WireItem {
+            Raw(MessageId, Value),
+            Summary(usize, Value),
+        }
+        let mut wire_items: Vec<(usize, WireItem)> = Vec::new();
+        // Leading system messages always precede everything on the wire.
         for (msg_id, message) in &unsummarized {
             if message.get("role").and_then(Value::as_str) == Some("system") {
                 engine.active.push(ContextEntry::Raw {
                     msg_id: *msg_id,
                     message: message.clone(),
                 });
+                continue;
             }
+            wire_items.push((*msg_id, WireItem::Raw(*msg_id, message.clone())));
         }
         for node in &engine.dag.nodes {
             let summary_message =
                 summary_wire_message(&node.source_ids, &node.text, &node.manifest, node.level);
-            engine.active.push(ContextEntry::Summary {
-                node_id: node.id,
-                message: summary_message,
-            });
+            let order_key = node.source_ids.iter().copied().max().unwrap_or(0);
+            wire_items.push((order_key, WireItem::Summary(node.id, summary_message)));
+        }
+        wire_items.sort_by_key(|(key, _)| *key);
+
+        for (_key, item) in wire_items {
+            match item {
+                WireItem::Raw(msg_id, message) => engine.active.push(ContextEntry::Raw {
+                    msg_id,
+                    message,
+                }),
+                WireItem::Summary(node_id, message) => {
+                    engine.active.push(ContextEntry::Summary {
+                        node_id,
+                        message,
+                    })
+                }
+            }
         }
 
-        // BTreeMap iteration is ascending by id — session order is preserved.
-        for (msg_id, message) in unsummarized {
-            if message.get("role").and_then(Value::as_str) == Some("system") {
-                continue;
-            }
-            engine.active.push(ContextEntry::Raw { msg_id, message });
-        }
+        // The pinned head is the raw run before the first summary (the first
+        // prefix-preserving cut); head-rewriting sessions have no summary and
+        // therefore no pin.
+        engine.pinned_prefix_entries = engine
+            .active
+            .iter()
+            .position(|entry| matches!(entry, ContextEntry::Summary { .. }))
+            .unwrap_or(0);
 
         debug!(
             "LCM rebuild_from_db: {} store entries, {} DAG nodes, {} active entries",
@@ -2679,6 +2792,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
         let budget = TokenBudget::new(4096, 1024);
         let compactor = ContextCompactor::new(
@@ -2707,6 +2821,17 @@ mod tests {
         let mut merge_observed = false;
         let mut peak_mass = 0usize;
 
+        let summary_node_ids = |engine: &LcmEngine| -> Vec<usize> {
+            engine
+                .active_entries()
+                .iter()
+                .filter_map(|entry| match entry {
+                    ContextEntry::Summary { node_id, .. } => Some(*node_id),
+                    ContextEntry::Raw { .. } => None,
+                })
+                .collect()
+        };
+
         for _round in 0..120 {
             for i in 0..12 {
                 ingest(&mut engine, next_id, "user", &format!("{i}: {body}"));
@@ -2720,6 +2845,7 @@ mod tests {
                 next_id += 1;
             }
             let before = summary_tokens(&engine);
+            let ids_before = summary_node_ids(&engine);
             engine
                 .compact(
                     Some(&compactor),
@@ -2729,6 +2855,7 @@ mod tests {
                 )
                 .await;
             let after = summary_tokens(&engine);
+            let ids_after = summary_node_ids(&engine);
             eprintln!(
                 "round: summaries={} mass={} -> {}",
                 engine
@@ -2739,7 +2866,11 @@ mod tests {
                 before,
                 after
             );
-            // A merge is the only way accumulated summary mass goes down.
+            // A merge retires the prior summary node while the live count
+            // stays flat — with a fixed-size mock the mass is identical
+            // before and after, so the node identity is the merge signal.
+            merge_observed |= ids_before != ids_after && ids_after.len() <= ids_before.len();
+            // A merge is also the only way accumulated summary mass goes down.
             merge_observed |= after < before;
             peak_mass = peak_mass.max(after);
         }
@@ -3020,6 +3151,7 @@ mod tests {
             tau_soft: 0.5,
             tau_hard: 0.85,
             deterministic_target: 512,
+            keep_prefix_fraction: 0.35,
         });
         ingest(engine, 1, "system", "S");
         ingest(engine, 2, "user", "Hi");
@@ -3043,6 +3175,7 @@ mod tests {
             tau_soft: 0.5,
             tau_hard: 0.85,
             deterministic_target: 512,
+            keep_prefix_fraction: 0.35,
         });
 
         // Simulate a realistic ~8K-token system prompt (32K chars ≈ 8K tokens)
@@ -3086,6 +3219,7 @@ mod tests {
             tau_soft: 0.5,
             tau_hard: 0.85,
             deterministic_target: 512,
+            keep_prefix_fraction: 0.35,
         });
 
         // Small system prompt
@@ -3111,6 +3245,7 @@ mod tests {
             tau_soft: 0.5,
             tau_hard: 0.85,
             deterministic_target: 512,
+            keep_prefix_fraction: 0.35,
         });
         ingest(&mut engine, 1, "system", "You are helpful.");
         ingest(
@@ -3137,10 +3272,15 @@ mod tests {
 
     #[tokio::test]
     async fn tool_rich_block_over_eighty_messages_uses_model_and_covers_late_correction() {
+        // keep_prefix_fraction: 0.0 — this test fixtures the block to exceed
+        // 80 covered messages and asserts model-summary coverage of a late
+        // correction; prefix preservation is covered elsewhere and would
+        // shrink the summarized span below the fixture's size assumptions.
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.1,
             tau_hard: 0.3,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.0,
         });
 
         ingest(&mut engine, 1, "system", "System prompt.");
@@ -3265,6 +3405,7 @@ mod tests {
             tau_soft: 0.1,
             tau_hard: 0.3,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
         ingest(&mut engine, 1, "system", "System prompt.");
 
@@ -3384,6 +3525,7 @@ mod tests {
             tau_soft: 0.1,
             tau_hard: 0.3,
             deterministic_target: 128,
+            keep_prefix_fraction: 0.35,
         });
         ingest(&mut engine, 1, "system", "System prompt.");
         for id in 2..=5 {
@@ -3605,6 +3747,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
 
         // System prompt.
@@ -3736,6 +3879,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 128,
+            keep_prefix_fraction: 0.35,
         });
 
         ingest(&mut engine, 1, "system", "System prompt.");
@@ -3906,6 +4050,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 128,
+            keep_prefix_fraction: 0.35,
         });
         ingest(&mut engine, 1, "system", "System prompt.");
         // Non-contiguous rowids (gap 6-9): min-max "2-13" would over-claim.
@@ -4032,6 +4177,7 @@ mod tests {
             tau_soft: 0.1,
             tau_hard: 0.3,
             deterministic_target: 128,
+            keep_prefix_fraction: 0.35,
         });
         ingest(&mut engine, 1, "system", "System prompt.");
         for id in 2..=8 {
@@ -4042,7 +4188,12 @@ mod tests {
                 &format!("source {id} {}", "durable evidence ".repeat(80)),
             );
         }
-        engine.store.remove(&2);
+        // The fold covers the summarized span after the kept head. Every
+        // complete boundary of that span includes its first raw row, so a
+        // missing row there must abort the fold entirely (recovery cannot
+        // shrink past it), while rows later in the span degrade to a shorter
+        // boundary that leaves them raw.
+        engine.store.remove(&3);
 
         let result = engine
             .compact(
@@ -4071,6 +4222,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 128,
+            keep_prefix_fraction: 0.35,
         });
 
         ingest(&mut engine, 1, "system", "System prompt.");
@@ -4125,6 +4277,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 128,
+            keep_prefix_fraction: 0.35,
         });
         ingest(&mut engine, 1, "system", "System prompt.");
         for i in 0..10 {
@@ -4166,6 +4319,7 @@ mod tests {
             tau_soft: 0.1,
             tau_hard: 0.3,
             deterministic_target: 128,
+            keep_prefix_fraction: 0.35,
         });
         ingest(&mut engine, 1, "system", "System prompt.");
         for i in 0..100 {
@@ -4206,6 +4360,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 128,
+            keep_prefix_fraction: 0.35,
         });
         ingest(&mut engine, 1, "system", "System prompt.");
         for i in 0..10 {
@@ -4326,6 +4481,7 @@ mod tests {
             tau_soft: 0.2,
             tau_hard: 0.5,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
 
         ingest(&mut engine, 1, "system", "System.");
@@ -4409,6 +4565,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
         let budget = TokenBudget::new(4096, 1024);
         let compactor = ContextCompactor::new(
@@ -4513,6 +4670,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
         let budget = TokenBudget::new(4096, 1024);
         let body = "the quick brown fox jumps over the lazy dog while the model prefills tokens ";
@@ -4618,6 +4776,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
         let compactor = ContextCompactor::new(
             Arc::new(SummarizerMock) as Arc<dyn LLMProvider>,
@@ -4960,6 +5119,7 @@ mod tests {
                 tau_soft: 0.3,
                 tau_hard: 0.6,
                 deterministic_target: 128,
+                keep_prefix_fraction: 0.35,
             });
 
             for (i, m) in conversation.iter().enumerate() {
@@ -5168,6 +5328,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.85,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
 
         // Ingest messages about Rust ownership.
@@ -5265,6 +5426,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.85,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
         ingest(&mut engine, 1, "system", "You are helpful.");
         ingest(
@@ -5342,6 +5504,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.85,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
 
         // Fill with enough messages to be near the hard limit.
@@ -5409,6 +5572,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.85,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
 
         ingest(&mut engine, 1, "system", "S");
@@ -5480,6 +5644,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
         // Large budget so the ONLY barrier to expansion is the cooldown
         // (with wire_tokens=0, headroom = hard_limit ≈ 59k tokens).
@@ -5557,6 +5722,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
         let budget = TokenBudget::new(100_000, 1_024);
         let compactor = ContextCompactor::new(
@@ -5617,6 +5783,7 @@ mod tests {
             tau_soft: 0.3,
             tau_hard: 0.6,
             deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
         });
         let budget = TokenBudget::new(100_000, 1_024);
         let compactor = ContextCompactor::new(
@@ -5706,6 +5873,7 @@ mod tests {
             tau_soft: 0.5,
             tau_hard: 0.85,
             deterministic_target: 512,
+            keep_prefix_fraction: 0.35,
         };
 
         let engine = LcmEngine::rebuild_from_db_nodes(&raw_messages, &db_nodes, config);
@@ -6029,6 +6197,7 @@ mod tests {
             tau_soft: 0.5,
             tau_hard: 0.85,
             deterministic_target: 512,
+            keep_prefix_fraction: 0.35,
         };
         let mut engine = LcmEngine::new(config);
 
