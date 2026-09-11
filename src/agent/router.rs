@@ -1297,6 +1297,9 @@ pub(crate) struct RoutedToolBatch {
     pub(crate) calls: Vec<RoutedToolCall>,
     /// Applies only after every rejection receipt in this batch is durable.
     pub(crate) return_after_rejections: bool,
+    /// User-role recovery instruction appended after the assistant carrier and
+    /// its matching rejection receipts, preserving the retained wire prefix.
+    pub(crate) post_rejection_instruction: Option<String>,
 }
 
 /// Determine the RouteResult for a successful specialist dispatch in route_tool_calls().
@@ -1322,15 +1325,38 @@ pub(crate) fn duplicate_receipt(
     cached_chars: usize,
     progress: &str,
 ) -> String {
+    // A handle excerpt is not a page: its rendered length is never a source
+    // cursor. Recover the original immutable artifact ID (including legacy
+    // handles), and always start the first inspection at source offset zero.
+    let recovery = cached
+        .and_then(|data| data.strip_prefix(crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER))
+        .and_then(|fields| fields.trim_start().strip_prefix("id:"))
+        .and_then(|fields| {
+            serde_json::Deserializer::from_str(fields)
+                .into_iter::<String>()
+                .next()
+                .and_then(Result::ok)
+        })
+        .filter(|id| !id.is_empty())
+        .map(|id| {
+            let args = serde_json::json!({"tool_call_id": id, "start_char": 0});
+            format!(
+                "\nRead the original saved output instead of repeating this call:\n\
+                 inspect_tool_result({args})\n\
+                 Then follow the inspection page's continuation instruction; \
+                 do not infer a cursor from the excerpt length."
+            )
+        })
+        .unwrap_or_default();
     match cached {
         Some(data) if hits <= 1 => {
-            format!("[cached result from earlier identical call — {cached_chars} chars]\n{data}\n{progress}")
+            format!("[cached result from earlier identical call — {cached_chars} chars]\n{data}{recovery}\n{progress}")
         }
         _ => format!(
             "[duplicate {name} call #{hits} this turn — the identical arguments were already \
              answered above; the cached result is already in this conversation. Do NOT repeat \
              this call. Vary the query meaningfully, use inspect_tool_result to re-read a \
-             stashed result, or write your final answer from the evidence you have.]\n{progress}"
+             stashed result, or write your final answer from the evidence you have.]{recovery}\n{progress}"
         ),
     }
 }
@@ -1719,15 +1745,14 @@ pub(crate) async fn route_tool_calls(
         // All tool calls were blocked.
         if blocked_count == original_count {
             ctx.flow.consecutive_all_blocked += 1;
-            if all_blocked_uncached && ctx.flow.consecutive_all_blocked == 2 {
-                ctx.messages
-                    .push_draft(crate::agent::markers::scaffold_user(
-                        "[system] Your last several tool calls were duplicates or blocked. \
+            let post_rejection_instruction =
+                (all_blocked_uncached && ctx.flow.consecutive_all_blocked == 2).then(|| {
+                    "[system] Your last several tool calls were duplicates or blocked. \
                      You already have the data you need from your previous tool results. \
                      Do NOT call any more tools. Write your final answer now using the \
-                     information you gathered.",
-                    ));
-            }
+                     information you gathered."
+                        .to_string()
+                });
             // A cached duplicate produces only a compact protocol receipt; it
             // does not execute a tool or add evidence. Count every all-blocked
             // round as zero progress so cached receipts cannot livelock the
@@ -1736,6 +1761,7 @@ pub(crate) async fn route_tool_calls(
             return RouteResult::Execute(RoutedToolBatch {
                 calls,
                 return_after_rejections: true,
+                post_rejection_instruction,
             });
         }
     }
@@ -1745,6 +1771,7 @@ pub(crate) async fn route_tool_calls(
     RouteResult::Execute(RoutedToolBatch {
         calls,
         return_after_rejections: false,
+        post_rejection_instruction: None,
     })
 }
 
@@ -1926,10 +1953,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn circuit_breaker_scaffold_is_injected() {
+    async fn circuit_breaker_recovery_does_not_rewrite_routed_prefix() {
         let mut ctx = test_turn_context();
         let arguments = HashMap::from([("command".to_string(), json!("pwd"))]);
         assert!(ctx.flow.tool_guard.allow("exec", &arguments).is_ok());
+        let original_messages: Vec<Value> = ctx.messages.iter().cloned().collect();
 
         for id in ["blocked-1", "blocked-2"] {
             let result = route_tool_calls(
@@ -1943,17 +1971,21 @@ mod tests {
                 ToolRouting::AlreadyRouted,
             )
             .await;
-            assert!(matches!(result, RouteResult::Execute(_)));
+            let RouteResult::Execute(batch) = result else {
+                panic!("blocked tool call should return a routed batch")
+            };
+            if id == "blocked-2" {
+                assert!(batch.post_rejection_instruction.is_some_and(|instruction| {
+                    instruction.contains("Your last several tool calls were duplicates or blocked")
+                }));
+            }
         }
 
-        assert!(ctx.messages.iter().any(|message| {
-            message
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|content| {
-                    content.contains("Your last several tool calls were duplicates or blocked")
-                })
-        }));
+        assert_eq!(
+            &*ctx.messages,
+            original_messages.as_slice(),
+            "routing must not insert recovery bytes before the assistant carrier"
+        );
     }
 
     // Duplicate receipts escalate: hit 1 replays the cached bytes, later
@@ -1979,6 +2011,37 @@ mod tests {
         // Defensive arm: classified blocked-with-result but cache vanished.
         let none = duplicate_receipt("recall", 1, None, 0, progress);
         assert!(none.contains("duplicate recall call #1"));
+    }
+
+    #[test]
+    fn duplicate_receipt_recovers_original_handle_from_first_page() {
+        // v1 persisted receipts may predate first_read and use chars. ID must
+        // survive JSON escaping, and the preview size must never become offset.
+        let id = "original_\"雪|call";
+        let handle = format!(
+            "{} id:{} | tool:\"exec\" | ok:true | chars:14355 | excerpt:\"828 chars\"",
+            crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER,
+            serde_json::to_string(id).unwrap()
+        );
+        for hit in [1, 2, 4] {
+            let receipt = duplicate_receipt("exec", hit, Some(&handle), handle.len(), "budget");
+            let call = receipt.split("inspect_tool_result(").nth(1).unwrap();
+            let args: Value = serde_json::from_str(call.split(")\n").next().unwrap()).unwrap();
+            assert_eq!(args["tool_call_id"], id);
+            assert_eq!(args["start_char"], 0);
+        }
+    }
+
+    #[test]
+    fn duplicate_receipt_does_not_invent_artifact_for_plain_or_bad_output() {
+        for data in [
+            "plain output",
+            "TOOL_RESULT_HANDLE v1 | id:broken",
+            "TOOL_RESULT_HANDLE v1 | id:\"\"",
+        ] {
+            let receipt = duplicate_receipt("exec", 1, Some(data), data.len(), "budget");
+            assert!(!receipt.contains("inspect_tool_result("), "{receipt}");
+        }
     }
 
     // T9 — TrioConfig has specialist_output_schema field, defaults to false
