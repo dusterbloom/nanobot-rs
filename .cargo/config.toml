@@ -1,7 +1,11 @@
+# macOS 27 beta SDK rot: the SDK's baked clang-runtime search path points at
+# the removed /Applications/Xcode.app (clang 17), so pyo3's `-lclang_rt.osx`
+# cannot resolve. Point ld at the CommandLineTools clang-21 runtime, which
+# exists. Harmless on machines where the SDK path is healthy.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-L/Library/Developer/CommandLineTools/usr/lib/clang/21/lib/darwin"]
+
+# Homebrew Python 3.14 is newer than this pyo3 release's known-max version;
+# the stable-ABI forward-compatibility build is fine for our use.
 [env]
-LIBTORCH_USE_PYTORCH = "1"
-# PyO3: suppress Python 3.14+ check when using abi3 stable ABI.
-# nanobot uses `python-kernel` feature (pyo3 0.23) with PyO3's
-# stable ABI mode so it works with Python 3.14+ despite the
-# 0.23 release only officially supporting up to 3.13.
 PYO3_USE_ABI3_FORWARD_COMPATIBILITY = "1"
