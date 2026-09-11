@@ -125,26 +125,39 @@ impl Drop for BackendActivityHeartbeat {
 }
 
 #[derive(Debug)]
-pub(super) struct LocalStreamProgress;
+pub(super) struct LocalStreamProgress {
+    /// Last phase reported by real progress (prefill/text/tool payload).
+    /// Transport-only liveness (SSE comments) holds this phase instead of
+    /// regressing to waiting-headers.
+    last_phase: Option<BackendActivity>,
+}
 
 impl LocalStreamProgress {
     pub(super) fn new() -> Self {
-        Self
+        Self { last_phase: None }
+    }
+
+    pub(super) fn on_transport_progress(&mut self) -> BackendActivity {
+        self.last_phase.unwrap_or(BackendActivity::WaitingForHeaders)
     }
 
     pub(super) fn on_prefill_progress(&mut self, processed: u64, total: u64) -> BackendActivity {
-        if total > 0 && processed >= total {
+        let phase = if total > 0 && processed >= total {
             BackendActivity::Decoding
         } else {
             BackendActivity::Prefill
-        }
+        };
+        self.last_phase = Some(phase);
+        phase
     }
 
     pub(super) fn on_text_or_thinking_delta(&mut self) -> BackendActivity {
+        self.last_phase = Some(BackendActivity::Decoding);
         BackendActivity::Decoding
     }
 
     pub(super) fn on_tool_call_delta(&mut self) -> BackendActivity {
+        self.last_phase = Some(BackendActivity::ToolPayload);
         BackendActivity::ToolPayload
     }
 }
@@ -255,5 +268,34 @@ mod stream_progress_tests {
             BackendActivity::Decoding
         );
         assert_eq!(progress.on_tool_call_delta(), BackendActivity::ToolPayload);
+    }
+
+    #[test]
+    fn transport_liveness_holds_the_last_known_phase() {
+        let mut progress = LocalStreamProgress::new();
+
+        // Before any real progress, transport liveness reports the initial
+        // wait state.
+        assert_eq!(
+            progress.on_transport_progress(),
+            BackendActivity::WaitingForHeaders
+        );
+
+        // After real progress, a transport-only tick holds the last phase —
+        // a long tool-payload generation (higgs: SSE comments while a
+        // `<tool_call>` block is open) must not read as a dead stream.
+        assert_eq!(progress.on_tool_call_delta(), BackendActivity::ToolPayload);
+        assert_eq!(
+            progress.on_transport_progress(),
+            BackendActivity::ToolPayload
+        );
+        assert_eq!(
+            progress.on_prefill_progress(10, 100),
+            BackendActivity::Prefill
+        );
+        assert_eq!(
+            progress.on_transport_progress(),
+            BackendActivity::Prefill
+        );
     }
 }
