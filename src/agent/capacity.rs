@@ -91,6 +91,7 @@ impl EffectiveCapacity {
         effective_capacity_from_limits(16_384, 4_096, 12_288, configured, immutable_prefix_tokens)
     }
 
+    #[cfg(test)]
     pub(crate) fn prompt_room(
         &self,
         planned_output: usize,
@@ -124,6 +125,7 @@ pub(crate) enum CapacityError {
 }
 
 impl HiggsCapacityProfile {
+    #[cfg(test)]
     pub(crate) fn schema_version(&self) -> u32 {
         self.schema_version
     }
@@ -132,6 +134,7 @@ impl HiggsCapacityProfile {
         &self.model
     }
 
+    #[cfg(test)]
     pub(crate) fn model_fingerprint(&self) -> &str {
         &self.model_fingerprint
     }
@@ -157,6 +160,7 @@ impl HiggsCapacityProfile {
     }
 
     /// Capacity generations are comparable only within one Higgs process boot.
+    #[cfg(test)]
     pub(crate) fn is_same_revision(&self, other: &Self) -> bool {
         self.boot_id == other.boot_id && self.generation == other.generation
     }
@@ -220,9 +224,6 @@ pub(crate) enum CapacityRefresh {
     /// Same endpoint+model but the boot ID changed: the snapshot was
     /// re-fetched and every retained session from the old boot is stale.
     BootChanged,
-    /// Endpoint+model changed away from a previously installed Higgs pair
-    /// (model switch or cloud takeover): the snapshot is dropped.
-    Invalidated,
 }
 
 /// Which source produced the current effective limits, for status surfaces.
@@ -261,6 +262,7 @@ impl CapacityRuntime {
     /// Whether a live snapshot is already installed for this endpoint+model.
     /// The loop consults this before issuing a fetch: an unchanged tuple
     /// never refetches.
+    #[cfg(test)]
     pub(crate) fn cached_for(&self, endpoint: &str, model: &str) -> bool {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         matches!(&state.key, Some(key) if key.0 == endpoint && key.1 == model)

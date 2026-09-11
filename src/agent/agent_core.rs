@@ -2918,7 +2918,7 @@ mod tests {
             "content": "summary",
             "_lcm_summary": true
         });
-        let mut live = vec![
+        let live = vec![
             serde_json::json!({"role": "system", "content": "current system"}),
             serde_json::json!({"role": "developer", "content": "new working memory"}),
             snapshot[1].clone(),

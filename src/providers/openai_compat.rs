@@ -1578,6 +1578,7 @@ impl LLMProvider for OpenAICompatProvider {
         self.higgs_session_cache
     }
 
+    #[allow(private_interfaces)]
     fn fetch_higgs_capacity<'a>(
         &'a self,
         model: &'a str,

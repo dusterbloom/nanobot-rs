@@ -157,6 +157,7 @@ impl ToolGuard {
         crate::agent::tool_runner::normalize_call_key(name, args)
     }
 
+    #[cfg(test)]
     pub fn allow(&mut self, name: &str, args: &HashMap<String, Value>) -> Result<(), String> {
         match self.decide(name, args) {
             ToolGuardDecision::Execute => Ok(()),

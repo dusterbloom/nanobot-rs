@@ -78,6 +78,7 @@ pub(crate) fn parse_specialist_response(raw: &str, _target: &str) -> SpecialistR
 /// High-level role in the trio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
+    #[cfg(test)]
     Main,
     Router,
     Specialist,
@@ -135,6 +136,7 @@ pub fn build_context_pack(
     // (request_strict_router_decision), so the packs never duplicate them.
     let _ = available_tools;
     let body = match role {
+        #[cfg(test)]
         Role::Main => format!(
             "Role: main\nUser intent:\n{}\n\nConversation summary:\n{}\n\nTask state:\n{}\n",
             user_intent, conversation_summary, task_state

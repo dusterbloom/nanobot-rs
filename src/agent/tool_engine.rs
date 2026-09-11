@@ -512,34 +512,13 @@ pub(crate) fn is_side_effect_tool(name: &str) -> bool {
     matches!(name, "exec" | "write_file" | "edit_file" | "apply_patch")
 }
 
-/// Local reads that cost nothing but a syscall. These auto-renew the tool
-/// lease without a checkpoint — they can't cause destructive loops, and
-/// blocking them behind a manual renewal ceremony wastes 3 round-trips on
-/// legitimate multi-file exploration.
-///
-/// Network tools (`web_search`, `web_fetch`) are deliberately NOT here.
-/// They mutate nothing locally, but they spend money, burn rate limits, and
-/// paginate in loops — bounding exactly that is what the lease is for.
-///
-/// `inspect_tool_result` and `get_tools` ARE here: they only re-read bytes
-/// already stashed in this session / enumerate tool definitions. Blocking
-/// them after exhaustion strands data the turn already paid for — the model
-/// can neither finish the task nor report what it fetched (session
-/// 20260827_064521: headlines fetched, then the turn died on a blocked
-/// inspect of the fetched page).
-/// Tools that produce or modify artifacts. The lease reserves one emergency
-/// slot for these after exhaustion — see the rejection site in
-/// `agent_loop::shared`.
-pub(crate) fn is_write_tool(name: &str) -> bool {
-    matches!(name, "write_file" | "edit_file" | "apply_patch")
-}
-
 /// True when an `exec` command is a pure read: it starts with a
 /// conventionally read-only binary and contains no redirect or mutating
 /// sub-command. Used to auto-renew the tool lease for exec-based reading —
 /// models commonly `cat`/`grep`/`find` through shell, and metering those as
 /// side-effect calls starves the turn's actual write. Conservative by
 /// design: anything ambiguous stays metered.
+#[cfg(test)]
 pub(crate) fn is_read_only_exec_command(command: Option<&str>) -> bool {
     let Some(cmd) = command else {
         return false;
@@ -587,6 +566,7 @@ pub(crate) fn is_read_only_exec_command(command: Option<&str>) -> bool {
     )
 }
 
+#[cfg(test)]
 pub(crate) fn is_read_only_tool(name: &str) -> bool {
     matches!(
         name,

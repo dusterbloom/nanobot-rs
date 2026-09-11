@@ -9,12 +9,10 @@
 //! Extracted from the JSONL `SessionManager` for reuse by the SQLite
 //! `SessionDb`. All functions are pure — no I/O.
 
-use serde_json::Value;
-use tracing::warn;
-
 use crate::agent::context_hygiene::cap_tool_result_for_replay;
 #[cfg(test)]
 use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
+use serde_json::Value;
 
 /// A real conversational user turn: a `role: "user"` message that is NOT an
 /// injected synthetic scaffolding nudge (grounding, format-anchor, response

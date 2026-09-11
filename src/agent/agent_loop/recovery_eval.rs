@@ -914,6 +914,7 @@ async fn context_reset_announcement_recovery_live() {
         .await
     {
         ForcedToolRecoveryOutcome::Response(response) => response,
+        ForcedToolRecoveryOutcome::Step(_) => panic!("capacity gate interrupted recovery eval"),
         ForcedToolRecoveryOutcome::ProviderError { error, .. } => panic!("{error}"),
         ForcedToolRecoveryOutcome::PersistenceError(error) => panic!("{error}"),
     };

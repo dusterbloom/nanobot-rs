@@ -335,6 +335,10 @@ pub trait LLMProvider: Send + Sync {
     /// untouched; the OpenAI-compatible provider overrides it when
     /// `localBackend=higgs`. This stays a boxed optional capability — never a
     /// generic capacity method on every provider.
+    // This optional hook is called only by the in-crate agent loop. Keeping
+    // its wire type crate-private avoids making Higgs an API requirement for
+    // third-party providers that implement this otherwise public trait.
+    #[allow(private_interfaces)]
     fn fetch_higgs_capacity<'a>(
         &'a self,
         _model: &'a str,

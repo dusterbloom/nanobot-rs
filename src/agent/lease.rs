@@ -75,12 +75,14 @@ impl ToolCallResult {
 /// must let the model choose to stop: nagging every text response would,
 /// once the strip is made sticky, loop until max iterations.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(test)]
 pub struct RenewalResult {
     valid: bool,
     missing_field: &'static str,
     attempted: bool,
 }
 
+#[cfg(test)]
 impl RenewalResult {
     fn accepted() -> Self {
         Self {
@@ -168,22 +170,19 @@ impl Lease {
         self.in_flight = self.in_flight.saturating_sub(count);
     }
 
+    #[cfg(test)]
     pub fn successful_executions(&self) -> u32 {
         self.successful_executions
     }
 
+    #[cfg(test)]
     pub fn is_exhausted(&self) -> bool {
         self.successful_executions.saturating_add(self.in_flight) >= self.lease_size
     }
 
+    #[cfg(test)]
     pub fn renewals_used(&self) -> u32 {
         self.renewals_used
-    }
-
-    /// Configured per-lease tool budget. Exposed so the renewal nudge
-    /// can tell the model exactly how many calls it has after renewal.
-    pub fn lease_size(&self) -> u32 {
-        self.lease_size
     }
 
     /// Try to renew the lease with a model-emitted checkpoint. The
@@ -195,6 +194,7 @@ impl Lease {
     /// Text with no checkpoint labels at all returns `not_attempted()`
     /// — the model is writing a final answer, not requesting more tools,
     /// and the lease must allow that exit.
+    #[cfg(test)]
     pub fn try_renew(&mut self, checkpoint: &str) -> RenewalResult {
         if self.renewals_used >= self.max_renewals {
             return RenewalResult::rejected("out_of_leases");
@@ -239,6 +239,7 @@ impl Lease {
     /// on its first `write_file`, which is exactly backwards — the reads are
     /// the cheap part. Both budgets are capped at `max_renewals`, so the worst
     /// case is 2× leases per turn, half of them read-only.
+    #[cfg(test)]
     pub fn auto_renew_for_read_only(&mut self) -> bool {
         if self.read_only_renewals_used >= self.max_renewals {
             return false;

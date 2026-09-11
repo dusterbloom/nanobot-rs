@@ -217,6 +217,7 @@ impl ContextCompactor {
         (prompt_tokens, output_tokens)
     }
 
+    #[cfg(test)]
     fn required_context_tokens(&self, input: &str, prompt: &str, ratio: usize) -> usize {
         let (prompt_tokens, output_tokens) = self.request_token_usage(input, prompt, ratio);
         prompt_tokens.saturating_add(output_tokens)
@@ -311,6 +312,7 @@ impl ContextCompactor {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn required_context_for_lcm(&self, messages: &[Value], mode: &str) -> usize {
         let transcript = build_transcript(messages);
         let prompt = Self::prompt_with_manifest_for_mode(mode);

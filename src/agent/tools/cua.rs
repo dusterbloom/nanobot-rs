@@ -283,7 +283,7 @@ impl CuaTool {
         else {
             return "Error: cua-driver call cancelled".to_string();
         };
-        let mut out = raw_out;
+        let out = raw_out;
         if !ok {
             if raw_err.contains("daemon is not running") {
                 return format!(

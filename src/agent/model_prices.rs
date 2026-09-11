@@ -11,10 +11,8 @@
 //! cost budgets on RLM delegation loops.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
 
 /// Cached model prices with timestamp.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,22 +23,22 @@ pub struct ModelPrices {
     pub fetched_at: i64,
 }
 
-/// How old the cache can be before we re-fetch (24 hours).
-const CACHE_MAX_AGE_SECS: i64 = 86400;
-
 /// OpenRouter API response structures (minimal).
 #[derive(Deserialize)]
+#[cfg(test)]
 struct OpenRouterModelsResponse {
     data: Vec<OpenRouterModel>,
 }
 
 #[derive(Deserialize)]
+#[cfg(test)]
 struct OpenRouterModel {
     id: String,
     pricing: Option<OpenRouterPricing>,
 }
 
 #[derive(Deserialize)]
+#[cfg(test)]
 struct OpenRouterPricing {
     prompt: Option<String>,
     completion: Option<String>,
@@ -48,6 +46,7 @@ struct OpenRouterPricing {
 
 impl ModelPrices {
     /// Create an empty price map.
+    #[cfg(test)]
     pub fn empty() -> Self {
         Self {
             prices: HashMap::new(),
@@ -55,57 +54,8 @@ impl ModelPrices {
         }
     }
 
-    /// Get the cache file path.
-    fn cache_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".nanobot").join("cache").join("model_prices.json"))
-    }
-
-    /// Load prices from cache, re-fetching if stale or missing.
-    /// Falls back to empty prices on any error (non-blocking).
-    pub async fn load() -> Self {
-        // Try loading from cache first.
-        if let Some(path) = Self::cache_path() {
-            if let Ok(data) = tokio::fs::read_to_string(&path).await {
-                if let Ok(cached) = serde_json::from_str::<ModelPrices>(&data) {
-                    let now = chrono::Utc::now().timestamp();
-                    if now - cached.fetched_at < CACHE_MAX_AGE_SECS {
-                        debug!(
-                            "Model prices loaded from cache ({} models)",
-                            cached.prices.len()
-                        );
-                        return cached;
-                    }
-                    debug!("Model price cache is stale, re-fetching");
-                }
-            }
-        }
-
-        // Fetch fresh prices.
-        match Self::fetch().await {
-            Ok(prices) => {
-                // Save to cache (best-effort).
-                if let Some(path) = Self::cache_path() {
-                    if let Some(parent) = path.parent() {
-                        let _ = tokio::fs::create_dir_all(parent).await;
-                    }
-                    if let Ok(json) = serde_json::to_string(&prices) {
-                        let _ = tokio::fs::write(&path, json).await;
-                    }
-                }
-                debug!(
-                    "Fetched {} model prices from OpenRouter",
-                    prices.prices.len()
-                );
-                prices
-            }
-            Err(e) => {
-                warn!("Failed to fetch model prices: {} — using empty prices", e);
-                Self::empty()
-            }
-        }
-    }
-
     /// Fetch prices from OpenRouter API.
+    #[cfg(test)]
     pub async fn fetch() -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
