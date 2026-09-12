@@ -204,14 +204,26 @@ impl Reflector {
         // Split response into facts and entities sections.
         let (facts, entities_section) = split_entities_section(&updated_memory);
 
-        // Atomic temp-file + rename; do not advance source state first.
-        memory_store.write_long_term(&facts);
-        if memory_store.read_long_term() != facts {
-            return Err(anyhow::anyhow!(
-                "atomic MEMORY.md replacement did not persist; completed sessions retained"
-            ));
+        // Guard against a logically-empty rewrite: an entities-only (or
+        // otherwise empty-preamble) response makes `facts` empty, which would
+        // atomically wipe the curated `MEMORY.md`. Preserve the existing memory
+        // (the snapshot the model was handed) and still advance the source rows
+        // so the one-shot production reflection spawn does not stall the pipeline.
+        if facts.trim().is_empty() && !current_memory.trim().is_empty() {
+            warn!(
+                "reflection produced no durable facts; preserving MEMORY.md, \
+                 marking completed sessions reflected to avoid a stall"
+            );
+        } else {
+            // Atomic temp-file + rename; do not advance source state first.
+            memory_store.write_long_term(&facts);
+            if memory_store.read_long_term() != facts {
+                return Err(anyhow::anyhow!(
+                    "atomic MEMORY.md replacement did not persist; completed sessions retained"
+                ));
+            }
+            info!("Reflector: MEMORY.md updated");
         }
-        info!("Reflector: MEMORY.md updated");
 
         // Extract entities/relations into knowledge graph.
         if !entities_section.is_empty() {
@@ -478,7 +490,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 1, 10).await;
         let provider = Arc::new(MockProvider::new("memory"));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 100_000, sessions, 10_000);
+        let reflector = Reflector::new(
+            provider,
+            "test".into(),
+            &workspace,
+            100_000,
+            sessions,
+            10_000,
+        );
         assert!(!reflector.should_reflect().await);
     }
 
@@ -512,7 +531,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 3, 100).await;
         let provider = Arc::new(MockProvider::new("Updated facts."));
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions.clone(), 10_000);
+        let reflector = Reflector::new(
+            provider,
+            "test".into(),
+            &workspace,
+            0,
+            sessions.clone(),
+            10_000,
+        );
 
         reflector.reflect().await.unwrap();
 
@@ -544,7 +570,14 @@ mod tests {
             sessions.clone(),
             10_000,
         );
-        let second = Reflector::new(provider.clone(), "test".into(), &workspace, 0, sessions, 10_000);
+        let second = Reflector::new(
+            provider.clone(),
+            "test".into(),
+            &workspace,
+            0,
+            sessions,
+            10_000,
+        );
 
         let (first_result, second_result) = tokio::join!(first.reflect(), second.reflect());
         first_result.unwrap();
@@ -563,7 +596,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 2, 100).await;
         let provider = Arc::new(FailingProvider);
-        let reflector = Reflector::new(provider, "test".into(), &workspace, 0, sessions.clone(), 10_000);
+        let reflector = Reflector::new(
+            provider,
+            "test".into(),
+            &workspace,
+            0,
+            sessions.clone(),
+            10_000,
+        );
 
         let result = reflector.reflect().await;
         assert!(result.is_err());
@@ -575,6 +615,77 @@ mod tests {
             remaining.len(),
             2,
             "completed sessions should be preserved on failure"
+        );
+    }
+
+    /// A malformed entities-only response (non-empty content with an empty
+    /// facts preamble) must not wipe the curated `MEMORY.md`. The reflector
+    /// preserves the existing memory and still advances the source rows so the
+    /// one-shot production reflection spawn does not stall the pipeline.
+    #[tokio::test]
+    async fn test_reflect_preserves_memory_on_entities_only_response() {
+        let tmp = TempDir::new().unwrap();
+        let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 2, 100).await;
+        MemoryStore::new(&workspace).write_long_term("- Durable fact from before");
+        // Non-empty content but ONLY an Entities section (model produced no facts).
+        let provider = Arc::new(MockProvider::new(
+            "## Entities\n- Alice (person): the user\n",
+        ));
+        let reflector = Reflector::new(
+            provider,
+            "test".into(),
+            &workspace,
+            0,
+            sessions.clone(),
+            10_000,
+        );
+
+        let result = reflector.reflect().await;
+        assert!(result.is_ok(), "reflect should succeed: {:?}", result.err());
+
+        let content = MemoryStore::new(&workspace).read_long_term();
+        assert!(
+            content.contains("Durable fact"),
+            "durable fact should be preserved: {content}"
+        );
+
+        // Source rows must still advance so the pipeline does not stall.
+        let wm = WorkingMemoryStore::new(sessions);
+        assert!(
+            wm.list_completed().await.unwrap().is_empty(),
+            "completed sessions should be consumed after a preserved-facts reflection"
+        );
+        assert_eq!(wm.list_reflected().await.unwrap().len(), 2);
+    }
+
+    /// When the model produces no durable facts AND there is no existing
+    /// curated memory to lose, reflection should still succeed and consume the
+    /// source rows (writing an empty memory is a harmless no-op).
+    #[tokio::test]
+    async fn test_reflect_empty_facts_with_no_existing_memory_succeeds() {
+        let tmp = TempDir::new().unwrap();
+        let (workspace, sessions) = setup_workspace_with_sessions(&tmp, 1, 100).await;
+        let provider = Arc::new(MockProvider::new("## Entities\n- Carol (person): user\n"));
+        let reflector = Reflector::new(
+            provider,
+            "test".into(),
+            &workspace,
+            0,
+            sessions.clone(),
+            10_000,
+        );
+
+        let result = reflector.reflect().await;
+        assert!(
+            result.is_ok(),
+            "reflect should succeed with no prior memory: {:?}",
+            result.err()
+        );
+
+        let wm = WorkingMemoryStore::new(sessions);
+        assert!(
+            wm.list_completed().await.unwrap().is_empty(),
+            "sessions should be consumed even when there is no memory to preserve"
         );
     }
 
@@ -596,6 +707,20 @@ mod tests {
         let (facts, entities) = split_entities_section(response);
         assert_eq!(facts, response);
         assert!(entities.is_empty());
+    }
+
+    /// An entities-only response (no facts preamble) yields an empty `facts`,
+    /// which is the precondition the empty-facts guard defends against.
+    #[test]
+    fn test_split_entities_section_entities_only_yields_empty_facts() {
+        let response = "## Entities\n- Alice (person): the user\n";
+        let (facts, entities) = split_entities_section(response);
+        assert!(
+            facts.is_empty(),
+            "facts preamble should be empty: {facts:?}"
+        );
+        assert!(entities.starts_with("## Entities"));
+        assert!(entities.contains("Alice (person)"));
     }
 
     #[cfg(feature = "knowledge-graph")]
