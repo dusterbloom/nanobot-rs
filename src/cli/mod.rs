@@ -23,7 +23,7 @@
     clippy::format_push_string,
     clippy::string_add
 )]
-mod core_builder;
+pub(crate) mod core_builder;
 mod provider;
 mod skills;
 mod voice;
