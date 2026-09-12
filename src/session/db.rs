@@ -3246,6 +3246,14 @@ impl SessionDb {
     /// updated sessions, excluding `exclude_session_id` and sessions without
     /// any real (non-synthetic, non-empty) user or assistant message.
     ///
+    /// `last_user` and `last_assistant` are a *same-turn* pair: the assistant
+    /// row is constrained to follow the selected user row (`m.id > MAX(user
+    /// id)`). When the session's final persisted turn did not complete — a
+    /// trailing user message with no following assistant reply — `last_user`
+    /// is that unanswered question and `last_assistant` is NULL, so the
+    /// continuity formatter renders `(no reply)` instead of pairing the
+    /// question with a prior turn's reply.
+    ///
     /// Deterministic, pure SQL — ordered by `updated_at` descending.
     pub async fn latest_session_tails(
         &self,
@@ -3262,6 +3270,10 @@ impl SessionDb {
                     (SELECT CAST(m.content AS TEXT) FROM messages m \
                      WHERE m.session_id = s.id AND m.role = 'assistant' \
                        AND m.synthetic = 0 AND m.content IS NOT NULL AND m.content != '' \
+                       AND m.id > (SELECT MAX(u.id) FROM messages u \
+                                   WHERE u.session_id = s.id AND u.role = 'user' \
+                                     AND u.synthetic = 0 \
+                                     AND u.content IS NOT NULL AND u.content != '') \
                      ORDER BY m.id DESC LIMIT 1) AS last_assistant \
                 FROM sessions s WHERE s.id != ?1 \
                 ORDER BY s.updated_at DESC \
@@ -3296,6 +3308,14 @@ impl SessionDb {
     /// `exclude_session_id`), with its last real exchange. This is the
     /// continuity source for idle-rollover rotations: the fresh session's
     /// predecessor is the same key's previous row, never an unrelated key's.
+    ///
+    /// `last_user` and `last_assistant` are a *same-turn* pair: the assistant
+    /// row is constrained to follow the selected user row (`m.id > MAX(user
+    /// id)`). For a session whose final persisted turn did not complete — a
+    /// trailing user message with no following assistant reply — `last_user`
+    /// is that unanswered question and `last_assistant` is NULL, so the
+    /// continuity formatter renders `(no reply)` rather than pairing it with
+    /// a prior turn's reply.
     pub async fn latest_session_tail_for_key(
         &self,
         session_key: &str,
@@ -3311,6 +3331,10 @@ impl SessionDb {
                     (SELECT CAST(m.content AS TEXT) FROM messages m \
                      WHERE m.session_id = s.id AND m.role = 'assistant' \
                        AND m.synthetic = 0 AND m.content IS NOT NULL AND m.content != '' \
+                       AND m.id > (SELECT MAX(u.id) FROM messages u \
+                                   WHERE u.session_id = s.id AND u.role = 'user' \
+                                     AND u.synthetic = 0 \
+                                     AND u.content IS NOT NULL AND u.content != '') \
                      ORDER BY m.id DESC LIMIT 1) AS last_assistant \
                 FROM sessions s \
                 WHERE s.session_key = ?1 AND s.id != ?2 \
@@ -6060,6 +6084,135 @@ mod tests {
         let tails = db.latest_session_tails("other", 3).await;
         assert_eq!(tails.len(), 1, "message-less sessions must be skipped");
         assert_eq!(tails[0].session_key, "cli:real");
+    }
+
+    // -------------------------------------------------------------------
+    // Same-turn pairing: a crash-mid-turn session (trailing user message
+    // with no following assistant reply) must yield `last_assistant = ""`
+    // so the continuity formatter renders `(no reply)`, rather than pairing
+    // the unanswered question with a prior turn's reply.
+    // -------------------------------------------------------------------
+
+    /// A session that completed one turn, then crashed after persisting the
+    /// next user message but before the assistant reply. The trailing user
+    /// question must NOT be paired with the prior turn's assistant reply.
+    #[tokio::test]
+    async fn test_latest_session_tail_for_key_dangling_trailing_user_is_no_reply() {
+        let (db, _dir) = make_db();
+        let prior = db.create_session("cli:oneshot-X").await;
+        // Turn 1 completes normally.
+        db.add_messages(
+            &prior.id,
+            &[
+                json!({"role": "user", "content": "q1"}),
+                json!({"role": "assistant", "content": "a1"}),
+            ],
+        )
+        .await;
+        // Turn 2: inbound user turn persisted, then crash before assistant.
+        db.add_message(&prior.id, &json!({"role": "user", "content": "q2"}))
+            .await;
+        let fresh = db.create_session("cli:oneshot-X").await;
+
+        let tail = db
+            .latest_session_tail_for_key("cli:oneshot-X", &fresh.id)
+            .await
+            .expect("prior session must be found");
+        assert_eq!(tail.session_id, prior.id);
+        assert_eq!(tail.last_user, "q2");
+        // a1 answered q1, NOT q2 — it must not be re-paired with q2.
+        assert_eq!(tail.last_assistant, "", "dangling user must have no reply");
+        assert_ne!(tail.last_user, "");
+    }
+
+    /// Same defect path via the cross-key `latest_session_tails` query used by
+    /// the `recall` tool's `latest_sessions` mode.
+    #[tokio::test]
+    async fn test_latest_session_tails_dangling_trailing_user_is_no_reply() {
+        let (db, _dir) = make_db();
+        let prior = db.create_session("cli:oneshot-X").await;
+        db.add_messages(
+            &prior.id,
+            &[
+                json!({"role": "user", "content": "q1"}),
+                json!({"role": "assistant", "content": "a1"}),
+            ],
+        )
+        .await;
+        db.add_message(&prior.id, &json!({"role": "user", "content": "q2"}))
+            .await;
+        let fresh = db.create_session("cli:oneshot-X").await;
+
+        let tails = db.latest_session_tails(&fresh.id, 3).await;
+        assert_eq!(
+            tails.len(),
+            1,
+            "only the prior (non-empty) session qualifies"
+        );
+        assert_eq!(tails[0].last_user, "q2");
+        assert_eq!(
+            tails[0].last_assistant, "",
+            "dangling user must not be paired with a1"
+        );
+    }
+
+    /// A normally-terminated session must still pair the *same* turn:
+    /// last_user=q2 with last_assistant=a2, never q2 with a1.
+    #[tokio::test]
+    async fn test_latest_session_tail_for_key_pairs_same_turn_normal_session() {
+        let (db, _dir) = make_db();
+        let prior = db.create_session("cli:oneshot-N").await;
+        db.add_messages(
+            &prior.id,
+            &[
+                json!({"role": "user", "content": "q1"}),
+                json!({"role": "assistant", "content": "a1"}),
+                json!({"role": "user", "content": "q2"}),
+                json!({"role": "assistant", "content": "a2"}),
+            ],
+        )
+        .await;
+        let fresh = db.create_session("cli:oneshot-N").await;
+
+        let tail = db
+            .latest_session_tail_for_key("cli:oneshot-N", &fresh.id)
+            .await
+            .expect("prior session must be found");
+        assert_eq!(tail.last_user, "q2");
+        assert_eq!(tail.last_assistant, "a2", "must pair the same turn, not a1");
+    }
+
+    /// End-to-end: the continuity formatter, driven by the real SQL output
+    /// (not a hand-built `SessionTail`), must render `(no reply)` for a
+    /// crash-mid-turn session that already has a prior completed turn.
+    #[tokio::test]
+    async fn test_continuity_line_renders_no_reply_for_dangling_session_via_real_sql() {
+        let (db, _dir) = make_db();
+        let prior = db.create_session("cli:oneshot-E2E").await;
+        db.add_messages(
+            &prior.id,
+            &[
+                json!({"role": "user", "content": "q1"}),
+                json!({"role": "assistant", "content": "a1"}),
+            ],
+        )
+        .await;
+        db.add_message(&prior.id, &json!({"role": "user", "content": "q2"}))
+            .await;
+        let fresh = db.create_session("cli:oneshot-E2E").await;
+
+        let tail = db
+            .latest_session_tail_for_key("cli:oneshot-E2E", &fresh.id)
+            .await
+            .expect("prior session must be found");
+        let line = crate::agent::continuity::format_continuity_line(&tail, chrono::Utc::now());
+        assert!(line.contains("q2"), "line: {line}");
+        assert!(line.contains("(no reply)"), "line: {line}");
+        // The prior turn's reply must NOT leak into the rendered exchange.
+        assert!(
+            !line.contains("a1"),
+            "prior reply must not appear: line: {line}"
+        );
     }
 
     #[tokio::test]
