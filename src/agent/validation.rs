@@ -204,26 +204,44 @@ fn raw_json_tool_call_span(content: &str) -> Option<(usize, usize)> {
 }
 
 fn json_object_end(content: &str, start: usize) -> Option<usize> {
-    let mut depth = 0usize;
+    bracket_span_end(content, start, '{', '}', 0)
+}
+
+/// Find the end offset (exclusive) of the matching `close` for the `open` at
+/// `start`, scanning the rest of `content` with string-awareness so brackets
+/// inside JSON string literals (and escaped quotes) do not affect depth.
+///
+/// `initial_depth` is the depth already open at `start` (e.g. `1` when the
+/// caller has already consumed the opening bracket). Used by both
+/// `json_object_end` (raw-JSON `{...}` spans) and `verb_hallucination_span`
+/// (verb-form `[Called ...]` spans), mirroring the same `in_string`/`escaped`
+/// scanner so a `close` char inside a JSON string literal in fabricated args
+/// (e.g. `[Called recall({"q": "a]b"})]`) does not prematurely close the span.
+fn bracket_span_end(
+    content: &str,
+    start: usize,
+    open: char,
+    close: char,
+    initial_depth: usize,
+) -> Option<usize> {
+    let mut depth = initial_depth;
     let mut in_string = false;
     let mut escaped = false;
 
     for (offset, ch) in content[start..].char_indices() {
         if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
+            match ch {
+                '"' if !escaped => in_string = false,
+                '\\' if !escaped => escaped = true,
+                _ => escaped = false,
             }
             continue;
         }
 
         match ch {
             '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
+            c if c == open => depth += 1,
+            c if c == close => {
                 depth = depth.saturating_sub(1);
                 if depth == 0 {
                     return Some(start + offset + ch.len_utf8());
@@ -233,6 +251,26 @@ fn json_object_end(content: &str, start: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Find the full `[verb … ]` span of a verb-form hallucinated tool call
+/// (`[Called foo({...})]`, `[I called: foo({...})]`, `[Calling tool: foo({...})]`).
+///
+/// `HALLUCINATED_CALL_RE` matches only the opening prefix up to the separator
+/// after the verb (e.g. `[Called ` or `[I called: `); `replace_all` on that
+/// prefix alone would leave the fabricated call's argument literal and a
+/// dangling closing `]` in the output. This mirrors `raw_json_tool_call_span`
+/// by anchoring from the regex match and scanning forward for the matching `]`
+/// with string-awareness (reusing `bracket_span_end`), so a `]` inside a JSON
+/// string literal in the args (e.g. `[Called recall({"q": "a]b"})]`) does not
+/// prematurely close the span. Returns `(start_of_open_bracket,
+/// end_after_close_bracket)` byte offsets.
+fn verb_hallucination_span(content: &str) -> Option<(usize, usize)> {
+    let m = HALLUCINATED_CALL_RE.find(content)?;
+    let start = m.start();
+    // The `[` at `start` is already open; scan from after the matched prefix.
+    let end = bracket_span_end(content, m.end(), '[', ']', 1)?;
+    Some((start, end))
 }
 
 fn value_is_raw_json_tool_call(value: &Value) -> bool {
@@ -324,6 +362,9 @@ pub fn strip_hallucinated_text(content: &str) -> String {
     let content = XML_HALLUCINATED_CALL_RE.replace_all(content, "");
     let mut content = content.to_string();
     while let Some((start, end)) = raw_json_tool_call_span(&content) {
+        content.replace_range(start..end, "");
+    }
+    while let Some((start, end)) = verb_hallucination_span(&content) {
         content.replace_range(start..end, "");
     }
     HALLUCINATED_CALL_RE
@@ -656,6 +697,7 @@ Done."#;
         let stripped = strip_hallucinated_text(content);
         assert!(!stripped.contains("[I called:"));
         assert!(stripped.contains("rest of text"));
+        assert_eq!(stripped, "rest of text");
     }
 
     #[test]
@@ -664,6 +706,70 @@ Done."#;
         let stripped = strip_hallucinated_text(content);
         assert!(!stripped.contains("[Called"));
         assert!(stripped.contains("more text"));
+        assert_eq!(stripped, "more text");
+    }
+
+    // --- Verb-shape strip must remove the FULL `[verb ... ]` span, not just the
+    // verb prefix. The bug at b/42e300a left the call body and a dangling `]`
+    // behind because `HALLUCINATED_CALL_RE` matched only up to the separator
+    // after the verb. The tests below pin exact output for each verb form.
+
+    #[test]
+    fn test_strip_verb_shape_exact_output_called() {
+        let content = "[Called recall({\"query\": \"test\"})] more text";
+        assert_eq!(strip_hallucinated_text(content), "more text");
+    }
+
+    #[test]
+    fn test_strip_verb_shape_exact_output_i_called() {
+        let content = "Processing... [I called: recall({\"query\": \"test\"})] Done.";
+        assert_eq!(strip_hallucinated_text(content), "Processing...  Done.");
+    }
+
+    #[test]
+    fn test_strip_verb_shape_exact_output_multiple() {
+        let content = "[Called spawn(...)] and [Called exec(...)]";
+        assert_eq!(strip_hallucinated_text(content), "and");
+    }
+
+    /// A `]` inside a JSON string literal in the fabricated call's args must not
+    /// prematurely close the span; the scanner must be string-aware just like
+    /// `json_object_end`. A naive depth-only counter would fail this.
+    #[test]
+    fn test_strip_verb_shape_exact_output_string_with_bracket() {
+        let content = r#"[Called recall({"q": "a]b"})] done"#;
+        assert_eq!(strip_hallucinated_text(content), "done");
+    }
+
+    /// A verb-form hallucination whose brackets enclose a nested JSON array
+    /// (`[1, 2]`) must still strip the outer span: the depth counter balances
+    /// the inner `[` against its matching inner `]` and the outer `]` closes.
+    #[test]
+    fn test_strip_verb_shape_nested_bracket_in_args() {
+        let content = r#"[Called foo({"xs": [1, 2]})] tail"#;
+        assert_eq!(strip_hallucinated_text(content), "tail");
+    }
+
+    /// Code-context brackets in a finished answer must survive the strip: the
+    /// scanner is anchored on `HALLUCINATED_CALL_RE`, which does not match Rust
+    /// attributes (`#[cfg(test)]`), macros (`vec![foo()]`), or indexing
+    /// (`items[i]`). Confirms no false positives introduced by the full-span
+    /// strip.
+    #[test]
+    fn test_strip_verb_shape_preserves_code_context() {
+        assert_eq!(
+            strip_hallucinated_text("Use `#[cfg(test)]` above the module."),
+            "Use `#[cfg(test)]` above the module."
+        );
+        assert_eq!(
+            strip_hallucinated_text("You can write let v = vec![foo()]; in Rust."),
+            "You can write let v = vec![foo()]; in Rust."
+        );
+        assert_eq!(
+            strip_hallucinated_text("items[len(items)]"),
+            "items[len(items)]"
+        );
+        assert_eq!(strip_hallucinated_text("arr[max(a,b)]"), "arr[max(a,b)]");
     }
 
     // --- TextualReplay mode: validation must be suppressed ---
