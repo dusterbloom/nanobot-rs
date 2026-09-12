@@ -68,11 +68,16 @@ fn log_path() -> PathBuf {
     home.join(".nanobot").join("higgs.log")
 }
 
-/// Read the stored PID, if any.
-fn read_pid() -> Option<u32> {
-    fs::read_to_string(pid_path())
+/// Read the stored PID from `pidfile`, if any.
+fn read_pid_at(pidfile: &Path) -> Option<u32> {
+    fs::read_to_string(pidfile)
         .ok()
         .and_then(|s| s.trim().parse().ok())
+}
+
+/// Read the stored PID for the managed Higgs, if any.
+fn read_pid() -> Option<u32> {
+    read_pid_at(&pid_path())
 }
 
 /// Check if a process is alive.
@@ -81,6 +86,7 @@ fn pid_is_alive(pid: u32) -> bool {
 }
 
 /// Outcome of `server_start`.
+#[derive(Debug)]
 pub(crate) enum StartResult {
     /// Server is healthy and ready.
     Ready,
@@ -118,7 +124,14 @@ pub(crate) async fn server_start(
             server_stop()?;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         } else {
-            let _ = fs::remove_file(pid_path());
+            // Managed Higgs is alive but not healthy on this port (e.g. the
+            // user changed `higgsPort` under a running sidecar). Stop it via
+            // the still-intact pidfile — `server_stop` signals the process and
+            // removes the pidfile — so the `setsid`-reparented child is reaped
+            // before `find_existing_higgs_process` below can re-find it and
+            // misreport our own orphan as a foreign process. Merely unlinking
+            // the pidfile would leak the multi-GB sidecar and never reap it.
+            server_stop().ok();
         }
     }
 
@@ -261,14 +274,29 @@ pub(crate) async fn server_start(
 }
 
 /// Stop the managed Higgs server.
+///
+/// Always succeeds (`Ok(())`): signalling is best-effort and the worst case
+/// (process already gone) just removes a stale pidfile. The `Result` is kept
+/// for the `server_stop()?` / `.ok()` call sites and a future hard-error path.
 pub(crate) fn server_stop() -> Result<(), String> {
-    let Some(pid) = read_pid() else {
-        return Ok(());
+    stop_tracked_at(&pid_path());
+    Ok(())
+}
+
+/// Stop the process tracked by `pidfile`: read its pid, signal it to exit
+/// (SIGTERM, then SIGKILL after a 5s grace period), and remove `pidfile`.
+///
+/// Extracted from `server_stop` so the stop-and-reap behavior is testable
+/// against a temp pidfile + stand-in process without touching the user's
+/// `~/.nanobot` directory or relying on `pgrep`.
+fn stop_tracked_at(pidfile: &Path) {
+    let Some(pid) = read_pid_at(pidfile) else {
+        return;
     };
 
     if !pid_is_alive(pid) {
-        let _ = fs::remove_file(pid_path());
-        return Ok(());
+        let _ = fs::remove_file(pidfile);
+        return;
     }
 
     platform::send_signal(pid, libc::SIGTERM);
@@ -284,16 +312,16 @@ pub(crate) fn server_stop() -> Result<(), String> {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    let _ = fs::remove_file(pid_path());
+    let _ = fs::remove_file(pidfile);
     tracing::info!(pid, "higgs stopped");
-    Ok(())
 }
 
 /// Check if any `higgs serve` process is already running on this system.
 ///
-/// Uses `pgrep` to find processes matching "higgs". Returns the first PID found,
-/// excluding our own nanobot-managed PID (if still tracked and alive on the
-/// expected port, we already returned early in `server_start`).
+/// Uses `pgrep -f "higgs serve"` to find matching processes. Returns the
+/// first PID that is NOT our own nanobot-managed Higgs (tracked in the PID
+/// file): if that managed Higgs is still alive and healthy on the expected
+/// port, `server_start` already returned early before calling this.
 fn find_existing_higgs_process() -> Option<u32> {
     let output = std::process::Command::new("pgrep")
         .args(["-f", "higgs serve"])
@@ -305,11 +333,27 @@ fn find_existing_higgs_process() -> Option<u32> {
     }
 
     let text = String::from_utf8_lossy(&output.stdout);
-    // Return the first PID that isn't our own process
-    let my_pid = std::process::id();
-    text.lines()
+    first_foreign_higgs_pid(&text, read_pid())
+}
+
+/// Pick the first `higgs serve` PID from `pgrep` stdout that is not the
+/// nanobot-managed Higgs (`managed_pid`).
+///
+/// Split out from `find_existing_higgs_process` so the exclusion is
+/// unit-testable without shelling out to `pgrep`. `managed_pid` is read from
+/// the PID file: when the file is gone (already stopped/consumed by
+/// `server_stop`), nothing is excluded and any running `higgs serve` is
+/// reported as foreign — the desired behavior once nanobot has reaped its own.
+///
+/// This honors the doc comment above: the OLD code excluded
+/// `std::process::id()` (nanobot's own pid), which `pgrep -f "higgs serve"`
+/// can never match, making the exclusion a dead no-op. The managed Higgs pid
+/// is the one that actually appears in `pgrep` output and must be filtered.
+fn first_foreign_higgs_pid(pgrep_stdout: &str, managed_pid: Option<u32>) -> Option<u32> {
+    pgrep_stdout
+        .lines()
         .filter_map(|l| l.trim().parse::<u32>().ok())
-        .find(|&pid| pid != my_pid)
+        .find(|&pid| Some(pid) != managed_pid)
 }
 
 /// Wait for the Higgs health endpoint to respond.
@@ -1512,5 +1556,356 @@ mod tests {
             filter_available_model_ids(models, &unavailable),
             vec!["system".to_string()]
         );
+    }
+
+    // ------------------------------------------------------------------------
+    // Lifecycle reap/exclusion regression coverage for the `higgsPort`-change
+    // bug: the alive-but-not-healthy managed Higgs must be STOPPED (via
+    // `server_stop`/`stop_tracked_at`), not merely untracked, so the
+    // `setsid`-reparented orphan is reaped before `find_existing_higgs_process`
+    // can re-find and misreport it as a foreign process.
+    //
+    // These tests use per-test tempdirs and isolated child processes (no
+    // process-global state) so they are safe under the default parallel test
+    // runner. The lifecycle helpers exercised (`stop_tracked_at`,
+    // `read_pid_at`, `first_foreign_higgs_pid`) are parameterised seams kept
+    // production-identical to `server_stop`/`read_pid`/the exclusion in
+    // `find_existing_higgs_process`.
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn stop_tracked_at_is_noop_when_pidfile_absent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("does-not-exist.pid");
+        assert!(!pidfile.exists());
+        stop_tracked_at(&pidfile);
+        assert!(!pidfile.exists());
+    }
+
+    #[test]
+    fn stop_tracked_at_removes_stale_pidfile_when_process_dead() {
+        // A pid far above any real pid_max (Linux ≤ 4194304, macOS ~99999) so
+        // it can never be a live process — `pid_is_alive` returns false without
+        // risking signalling an unrelated recycled pid.
+        let impossible_pid: u32 = 5_000_000;
+        assert!(
+            !pid_is_alive(impossible_pid),
+            "precondition: stand-in pid must not be alive"
+        );
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("higgs.pid");
+        std::fs::write(&pidfile, impossible_pid.to_string()).expect("write pidfile");
+
+        stop_tracked_at(&pidfile);
+        assert!(!pidfile.exists(), "stale pidfile must be removed");
+        assert!(
+            !pid_is_alive(impossible_pid),
+            "no signal sent to a dead pid"
+        );
+    }
+
+    #[test]
+    fn stop_tracked_at_reaps_live_tracked_process_and_removes_pidfile() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("higgs.pid");
+
+        // Stand-in for the managed sidecar: a long-lived child we can signal.
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep stand-in");
+        let pid = child.id();
+
+        // Reaper thread mirrors the production reaper in `server_start`: it
+        // reaps the child so it doesn't linger as a zombie (which would keep
+        // `pid_is_alive` — kill(pid, 0) — returning true and stall the SIGTERM
+        // loop). `wait()` returning is also proof the child exited.
+        let reaper = std::thread::spawn(move || child.wait());
+
+        std::fs::write(&pidfile, pid.to_string()).expect("write pidfile");
+        // The stand-in is genuinely alive before stop.
+        assert!(
+            pid_is_alive(pid),
+            "precondition: stand-in alive before stop"
+        );
+
+        stop_tracked_at(&pidfile);
+        assert!(!pidfile.exists(), "pidfile must be removed after stop");
+
+        let exit = reaper
+            .join()
+            .expect("reaper thread panicked")
+            .expect("wait failed");
+        // `sleep 60` would not exit on its own during the test; it died because
+        // stop_tracked_at SIGTERM'd it. On Unix a signal termination carries no
+        // exit code and a signal number.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert!(
+                exit.code().is_none(),
+                "expected signal termination, got code {:?}",
+                exit.code()
+            );
+            assert_eq!(
+                exit.signal(),
+                Some(libc::SIGTERM),
+                "expected SIGTERM from stop_tracked_at"
+            );
+        }
+        let _ = exit;
+    }
+
+    #[test]
+    fn bug_scenario_orphan_then_find_no_longer_misreports_own_sidecar() {
+        // Reproduces the port-change scenario at the unit level:
+        //   1. the previously-managed Higgs is alive but on the wrong port
+        //      (stand-in: a `sleep` child tracked by a temp pidfile);
+        //   2. the fixed `server_start` else-branch reaps it via stop_tracked_at
+        //      (the OLD code only unlinked the pidfile, leaving the orphan);
+        //   3. `find_existing_higgs_process`'s pgrep would now find nothing, so
+        //      `first_foreign_higgs_pid` returns None — no false "foreign
+        //      process" error naming nanobot's own spawned sidecar.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pidfile = tmp.path().join("higgs.pid");
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep stand-in");
+        let pid = child.id();
+        let reaper = std::thread::spawn(move || child.wait());
+        std::fs::write(&pidfile, pid.to_string()).expect("write pidfile");
+
+        // Step 2: the fixed else-branch reaps the managed process.
+        stop_tracked_at(&pidfile);
+        assert!(!pidfile.exists(), "pidfile consumed by the stop");
+
+        let exit = reaper
+            .join()
+            .expect("reaper thread panicked")
+            .expect("wait failed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            assert!(
+                exit.signal().is_some(),
+                "managed stand-in was signalled to death (reaped, not orphaned)"
+            );
+        }
+        let _ = exit;
+
+        // Step 3: pgrep would find nothing because the orphan is dead, and the
+        // pidfile no longer tracks any managed pid — nothing to misreport as
+        // foreign. server_start would proceed to spawn a fresh sidecar.
+        assert_eq!(
+            first_foreign_higgs_pid("", None),
+            None,
+            "no foreign-process error after reaping our own orphan"
+        );
+    }
+
+    #[test]
+    fn first_foreign_higgs_pid_excludes_managed_pid() {
+        // pgrep finds only the nanobot-managed Higgs → not foreign → None.
+        assert_eq!(first_foreign_higgs_pid("4242\n", Some(4242)), None);
+        // Multiple lines, all the managed pid → None.
+        assert_eq!(first_foreign_higgs_pid("4242\n4242\n", Some(4242)), None);
+    }
+
+    #[test]
+    fn first_foreign_higgs_pid_returns_foreign_when_mixed() {
+        // Managed pid present alongside a foreign one → return the foreign pid.
+        assert_eq!(
+            first_foreign_higgs_pid("4242\n9999\n", Some(4242)),
+            Some(9999),
+            "managed pid must be skipped, foreign returned"
+        );
+        // Order independence: foreign listed first is still returned.
+        assert_eq!(
+            first_foreign_higgs_pid("9999\n4242\n", Some(4242)),
+            Some(9999),
+        );
+        // First foreign wins when several foreign pids are present.
+        assert_eq!(
+            first_foreign_higgs_pid("4242\n1111\n2222\n", Some(4242)),
+            Some(1111),
+        );
+    }
+
+    #[test]
+    fn first_foreign_higgs_pid_returns_foreign_when_no_managed() {
+        // No managed pid tracked (pidfile gone after server_stop) → any running
+        // `higgs serve` is genuinely foreign.
+        assert_eq!(first_foreign_higgs_pid("9999\n", None), Some(9999));
+        assert_eq!(first_foreign_higgs_pid("1\n2\n3\n", None), Some(1));
+    }
+
+    #[test]
+    fn first_foreign_higgs_pid_does_not_exclude_nanobot_own_pid() {
+        // Regression guard for the original bug: exclusion must key off the
+        // MANAGED Higgs pid (read from the pidfile), not nanobot's own pid
+        // (std::process::id()), since nanobot's pid never appears in
+        // `pgrep -f "higgs serve"` output. A pid equal to nanobot's own pid is
+        // only excluded if it equals the managed pid; otherwise it is foreign.
+        let me = std::process::id();
+        assert_eq!(
+            first_foreign_higgs_pid(&format!("{me}\n"), Some(4242)),
+            Some(me),
+            "nanobot's own pid is NOT the managed-pid exclusion key"
+        );
+        assert_eq!(first_foreign_higgs_pid(&format!("{me}\n"), None), Some(me));
+        // But when it happens to equal the managed pid, it is excluded.
+        assert_eq!(first_foreign_higgs_pid(&format!("{me}\n"), Some(me)), None);
+    }
+
+    // ------------------------------------------------------------------------
+    // Linux-runnable E2E substitute for the plan's B6 (Mac-only Higgs scenario).
+    // Exercises the REAL `server_start` production code — including
+    // `set_new_session`, the reaper thread, `read_pid`/`pid_path`/`log_path`
+    // under an isolated HOME, the real `wait_for_ready` HTTP probe, and the
+    // real `find_existing_higgs_process` `pgrep` — through the exact
+    // `higgsPort`-change scenario from the bug report, using a stand-in
+    // `higgs` binary (a python3 http.server) in place of the Apple-Silicon
+    // Higgs.
+    //
+    // `#[ignore]` because it mutates HOME/HIGGS_BIN (process-global) and binds
+    // ports — run with: `cargo test --lib -- --ignored --exact --test-threads=1
+    // higgs::tests::server_start_port_change_e2e_reaps_orphan_no_foreign_error`
+    // ------------------------------------------------------------------------
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind ephemeral")
+            .local_addr()
+            .expect("local addr")
+            .port()
+    }
+
+    fn write_higgs_standin(dir: &Path) -> PathBuf {
+        // A stand-in for the Apple-Silicon Higgs binary: a python3 script that
+        // accepts `serve --model DIR --port P --mlx-profile throughput` and
+        // serves /health (200) and /v1/models (200) on P. `exec` via the
+        // shebang means the spawned pid IS python's pid, so server_stop's
+        // SIGTERM reaches the actual server (python's default SIGTERM handler
+        // terminates it promptly). The cmdline contains "<script> serve ...";
+        // naming the script `higgs` makes `pgrep -f "higgs serve"` match it,
+        // keeping `find_existing_higgs_process` faithful.
+        let script = dir.join("higgs");
+        let body = concat!(
+            "#!/usr/bin/env python3\n",
+            "import http.server, json, sys\n",
+            "port = None\n",
+            "args = sys.argv[1:]\n",
+            "for i, a in enumerate(args):\n",
+            "    if a == \"--port\" and i + 1 < len(args):\n",
+            "        port = int(args[i+1])\n",
+            "if port is None:\n",
+            "    sys.exit(2)\n",
+            "class H(http.server.BaseHTTPRequestHandler):\n",
+            "    def do_GET(self):\n",
+            "        if self.path == \"/health\":\n",
+            "            self.send_response(200); self.end_headers(); self.wfile.write(b\"ok\")\n",
+            "        elif self.path == \"/v1/models\":\n",
+            "            self.send_response(200); self.send_header(\"Content-Type\",\"application/json\"); self.end_headers()\n",
+            "            self.wfile.write(json.dumps({\"data\":[{\"id\":\"testmodel\",\"object\":\"model\"}]}).encode())\n",
+            "        else:\n",
+            "            self.send_response(404); self.end_headers()\n",
+            "    def log_message(self, *a): pass\n",
+            "http.server.HTTPServer((\"127.0.0.1\", port), H).serve_forever()\n",
+        );
+        std::fs::write(&script, body).expect("write stand-in");
+        // chmod +x
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut perm = std::fs::metadata(&script).expect("stat").permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&script, perm).expect("chmod");
+        }
+        script
+    }
+
+    #[tokio::test]
+    #[ignore = "E2E: mutates HOME/HIGGS_BIN + binds ports; run with --ignored --exact --test-threads=1"]
+    async fn server_start_port_change_e2e_reaps_orphan_no_foreign_error() {
+        // Isolate HOME (so pid_path()/log_path() land in a tempdir) and HIGGS_BIN
+        // (so find_binary() returns our stand-in).
+        let home = tempfile::tempdir().expect("home tempdir");
+        let prev_home = std::env::var_os("HOME");
+        let prev_higgs_bin = std::env::var_os("HIGGS_BIN");
+        std::env::set_var("HOME", home.path());
+        std::env::set_var("HIGGS_BIN", write_higgs_standin(home.path()));
+
+        let port_a = free_port();
+        let port_b = free_port();
+        assert_ne!(port_a, port_b, "need two distinct ports");
+
+        let bin = crate::higgs::find_binary().expect("stand-in higgs via HIGGS_BIN");
+
+        // --- Run 1: spawn the managed sidecar on port_a (the "old port"). ---
+        let r1 = crate::higgs::server_start(&bin, port_a, "testmodel", "testmodel", None).await;
+        assert!(r1.is_ok(), "run 1 should spawn: {r1:?}");
+        assert!(matches!(r1, Ok(StartResult::Ready)), "run 1 ready: {r1:?}");
+        // Managed pid is tracked and the sidecar answers on port_a.
+        let pid1 = read_pid().expect("pidfile after run 1");
+        assert!(pid_is_alive(pid1), "stand-in alive after run 1");
+        assert!(
+            wait_for_ready(port_a, 1).await,
+            "port_a serving after run 1 (stand-in is up)"
+        );
+
+        // --- Run 2: user changed higgsPort to port_b. The OLD branch would
+        //     unlink the pidfile and then `find_existing_higgs_process` would
+        //     re-find the still-alive stand-in on port_a and return an Err. The
+        //     fix reaps it (else-branch server_stop) and spawns fresh on port_b.
+        let r2 = crate::higgs::server_start(&bin, port_b, "testmodel", "testmodel", None).await;
+        assert!(
+            r2.is_ok(),
+            "run 2 must NOT return the 'another Higgs process is already running' error: {r2:?}"
+        );
+        assert!(matches!(r2, Ok(StartResult::Ready)), "run 2 ready: {r2:?}");
+
+        // The orphan on port_a was reaped (server_stop SIGTERM'd it).
+        assert!(
+            !wait_for_ready(port_a, 1).await,
+            "port_a must be quiet after run 2 — the wrong-port orphan was reaped"
+        );
+        // A fresh sidecar is up on port_b and tracked.
+        assert!(
+            wait_for_ready(port_b, 1).await,
+            "port_b serving after run 2 (fresh sidecar spawned)"
+        );
+        let pid2 = read_pid().expect("pidfile after run 2");
+        assert_ne!(pid1, pid2, "run 2 must have spawned a NEW sidecar");
+        assert!(pid_is_alive(pid2), "fresh sidecar alive");
+
+        // find_existing_higgs_process now returns None: the only `higgs serve`
+        // around is OUR managed one (tracked in the pidfile) → excluded. This
+        // verifies the exclusion fix end-to-end through the real pgrep.
+        assert_eq!(
+            find_existing_higgs_process(),
+            None,
+            "no foreign Higgs reported; our managed sidecar is excluded"
+        );
+
+        // --- Cleanup: reap the fresh sidecar and restore env. ---
+        let stop = crate::higgs::server_stop();
+        assert!(stop.is_ok(), "cleanup server_stop: {stop:?}");
+        assert!(
+            !wait_for_ready(port_b, 1).await,
+            "port_b quiet after cleanup"
+        );
+        assert_eq!(read_pid(), None, "pidfile removed after cleanup");
+
+        // Restore env (best-effort).
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_higgs_bin {
+            Some(v) => std::env::set_var("HIGGS_BIN", v),
+            None => std::env::remove_var("HIGGS_BIN"),
+        }
     }
 }
