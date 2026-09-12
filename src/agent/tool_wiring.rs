@@ -270,6 +270,12 @@ impl PipelineHost for AgentHost {
 #[async_trait]
 impl LoopHost for AgentHost {
     async fn run_loop(&self, req: LoopRequest) -> Result<LoopReply, ToolError> {
+        let key = format!("{}:{}", self.channel, self.chat_id);
+        let policy = {
+            let map = self.session_policies.lock().await;
+            map.get(&key).cloned().unwrap_or_default()
+        };
+        let effective_model = policy::enforce_subagent_model(&policy, req.model);
         let text = crate::agent::host_bridge::into_model_text(
             self.subagents
                 .run_loop(
@@ -277,7 +283,7 @@ impl LoopHost for AgentHost {
                     req.max_rounds,
                     req.tools,
                     req.stop_condition,
-                    req.model,
+                    effective_model,
                     req.working_dir,
                 )
                 .await,
@@ -482,11 +488,11 @@ mod tests {
 mod agent_host_tests {
     use super::*;
     use crate::agent::host_bridge::{
-        CancelRequest, CheckRequest, HostReply, HostRequest, ListSubagentsRequest,
+        CancelRequest, CheckRequest, HostReply, HostRequest, ListSubagentsRequest, LoopRequest,
         SendMessageRequest, SpawnRequest, WaitRequest,
     };
     use crate::bus::events::InboundMessage;
-    use crate::providers::base::{LLMProvider, LLMResponse};
+    use crate::providers::base::{FinishReason, LLMProvider, LLMResponse};
 
     /// Provider that never completes a call — enough for `SubagentManager` to
     /// construct and for `spawn` to start a task that fails harmlessly.
@@ -535,6 +541,82 @@ mod agent_host_tests {
             outbound,
             channel: "telegram".to_string(),
             chat_id: "42".to_string(),
+        }
+    }
+
+    /// Build an `AgentHost` backed by an explicit provider (so tests can
+    /// capture the model reaching `provider.chat`).
+    fn make_host_with_provider(
+        workspace: &std::path::Path,
+        provider: Arc<dyn LLMProvider>,
+    ) -> AgentHost {
+        let (bus_tx, _bus_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+        let (outbound, _out_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+        let subagents = Arc::new(SubagentManager::new(
+            provider,
+            workspace.to_path_buf(),
+            bus_tx,
+            "mock-model".to_string(),
+            None,
+            0,
+            false,
+            false,
+            30_000,
+        ));
+        AgentHost {
+            subagents,
+            session_policies: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            pipeline_provider: Arc::new(NeverCompletesProvider),
+            pipeline_model: "mock-model".to_string(),
+            workspace: workspace.to_path_buf(),
+            outbound,
+            channel: "telegram".to_string(),
+            chat_id: "42".to_string(),
+        }
+    }
+
+    /// Insert a `local_only` session policy under the `channel:chat_id` key
+    /// that `AgentHost` queries, mirroring what `prepare_context` writes on a
+    /// gateway channel.
+    async fn set_local_only(host: &AgentHost) {
+        let key = format!("{}:{}", host.channel, host.chat_id);
+        let mut map = host.session_policies.lock().await;
+        map.insert(key, policy::SessionPolicy { local_only: true });
+    }
+
+    /// Provider that records the `model` argument of every `chat` call and
+    /// returns a content-only "DONE" response (no tool calls) so `run_loop`
+    /// terminates after a single round.
+    struct RecordingProvider {
+        models: std::sync::Arc<std::sync::Mutex<Vec<Option<String>>>>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for RecordingProvider {
+        fn get_default_model(&self) -> &str {
+            "mock-model"
+        }
+
+        async fn chat(
+            &self,
+            _messages: &[serde_json::Value],
+            _tools: Option<&[serde_json::Value]>,
+            model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<LLMResponse> {
+            self.models
+                .lock()
+                .unwrap()
+                .push(model.map(|s| s.to_string()));
+            Ok(LLMResponse {
+                content: Some("DONE".to_string()),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: HashMap::new(),
+            })
         }
     }
 
@@ -667,5 +749,131 @@ mod agent_host_tests {
             .as_str()
             .unwrap()
             .contains("No subagents currently running."));
+    }
+
+    /// Contrast baseline: `spawn` already enforces `local_only` by rewriting
+    /// a cloud model override to `"local"` in its reply text. This anchors the
+    /// behavior `run_loop` is expected to mirror.
+    #[tokio::test]
+    async fn spawn_under_local_only_rewrites_cloud_model_to_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = make_host(dir.path());
+        set_local_only(&host).await;
+        let reply = host
+            .spawn(SpawnRequest {
+                task: "do a thing".to_string(),
+                label: Some("explore".to_string()),
+                profile: None,
+                model: Some("claude-opus-4-6".to_string()),
+                working_dir: None,
+                channel: "telegram".to_string(),
+                chat_id: "42".to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            reply.text.contains(", model: local)."),
+            "spawn must rewrite a cloud model override to \"local\" under local_only. Got: {}",
+            reply.text
+        );
+    }
+
+    /// `run_loop` must mirror `spawn`: under `local_only` a cloud model
+    /// override is rewritten to `"local"` before reaching the provider.
+    #[tokio::test]
+    async fn run_loop_under_local_only_rewrites_cloud_model_to_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let host = make_host_with_provider(
+            dir.path(),
+            Arc::new(RecordingProvider {
+                models: models.clone(),
+            }),
+        );
+        set_local_only(&host).await;
+        host.run_loop(LoopRequest {
+            task: "summarize the logs".to_string(),
+            max_rounds: 3,
+            tools: None,
+            stop_condition: None,
+            model: Some("claude-opus-4-6".to_string()),
+            working_dir: None,
+        })
+        .await
+        .unwrap();
+        let captured = models.lock().unwrap().clone();
+        assert!(
+            !captured.is_empty() && captured.iter().all(|m| m.as_deref() == Some("local")),
+            "run_loop must rewrite a cloud model override to \"local\" under local_only (mirroring spawn). \
+             Captured provider models: {:?}",
+            captured
+        );
+    }
+
+    /// `run_loop` under `local_only` must keep an already-local override
+    /// (`enforce_subagent_model` passes `local*` strings through unchanged).
+    #[tokio::test]
+    async fn run_loop_under_local_only_keeps_local_model_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let host = make_host_with_provider(
+            dir.path(),
+            Arc::new(RecordingProvider {
+                models: models.clone(),
+            }),
+        );
+        set_local_only(&host).await;
+        host.run_loop(LoopRequest {
+            task: "summarize the logs".to_string(),
+            max_rounds: 3,
+            tools: None,
+            stop_condition: None,
+            model: Some("local:nano".to_string()),
+            working_dir: None,
+        })
+        .await
+        .unwrap();
+        let captured = models.lock().unwrap().clone();
+        assert!(
+            !captured.is_empty() && captured.iter().all(|m| m.as_deref() == Some("local:nano")),
+            "run_loop must keep an already-local model override under local_only. \
+             Captured provider models: {:?}",
+            captured
+        );
+    }
+
+    /// `run_loop` without `local_only` is a passthrough — the cloud override
+    /// reaches the provider unchanged (no regression in the common case).
+    #[tokio::test]
+    async fn run_loop_without_local_only_passes_model_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let host = make_host_with_provider(
+            dir.path(),
+            Arc::new(RecordingProvider {
+                models: models.clone(),
+            }),
+        );
+        // No local_only policy set — default session policy is a passthrough.
+        host.run_loop(LoopRequest {
+            task: "summarize the logs".to_string(),
+            max_rounds: 3,
+            tools: None,
+            stop_condition: None,
+            model: Some("claude-opus-4-6".to_string()),
+            working_dir: None,
+        })
+        .await
+        .unwrap();
+        let captured = models.lock().unwrap().clone();
+        assert!(
+            !captured.is_empty()
+                && captured
+                    .iter()
+                    .all(|m| m.as_deref() == Some("claude-opus-4-6")),
+            "run_loop must pass a cloud model override through unchanged when local_only is off. \
+             Captured provider models: {:?}",
+            captured
+        );
     }
 }
