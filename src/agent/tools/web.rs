@@ -133,6 +133,27 @@ fn validate_url(url_str: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Build the SSRF-aware redirect policy used by [`WebFetchTool`]'s HTTP client.
+///
+/// `Policy::limited` only caps the *number* of redirects; it never inspects the
+/// *destination*, so a public URL can 30x to a private/loopback/metadata host
+/// (e.g. `http://localhost:8080/admin` or `http://169.254.169.254/...`) and the
+/// body would be fetched and returned to the model, bypassing [`validate_url`].
+/// Each redirect hop is re-validated with `validate_url` and refused as a
+/// request error if it points at a blocked host; the `MAX_REDIRECTS` hop cap
+/// from the old `Policy::limited` is preserved via `attempt.previous()`.
+fn ssrf_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if let Err(e) = validate_url(attempt.url().as_str()) {
+            return attempt.error(format!("redirect to blocked host (SSRF guard): {e}"));
+        }
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        attempt.follow()
+    })
+}
+
 // ---------------------------------------------------------------------------
 // WebSearchTool
 // ---------------------------------------------------------------------------
@@ -654,7 +675,7 @@ impl WebFetchTool {
     /// Create a new web fetch tool.
     pub fn new(max_chars: usize) -> Self {
         let client = Client::builder()
-            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+            .redirect(ssrf_redirect_policy())
             .user_agent(USER_AGENT)
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -805,6 +826,18 @@ impl WebFetchTool {
             Ok(response) => {
                 let status = response.status().as_u16();
                 let final_url = response.url().to_string();
+                // Defense-in-depth: the redirect policy re-validates every hop,
+                // but re-check the final post-redirect URL so a blocked
+                // destination can never reach the body-read path even if the
+                // policy were bypassed or a client followed a redirect anyway.
+                if let Err(e) = validate_url(&final_url) {
+                    return serde_json::json!({
+                        "error": format!("Redirect landed on blocked URL: {e}"),
+                        "url": url,
+                        "finalUrl": final_url
+                    })
+                    .to_string();
+                }
                 let content_type = response
                     .headers()
                     .get("content-type")
@@ -995,6 +1028,19 @@ fn fallback_extract(html: &str, mode: &str) -> String {
         result
     } else {
         format!("# {}\n\n{}", title.trim(), result)
+    }
+}
+
+#[cfg(test)]
+impl WebFetchTool {
+    /// Test-only: inject a pre-built client (SSRF policy + DNS overrides for
+    /// mock servers) so the redirect chain can be exercised through `run()`.
+    fn new_with_client(max_chars: usize, client: Client) -> Self {
+        Self {
+            max_chars,
+            client,
+            crw_url: String::new(),
+        }
     }
 }
 
@@ -1930,5 +1976,491 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
         // TEMPORARILY: use current signature so registry tests can run RED.
         let tool = WebFetchTool::new(10000);
         assert_eq!(tool.name(), "web_fetch");
+    }
+
+    // -----------------------------------------------------------------------
+    // SSRF redirect guard — re-validate every redirect hop
+    //
+    // The pre-fix client used `Policy::limited`, which caps the *count* of
+    // redirects but never inspects the destination. These tests wire the tool
+    // to a real reqwest client (carrying the production `ssrf_redirect_policy`)
+    // and a mock HTTP server, and assert that a redirect to a blocked host is
+    // refused, the blocked target is never contacted, and legitimate
+    // (allowed-host) redirects still succeed.
+    // -----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A minimal HTTP/1.1 mock server bound to 127.0.0.1:0. Counts accepted
+    /// connections so a test can prove a blocked redirect target was *never*
+    /// contacted (the strongest SSRF-prevention guarantee).
+    struct MockServer {
+        port: u16,
+        hits: Arc<AtomicUsize>,
+    }
+
+    impl MockServer {
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Build a raw HTTP/1.1 response (status line + headers + fixed body).
+    fn mock_http_response(status: &str, headers: &[(&str, &str)], body: &str) -> Vec<u8> {
+        use std::fmt::Write;
+        let mut resp = String::new();
+        let _ = write!(resp, "HTTP/1.1 {status}\r\n");
+        for (k, v) in headers {
+            let _ = write!(resp, "{k}: {v}\r\n");
+        }
+        let _ = write!(
+            resp,
+            "Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        resp.into_bytes()
+    }
+
+    /// Bind a mock server; each accepted connection produces `responder(path)`
+    /// where `path` is parsed from the request line.
+    async fn start_mock_server<F>(responder: F) -> MockServer
+    where
+        F: Fn(&str) -> Vec<u8> + Send + Sync + 'static,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let port = listener.local_addr().expect("local_addr").port();
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((mut stream, _)) => {
+                        hits_clone.fetch_add(1, Ordering::SeqCst);
+                        let mut buf = vec![0u8; 8192];
+                        let _ = stream.read(&mut buf).await;
+                        let req = String::from_utf8_lossy(&buf);
+                        let path = req
+                            .lines()
+                            .next()
+                            .and_then(|line| line.split_whitespace().nth(1))
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("/");
+                        let resp = responder(path);
+                        let _ = stream.write_all(&resp).await;
+                        let _ = stream.flush().await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        MockServer { port, hits }
+    }
+
+    /// A client identical to `WebFetchTool::new`'s except `attacker.test` is
+    /// DNS-overridden to 127.0.0.1 so mock servers are reachable through a
+    /// host name that passes `validate_url`. URL ports win over the override,
+    /// so each `http://attacker.test:<port>/...` connects to the matching mock.
+    fn ssrf_test_client() -> Client {
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("parse addr");
+        Client::builder()
+            .redirect(ssrf_redirect_policy())
+            .resolve("attacker.test", addr)
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("build client")
+    }
+
+    fn fetch_params(url: String) -> HashMap<String, serde_json::Value> {
+        let mut params = HashMap::new();
+        params.insert("url".to_string(), serde_json::Value::String(url));
+        params
+    }
+
+    /// CONTROL: with the pre-fix `Policy::limited` (no destination check), a
+    /// 302 to a loopback host IS followed and its body is returned. Proves the
+    /// hole the custom policy closes. Bypasses `run()` to isolate policy
+    /// behaviour (no initial `validate_url` / final-URL check).
+    #[tokio::test]
+    async fn policy_limited_follows_redirect_to_loopback_control() {
+        let internal = start_mock_server(|_| {
+            mock_http_response(
+                "200 OK",
+                &[("Content-Type", "text/plain")],
+                "INTERNAL SECRET",
+            )
+        })
+        .await;
+        let internal_port = internal.port;
+        let attacker = start_mock_server(move |_| {
+            mock_http_response(
+                "302 Found",
+                &[(
+                    "Location",
+                    &format!("http://127.0.0.1:{internal_port}/admin"),
+                )],
+                "",
+            )
+        })
+        .await;
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let leaky = Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+            .resolve("attacker.test", addr)
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let resp = leaky
+            .get(format!("http://attacker.test:{}/redirect", attacker.port))
+            .send()
+            .await
+            .unwrap();
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("INTERNAL SECRET"),
+            "control: limited policy must follow the redirect to loopback, got: {body}"
+        );
+        assert_eq!(
+            internal.hits(),
+            1,
+            "control: limited policy contacted the internal host"
+        );
+    }
+
+    /// FIX: through `run()`, a redirect to a loopback IP is refused; the
+    /// internal target is never contacted and its content never reaches the
+    /// model.
+    #[tokio::test]
+    async fn web_fetch_blocks_redirect_to_loopback_ip() {
+        let internal = start_mock_server(|_| {
+            mock_http_response(
+                "200 OK",
+                &[("Content-Type", "text/plain")],
+                "INTERNAL SECRET",
+            )
+        })
+        .await;
+        let internal_port = internal.port;
+        let attacker = start_mock_server(move |_| {
+            mock_http_response(
+                "302 Found",
+                &[(
+                    "Location",
+                    &format!("http://127.0.0.1:{internal_port}/admin"),
+                )],
+                "",
+            )
+        })
+        .await;
+        let tool = WebFetchTool::new_with_client(50000, ssrf_test_client());
+        let result = tool
+            .run(fetch_params(format!(
+                "http://attacker.test:{}/redirect",
+                attacker.port
+            )))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&result).expect("envelope");
+        assert!(
+            v.get("error").is_some(),
+            "redirect to loopback IP must produce an error envelope, got: {result}"
+        );
+        assert!(
+            v.get("text")
+                .and_then(|t| t.as_str())
+                .is_none_or(|t| !t.contains("INTERNAL SECRET")),
+            "internal content must not reach the model, got: {result}"
+        );
+        assert_eq!(
+            internal.hits(),
+            0,
+            "the blocked redirect target must never be contacted"
+        );
+        assert_eq!(attacker.hits(), 1, "only the initial request was made");
+    }
+
+    /// FIX: a redirect to the `localhost` name is refused (the name is on the
+    /// blocklist independent of the IP-range check).
+    #[tokio::test]
+    async fn web_fetch_blocks_redirect_to_localhost_name() {
+        let internal = start_mock_server(|_| {
+            mock_http_response(
+                "200 OK",
+                &[("Content-Type", "text/plain")],
+                "LOCALHOST SECRET",
+            )
+        })
+        .await;
+        let internal_port = internal.port;
+        let attacker = start_mock_server(move |_| {
+            mock_http_response(
+                "302 Found",
+                &[(
+                    "Location",
+                    &format!("http://localhost:{internal_port}/admin"),
+                )],
+                "",
+            )
+        })
+        .await;
+        let tool = WebFetchTool::new_with_client(50000, ssrf_test_client());
+        let result = tool
+            .run(fetch_params(format!(
+                "http://attacker.test:{}/redirect",
+                attacker.port
+            )))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&result).expect("envelope");
+        assert!(
+            v.get("error").is_some(),
+            "redirect to localhost must produce an error envelope, got: {result}"
+        );
+        assert_eq!(
+            internal.hits(),
+            0,
+            "the blocked localhost redirect target must never be contacted"
+        );
+    }
+
+    /// FIX: a redirect into the RFC1918 private range is refused.
+    #[tokio::test]
+    async fn web_fetch_blocks_redirect_to_private_ip() {
+        let attacker = start_mock_server(|_| {
+            mock_http_response("302 Found", &[("Location", "http://192.168.0.1/admin")], "")
+        })
+        .await;
+        let tool = WebFetchTool::new_with_client(50000, ssrf_test_client());
+        let result = tool
+            .run(fetch_params(format!(
+                "http://attacker.test:{}/redirect",
+                attacker.port
+            )))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&result).expect("envelope");
+        assert!(
+            v.get("error").is_some(),
+            "redirect to RFC1918 IP must produce an error envelope, got: {result}"
+        );
+        let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        assert!(
+            !text.contains("admin"),
+            "private-range response must not reach the model, got: {result}"
+        );
+        assert_eq!(attacker.hits(), 1, "only the initial request was made");
+    }
+
+    /// FIX: the cloud-metadata IP (169.254.169.254) redirect is refused by the
+    /// policy before any connection to it is attempted.
+    #[tokio::test]
+    async fn web_fetch_blocks_redirect_to_metadata_ip() {
+        let attacker = start_mock_server(|_| {
+            mock_http_response(
+                "302 Found",
+                &[(
+                    "Location",
+                    "http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                )],
+                "",
+            )
+        })
+        .await;
+        let tool = WebFetchTool::new_with_client(50000, ssrf_test_client());
+        let result = tool
+            .run(fetch_params(format!(
+                "http://attacker.test:{}/redirect",
+                attacker.port
+            )))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&result).expect("envelope");
+        assert!(
+            v.get("error").is_some(),
+            "redirect to metadata IP must produce an error envelope, got: {result}"
+        );
+        let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        assert!(
+            !text.contains("iam/security-credentials")
+                && !text.contains("SecretAccessKey")
+                && !text.contains("AccessKeyId"),
+            "metadata content must not reach the model, got: {result}"
+        );
+        assert_eq!(attacker.hits(), 1, "only the initial request was made");
+    }
+
+    /// NO REGRESSION: a redirect to a host that passes `validate_url` is still
+    /// followed, and the final response body is returned. Uses a second mock
+    /// on `attacker.test` (different port) as the redirect destination.
+    #[tokio::test]
+    async fn web_fetch_follows_allowed_redirect() {
+        let dest = start_mock_server(|_| {
+            mock_http_response(
+                "200 OK",
+                &[("Content-Type", "text/plain")],
+                "OK REDIRECTED CONTENT",
+            )
+        })
+        .await;
+        let dest_port = dest.port;
+        let attacker = start_mock_server(move |_| {
+            mock_http_response(
+                "302 Found",
+                &[(
+                    "Location",
+                    &format!("http://attacker.test:{dest_port}/dest"),
+                )],
+                "",
+            )
+        })
+        .await;
+        let tool = WebFetchTool::new_with_client(50000, ssrf_test_client());
+        let result = tool
+            .run(fetch_params(format!(
+                "http://attacker.test:{}/redirect",
+                attacker.port
+            )))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&result).expect("envelope");
+        assert!(
+            v.get("error").is_none(),
+            "allowed redirect must not error, got: {result}"
+        );
+        assert_eq!(
+            v["status"].as_u64(),
+            Some(200),
+            "allowed redirect must resolve to 200, got: {result}"
+        );
+        assert!(
+            v["text"]
+                .as_str()
+                .is_some_and(|t| t.contains("OK REDIRECTED CONTENT")),
+            "followed-redirect body must be returned, got: {result}"
+        );
+        assert_eq!(
+            attacker.hits(),
+            1,
+            "initial request only on the attacker host"
+        );
+        assert_eq!(dest.hits(), 1, "redirect target was reached exactly once");
+    }
+
+    /// The final-URL defense-in-depth: even if a client *does* follow a redirect
+    /// to a blocked host (here the pre-fix `Policy::limited`, which lacks the
+    /// destination check, is injected so the redirect *is* followed and the
+    /// internal server *is* contacted), `run()` must still refuse to return the
+    /// body via the post-`send()` final-URL guard. We use loopback (reachable)
+    /// so the redirect genuinely lands, then assert the guard's own message.
+    #[tokio::test]
+    async fn web_fetch_defense_in_depth_blocks_landed_blocked_url() {
+        let internal = start_mock_server(|_| {
+            mock_http_response("200 OK", &[("Content-Type", "text/plain")], "LANDED SECRET")
+        })
+        .await;
+        let internal_port = internal.port;
+        let attacker = start_mock_server(move |_| {
+            mock_http_response(
+                "302 Found",
+                &[(
+                    "Location",
+                    &format!("http://127.0.0.1:{internal_port}/admin"),
+                )],
+                "",
+            )
+        })
+        .await;
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let leaky = Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+            .resolve("attacker.test", addr)
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let tool = WebFetchTool::new_with_client(50000, leaky);
+        let result = tool
+            .run(fetch_params(format!(
+                "http://attacker.test:{}/redirect",
+                attacker.port
+            )))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&result).expect("envelope");
+        assert!(
+            v.get("error").is_some(),
+            "final-URL defense-in-depth must block the landed private URL, got: {result}"
+        );
+        assert!(
+            v["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("Redirect landed on blocked URL")),
+            "error must come from the final-URL guard, got: {result}"
+        );
+        let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        assert!(
+            !text.contains("LANDED SECRET"),
+            "internal content must not reach the model, got: {result}"
+        );
+        assert_eq!(
+            internal.hits(),
+            1,
+            "old policy followed the redirect (contacted internal), but the guard stops the body"
+        );
+    }
+
+    /// Regression guard: a *direct* (non-redirect) request to a blocked host is
+    /// still rejected by the initial `validate_url` (this predates the fix and
+    /// must keep working).
+    #[tokio::test]
+    async fn web_fetch_direct_loopback_still_blocked() {
+        let tool = WebFetchTool::new(50000);
+        let result = tool
+            .run(fetch_params("http://127.0.0.1:1/admin".to_string()))
+            .await;
+        assert!(
+            result.contains("error") && result.contains("blocked"),
+            "direct loopback URL must be rejected by validate_url: {result}"
+        );
+    }
+
+    /// The policy itself enforces the `MAX_REDIRECTS` cap (re-implementing
+    /// `Policy::limited`'s count guard): a chain longer than the cap is
+    /// refused rather than followed forever. Distinct paths are used so
+    /// reqwest's own redirect-loop detection (same URL twice) does not fire
+    /// before the count guard.
+    fn next_hop(path: &str) -> String {
+        let n = path
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0)
+            + 1;
+        format!("/hop/{n}")
+    }
+
+    #[tokio::test]
+    async fn ssrf_policy_enforces_max_redirects() {
+        let attacker = start_mock_server(|path| {
+            mock_http_response("302 Found", &[("Location", &next_hop(path))], "")
+        })
+        .await;
+        let tool = WebFetchTool::new_with_client(50000, ssrf_test_client());
+        let result = tool
+            .run(fetch_params(format!(
+                "http://attacker.test:{}/start",
+                attacker.port
+            )))
+            .await;
+        let v: serde_json::Value = serde_json::from_str(&result).expect("envelope");
+        assert!(
+            v.get("error").is_some(),
+            "redirect chain past MAX_REDIRECTS must error, got: {result}"
+        );
+        assert!(
+            attacker.hits() <= MAX_REDIRECTS + 1,
+            "must not follow more than {MAX_REDIRECTS} redirects, got {} hits",
+            attacker.hits()
+        );
+        assert!(
+            attacker.hits() >= 2,
+            "must have followed at least one redirect before capping, got {} hits",
+            attacker.hits()
+        );
     }
 }
