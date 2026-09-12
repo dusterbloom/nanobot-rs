@@ -674,6 +674,13 @@ static RE_ITALIC: LazyLock<Regex> =
 static RE_STRIKE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"~~(.+?)~~").unwrap());
 static RE_BULLET: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^[-*]\s+").unwrap());
 
+/// Escape `&`, `<`, `>` for safe inclusion in Telegram HTML.
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Convert markdown to Telegram-safe HTML.
 ///
 /// This is a port of the Python `_markdown_to_telegram_html` function.
@@ -709,14 +716,17 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
     let text = RE_BLOCKQUOTE.replace_all(&text, "$1").to_string();
 
     // 5. Escape HTML special characters.
-    let text = text
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
+    let text = html_escape(&text);
 
-    // 6. Links [text](url).
+    // 6. Links: stash the already-escaped href in a \x00LK{i}\x00 placeholder so
+    //    emphasis below can't corrupt URLs; link text stays in-stream for **[t](u)**, [**b**](u).
+    let mut hrefs: Vec<String> = Vec::new();
     let text = RE_LINK
-        .replace_all(&text, r#"<a href="$2">$1</a>"#)
+        .replace_all(&text, |caps: &regex::Captures| {
+            let idx = hrefs.len();
+            hrefs.push(caps[2].to_string());
+            format!("<a href=\"\x00LK{}\x00\">{}</a>", idx, &caps[1])
+        })
         .to_string();
 
     // 7. Bold **text** or __text__.
@@ -734,26 +744,23 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
 
     // 11. Restore inline code.
     for (i, code) in inline_codes.iter().enumerate() {
-        let escaped = code
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
         text = text.replace(
             &format!("\x00IC{}\x00", i),
-            &format!("<code>{}</code>", escaped),
+            &format!("<code>{}</code>", html_escape(code)),
         );
     }
 
     // 12. Restore code blocks.
     for (i, code) in code_blocks.iter().enumerate() {
-        let escaped = code
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;");
         text = text.replace(
             &format!("\x00CB{}\x00", i),
-            &format!("<pre><code>{}</code></pre>", escaped),
+            &format!("<pre><code>{}</code></pre>", html_escape(code)),
         );
+    }
+
+    // 13. Restore link hrefs verbatim (already escaped by step 5; re-escaping would double-escape &).
+    for (i, href) in hrefs.iter().enumerate() {
+        text = text.replace(&format!("\x00LK{}\x00", i), href);
     }
 
     text
@@ -867,6 +874,50 @@ mod tests {
     fn test_link() {
         let result = markdown_to_telegram_html("[click here](https://example.com)");
         assert_eq!(result, r#"<a href="https://example.com">click here</a>"#);
+    }
+
+    // ----- links: href protection from emphasis (regression) -----
+
+    #[test]
+    fn test_link_href_with_underscored_segment() {
+        // Italic markers inside a URL must not be rewritten to <i>...</i>.
+        let result = markdown_to_telegram_html("[link](https://example.com/_foo_)");
+        assert_eq!(result, r#"<a href="https://example.com/_foo_">link</a>"#);
+    }
+
+    #[test]
+    fn test_link_href_with_bold_star_markers() {
+        // ** inside a URL must not be rewritten to <b>...</b>.
+        let result = markdown_to_telegram_html("[b](https://x.com/a**b**c)");
+        assert_eq!(result, r#"<a href="https://x.com/a**b**c">b</a>"#);
+    }
+
+    #[test]
+    fn test_link_href_with_strikethrough_markers() {
+        // ~~ inside a URL must not be rewritten to <s>...</s>.
+        let result = markdown_to_telegram_html("[s](https://x.com/a~~b~~c)");
+        assert_eq!(result, r#"<a href="https://x.com/a~~b~~c">s</a>"#);
+    }
+
+    #[test]
+    fn test_link_href_ampersand_not_double_escaped() {
+        // Query ampersand must not be double-escaped.
+        let result = markdown_to_telegram_html("[a](https://x.com/?p=1&q=2)");
+        assert_eq!(result, r#"<a href="https://x.com/?p=1&amp;q=2">a</a>"#);
+    }
+
+    // ----- links: nested emphasis preserved (no regression) -----
+
+    #[test]
+    fn test_bold_wrapping_link_star() {
+        let result = markdown_to_telegram_html("**[txt](https://x.com)**");
+        assert_eq!(result, r#"<b><a href="https://x.com">txt</a></b>"#);
+    }
+
+    #[test]
+    fn test_bold_in_link_text_star() {
+        let result = markdown_to_telegram_html("[**bold**](https://x.com)");
+        assert_eq!(result, r#"<a href="https://x.com"><b>bold</b></a>"#);
     }
 
     // ----- headers -----
