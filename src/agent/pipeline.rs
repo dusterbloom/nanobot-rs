@@ -345,11 +345,12 @@ async fn vote_on_step(
 
         // Check ahead-by-k: does this answer lead the second-place by k?
         let max_count = *count;
+        // Exclude by key, not by value: a value filter drops co-tied entries on a tie.
         let second_max = tallies
-            .values()
-            .filter(|&&v| v != max_count)
+            .iter()
+            .filter(|(k, _)| **k != normalized)
+            .map(|(_, v)| *v)
             .max()
-            .copied()
             .unwrap_or(0);
 
         if max_count >= second_max + ahead_by_k {
@@ -592,6 +593,33 @@ mod tests {
         let (answer, voters) = vote_on_step(&provider, "mock", "test", 1, 5).await;
         assert_eq!(answer.trim().to_lowercase(), "a");
         assert!(voters <= 3);
+    }
+
+    #[tokio::test]
+    async fn test_vote_tie_bug() {
+        // ahead_by_k = 2 with a 2k+1 = 5 voter budget. Alternating "A"/"B"
+        // votes tie 2-2 at voter 4. The vote must NOT converge on the tie
+        // (no answer leads by 2); it must continue until the budget is
+        // exhausted and then fall back to plurality.
+        let provider = MockPipelineProvider::new(vec!["A", "B"]);
+        let (answer, voters) = vote_on_step(&provider, "mock", "test", 2, 5).await;
+        assert_eq!(
+            voters, 5,
+            "tied at 2-2 after voter 4, must keep voting until the budget is exhausted"
+        );
+        // Plurality after 5 voters: {a:3, b:2} -> "a".
+        assert_eq!(answer.trim().to_lowercase(), "a");
+    }
+
+    #[tokio::test]
+    async fn test_vote_genuine_margin_still_converges() {
+        // A real ahead-by-k lead must still converge early. Votes "A","B",
+        // "A","A" with k=2: after voter 4, A has 3 vs B's 1, so A leads by 2
+        // and voting converges at voter 4 — not exhausting the 5-voter budget.
+        let provider = MockPipelineProvider::new(vec!["A", "B", "A", "A"]);
+        let (answer, voters) = vote_on_step(&provider, "mock", "test", 2, 5).await;
+        assert_eq!(answer.trim().to_lowercase(), "a");
+        assert_eq!(voters, 4);
     }
 
     #[tokio::test]
