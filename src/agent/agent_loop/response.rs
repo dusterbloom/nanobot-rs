@@ -1647,4 +1647,57 @@ mod tests {
         assert_eq!(maps[0]["name"], "read_file");
         assert_eq!(maps[0]["arguments"]["path"], "/tmp/x");
     }
+
+    /// End-to-end at the strip boundary: real native `tool_calls` AND verb-form
+    /// hallucinated text in `content` (the `StripHallucination` scenario from
+    /// b/42e300a). `classify_response` returns `ToolCalls`; the handler at
+    /// `response.rs:540-549` then calls `strip_hallucinated_text` and persists
+    /// the result as the assistant message. This test drives the same
+    /// classify→strip sequence the handler uses and pins the final content that
+    /// would be journaled — proving the residual `recall({...})]` no longer
+    /// reaches conversation history.
+    #[test]
+    fn strip_hallucination_e2e_verb_form_content_is_clean_for_history() {
+        let content = "Processing... [Called recall({\"query\": \"test\"})] Done.";
+        let resp = make_response_with_tools(Some(content), &["read_file"], "stop");
+        let kind = classify_response(&resp, false, false, false, &default_retries(), false);
+
+        // The handler only strips for the ToolCalls arm.
+        assert!(
+            matches!(kind, ResponseKind::ToolCalls { .. }),
+            "mixed real-tools + verb hallucination must classify as ToolCalls (handler strips), got {kind:?}"
+        );
+
+        // Simulate the handler's strip (response.rs:542-547): the only
+        // mutation it applies to `response.content` before persistence.
+        let mut final_content = resp.content.clone().unwrap_or_default();
+        let stripped = validation::strip_hallucinated_text(&final_content);
+        if stripped.len() != final_content.len() {
+            final_content = stripped;
+        }
+
+        // The bug report's residual signatures must be gone: no dangling `]`,
+        // no leftover fabricated call literal, surrounding prose preserved.
+        assert!(
+            !final_content.contains(']'),
+            "no dangling closing bracket should be persisted to history: {final_content:?}"
+        );
+        assert!(
+            !final_content.contains("recall("),
+            "no leftover fabricated call literal should be persisted: {final_content:?}"
+        );
+        assert!(
+            !final_content.contains("[Called"),
+            "verb prefix must not be persisted: {final_content:?}"
+        );
+        assert!(
+            final_content.contains("Processing...") && final_content.contains("Done."),
+            "surrounding prose must survive into history: {final_content:?}"
+        );
+        // Sanity: this path stripped (otherwise the assertions above are vacuous).
+        assert_ne!(
+            final_content, content,
+            "the strip must have changed the content (else the handler keeps the residual)"
+        );
+    }
 }
