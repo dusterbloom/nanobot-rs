@@ -476,7 +476,7 @@ impl AgentLoopShared {
         // --- Pre-classification mutations ---
         // Extract textual tool calls before classification so the response
         // object is in a consistent state for classify_response().
-        self.extract_textual_tool_calls(&mut response);
+        self.extract_textual_tool_calls(&mut response, ctx.protocol.is_textual_replay());
 
         // Strip thinking tags leaked by models (Qwen3, MiniCPM, etc.)
         if let Some(ref mut content) = response.content {
@@ -723,7 +723,7 @@ impl AgentLoopShared {
     // Pre-classification: extract textual tool calls
     // -----------------------------------------------------------------------
 
-    fn extract_textual_tool_calls(&self, response: &mut LLMResponse) {
+    fn extract_textual_tool_calls(&self, response: &mut LLMResponse, is_textual_replay: bool) {
         if response.has_tool_calls() {
             return;
         }
@@ -746,18 +746,7 @@ impl AgentLoopShared {
         // conversation history and confuses the model into repeating the same
         // broken XML format on subsequent iterations.
         if parsed.is_empty() {
-            if has_xml_blocks {
-                if let Some(ref mut content) = response.content {
-                    let cleaned = strip_xml_tool_calls(content);
-                    if cleaned.len() != content.len() {
-                        debug!(
-                            "Stripped empty/malformed <tool_call> blocks from response \
-                             (no valid tool calls parsed)"
-                        );
-                        *content = cleaned;
-                    }
-                }
-            }
+            strip_unparseable_brackets(response, is_textual_replay);
             return;
         }
 
@@ -1214,6 +1203,45 @@ impl AgentLoopShared {
 // ============================================================================
 // Helpers
 // ============================================================================
+
+// Strip unparseable tool-call markup from `response.content` when no valid tool
+// calls were parsed: empty/malformed tool_call XML blocks always, and — as
+// defence-in-depth for textual replay — leftover `[I called: ...]` brackets so
+// the raw syntax never leaks into the user-facing response. In textual-replay
+// mode validation is disabled (it would death-spiral), so nothing downstream
+// would catch the leftover brackets; the textual strip is gated on
+// `is_textual_replay` because non-textual mode relies on the leftover bracket
+// being visible to validation's hallucination detector.
+fn strip_unparseable_brackets(response: &mut LLMResponse, is_textual_replay: bool) {
+    let has_xml_blocks = response
+        .content
+        .as_deref()
+        .is_some_and(|c| c.contains("<tool_call"));
+    if has_xml_blocks {
+        if let Some(ref mut content) = response.content {
+            let cleaned = strip_xml_tool_calls(content);
+            if cleaned.len() != content.len() {
+                debug!(
+                    "Stripped empty/malformed tool_call blocks from response \
+                     (no valid tool calls parsed)"
+                );
+                *content = cleaned;
+            }
+        }
+    }
+    if is_textual_replay {
+        if let Some(ref mut content) = response.content {
+            let cleaned = strip_textual_tool_calls(content);
+            if cleaned.len() != content.len() {
+                debug!(
+                    "Stripped unparseable [I called: ...] brackets from \
+                     textual-replay response (no valid tool calls parsed)"
+                );
+                *content = cleaned;
+            }
+        }
+    }
+}
 
 /// Render raw messages through the conversation protocol, then append
 /// the rescue prompt. This ensures local servers never receive invalid
