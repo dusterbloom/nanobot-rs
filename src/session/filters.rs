@@ -165,7 +165,18 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
     }
 
     // Stage 5: filter and map each surviving message to wire format.
-    let mapped: Vec<Value> = messages[safe_start..]
+    //
+    // Carry each kept entry's ORIGINAL `messages` index (`safe_start + offset`)
+    // alongside its mapped wire value. Stage 6 recomputes "real user turn"
+    // boundaries with `is_real_user_turn`, whose predicate depends on the
+    // `_synthetic` / `_cache_replay` flags — which this stage deliberately strips
+    // from the wire value. Threading the original index lets Stage 6 run the
+    // predicate against the original row (where the flags survive) so Stage 5
+    // and Stage 6 agree on what counts as a turn; without it, surviving
+    // cache-replay scaffolds read as real user turns and the kept-history head
+    // can land on (and the wire history begin with) a synthetic
+    // `[format-anchor]…` nudge — see `is_real_user_turn`'s contract.
+    let (orig_idx, mapped): (Vec<usize>, Vec<Value>) = messages[safe_start..]
         .iter()
         .enumerate()
         .filter(|(_, m)| {
@@ -178,7 +189,7 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
                 // Skip internal LCM summary entries — not valid wire format.
                 && m.get("role").and_then(|r| r.as_str()) != Some("summary")
         })
-        .map(|(_offset, m)| {
+        .map(|(offset, m)| {
             let role = m.get("role").and_then(|v| v.as_str()).unwrap_or("user");
             // Tool results are the bulkiest, lowest-value-once-stale part of
             // history (web_fetch / skill dumps). Cap their body to a generous,
@@ -238,9 +249,9 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
             if let Some(db_id) = m.get("_db_id") {
                 msg["_db_id"] = db_id.clone();
             }
-            msg
+            (safe_start + offset, msg)
         })
-        .collect();
+        .unzip();
 
     // Stage 6: Token budget — prevent context bombs from sessions that
     // accumulated large tool results. Walk backward from the end, keeping
@@ -268,7 +279,13 @@ pub fn filter_history(messages: &[Value], max_messages: usize, max_turns: usize)
     // warm. Whole-turn granularity also avoids starting the wire history on an
     // assistant/tool message.
     let turn_starts: Vec<usize> = (0..mapped.len())
-        .filter(|&i| is_real_user_turn(&mapped[i]))
+        // Run the turn-boundary predicate on the ORIGINAL row (`messages[orig_idx[i]]`),
+        // where `_synthetic` / `_cache_replay` are intact. Stage 5 strips those
+        // flags from the wire value; running the predicate on `mapped[i]` would
+        // miscount surviving cache-replay scaffolds as real user turns and let
+        // the kept-history head land on a synthetic nudge — see the Stage 5
+        // comment and `is_real_user_turn`'s contract.
+        .filter(|&i| is_real_user_turn(&messages[orig_idx[i]]))
         .collect();
     // Fewest oldest turns to drop so the kept suffix fits the budget.
     let mut min_drop = turn_starts.len();
@@ -670,6 +687,156 @@ mod tests {
             out_n1[0..out_n.len()],
             out_n[..],
             "legacy scaffold replay must keep reloads append-only"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Cache-replay scaffold × Stage 6 token budget (regression repros)
+    //
+    // Stage 6 recomputes "real user turn" boundaries and drops whole oldest
+    // turns to fit the token budget. The bug: Stage 5 strips `_synthetic` /
+    // `_cache_replay` from the wire-format `mapped` slice, so running
+    // `is_real_user_turn` on `mapped` miscounts surviving cache-replay scaffolds
+    // as real turns. The kept-history head can then land on (and the wire
+    // history begin with) a synthetic `[format-anchor]…` nudge instead of a
+    // real user question — breaking `is_real_user_turn`'s contract and the
+    // prefix-stability invariant. The fix threads the original `messages`
+    // index through Stage 5 so Stage 6 runs the predicate on the original row,
+    // where the synthetic flag survives.
+    // ------------------------------------------------------------------
+
+    /// Repro A: with batch=1 (max_turns=0), the Stage-6 drop lands the kept head
+    /// on a cache-replay scaffold. Without the fix, `result[0]` is the
+    /// `[format-anchor]…` synthetic nudge; with it, `result[0]` is the real
+    /// user question `q1`.
+    #[test]
+    fn test_token_budget_head_lands_on_cache_replay_synthetic() {
+        let fat_a = "y".repeat(6000); // ~1505 tokens
+        let scaffold = format!("[format-anchor] {}", "x".repeat(84)); // ~30 tokens
+        let messages = vec![
+            user("q0"),
+            json!({"role": "assistant", "content": fat_a}),
+            cache_replay_synthetic(&scaffold),
+            user("q1"),
+            assistant("a1"),
+            user("q2"),
+            assistant("a2"),
+        ];
+        let result = filter_history(&messages, 7, 0); // budget = 7*150 = 1050
+        assert!(!result.is_empty());
+        let head = result[0]["content"].as_str().unwrap_or("");
+        assert!(
+            !head.starts_with("[format-anchor]")
+                && !head.starts_with("[grounding]")
+                && !head.starts_with("[System notice]")
+                && !head.starts_with("[System] Loop detected:")
+                && !head.starts_with("[system] Report what the previous tool"),
+            "kept head must begin at a REAL user turn, not a cache-replay synthetic \
+             scaffold; got head = {head:?}"
+        );
+    }
+
+    /// Repro B: in the batch=1 regime, the miscounted scaffold makes the
+    /// kept-history head flip between a scaffold and a real user turn across
+    /// consecutive reloads, so turn N+1's wire history is NOT an append-only
+    /// extension of turn N's — the sent prefix diverges at index 0 and the
+    /// inference server re-prefills the entire prompt every turn once the
+    /// budget saturates.
+    #[test]
+    fn test_token_budget_prefix_unstable_with_cache_replay_synthetic() {
+        let a0 = "y".repeat(6000); // ~1505 tokens (forces Stage 6 to bind)
+        let a1 = "y".repeat(2380); // ~600 tokens
+        let a2 = "y".repeat(2280); // ~575 tokens
+        let scaffold = format!("[format-anchor] {}", "x".repeat(84)); // ~30 tokens
+        let turn_n = vec![
+            user("q0"),
+            json!({"role": "assistant", "content": a0}),
+            cache_replay_synthetic(&scaffold),
+            user("q1"),
+            json!({"role": "assistant", "content": a1}),
+        ];
+        let mut turn_n1 = turn_n.clone();
+        turn_n1.extend(vec![
+            user("q2"),
+            json!({"role": "assistant", "content": a2}),
+        ]);
+
+        // batch = (0/2).max(1) = 1; budget = 8*150 = 1200. Without the fix the
+        // drop count advances from 1 (head=scaffold) to 2 (head=q1) across the
+        // reload, so the prefix diverges at index 0.
+        let out_n = filter_history(&turn_n, 8, 0);
+        let out_n1 = filter_history(&turn_n1, 8, 0);
+
+        assert!(!out_n.is_empty() && !out_n1.is_empty());
+        let head_n = out_n[0]["content"].as_str().unwrap_or("");
+        let head_n1 = out_n1[0]["content"].as_str().unwrap_or("");
+        assert!(
+            !head_n.starts_with("[format-anchor]"),
+            "turn N head shifted onto a scaffold; got {head_n:?}"
+        );
+        assert_eq!(
+            out_n[0], out_n1[0],
+            "prefix diverged at index 0: reload is not append-only (Stage 6 head \
+             shifted across reloads due to scaffold miscount); out_n head = \
+             {head_n:?}, out_n1 head = {head_n1:?}"
+        );
+        // The prefix-cache invariant: turn N's wire history must be a
+        // byte-identical prefix of turn N+1's.
+        assert!(out_n.len() <= out_n1.len());
+        for (i, m) in out_n.iter().enumerate() {
+            assert_eq!(m, &out_n1[i], "prefix diverged at index {i}");
+        }
+    }
+
+    /// Repro C: at production defaults (max_turns=60 → batch=30, max_messages=93
+    /// → budget=13950) the scaffold head *parks* on a cache-replay scaffold for a
+    /// stretch of reloads rather than flipping each turn. The unambiguous
+    /// invariant — the kept head must be a real user turn, not a synthetic — is
+    /// what this test pins, at exactly the shipped configuration.
+    #[test]
+    fn test_token_budget_scaffold_head_at_production_defaults() {
+        let max_messages = 93usize; // history_limit_lcm(20000)
+        let max_turns = 60usize; // DEFAULT_RETENTION_TURNS → batch = 30
+        let budget = max_messages * 150; // 13950
+        let fat = "y".repeat(4000); // ~1005 tokens
+        let scaffold_body = format!("[format-anchor] {}", "x".repeat(84));
+
+        let build_turns = |n: usize| -> Vec<Value> {
+            let mut v = Vec::new();
+            for i in 0..n {
+                v.push(user(&format!("q{i}")));
+                v.push(json!({"role": "assistant", "content": &fat}));
+                v.push(cache_replay_synthetic(&scaffold_body));
+            }
+            v
+        };
+
+        let turn_n = build_turns(30);
+        let mut turn_n1 = turn_n.clone();
+        turn_n1.extend(build_turns(1));
+
+        let out_n = filter_history(&turn_n, max_messages, max_turns);
+        let out_n1 = filter_history(&turn_n1, max_messages, max_turns);
+
+        assert!(!out_n.is_empty());
+        assert!(
+            out_n.iter().map(estimate_msg_tokens).sum::<usize>() <= budget,
+            "kept suffix must respect the Stage-6 token ceiling"
+        );
+        assert!(
+            out_n.len() < turn_n.len(),
+            "Stage 6 must have dropped some history (turn_n is over budget)"
+        );
+
+        let head = out_n[0]["content"].as_str().unwrap_or("");
+        assert!(
+            !head.starts_with("[format-anchor]"),
+            "at max_turns=60/batch=30 the kept head parked on a scaffold: {head:?}"
+        );
+        let head1 = out_n1[0]["content"].as_str().unwrap_or("");
+        assert!(
+            !head1.starts_with("[format-anchor]"),
+            "at max_turns=60/batch=30 the next reload's head parked on a scaffold: {head1:?}"
         );
     }
 
