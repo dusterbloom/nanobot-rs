@@ -27,7 +27,6 @@
 //! };
 //! ```
 
-use once_cell::sync::Lazy;
 use regex::Regex;
 use serde_json::{json, Value};
 use std::sync::LazyLock;
@@ -35,23 +34,18 @@ use std::sync::LazyLock;
 use super::turn::{ToolCall, Turn};
 use crate::agent::model_capabilities::lookup_default;
 
-// Matches the outer `[I called: ...]` or `[Called: ...]` or `[called ...]` or
-// `[Calling tool: ...]` bracket. Captures the inner content.
-// The alternation handles both past tense (called/calling) and the extra "tool"
-// word that local models sometimes insert.
+// Matches the OPENING of a textual tool-call bracket — `[I called: ...]`,
+// `[Called: ...]`, `[called ...]`, `[Calling tool: ...]` — case-insensitively.
+// Only the prefix is matched by regex; the closing `]` is located by the
+// brace/string-aware scanner [`find_textual_call_close`] so that `]`
+// characters nested inside the bracket's JSON args (an array literal in a
+// string value, a `]` inside a nested object) do not prematurely close the
+// bracket. The alternation handles both past tense (called/calling) and the
+// extra "tool" word local models sometimes insert.
 #[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
-static TEXTUAL_CALL_OUTER_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\[(?:I\s+)?call(?:ed|ing)(?:\s+tool)?[:\s]\s*(.*?)\]")
-        .expect("textual call outer regex")
-});
-
-// Matches a single `tool_name({...})` pair within the inner content.
-// The format rendered by TextualReplay is: tool_name({"arg": "val"})
-// Captures: (1) tool name, (2) JSON args string (including the braces)
-#[allow(clippy::expect_used)] // static regex: invalid pattern is a programmer error at startup
-static TEXTUAL_CALL_ITEM_RE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(\w+)\s*\(\s*(\{[^}]*(?:\{[^}]*\}[^}]*)?\})\s*\)")
-        .expect("textual call item regex")
+static TEXTUAL_CALL_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\[(?:I\s+)?call(?:ed|ing)(?:\s+tool)?[:\s]")
+        .expect("textual call prefix regex")
 });
 
 /// A parsed tool call extracted from textual replay format.
@@ -403,31 +397,173 @@ impl ConversationProtocol for LocalProtocol {
 /// This function extracts each `tool_name({args})` pair and returns a
 /// `Vec<ParsedToolCall>`. Entries with malformed JSON are silently skipped.
 ///
+/// The argument object is located by a brace-depth scan that honours JSON
+/// string literals, so JSON of arbitrary brace depth — including `write_file`
+/// calls whose `content` itself holds nested JSON or an array of objects —
+/// parses correctly. The closing `]` of the outer bracket is located the
+/// same way, so `]` characters inside a JSON string value do not prematurely
+/// close the bracket.
+///
 /// The caller is responsible for assigning call IDs and stripping the matched
 /// text from the response content.
 pub fn parse_textual_tool_calls(text: &str) -> Vec<ParsedToolCall> {
     let mut result = Vec::new();
-
-    for outer_cap in TEXTUAL_CALL_OUTER_RE.captures_iter(text) {
-        let inner = match outer_cap.get(1) {
-            Some(m) => m.as_str(),
-            None => continue,
-        };
-
-        for item_cap in TEXTUAL_CALL_ITEM_RE.captures_iter(inner) {
-            let tool = item_cap[1].to_string();
-            let args_str = &item_cap[2];
-
-            match serde_json::from_str::<Value>(args_str) {
-                Ok(args) => result.push(ParsedToolCall { tool, args }),
-                Err(_) => {
-                    // Best-effort: skip malformed JSON, don't abort the whole parse.
-                }
-            }
+    // `last_consumed` advances past each fully-matched bracket so a prefix
+    // that lies inside an already-consumed bracket's JSON string value (e.g. a
+    // model that embeds `[I called: ...]` inside an arg string) is not
+    // re-parsed as a phantom tool call.
+    let mut last_consumed = 0usize;
+    for m in TEXTUAL_CALL_PREFIX_RE.find_iter(text) {
+        if m.start() < last_consumed {
+            continue;
         }
+        let prefix_end = m.end();
+        let Some(close_idx) = find_textual_call_close(text, prefix_end) else {
+            // No closing `]` at brace depth 0 — truncated/malformed bracket.
+            // Advance past this prefix so the iterator can still find a later
+            // well-formed bracket without re-scanning the same span.
+            last_consumed = prefix_end;
+            continue;
+        };
+        let close_end = close_idx + ']'.len_utf8();
+        let inner = &text[prefix_end..close_idx];
+        parse_textual_call_items(inner, &mut result);
+        last_consumed = close_end;
     }
 
     result
+}
+
+/// Locate the `]` that closes a textual tool-call bracket, starting just after
+/// the matched prefix. Scans with brace-depth and JSON-string awareness so
+/// `]` characters nested inside the bracket's JSON args (an array literal in a
+/// string value, a `]` inside a nested object, etc.) do not prematurely close.
+///
+/// Returns the byte index of the closing `]`, or `None` if no such `]` exists
+/// at brace depth 0 (truncated/unclosed bracket).
+fn find_textual_call_close(text: &str, start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            ']' if depth == 0 => return Some(start + offset),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Parse one or more comma-separated `tool_name({...})` pairs from `inner`,
+/// appending valid calls to `result`. The args object is located by
+/// [`json_object_end`] so any brace depth is supported; braces inside JSON
+/// string values are ignored. Entries whose args fail to parse as JSON are
+/// silently skipped (best-effort), matching the historical contract.
+fn parse_textual_call_items(inner: &str, result: &mut Vec<ParsedToolCall>) {
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Skip separators (whitespace and commas between multiple calls).
+        while i < bytes.len() && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        // Capture the tool name (ASCII alphanumerics + underscore).
+        let name_start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i == name_start {
+            break; // no tool name — malformed
+        }
+        let tool = inner[name_start..i].to_string();
+        // Optional whitespace, then `(`.
+        i = skip_ascii_ws(inner, i);
+        if i >= bytes.len() || bytes[i] != b'(' {
+            break;
+        }
+        i += 1;
+        // Optional whitespace, then the balanced `{...}` args object.
+        i = skip_ascii_ws(inner, i);
+        if i >= bytes.len() || bytes[i] != b'{' {
+            break;
+        }
+        let Some(obj_end) = json_object_end(inner, i) else {
+            break; // unbalanced braces
+        };
+        let args_str = &inner[i..obj_end];
+        i = obj_end;
+        // Optional whitespace, then `)`.
+        i = skip_ascii_ws(inner, i);
+        if i >= bytes.len() || bytes[i] != b')' {
+            break;
+        }
+        i += 1;
+        match serde_json::from_str::<Value>(args_str) {
+            Ok(args) => result.push(ParsedToolCall { tool, args }),
+            Err(_) => {
+                // Best-effort: skip malformed JSON, don't abort the whole parse.
+            }
+        }
+    }
+}
+
+/// Advance `i` past leading ASCII whitespace.
+const fn skip_ascii_ws(s: &str, mut i: usize) -> usize {
+    let bytes = s.as_bytes();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    i
+}
+
+/// Scan the JSON object that opens at `s[start..]` (which must begin with `{`)
+/// for its matching `}`, honouring nested braces and JSON string literals so
+/// braces inside string values do not prematurely close. Returns the byte
+/// index just past the closing `}` (exclusive end), or `None` if unbalanced.
+fn json_object_end(s: &str, start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in s[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(start + offset + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Marker heading of the textual-tools prompt block. Callers use it to check
@@ -473,14 +609,35 @@ pub fn textual_tools_block(tool_defs: &[Value]) -> String {
 
 /// Strip textual tool call brackets from response content.
 ///
-/// Removes all `[I called: ...]` / `[Called: ...]` patterns, trims, and returns
-/// the cleaned text.  Used after `parse_textual_tool_calls()` to avoid sending
-/// bracket noise to the user or to downstream tools.
+/// Removes all `[I called: ...]` / `[Called: ...]` / `[Calling tool: ...]`
+/// patterns — located with the same brace/string-aware scanner as
+/// [`parse_textual_tool_calls`] so a `]` inside a JSON arg value does not
+/// leave a dangling tail — trims, and returns the cleaned text.  Used after
+/// `parse_textual_tool_calls()` to avoid sending bracket noise to the user
+/// or to downstream tools.
 pub fn strip_textual_tool_calls(content: &str) -> String {
-    TEXTUAL_CALL_OUTER_RE
-        .replace_all(content, "")
-        .trim()
-        .to_string()
+    let mut stripped = String::with_capacity(content.len());
+    let mut last_end = 0usize;
+    let mut last_consumed = 0usize;
+    for m in TEXTUAL_CALL_PREFIX_RE.find_iter(content) {
+        if m.start() < last_consumed {
+            continue;
+        }
+        let prefix_start = m.start();
+        let prefix_end = m.end();
+        let Some(close_idx) = find_textual_call_close(content, prefix_end) else {
+            // Unclosed bracket — keep its bytes (can't reliably strip) and
+            // advance so a nested prefix isn't re-processed.
+            last_consumed = prefix_end;
+            continue;
+        };
+        let close_end = close_idx + ']'.len_utf8();
+        stripped.push_str(&content[last_end..prefix_start]);
+        last_end = close_end;
+        last_consumed = close_end;
+    }
+    stripped.push_str(&content[last_end..]);
+    stripped.trim().to_string()
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1406,6 +1563,209 @@ mod tests {
         let calls = parse_textual_tool_calls(text);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].tool, "read_file");
+    }
+
+    // ---- parse_textual_tool_calls(): deep / nested JSON args ----
+    //
+    // Regression coverage for the depth-1 brace regex bug: a `write_file`
+    // whose `content` itself holds structured JSON (depth 2+) was silently
+    // dropped. The brace/string-aware scanner now parses any depth.
+
+    /// Depth-1 nesting (the only case the old regex handled) must still parse.
+    #[test]
+    fn parse_depth_one_nested_args_still_parses() {
+        let text = r#"[I called: web_search({"query": "rust", "filter": {"lang": "en"}})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "web_search");
+        assert_eq!(calls[0].args["query"], "rust");
+        assert_eq!(calls[0].args["filter"]["lang"], "en");
+    }
+
+    /// Depth-2 nested object in the args object itself (Evidence 1, case 7).
+    #[test]
+    fn parse_depth_two_nested_object_in_args() {
+        let text = r#"[I called: write_file({"path": "deep.json", "content": "{\"a\": {\"b\": {\"c\": 1}}}"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 1, "depth-2 nested JSON must not be dropped");
+        assert_eq!(calls[0].tool, "write_file");
+        assert_eq!(calls[0].args["path"], "deep.json");
+        // `content` is a JSON string whose value is itself nested JSON.
+        let content = calls[0].args["content"].as_str().unwrap();
+        assert_eq!(content, r#"{"a": {"b": {"c": 1}}}"#);
+    }
+
+    /// `write_file` whose content is a JSON config object (Evidence 1, case 1)
+    /// — the bread-and-butter "create a config file" tool call.
+    #[test]
+    fn parse_write_file_with_nested_json_content() {
+        let text = r#"[I called: write_file({"path": "config.json", "content": "{\"server\": {\"host\": \"localhost\", \"port\": 8080}}"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "write_file with nested JSON content must parse"
+        );
+        assert_eq!(calls[0].tool, "write_file");
+        assert_eq!(calls[0].args["path"], "config.json");
+        assert_eq!(
+            calls[0].args["content"].as_str().unwrap(),
+            r#"{"server": {"host": "localhost", "port": 8080}}"#,
+        );
+    }
+
+    /// `write_file` whose content is a JSON array of objects (Evidence 1,
+    /// case 5). This exercises BOTH defences: the `]` inside the content
+    /// string must not close the outer bracket, and the braces inside the
+    /// string must not advance brace depth.
+    #[test]
+    fn parse_write_file_with_json_array_content() {
+        let text = r#"[I called: write_file({"path": "items.json", "content": "[{\"id\":1},{\"id\":2}]"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 1, "array-of-objects content must parse");
+        assert_eq!(calls[0].tool, "write_file");
+        assert_eq!(
+            calls[0].args["content"].as_str().unwrap(),
+            r#"[{"id":1},{"id":2}]"#,
+        );
+    }
+
+    /// Braces inside the content string (`"}}"`) must not premaurely close
+    /// the args object (Evidence 1, case 8).
+    #[test]
+    fn parse_braces_inside_string_value_do_not_close_args() {
+        let text = r#"[I called: write_file({"path": "x.txt", "content": "}}"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "write_file");
+        assert_eq!(calls[0].args["content"].as_str().unwrap(), "}}");
+    }
+
+    /// A `]` appearing inside a JSON string value must not close the outer
+    /// bracket prematurely, and a following valid call must still parse.
+    #[test]
+    fn parse_bracket_inside_string_does_not_close_outer() {
+        let text = r#"[I called: write_file({"path": "a]b", "content": "x"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "bracket inside string must not break the parse"
+        );
+        assert_eq!(calls[0].tool, "write_file");
+        assert_eq!(calls[0].args["path"], "a]b");
+    }
+
+    /// Backslash-escaped quotes inside a JSON string value must keep the
+    /// scanner inside the string so a brace that follows a `\"` is not
+    /// treated as structural.
+    #[test]
+    fn parse_escaped_quotes_in_string_keep_string_state() {
+        let text = r#"[I called: write_file({"path": "a", "content": "she said {\"hi\"}"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool, "write_file");
+        assert_eq!(
+            calls[0].args["content"].as_str().unwrap(),
+            r#"she said {"hi"}"#,
+        );
+    }
+
+    /// Multiple comma-separated calls, the second of which carries
+    /// depth-2 JSON — both must parse (no abort on deep nesting).
+    #[test]
+    fn parse_multiple_calls_with_deep_json_tail() {
+        let text = r#"[I called: read_file({"path": "a"}), write_file({"path": "b", "content": "{\"x\": {\"y\": 1}}"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 2, "both flat and deep calls must parse");
+        assert_eq!(calls[0].tool, "read_file");
+        assert_eq!(calls[1].tool, "write_file");
+        assert_eq!(
+            calls[1].args["content"].as_str().unwrap(),
+            r#"{"x": {"y": 1}}"#,
+        );
+    }
+
+    /// A nested `[I called: ...]` bracket embedded inside an arg's string
+    /// value must NOT be re-parsed as a phantom second tool call. This locks
+    /// in the `last_consumed` cursor in `parse_textual_tool_calls`.
+    #[test]
+    fn parse_nested_bracket_in_string_is_not_phantom_call() {
+        let text = r#"[I called: tool({"note": "[I called: x({})]"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(
+            calls.len(),
+            1,
+            "embedded bracket inside a string must not yield a phantom call"
+        );
+        assert_eq!(calls[0].tool, "tool");
+        assert_eq!(calls[0].args["note"].as_str().unwrap(), "[I called: x({})]");
+        assert!(
+            !calls.iter().any(|c| c.tool == "x"),
+            "phantom `x` call must not be synthesised from the embedded bracket"
+        );
+    }
+
+    /// Two sequential textual brackets in one response must both parse.
+    #[test]
+    fn parse_two_sequential_brackets() {
+        let text = r#"First, read. [I called: read_file({"path": "a"})] Then write. [I called: write_file({"path": "b", "content": "{\"k\": 1}"})]"#;
+        let calls = parse_textual_tool_calls(text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].tool, "read_file");
+        assert_eq!(calls[1].tool, "write_file");
+        assert_eq!(calls[1].args["content"].as_str().unwrap(), r#"{"k": 1}"#,);
+    }
+
+    /// A truncated bracket with no closing `]` yields no calls (the scanner
+    /// cannot find a balanced close), rather than panicking or over-consuming.
+    #[test]
+    fn parse_unclosed_bracket_returns_empty() {
+        let text = "[I called: write_file({\"path\": \"a\"";
+        let calls = parse_textual_tool_calls(text);
+        assert!(calls.is_empty(), "unclosed bracket must yield no calls");
+    }
+
+    // ---- strip_textual_tool_calls(): deep brackets stripped ----
+
+    /// The full bracket span must be stripped even when the args carry
+    /// depth-2 JSON — no raw `[I called: ...]` may leak into the response.
+    #[test]
+    fn strip_removes_deep_json_bracket() {
+        let text = r#"Some preamble. [I called: write_file({"path": "config.json", "content": "{\"server\": {\"host\": \"localhost\"}}"})] Trailing prose."#;
+        let stripped = strip_textual_tool_calls(text);
+        assert!(
+            !stripped.contains("[I called:"),
+            "bracket must be stripped: {stripped:?}"
+        );
+        assert!(
+            !stripped.contains("write_file"),
+            "tool call must be stripped: {stripped:?}"
+        );
+        assert!(stripped.contains("Some preamble."));
+        assert!(stripped.contains("Trailing prose."));
+    }
+
+    /// A `]` inside a JSON string value must not truncate stripping — the
+    /// whole bracket (out to the real closing `]`) must be removed.
+    #[test]
+    fn strip_removes_bracket_with_array_content() {
+        let text = r#"Preamble. [I called: write_file({"content": "[1,2]"})] Tail."#;
+        let stripped = strip_textual_tool_calls(text);
+        assert!(
+            !stripped.contains("[I called:"),
+            "bracket with array content must be stripped"
+        );
+        assert!(stripped.contains("Preamble."));
+        assert!(stripped.contains("Tail."));
+    }
+
+    /// Defence-in-depth contract: `strip_textual_tool_calls` is a no-op on
+    /// prose that contains no textual bracket.
+    #[test]
+    fn strip_leaves_plain_text_unchanged_deep() {
+        let text = "The answer is 42. {not a tool call}";
+        assert_eq!(strip_textual_tool_calls(text), text);
     }
 
     // ---- "Calling tool" variant (local model format confusion) ----
