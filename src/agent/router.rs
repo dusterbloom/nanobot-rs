@@ -1787,8 +1787,7 @@ mod tests {
     use crate::agent::agent_core::{build_swappable_core, RuntimeCounters, SwappableCoreConfig};
     use crate::agent::agent_loop::{
         CompactionHandle, FlowControl, HiggsSessionRoute, MessageLog, ProviderCallMode,
-        ProviderRequestState, RetainedRouteCleanupGuard, RouterSyntheticCallSequence,
-        TurnCapacityRecovery, TurnOutcome,
+        ProviderRequestState, RetainedRouteCleanupGuard, RouterSyntheticCallSequence, TurnOutcome,
     };
     use crate::agent::lane::Lane;
     use crate::agent::protocol::CloudProtocol;
@@ -1914,7 +1913,6 @@ mod tests {
             content_gate: crate::agent::context_gate::ContentGate::new(4096, 0.25),
             counters,
             capacity: Arc::new(crate::agent::capacity::CapacityRuntime::default()),
-            capacity_recovery: TurnCapacityRecovery::default(),
             effective_budget: crate::agent::token_budget::TokenBudget::new(4096, 512),
             flow: FlowControl {
                 router_preflight_done: false,
@@ -1943,8 +1941,6 @@ mod tests {
                 provider_call_mode: ProviderCallMode::Normal,
                 terminal_attempted: false,
                 infra_error: None,
-                capacity_retry_after_ms: None,
-                pending_capacity_id: None,
             },
             health_registry: None,
             taint_state: crate::agent::taint::TaintState::new(),

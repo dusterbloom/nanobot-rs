@@ -818,10 +818,7 @@ async fn run_turn(
     let initial_tokens = state.lock().used;
     let started = Instant::now();
     ctx.persist_pending_protocol_messages().await.unwrap();
-    agent
-        .shared
-        .run_agent_loop(&mut ctx, CapacityRetryMode::Defer)
-        .await;
+    agent.shared.run_agent_loop(&mut ctx).await;
     ACTIVE.lock().remove(&ctx.request_id);
     let outcome = format!("{:?}", ctx.turn_outcome);
     let session_id = ctx.session_id.clone();
@@ -937,10 +934,7 @@ async fn context_reset_announcement_recovery_live() {
         if boundary_ready(&ctx).await {
             ctx.turn_outcome = TurnOutcome::Finished;
         } else {
-            agent
-                .shared
-                .run_agent_loop(&mut ctx, CapacityRetryMode::Defer)
-                .await;
+            agent.shared.run_agent_loop(&mut ctx).await;
         }
     }
     ACTIVE.lock().remove(&ctx.request_id);
@@ -1136,6 +1130,9 @@ async fn recovery_eval_live() {
                     source_rows,
                     source_turn,
                     TokenBudget::new(CEILING, 2048),
+                    // Offline checkpoint preparation has no request catalog;
+                    // run_turn installs and budgets its isolated tools later.
+                    0,
                     crate::agent::lcm::CompactionFailureMode::Deterministic,
                     tokio_util::sync::CancellationToken::new(),
                     Arc::new(crate::agent::agent_loop::compaction::CompactionPublication::new()),

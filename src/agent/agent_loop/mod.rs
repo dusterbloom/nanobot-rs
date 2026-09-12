@@ -106,7 +106,6 @@ fn is_coalescible_user_message(msg: &InboundMessage) -> bool {
     !is_system_message(msg)
         && !msg.content.trim_start().starts_with('/')
         && !crate::agent::idle::is_idle_message(msg)
-        && !msg.metadata.contains_key(CAPACITY_RESUME_PENDING_ID)
 }
 
 impl AgentLoop {
@@ -186,8 +185,6 @@ impl AgentLoop {
         let shared = Arc::new(AgentLoopShared {
             core_handle: core_handle.clone(),
             subagents,
-            bus_inbound_tx: bus_inbound_tx.clone(),
-            capacity_resume_poller_started: std::sync::atomic::AtomicBool::new(false),
             bus_outbound_tx,
             cron_service,
             email_config,
@@ -228,7 +225,6 @@ impl AgentLoop {
                     });
                 }
             }));
-
 
         Self {
             shared,
@@ -314,11 +310,6 @@ impl AgentLoop {
 
         // Spawn background reflection if completed SQLite working memory has accumulated.
         Self::spawn_background_reflection(&self.shared);
-        // Task 6: resume poller for capacity-suspended turns — started at
-        // loop run (after set_idle_runtime's get_mut window), dies with the
-        // loop via its weak reference.
-        self.shared.ensure_capacity_resume_poller();
-
         let semaphore = Arc::new(Semaphore::new(self.max_concurrent_chats));
         // Per-session locks to serialize messages within the same conversation.
         let session_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
@@ -491,7 +482,7 @@ impl AgentLoop {
                 let stream_is_telegram = stream_tx.is_some();
 
                 let response = shared
-                    .process_message(&msg, stream_tx, None, None, None, CapacityRetryMode::Defer)
+                    .process_message(&msg, stream_tx, None, None, None)
                     .await;
 
                 // Quiet by default for idle turns: the final reply is logged
@@ -519,11 +510,6 @@ impl AgentLoop {
                         outbound
                     }
                     None => {
-                        if msg.metadata.contains_key(CAPACITY_RESUME_PENDING_ID) {
-                            debug!(chat_id = %msg.chat_id, "stale_capacity_resume_ignored");
-                            drop(permit);
-                            return;
-                        }
                         error!(
                             channel = %msg.channel,
                             chat_id = %msg.chat_id,
@@ -704,7 +690,7 @@ impl AgentLoop {
 
         match self
             .shared
-            .process_message(&msg, None, None, None, None, CapacityRetryMode::Defer)
+            .process_message(&msg, None, None, None, None)
             .await
         {
             Some(response) => response.content,
@@ -748,7 +734,6 @@ impl AgentLoop {
                 tool_event_tx,
                 cancellation_token,
                 priority_rx,
-                CapacityRetryMode::Wait,
             )
             .await
         {
@@ -819,7 +804,6 @@ impl AgentLoop {
                     tool_event_tx,
                     cancellation_token,
                     None,
-                    CapacityRetryMode::Wait,
                 )
                 .await
             {

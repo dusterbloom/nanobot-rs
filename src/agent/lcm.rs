@@ -577,9 +577,9 @@ pub struct LcmEngine {
     /// so `auto_expand` can apply `FRESH_SUMMARY_COOLDOWN_TURNS`.
     current_turn: u64,
     /// Entries at the head of `active` pinned verbatim by the first
-    /// prefix-preserving cut. Compaction spans never start before this, so
-    /// the wire prefix stays byte-identical across all later compactions and
-    /// merges happen only in the unpinned tail. Derived on rebuild.
+    /// prefix-preserving cut. While history fits the live budget, compaction
+    /// spans start after this byte-identical head. Capacity recovery may
+    /// release it to fold older rows as well. Derived on rebuild.
     pinned_prefix_entries: usize,
     /// Cut position computed during an in-flight compaction, committed to
     /// `pinned_prefix_entries` only when that compaction succeeds.
@@ -591,6 +591,8 @@ pub struct LcmEngine {
 pub(crate) struct LcmCompactionState {
     dag: SummaryDag,
     active: Vec<ContextEntry>,
+    pinned_prefix_entries: usize,
+    pending_pinned_prefix: Option<usize>,
 }
 
 impl LcmEngine {
@@ -626,12 +628,16 @@ impl LcmEngine {
         LcmCompactionState {
             dag: self.dag.clone(),
             active: self.active.clone(),
+            pinned_prefix_entries: self.pinned_prefix_entries,
+            pending_pinned_prefix: self.pending_pinned_prefix,
         }
     }
 
     pub(crate) fn restore_compaction_state(&mut self, state: LcmCompactionState) {
         self.dag = state.dag;
         self.active = state.active;
+        self.pinned_prefix_entries = state.pinned_prefix_entries;
+        self.pending_pinned_prefix = state.pending_pinned_prefix;
         self.async_compaction_pending = false;
     }
 
@@ -790,6 +796,17 @@ impl LcmEngine {
         failure_mode: CompactionFailureMode,
     ) -> Option<Turn> {
         let available = budget.available_budget(tool_def_tokens);
+        // Cache reuse cannot make durable history permanently uncompactable:
+        // either compaction mode may run after the live envelope contracts.
+        // Ignore the pin under pressure, committing its release only with the
+        // new summary so a failed attempt preserves the previous projection.
+        let preserve_prefix = self.conversation_tokens() <= available;
+        let pinned_prefix = if preserve_prefix {
+            self.pinned_prefix_entries
+        } else {
+            0
+        };
+        self.pending_pinned_prefix = None;
         let target = (available as f64 * self.config.tau_soft * 0.8) as usize;
 
         // Token-budgeted protection: keep ~1k tokens of the most recent raw
@@ -806,7 +823,7 @@ impl LcmEngine {
         // server-side prompt cache retain the prefix across compactions.
         let (mut block_start, mut block_end) =
             match self.find_oldest_raw_block_impl(protect_tokens, selection) {
-                Some((start, end)) => (start.max(self.pinned_prefix_entries), end),
+                Some((start, end)) => (start.max(pinned_prefix), end),
                 None => (0, 0),
             };
         // Inside AppendOnly selection a Summary entry is a span boundary:
@@ -909,42 +926,43 @@ impl LcmEngine {
             // A pinned head is exempt from further cuts: they would only
             // churn the wire mid-span without deepening cache reuse.
             let head_already_pinned = self.pinned_prefix_entries > 0;
-            if self.config.keep_prefix_fraction > 0.0 && !head_already_pinned {
-            let keep_target_tokens = (block_token_total as f64
-                * self.config.keep_prefix_fraction.clamp(0.0, 0.9)) as usize;
-            let mut cut = block_start;
-            for len in self.complete_compaction_boundaries(block_start, block_end) {
-                // The cut must leave a tail to summarize — a boundary covering
-                // the whole block defeats the purpose.
-                if len >= block_end - block_start {
-                    break;
+            if preserve_prefix && self.config.keep_prefix_fraction > 0.0 && !head_already_pinned {
+                let keep_target_tokens = (block_token_total as f64
+                    * self.config.keep_prefix_fraction.clamp(0.0, 0.9))
+                    as usize;
+                let mut cut = block_start;
+                for len in self.complete_compaction_boundaries(block_start, block_end) {
+                    // The cut must leave a tail to summarize — a boundary covering
+                    // the whole block defeats the purpose.
+                    if len >= block_end - block_start {
+                        break;
+                    }
+                    if prefix_tokens[len] <= keep_target_tokens {
+                        cut = block_start + len;
+                    } else {
+                        break;
+                    }
                 }
-                if prefix_tokens[len] <= keep_target_tokens {
-                    cut = block_start + len;
-                } else {
-                    break;
+                // A Summary entry must never be kept verbatim in the head: it
+                // would never merge, and summary mass would grow unbounded across
+                // compactions. Collapse the cut to the first summary so it is
+                // folded (merged) with the tail.
+                if cut > block_start {
+                    if let Some(first_summary) = (block_start..cut)
+                        .find(|&i| matches!(&self.active[i], ContextEntry::Summary { .. }))
+                    {
+                        cut = first_summary;
+                    }
                 }
-            }
-            // A Summary entry must never be kept verbatim in the head: it
-            // would never merge, and summary mass would grow unbounded across
-            // compactions. Collapse the cut to the first summary so it is
-            // folded (merged) with the tail.
-            if cut > block_start {
-                if let Some(first_summary) = (block_start..cut).find(|&i| {
-                    matches!(&self.active[i], ContextEntry::Summary { .. })
-                }) {
-                    cut = first_summary;
+                if cut > block_start {
+                    debug!(
+                        kept_messages = cut - block_start,
+                        kept_tokens = prefix_tokens[cut - block_start],
+                        "LCM: keeping verbatim prefix head for cache reuse"
+                    );
+                    block_start = cut;
+                    self.pending_pinned_prefix = Some(cut);
                 }
-            }
-            if cut > block_start {
-                debug!(
-                    kept_messages = cut - block_start,
-                    kept_tokens = prefix_tokens[cut - block_start],
-                    "LCM: keeping verbatim prefix head for cache reuse"
-                );
-                block_start = cut;
-                self.pending_pinned_prefix = Some(cut);
-            }
             }
         }
 
@@ -1141,7 +1159,9 @@ impl LcmEngine {
         }
         self.active = new_active;
         self.async_compaction_pending = false;
-        if let Some(pin) = self.pending_pinned_prefix.take() {
+        if !preserve_prefix {
+            self.pinned_prefix_entries = 0;
+        } else if let Some(pin) = self.pending_pinned_prefix.take() {
             self.pinned_prefix_entries = self.pinned_prefix_entries.max(pin);
         }
 
@@ -1263,7 +1283,7 @@ impl LcmEngine {
     /// Select the largest oldest prefix whose complete model request fits.
     /// A prefix never ends between an assistant tool call and its recorded
     /// results. If no useful complete prefix fits, the caller preserves all
-    /// raw entries and lets typed capacity recovery decide when to retry.
+    /// raw entries so a later compaction can retry without losing evidence.
     fn largest_fitting_compaction_end(
         &self,
         block_start: usize,
@@ -1874,16 +1894,12 @@ impl LcmEngine {
 
         for (_key, item) in wire_items {
             match item {
-                WireItem::Raw(msg_id, message) => engine.active.push(ContextEntry::Raw {
-                    msg_id,
-                    message,
-                }),
-                WireItem::Summary(node_id, message) => {
-                    engine.active.push(ContextEntry::Summary {
-                        node_id,
-                        message,
-                    })
+                WireItem::Raw(msg_id, message) => {
+                    engine.active.push(ContextEntry::Raw { msg_id, message })
                 }
+                WireItem::Summary(node_id, message) => engine
+                    .active
+                    .push(ContextEntry::Summary { node_id, message }),
             }
         }
 
@@ -1956,18 +1972,12 @@ async fn escalated_summary(
         return Ok(None);
     };
 
-    let mut capacity_retry_used = false;
-
     // Level 1: Preserve details. Only a completed but insufficient summary may
     // escalate. A transport or fidelity-gate error is indeterminate and must
     // not launch another generation behind work the backend may still own.
-    match summarize_with_capacity_retry(
-        compactor,
-        messages,
-        "preserve_details",
-        &mut capacity_retry_used,
-    )
-    .await
+    match compactor
+        .summarize_for_lcm(messages, "preserve_details")
+        .await
     {
         Ok(reply) => {
             let (summary, manifest) = extract_summary_manifest(reply);
@@ -1983,59 +1993,14 @@ async fn escalated_summary(
     // Level 2: Bullet points, more aggressive compression. This is the last
     // level — an error here has nowhere left to escalate to, so it
     // propagates as the caller-visible failure for this compaction attempt.
-    let reply = summarize_with_capacity_retry(
-        compactor,
-        messages,
-        "bullet_points",
-        &mut capacity_retry_used,
-    )
-    .await?;
+    let reply = compactor
+        .summarize_for_lcm(messages, "bullet_points")
+        .await?;
     let (summary, manifest) = extract_summary_manifest(reply);
     if summary_is_acceptable(&summary, original_tokens, 2)? {
         return Ok(Some((summary, manifest, 2)));
     }
     Ok(None)
-}
-
-/// Retry only one compaction request when Higgs supplies a typed, tighter
-/// admission ceiling. The retry uses the server's safe prompt limit rather
-/// than the client estimate; all other errors remain indeterminate and fall
-/// through to the deterministic recovery index.
-async fn summarize_with_capacity_retry(
-    compactor: &ContextCompactor,
-    messages: &[Value],
-    mode: &str,
-    capacity_retry_used: &mut bool,
-) -> Result<String> {
-    match compactor.summarize_for_lcm(messages, mode).await {
-        Ok(summary) => Ok(summary),
-        Err(error) if !*capacity_retry_used => {
-            let Some((safe_prompt, safe_total)) = capacity_retry_limits(&error) else {
-                return Err(error);
-            };
-            *capacity_retry_used = true;
-            let retry = compactor.with_runtime_limits(safe_total, safe_prompt);
-            if !retry.lcm_request_fits(messages, mode) {
-                return Err(error);
-            }
-            retry.summarize_for_lcm(messages, mode).await
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn capacity_retry_limits(error: &anyhow::Error) -> Option<(usize, usize)> {
-    let crate::errors::ProviderError::HiggsCapacityExceeded {
-        safe_prompt_tokens,
-        safe_total_tokens,
-        ..
-    } = error.downcast_ref::<crate::errors::ProviderError>()?
-    else {
-        return None;
-    };
-    let safe_prompt = usize::try_from(*safe_prompt_tokens).ok()?;
-    let safe_total = usize::try_from(*safe_total_tokens).ok()?;
-    (safe_prompt > 0 && safe_prompt <= safe_total).then_some((safe_prompt, safe_total))
 }
 
 /// Canonical integrity digest over the exact covered rows: sort by ID, then
@@ -2612,7 +2577,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn typed_capacity_shrink_retries_once_with_server_ceiling() {
+    async fn typed_capacity_error_does_not_retry_or_shrink_summary() {
         let calls = Arc::new(AtomicUsize::new(0));
         let compactor = ContextCompactor::new(
             Arc::new(CapacityThenSummaryMock {
@@ -2626,16 +2591,9 @@ mod tests {
             json!({"role": "assistant", "content": "The original request is still pending."}),
         ];
 
-        let summary = escalated_summary(&messages, 64, Some(&compactor))
-            .await
-            .expect("typed capacity retry must not become a terminal error")
-            .expect("retry response must be accepted");
-        assert_eq!(summary.2, 1);
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "exactly one retry is allowed"
-        );
+        let result = escalated_summary(&messages, 64, Some(&compactor)).await;
+        assert!(result.is_err(), "allocation rejection must remain an error");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no adaptive retry");
     }
 
     /// Mock LLM that reflects real input content back as short bullets
@@ -3948,6 +3906,122 @@ mod tests {
         for id in engine.store_ids() {
             assert_eq!(engine.expand(&[id]).len(), 1);
         }
+    }
+
+    fn prefix_recovery_fixture(config: LcmConfig) -> LcmEngine {
+        let mut engine = LcmEngine::new(config);
+        for id in 1..=80 {
+            let role = if id % 2 == 1 { "user" } else { "assistant" };
+            engine.ingest(msg(id, role, &"word ".repeat(500)));
+        }
+        engine
+    }
+
+    #[tokio::test]
+    async fn prefix_recovery_releases_pin_when_capacity_contracts() {
+        for mode in [
+            CompactionFailureMode::Deterministic,
+            CompactionFailureMode::PreserveContext,
+        ] {
+            let mut engine = prefix_recovery_fixture(LcmConfig::default());
+            let wide = TokenBudget::new(100_000, 1_000);
+            assert!(engine
+                .compact(None, &wide, 0, CompactionFailureMode::Deterministic)
+                .await
+                .is_some());
+            assert!(
+                engine.pinned_prefix_entries > 0,
+                "fitting folds retain the cache prefix"
+            );
+            let narrow = TokenBudget::new(4_000, 1_000);
+            for _ in 0..8 {
+                if engine.compact(None, &narrow, 0, mode).await.is_none() {
+                    break;
+                }
+            }
+            assert!(
+                engine.active_tokens() <= narrow.available_budget(0),
+                "recovery must fit the narrower envelope, got {} tokens",
+                engine.active_tokens()
+            );
+            assert_eq!(
+                engine.store_len(),
+                80,
+                "recovery keeps every durable original"
+            );
+            let raws: Vec<Value> = engine.store.values().cloned().collect();
+            let nodes: Vec<_> = engine
+                .dag
+                .nodes
+                .iter()
+                .map(|node| {
+                    (
+                        node.id,
+                        node.source_ids.clone(),
+                        node.child_summaries.clone(),
+                        node.text.clone(),
+                        node.tokens,
+                        node.level,
+                        node.manifest.clone(),
+                        String::new(),
+                    )
+                })
+                .collect();
+            let rebuilt = LcmEngine::rebuild_from_db_nodes(&raws, &nodes, LcmConfig::default());
+            assert_eq!(engine.active_context(), rebuilt.active_context());
+            assert_eq!(engine.pinned_prefix_entries, rebuilt.pinned_prefix_entries);
+        }
+    }
+
+    #[tokio::test]
+    async fn prefix_recovery_rollback_restores_committed_pin() {
+        let mut engine = prefix_recovery_fixture(LcmConfig::default());
+        let snapshot = engine.compaction_state();
+        let original = engine.active_context();
+        assert!(engine
+            .compact(
+                None,
+                &TokenBudget::new(100_000, 1_000),
+                0,
+                CompactionFailureMode::Deterministic
+            )
+            .await
+            .is_some());
+        assert!(engine.pinned_prefix_entries > 0);
+        engine.restore_compaction_state(snapshot);
+        assert_eq!(engine.active_context(), original);
+        assert!(engine.dag().is_empty());
+        assert_eq!(
+            engine.pinned_prefix_entries, 0,
+            "a rejected checkpoint cannot leave an uncommitted prefix pinned"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_recovery_rollback_restores_pending_pin() {
+        let mut engine = prefix_recovery_fixture(LcmConfig {
+            deterministic_target: 1,
+            ..LcmConfig::default()
+        });
+        let snapshot = engine.compaction_state();
+        assert!(engine
+            .compact(
+                None,
+                &TokenBudget::new(100_000, 1_000),
+                0,
+                CompactionFailureMode::Deterministic
+            )
+            .await
+            .is_none());
+        assert!(
+            engine.pending_pinned_prefix.is_some(),
+            "the cut was planned before its summary failed"
+        );
+        engine.restore_compaction_state(snapshot);
+        assert_eq!(
+            engine.pending_pinned_prefix, None,
+            "rollback cannot retain an abandoned cut for a later checkpoint"
+        );
     }
 
     #[test]

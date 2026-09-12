@@ -1,0 +1,237 @@
+{
+  "power": "battery; explicitly authorized by user",
+  "higgs_binary_sha256": "0e9dff7fa3eb6ca43a809acba80732ad3e6ab4c87e509a2dfa873dd8247eb977",
+  "nanobot_binary_sha256": "f062a2f1d15fffdd6ac2b63e83c4112cc08fd4c006bcac720e809fd4150aa6ca",
+  "capacity": {
+    "schemaVersion": 1,
+    "model": "escha-35b-a3b",
+    "modelFingerprint": "sha256:adf23a8e2f3b720f38311bd469a5df275b2d41fb6bfeb0e0cb337244b3dbfa2a",
+    "bootId": "9a1053f3-1cf7-4d10-b516-98c80a98be6b",
+    "generation": 2,
+    "availability": "available",
+    "pressure": "normal",
+    "safeTotalTokens": 32768,
+    "recommendedOutputTokens": 4096,
+    "maxPromptTokens": 28672,
+    "retainedSessionTokens": 32768,
+    "retainedBytes": 2147483648,
+    "prefixCacheBytes": 1073741824,
+    "basis": "configured"
+  },
+  "disk_first": {
+    "phase": "fixed-disk-first",
+    "elapsed_seconds": 13.855795957962982,
+    "response": {
+      "id": "chatcmpl-e006b12f-a3e6-4545-981a-2d651dbe0008",
+      "object": "chat.completion",
+      "created": 1789224765,
+      "model": "escha-35b-a3b",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "RESTART-7319"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1479,
+        "completion_tokens": 8,
+        "total_tokens": 1487
+      }
+    },
+    "files": {
+      ".higgs-prefix-cache-1d3e1f8a84aba10ae5fc9004127f783643461329aa2667385e2979b547a12b71.bin": 96011860
+    }
+  },
+  "disk_restart": {
+    "phase": "fixed-disk-restart",
+    "elapsed_seconds": 1.872578667011112,
+    "response": {
+      "id": "chatcmpl-592c583f-642e-4cba-afdc-c1970ce36e4b",
+      "object": "chat.completion",
+      "created": 1789224819,
+      "model": "escha-35b-a3b",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "RESTART-7319"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 1479,
+        "completion_tokens": 8,
+        "total_tokens": 1487,
+        "prompt_tokens_details": {
+          "cached_tokens": 1472
+        }
+      }
+    },
+    "files": {
+      ".higgs-prefix-cache-1d3e1f8a84aba10ae5fc9004127f783643461329aa2667385e2979b547a12b71.bin": 96011860
+    }
+  },
+  "announcement_recovery": {
+    "announcement_persisted": true,
+    "boundary_outcome": "Finished",
+    "boundary_pass": true,
+    "boundary_response": "The turn ended before I could produce a final answer. The actions above may be incomplete.",
+    "boundary_session_id": "20260912_145410_4e2d18",
+    "boundary_tool_sequence": [
+      "notes",
+      "new_context"
+    ],
+    "checkpoint": "Task: Targeted obligation replay (Revision 4)\nProject: QUARTZ\nBranch: hotfix/q1\nOwner: Neri-1\nChecksum: 7aF03-bC9x-00Q\nReceipt: rcpt_Q8n3_L04\nPayment status: settled\nExport status: pending\nNext action: review_diff\nExecute: false\nDiagnostic code: D-b3c501b29525acfb\nStatus: Checkpoint/reset completed. Snapshot saved.\nEvidence pointers: None attached in this checkpoint.",
+    "checkpoint_preserves_snapshot": true,
+    "checkpoint_unchanged": true,
+    "current_task": "Targeted obligation replay. Revision 4 was submitted successfully with snapshot: project=QUARTZ, branch=hotfix/q1, owner=Neri-1, checksum=7aF03-bC9x-00Q, receipt=rcpt_Q8n3_L04, payment_status=settled, export_status=pending, next_action=review_diff, execute=false, diagnostic_code=D-b3c501b29525acfb. Complete the announced checkpoint/reset without repeating the submission or any external action.",
+    "expected": {
+      "branch": "hotfix/q1",
+      "checksum": "7aF03-bC9x-00Q",
+      "diagnostic_code": "D-b3c501b29525acfb",
+      "execute": false,
+      "export_status": "pending",
+      "next_action": "review_diff",
+      "owner": "Neri-1",
+      "payment_status": "settled",
+      "project": "QUARTZ",
+      "receipt": "rcpt_Q8n3_L04"
+    },
+    "fresh_recovery": {
+      "completed_compactions": 0,
+      "initial_estimated_tokens": 634,
+      "outcome": "Finished",
+      "response": "The task has been completed. The durable checkpoint was read, and the result was submitted exactly once with all required fields:\n- **project**: QUARTZ\n- **branch**: hotfix/q1\n- **owner**: Neri-1\n- **checksum**: 7aF03-bC9x-00Q\n- **receipt**: rcpt_Q8n3_L04\n- **payment_status**: settled\n- **export_status**: pending\n- **next_action**: review_diff\n- **execute**: false\n- **diagnostic_code**: D-b3c501b29525acfb",
+      "seconds": 21.009964416,
+      "session_id": "20260912_145428_69e7d8"
+    },
+    "fresh_recovery_pass": true,
+    "fresh_result": {
+      "branch": "hotfix/q1",
+      "checksum": "7aF03-bC9x-00Q",
+      "diagnostic_code": "D-b3c501b29525acfb",
+      "execute": false,
+      "export_status": "pending",
+      "next_action": "review_diff",
+      "owner": "Neri-1",
+      "payment_status": "settled",
+      "project": "QUARTZ",
+      "receipt": "rcpt_Q8n3_L04"
+    },
+    "instruction_persisted": true,
+    "pass": true,
+    "recorded_announcement": "Context decision: checkpoint/reset. The estimated remaining capacity is 0 tokens, meaning the current context window is nearly full and there is no room to safely process further updates or perform a reliable next inspection. I will checkpoint the current snapshot (revision 4) with its diagnostic code and evidence pointers, then reset to preserve correctness on the next update.",
+    "recovered_first_calls": [
+      "notes"
+    ],
+    "replay_request_is_stateless": true,
+    "requested_higgs_session_cache_policy": "require_continuation",
+    "requested_higgs_session_id": 991,
+    "rollover": true
+  },
+  "lcm_recovery": {
+    "actual": {
+      "artifact": "spool-17",
+      "checksum": "7af09cB2-e41D-009x",
+      "region": "eu-south-2",
+      "verified": true
+    },
+    "arm": "A",
+    "case": "buried_identifier",
+    "context_ceiling": 16384,
+    "expected": {
+      "artifact": "spool-17",
+      "checksum": "7af09cB2-e41D-009x",
+      "region": "eu-south-2",
+      "verified": true
+    },
+    "forbidden_actions": 0,
+    "model": "escha-35b-a3b",
+    "pass": true,
+    "preparation": {
+      "seconds": 0.010083333,
+      "summary_nodes": 1
+    },
+    "preparation_submissions": 0,
+    "recovery": {
+      "completed_compactions": 0,
+      "initial_estimated_tokens": 2796,
+      "outcome": "Finished",
+      "response": "Artifact manifest submitted:\n- **artifact**: spool-17\n- **checksum**: 7af09cB2-e41D-009x\n- **region**: eu-south-2\n- **verified**: true",
+      "seconds": 50.161572875,
+      "session_id": "20260912_145449_3c8110"
+    },
+    "recovery_submissions": 1,
+    "total_seconds": 50.181028292
+  },
+  "benchmark": {
+    "before": "Three capacity-unavailable responses; old binary cannot consume configured capacity basis. No valid speed comparison.",
+    "new_wall_ms": [
+      20099,
+      1249,
+      1142
+    ],
+    "new_metrics": [
+      {
+        "timestamp": "2026-09-12T16:56:44.138362+02:00",
+        "request_id": "d5a17c92",
+        "logical_session": "20260912_145627_9fed38",
+        "cache_route": "active",
+        "role": "main",
+        "model": "local:escha-35b-a3b",
+        "provider_base": "http://127.0.0.1:9000/v1",
+        "elapsed_ms": 16618,
+        "ttft_ms": 16437,
+        "prompt_tokens": 1982,
+        "completion_tokens": 11,
+        "cache_creation_tokens": 1982,
+        "status": "ok",
+        "tool_calls_requested": 0,
+        "tool_calls_executed": 0
+      },
+      {
+        "timestamp": "2026-09-12T16:56:45.457488+02:00",
+        "request_id": "a402e53e",
+        "logical_session": "20260912_145627_9fed38",
+        "cache_route": "active",
+        "role": "main",
+        "model": "local:escha-35b-a3b",
+        "provider_base": "http://127.0.0.1:9000/v1",
+        "elapsed_ms": 1116,
+        "ttft_ms": 858,
+        "prompt_tokens": 2017,
+        "completion_tokens": 13,
+        "cache_read_tokens": 1992,
+        "cache_creation_tokens": 25,
+        "status": "ok",
+        "tool_calls_requested": 0,
+        "tool_calls_executed": 0
+      },
+      {
+        "timestamp": "2026-09-12T16:56:46.680509+02:00",
+        "request_id": "0cceb1bd",
+        "logical_session": "20260912_145627_9fed38",
+        "cache_route": "active",
+        "role": "main",
+        "model": "local:escha-35b-a3b",
+        "provider_base": "http://127.0.0.1:9000/v1",
+        "elapsed_ms": 1059,
+        "ttft_ms": 885,
+        "prompt_tokens": 2054,
+        "completion_tokens": 11,
+        "cache_read_tokens": 2033,
+        "cache_creation_tokens": 21,
+        "status": "ok",
+        "tool_calls_requested": 0,
+        "tool_calls_executed": 0
+      }
+    ]
+  },
+  "owned_server_stopped": true
+}

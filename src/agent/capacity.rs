@@ -22,6 +22,7 @@ pub(crate) enum CapacityPressure {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CapacityBasis {
+    Configured,
     Conservative,
     Learned,
 }
@@ -75,8 +76,7 @@ pub(crate) struct EffectiveCapacity {
     pub(crate) output_tokens: usize,
 }
 
-/// One `/v1/capacity` fetch result: the live profile, or the marker for an
-/// old Higgs whose route-absent 404 selects the conservative legacy fallback.
+/// Fixed model-context discovery, or an older endpoint without this route.
 #[derive(Debug)]
 pub(crate) enum HiggsCapacityFetch {
     Profile(HiggsCapacityProfile),
@@ -88,7 +88,13 @@ impl EffectiveCapacity {
         configured: &TokenBudget,
         immutable_prefix_tokens: usize,
     ) -> Result<Self, CapacityError> {
-        effective_capacity_from_limits(16_384, 4_096, 12_288, configured, immutable_prefix_tokens)
+        effective_capacity_from_limits(
+            configured.max_context(),
+            configured.response_reserve(),
+            configured.available_budget(0),
+            configured,
+            immutable_prefix_tokens,
+        )
     }
 
     #[cfg(test)]
@@ -170,8 +176,12 @@ impl HiggsCapacityProfile {
         configured: &TokenBudget,
         immutable_prefix_tokens: usize,
     ) -> Result<EffectiveCapacity, CapacityError> {
-        if self.availability == CapacityAvailability::Unavailable {
-            return Err(CapacityError::Unavailable);
+        // Older endpoints expose pressure/learned windows. Those are telemetry,
+        // never a model context contract: only a configured profile may cap us.
+        if self.basis != CapacityBasis::Configured
+            || self.availability == CapacityAvailability::Unavailable
+        {
+            return EffectiveCapacity::legacy_higgs(configured, immutable_prefix_tokens);
         }
 
         let safe_total =
@@ -190,12 +200,9 @@ impl HiggsCapacityProfile {
     }
 }
 
-/// Loop-level holder for the live Higgs capacity snapshot. Lives beside
-/// `RuntimeCounters` on the `AgentHandle` (persists across core swaps), keyed
-/// by endpoint+model so an unchanged provider tuple never refetches. The
-/// configured `SwappableCore.token_budget` stays immutable; the effective
-/// request budget is derived at use time and can shrink per boot/generation
-/// without a config rewrite or core rebuild.
+/// Fixed model limits discovered from Higgs, retained across core swaps.
+/// The configured budget stays immutable. Only `basis: configured` narrows
+/// it; pressure and legacy learned windows are advisory metadata.
 pub(crate) struct CapacityRuntime {
     state: std::sync::Mutex<CapacityRuntimeState>,
 }
@@ -204,7 +211,7 @@ pub(crate) struct CapacityRuntime {
 struct CapacityRuntimeState {
     /// Identity of the installed snapshot: endpoint + model.
     key: Option<(String, String)>,
-    /// The installed live snapshot, or the frozen legacy fallback.
+    /// The installed fixed context metadata, or the older-endpoint marker.
     installed: Option<InstalledCapacity>,
 }
 
@@ -229,13 +236,12 @@ pub(crate) enum CapacityRefresh {
 /// Which source produced the current effective limits, for status surfaces.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CapacitySource {
-    /// Live `/v1/capacity` snapshot narrowed by the configured ceiling.
-    Adaptive { basis: CapacityBasis },
-    /// Snapshot reports unavailable: the configured ceiling is kept and the
-    /// request path surfaces the typed 503.
+    /// Server's fixed model context narrowed by the configured ceiling.
+    Configured,
+    /// Unloaded model metadata: keep configured limits and let the request
+    /// report an actual model/allocation failure.
     Unavailable,
-    /// Old Higgs without `/v1/capacity`: frozen 16,384-total/4,096-output
-    /// fallback. Renderers must label this "legacy", never "adaptive".
+    /// Older endpoint or learned snapshot: use configured limits.
     Legacy,
 }
 
@@ -292,8 +298,7 @@ impl CapacityRuntime {
         refresh
     }
 
-    /// Freeze the conservative legacy fallback for an old Higgs without
-    /// `/v1/capacity`: 16,384 total tokens, at most 4,096 output.
+    /// Record an older endpoint without fixed model-context discovery.
     pub(crate) fn install_legacy(&self, endpoint: &str, model: &str) -> CapacityRefresh {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let refresh = if state.installed.is_some() {
@@ -368,12 +373,12 @@ impl CapacityRuntime {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         match &state.installed {
             Some(InstalledCapacity::Profile(profile)) => Some(CapacityDescription {
-                source: if profile.availability() == CapacityAvailability::Available {
-                    CapacitySource::Adaptive {
-                        basis: profile.basis(),
-                    }
-                } else {
+                source: if profile.availability() == CapacityAvailability::Unavailable {
                     CapacitySource::Unavailable
+                } else if profile.basis() == CapacityBasis::Configured {
+                    CapacitySource::Configured
+                } else {
+                    CapacitySource::Legacy
                 },
                 pressure: Some(profile.pressure()),
                 generation: profile.generation(),
@@ -506,8 +511,20 @@ mod tests {
             "retainedSessionTokens": 49_152,
             "retainedBytes": 2_147_483_648_u64,
             "prefixCacheBytes": 1_073_741_824_u64,
-            "basis": "learned"
+            "basis": "configured"
         })
+    }
+
+    #[test]
+    fn learned_pressure_limits_cannot_narrow_configured_budget() {
+        let mut value = available_profile();
+        value["basis"] = json!("learned");
+        value["pressure"] = json!("critical");
+        let runtime = CapacityRuntime::default();
+        runtime.install_profile("endpoint", "model", serde_json::from_value(value).unwrap());
+        let budget = runtime.effective_budget(&TokenBudget::new(100_000, 8_000), 0);
+        assert_eq!(budget.max_context(), 100_000);
+        assert_eq!(budget.response_reserve(), 8_000);
     }
 
     #[test]
@@ -537,7 +554,7 @@ mod tests {
         assert_eq!(profile.generation(), 7);
         assert_eq!(profile.availability(), CapacityAvailability::Available);
         assert_eq!(profile.pressure(), CapacityPressure::Normal);
-        assert_eq!(profile.basis(), CapacityBasis::Learned);
+        assert_eq!(profile.basis(), CapacityBasis::Configured);
     }
 
     #[test]
@@ -598,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_profile_has_no_effective_budget() {
+    fn unavailable_profile_preserves_configured_budget() {
         let mut value = available_profile();
         value["availability"] = json!("unavailable");
         for field in [
@@ -614,8 +631,11 @@ mod tests {
         let profile = serde_json::from_value::<HiggsCapacityProfile>(value).unwrap();
 
         assert_eq!(
-            profile.effective_capacity(&TokenBudget::new(64_000, 8_000), 2_000),
-            Err(CapacityError::Unavailable)
+            profile
+                .effective_capacity(&TokenBudget::new(64_000, 8_000), 2_000)
+                .unwrap()
+                .total_tokens,
+            64_000
         );
     }
 
@@ -694,19 +714,14 @@ mod tests {
     }
 
     #[test]
-    fn describe_reports_adaptive_snapshot_and_matches_effective_budget() {
+    fn describe_reports_fixed_snapshot_and_matches_effective_budget() {
         let runtime = CapacityRuntime::default();
         let profile = serde_json::from_value::<HiggsCapacityProfile>(available_profile()).unwrap();
         runtime.install_profile("http://127.0.0.1:1/v1", "escha-35b-a3b", profile);
         let configured = TokenBudget::new(100_000, 8_000);
 
         let described = runtime.describe(&configured, 2_000).unwrap();
-        assert_eq!(
-            described.source,
-            CapacitySource::Adaptive {
-                basis: CapacityBasis::Learned
-            }
-        );
+        assert_eq!(described.source, CapacitySource::Configured);
         assert_eq!(described.pressure, Some(CapacityPressure::Normal));
         assert_eq!(described.generation, 7);
         assert_eq!(described.boot_id, "boot-1");
@@ -733,8 +748,8 @@ mod tests {
             .unwrap();
         assert_eq!(described.source, CapacitySource::Legacy);
         assert_eq!(described.pressure, None);
-        assert_eq!(described.total_tokens, 16_384);
-        assert_eq!(described.output_tokens, 4_096);
+        assert_eq!(described.total_tokens, 100_000);
+        assert_eq!(described.output_tokens, 8_000);
     }
 
     #[test]
@@ -804,19 +819,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_higgs_fallback_is_bounded_to_16k_total_and_4k_output() {
+    fn legacy_higgs_preserves_configured_limits() {
         let fallback =
             EffectiveCapacity::legacy_higgs(&TokenBudget::new(100_000, 8_000), 1_000).unwrap();
         assert_eq!(
             fallback,
             EffectiveCapacity {
                 immutable_prefix_tokens: 1_000,
-                total_tokens: 16_384,
-                max_prompt_tokens: 12_288,
-                output_tokens: 4_096,
+                total_tokens: 100_000,
+                max_prompt_tokens: 92_000,
+                output_tokens: 8_000,
             }
         );
-        assert_eq!(fallback.prompt_room(4_096, 288), Ok(11_000));
+        assert_eq!(fallback.prompt_room(4_096, 288), Ok(90_712));
         assert_eq!(
             EffectiveCapacity::legacy_higgs(&TokenBudget::new(10_000, 2_000), 1_000).unwrap(),
             EffectiveCapacity {

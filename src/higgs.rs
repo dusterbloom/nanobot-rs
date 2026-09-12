@@ -624,7 +624,7 @@ fn models_url_from_base(api_base: &str) -> String {
     versioned_endpoint_url(api_base, "models")
 }
 
-fn versioned_endpoint_url(api_base: &str, endpoint: &str) -> String {
+pub(crate) fn versioned_endpoint_url(api_base: &str, endpoint: &str) -> String {
     let base = api_base.trim_end_matches('/');
     if base.ends_with("/v1") {
         format!("{base}/{endpoint}")

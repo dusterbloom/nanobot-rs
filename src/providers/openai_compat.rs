@@ -1607,10 +1607,7 @@ impl LLMProvider for OpenAICompatProvider {
                 return Ok(());
             }
             let model = strip_internal_local_model_prefix(model);
-            let url = format!(
-                "{}/v1/sessions/drop",
-                self.api_base.trim_end_matches('/')
-            );
+            let url = crate::higgs::versioned_endpoint_url(&self.api_base, "sessions/drop");
             let response = self
                 .client
                 .post(url)
@@ -4423,6 +4420,24 @@ mod tests {
             String::from_utf8(request).expect("capacity request is HTTP text")
         });
         (format!("http://{address}"), task)
+    }
+
+    #[tokio::test]
+    async fn higgs_session_drop_uses_one_version_prefix() {
+        for suffix in ["", "/", "/v1", "/v1/"] {
+            let (base, server) =
+                spawn_capacity_server("200 OK", Some("application/json"), "{}").await;
+            let provider =
+                OpenAICompatProvider::new("local", Some(&format!("{base}{suffix}")), Some("escha"))
+                    .with_higgs_session_cache(true);
+            provider.drop_higgs_sessions("escha", &[123]).await.unwrap();
+            let request = server.await.unwrap();
+            assert_eq!(
+                request.lines().next(),
+                Some("POST /v1/sessions/drop HTTP/1.1"),
+                "incorrect release route for API base suffix {suffix:?}"
+            );
+        }
     }
 
     fn available_capacity_body() -> &'static str {

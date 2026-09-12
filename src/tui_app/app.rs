@@ -52,9 +52,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::render;
 use crate::agent::audit::ToolEvent;
-use crate::agent::capacity::{
-    CapacityBasis, CapacityDescription, CapacityPressure, CapacitySource,
-};
+use crate::agent::capacity::{CapacityDescription, CapacitySource};
 use crate::agent::token_budget::TokenBudget;
 use crate::repl::commands::ModelEntry;
 use crate::repl::{parse_control_marker, CacheResetReason, CacheStatus, ControlMarker};
@@ -3165,33 +3163,18 @@ fn footer_line(
     Line::from(spans)
 }
 
-/// Footer segment for the installed capacity snapshot: effective live limits
-/// with explicit prompt/output labels so the reserve cannot read as usage.
-/// An unavailable snapshot keeps the configured ceiling and says so.
+/// Fixed prompt/output limits; output is a reservation, not current usage.
 pub(crate) fn capacity_footer_label(d: &CapacityDescription) -> String {
     let limits = format!(
         "prompt {} · output {}",
         format_k_tokens(d.total_tokens.saturating_sub(d.output_tokens) as u64),
         format_k_tokens(d.output_tokens as u64)
     );
-    let mut label = match d.source {
-        CapacitySource::Adaptive { basis } => match basis {
-            CapacityBasis::Conservative => "adaptive (conservative)".to_string(),
-            CapacityBasis::Learned => "adaptive (learned)".to_string(),
-        },
-        CapacitySource::Unavailable => "unavailable · configured".to_string(),
-        CapacitySource::Legacy => "legacy".to_string(),
+    let label = match d.source {
+        CapacitySource::Configured => "fixed",
+        CapacitySource::Unavailable => "configured",
+        CapacitySource::Legacy => "configured (legacy server)",
     };
-    if let Some(pressure) = d.pressure {
-        if pressure != CapacityPressure::Normal {
-            label.push_str(" · ");
-            label.push_str(match pressure {
-                CapacityPressure::Normal => "normal",
-                CapacityPressure::Constrained => "constrained",
-                CapacityPressure::Critical => "critical",
-            });
-        }
-    }
     format!("{limits} {label}")
 }
 
@@ -5019,6 +5002,8 @@ mod tests {
 
     #[test]
     fn capacity_footer_segment_degrades_gracefully() {
+        use crate::agent::capacity::CapacityPressure;
+
         // No snapshot installed (cloud / pre-discovery): no capacity segment.
         let plain = flatten_text(Text::from(footer_line(
             &test_footer(),
@@ -5037,34 +5022,27 @@ mod tests {
             total_tokens: 16_384,
             output_tokens: 4_096,
         });
-        assert_eq!(legacy, "prompt 12K · output 4K legacy");
+        assert_eq!(legacy, "prompt 12K · output 4K configured (legacy server)");
 
         let adaptive = capacity_footer_label(&CapacityDescription {
-            source: CapacitySource::Adaptive {
-                basis: CapacityBasis::Learned,
-            },
+            source: CapacitySource::Configured,
             pressure: Some(CapacityPressure::Constrained),
             generation: 7,
             boot_id: "boot-1".into(),
             total_tokens: 49_152,
             output_tokens: 4_096,
         });
-        assert_eq!(
-            adaptive,
-            "prompt 44K · output 4K adaptive (learned) · constrained"
-        );
+        assert_eq!(adaptive, "prompt 44K · output 4K fixed");
         // Normal pressure stays quiet — the footer is calm by design.
         let calm = capacity_footer_label(&CapacityDescription {
-            source: CapacitySource::Adaptive {
-                basis: CapacityBasis::Conservative,
-            },
+            source: CapacitySource::Configured,
             pressure: Some(CapacityPressure::Normal),
             generation: 1,
             boot_id: "boot-1".into(),
             total_tokens: 49_152,
             output_tokens: 4_096,
         });
-        assert_eq!(calm, "prompt 44K · output 4K adaptive (conservative)");
+        assert_eq!(calm, "prompt 44K · output 4K fixed");
 
         let mut footer = test_footer();
         footer.capacity = Some(legacy);
@@ -5076,7 +5054,7 @@ mod tests {
             0,
         )));
         assert!(
-            with_capacity.contains("capacity prompt 12K · output 4K legacy"),
+            with_capacity.contains("capacity prompt 12K · output 4K configured (legacy server)"),
             "footer: {with_capacity}"
         );
     }

@@ -417,6 +417,7 @@ pub(super) async fn execute_lcm_compaction(
     // generation, and any length retry all use this envelope instead of the
     // wider configured model ceiling.
     compaction_budget: TokenBudget,
+    tool_def_tokens: usize,
     failure_mode: CompactionFailureMode,
     cancellation: tokio_util::sync::CancellationToken,
     publication: Arc<CompactionPublication>,
@@ -466,6 +467,36 @@ pub(super) async fn execute_lcm_compaction(
             ModelCallPurpose::Compaction,
         ));
     let compactor = core.compactor.with_provider(recorded_provider);
+    // LCM stores only durable conversation rows. Reattach the complete
+    // non-durable prompt prefix (system + optional developer) and any
+    // same-snapshot ephemeral tail so installing the checkpoint cannot erase
+    // instructions or scaffolding that the engine intentionally did not ingest.
+    let prompt_prefix_len = messages
+        .iter()
+        .take_while(|message| {
+            matches!(
+                message.get("role").and_then(Value::as_str),
+                Some("system" | "developer")
+            )
+        })
+        .count();
+    let ephemeral_tail: Vec<Value> = messages[prompt_prefix_len..]
+        .iter()
+        .filter(|message| {
+            message.get("_db_id").is_none()
+                && !message
+                    .get("_lcm_summary")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+        })
+        .cloned()
+        .collect();
+    // These bytes are reattached unchanged below and cannot be folded.
+    // Reserve them alongside the actual tool catalog so releasing a pin is
+    // decided against the full foreground wire, not just durable history.
+    let fixed_tokens = TokenBudget::estimate_tokens(&messages[..prompt_prefix_len])
+        .saturating_add(TokenBudget::estimate_tokens(&ephemeral_tail))
+        .saturating_add(tool_def_tokens);
     let summary_turn = tokio::select! {
         biased;
         // Cancellation after `request_async_compaction()` must clear the
@@ -477,7 +508,7 @@ pub(super) async fn execute_lcm_compaction(
         }
         summary = mutation
             .engine_mut()
-            .compact(Some(&compactor), &compaction_budget, 0, failure_mode)
+            .compact(Some(&compactor), &compaction_budget, fixed_tokens, failure_mode)
             => summary,
     };
     let compacted_conversation = mutation.engine().active_context();
@@ -505,29 +536,6 @@ pub(super) async fn execute_lcm_compaction(
         ))
     });
 
-    // LCM stores only durable conversation rows. Reattach the complete
-    // non-durable prompt prefix (system + optional developer) and any
-    // same-snapshot ephemeral tail so installing the checkpoint cannot erase
-    // instructions or scaffolding that the engine intentionally did not ingest.
-    let prompt_prefix_len = messages
-        .iter()
-        .take_while(|message| {
-            matches!(
-                message.get("role").and_then(Value::as_str),
-                Some("system" | "developer")
-            )
-        })
-        .count();
-    let ephemeral_tail = messages[prompt_prefix_len..]
-        .iter()
-        .filter(|message| {
-            message.get("_db_id").is_none()
-                && !message
-                    .get("_lcm_summary")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-        })
-        .cloned();
     let mut compacted_messages =
         Vec::with_capacity(prompt_prefix_len + compacted_conversation.len() + messages.len());
     compacted_messages.extend_from_slice(&messages[..prompt_prefix_len]);
