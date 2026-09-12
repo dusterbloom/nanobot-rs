@@ -16,9 +16,9 @@
 //! ## Pipeline Order
 //! 1. `dedup_tool_results` - Keep only last result per tool_call_id
 //! 2. `merge_consecutive_same_role` - Merge consecutive same-role messages
-//! 3. `drop_old_tool_results` - Keep only last N tool results
+//! 3. `drop_old_tool_results` - Keep last N tool results (whole multi-call batches)
 //! 4. `truncate_old_assistant_messages` - Compress old assistant content
-//! 5. `strip_dangling_tool_calls` - Remove tool calls without immediate results
+//! 5. `strip_dangling_tool_calls` - Strip individual tool calls lacking immediate results
 //! 6. `remove_orphaned_tool_results` - Remove results without matching calls
 
 use std::collections::{HashMap, HashSet};
@@ -225,37 +225,74 @@ fn merge_consecutive_same_role(messages: &mut Vec<Value>) {
     *messages = merged;
 }
 
-/// Drop tool-result messages entirely, keeping only the last `keep_last_n`.
+/// Drop tool-result messages, keeping at least the last `keep_last_n`.
+///
 /// (Formerly `truncate_old_tool_results` — renamed: it removes messages, it
 /// does not shrink bodies. Body shrinking lives in [`shrink_tool_body`].)
+///
+/// Keeps/drops *whole multi-call batches*: a single assistant turn's tool
+/// results are never split by the keep boundary. If the boundary would land
+/// inside a multi-call batch, the whole straddling batch is kept (round up),
+/// so the next pipeline pass always sees a consistent sibling set — never a
+/// partial one that [`strip_dangling_tool_calls`] could mistake for a
+/// corrupt log and wipe.
 pub fn drop_old_tool_results(messages: &mut Vec<Value>, keep_last_n: usize) {
     if keep_last_n == usize::MAX || messages.len() <= keep_last_n {
         return;
     }
 
-    let tool_result_positions: Vec<(usize, String)> = messages
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, m)| get_tool_result_id(m).map(|id| (idx, id)))
-        .collect();
+    // Group tool results into batches: each maximal run of consecutive
+    // tool-role messages is one batch (an assistant turn's results arrive
+    // contiguously, and `merge_consecutive_same_role` never merges tool
+    // messages). Keeping/dropping whole batches guarantees a multi-call
+    // assistant is never left with a partial result set at the keep boundary.
+    let mut batches: Vec<Vec<(usize, String)>> = Vec::new();
+    for (idx, message) in messages.iter().enumerate() {
+        if get_role(message) != "tool" {
+            continue;
+        }
+        let Some(result_id) = get_tool_result_id(message) else {
+            continue;
+        };
+        let continues_run = batches
+            .last()
+            .and_then(|b| b.last())
+            .is_some_and(|(prev_idx, _)| *prev_idx + 1 == idx);
+        if !continues_run {
+            batches.push(Vec::new());
+        }
+        if let Some(batch_slot) = batches.last_mut() {
+            batch_slot.push((idx, result_id));
+        }
+    }
 
-    if tool_result_positions.len() <= keep_last_n {
+    let total_results: usize = batches.iter().map(Vec::len).sum();
+    if total_results <= keep_last_n {
         return;
     }
 
-    let keep_from = tool_result_positions.len().saturating_sub(keep_last_n);
-    let keep_ids: HashSet<String> = tool_result_positions
-        .into_iter()
-        .skip(keep_from)
-        .map(|(_, id)| id)
+    // Walk batches newest-first, keeping whole batches until the cumulative
+    // kept count reaches `keep_last_n`. The straddling batch (the one that
+    // crosses the count threshold) is kept entirely — round up, never split.
+    let mut kept_count: usize = 0;
+    let mut keep_from_batch: usize = batches.len();
+    for (rev_i, batch) in batches.iter().enumerate().rev() {
+        kept_count = kept_count.saturating_add(batch.len());
+        if kept_count >= keep_last_n {
+            keep_from_batch = rev_i;
+            break;
+        }
+    }
+
+    let keep_ids: HashSet<String> = batches[keep_from_batch..]
+        .iter()
+        .flat_map(|kept_batch| kept_batch.iter().map(|(_, id)| id))
+        .cloned()
         .collect();
 
-    messages.retain(|m| {
-        if let Some(id) = get_tool_result_id(m) {
-            keep_ids.contains(&id)
-        } else {
-            true
-        }
+    messages.retain(|m| match get_tool_result_id(m) {
+        Some(id) => keep_ids.contains(&id),
+        None => true,
     });
 }
 
@@ -342,17 +379,37 @@ pub fn strip_dangling_tool_calls(messages: &mut Vec<Value>) {
             next_idx += 1;
         }
 
-        let has_matching_results =
-            !all_results.is_empty() && tool_call_ids.iter().all(|id| all_results.contains(id));
+        // A tool call is "dangling" only when its OWN matching result is
+        // absent from the immediate trailing tool-run. Strip just those calls
+        // and keep the ones whose results survived the prior keep-window
+        // pass. The previous all-or-nothing check (`iter().all(...)`) wiped
+        // the WHOLE batch whenever any sibling was missing — which destroyed
+        // retention-driven partial sets produced by `drop_old_tool_results`
+        // at the keep boundary, so the last N tool results the caller asked
+        // to keep could be lost along with the assistant carrier.
+        let dangling_ids: HashSet<String> = tool_call_ids
+            .iter()
+            .filter(|id| !all_results.contains(id.as_str()))
+            .cloned()
+            .collect();
 
-        if has_matching_results {
+        if dangling_ids.is_empty() {
             continue;
         }
 
-        if let Some(tc) = messages[idx].get("tool_calls").and_then(|t| t.as_array()) {
-            if !tc.is_empty() {
-                messages[idx]["tool_calls"] = Value::Array(vec![]);
-            }
+        if let Some(tool_calls) = messages[idx]
+            .get("tool_calls")
+            .and_then(|t| t.as_array())
+            .cloned()
+        {
+            let retained_calls: Vec<Value> = tool_calls
+                .into_iter()
+                .filter(|call| match call.get("id").and_then(|v| v.as_str()) {
+                    Some(call_id) => !dangling_ids.contains(call_id),
+                    None => true,
+                })
+                .collect();
+            messages[idx]["tool_calls"] = Value::Array(retained_calls);
         }
     }
 
@@ -820,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_tool_results_marks_dangling() {
+    fn test_partial_tool_results_strips_only_dangling_calls() {
         let mut messages = vec![
             json!({
                 "role": "assistant",
@@ -838,8 +895,196 @@ mod tests {
         ];
         strip_dangling_tool_calls(&mut messages);
 
+        // Only the dangling call (tc_2, no result) is stripped; the matched
+        // call (tc_1) and its result survive. Previously this wiped *all*
+        // tool_calls, which destroyed retention-driven partial sets produced
+        // by `drop_old_tool_results` at the keep boundary (see
+        // `test_pipeline_preserves_straddling_multi_call_batch`).
         let tool_calls = messages[0].get("tool_calls").and_then(|tc| tc.as_array());
-        assert!(tool_calls.is_none() || tool_calls.unwrap().is_empty());
+        assert!(
+            tool_calls.is_some(),
+            "assistant with a surviving call must not be dropped"
+        );
+        let kept_ids: Vec<String> = tool_calls
+            .unwrap()
+            .iter()
+            .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        assert_eq!(kept_ids, vec!["tc_1".to_string()]);
+        assert_eq!(messages.len(), 2, "matched call + its result remain");
+        assert_eq!(get_role(&messages[1]), "tool");
+        assert_eq!(get_tool_result_id(&messages[1]), Some("tc_1".to_string()));
+    }
+
+    /// `strip_dangling_tool_calls` must strip ONLY the call whose result is
+    /// missing and keep the rest; a 3-call assistant with one missing result
+    /// keeps the 2 matched calls and their results.
+    #[test]
+    fn test_strip_dangling_strips_only_missing_calls() {
+        let mut messages = vec![
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "tc_1", "name": "read", "arguments": {}},
+                    {"id": "tc_2", "name": "exec", "arguments": {}},
+                    {"id": "tc_3", "name": "exec", "arguments": {}}
+                ]
+            }),
+            json!({"role":"tool","tool_call_id":"tc_1","content":"r1"}),
+            json!({"role":"tool","tool_call_id":"tc_2","content":"r2"}),
+            // tc_3 result missing -> dangling
+        ];
+        strip_dangling_tool_calls(&mut messages);
+
+        let kept_ids: Vec<String> = messages[0]
+            .get("tool_calls")
+            .and_then(|tc| tc.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // Only tc_3 is stripped; tc_1 and tc_2 survive. The old all-or-nothing
+        // wipe would have cleared all three.
+        assert_eq!(kept_ids, vec!["tc_1".to_string(), "tc_2".to_string()]);
+        assert_eq!(messages.len(), 3, "matched assistant + 2 results remain");
+        let result_ids: Vec<String> = messages
+            .iter()
+            .skip(1)
+            .filter_map(|m| get_tool_result_id(m))
+            .collect();
+        assert_eq!(result_ids, vec!["tc_1".to_string(), "tc_2".to_string()]);
+    }
+
+    /// `drop_old_tool_results` must keep/drop whole multi-call batches: when a
+    /// 3-call batch straddles the keep boundary (keep_last_n=2), the whole
+    /// batch is kept and the older batch is dropped — never a partial sibling
+    /// set that downstream passes could mistake for corruption.
+    #[test]
+    fn test_drop_old_tool_results_never_splits_multi_call_batch() {
+        let mut messages = vec![
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"old_1","name":"read","arguments":{}},
+                {"id":"old_2","name":"read","arguments":{}}]}),
+            json!({"role":"tool","tool_call_id":"old_1","content":"o1"}),
+            json!({"role":"tool","tool_call_id":"old_2","content":"o2"}),
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"new_1","name":"read","arguments":{}},
+                {"id":"new_2","name":"read","arguments":{}},
+                {"id":"new_3","name":"read","arguments":{}}]}),
+            json!({"role":"tool","tool_call_id":"new_1","content":"n1"}),
+            json!({"role":"tool","tool_call_id":"new_2","content":"n2"}),
+            json!({"role":"tool","tool_call_id":"new_3","content":"n3"}),
+        ];
+
+        drop_old_tool_results(&mut messages, 2);
+
+        let survivor_ids: HashSet<String> = messages
+            .iter()
+            .filter_map(|m| get_tool_result_id(m))
+            .collect();
+        assert_eq!(
+            survivor_ids,
+            ["new_1", "new_2", "new_3"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<HashSet<_>>(),
+            "straddling multi-call batch must be kept whole; got {:?}",
+            survivor_ids
+        );
+        assert!(!survivor_ids.contains("old_1"));
+        assert!(!survivor_ids.contains("old_2"));
+    }
+
+    /// End-to-end reproduction of the reported bug: a multi-call batch
+    /// straddling the keep boundary used to yield `messages: []` after the
+    /// full pipeline; the last N tool results must now survive.
+    #[test]
+    fn test_pipeline_preserves_straddling_multi_call_batch() {
+        let mut messages = vec![
+            // older multi-call batch
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"old_1","name":"read","arguments":{}},
+                {"id":"old_2","name":"read","arguments":{}}]}),
+            json!({"role":"tool","tool_call_id":"old_1","content":"o1"}),
+            json!({"role":"tool","tool_call_id":"old_2","content":"o2"}),
+            // multi-call batch that straddles the keep boundary
+            json!({"role":"assistant","content":"","tool_calls":[
+                {"id":"new_1","name":"read","arguments":{}},
+                {"id":"new_2","name":"read","arguments":{}},
+                {"id":"new_3","name":"read","arguments":{}}]}),
+            json!({"role":"tool","tool_call_id":"new_1","content":"n1"}),
+            json!({"role":"tool","tool_call_id":"new_2","content":"n2"}),
+            json!({"role":"tool","tool_call_id":"new_3","content":"n3"}),
+        ];
+
+        hygiene_pipeline(&mut messages, 2);
+
+        let survivor_ids: Vec<String> = messages
+            .iter()
+            .filter_map(|m| get_tool_result_id(m))
+            .collect();
+        assert!(
+            survivor_ids.contains(&"new_2".to_string())
+                && survivor_ids.contains(&"new_3".to_string()),
+            "last 2 tool results must survive the pipeline; got {:?}",
+            survivor_ids
+        );
+        assert!(!survivor_ids.contains(&"old_1".to_string()));
+        assert!(!survivor_ids.contains(&"old_2".to_string()));
+        // The recent multi-call assistant carrier must survive (not wiped).
+        let has_recent_assistant = messages.iter().any(|m| {
+            get_role(m) == "assistant"
+                && m.get("tool_calls")
+                    .and_then(|tc| tc.as_array())
+                    .is_some_and(|a| !a.is_empty())
+        });
+        assert!(
+            has_recent_assistant,
+            "recent multi-call assistant must survive; messages: {:?}",
+            messages
+        );
+        // Every surviving tool result must have a matching surviving tool call.
+        let surviving_calls: HashSet<String> =
+            messages.iter().flat_map(|m| get_tool_call_ids(m)).collect();
+        for id in &survivor_ids {
+            assert!(
+                surviving_calls.contains(id),
+                "orphaned result {} survived without a matching call",
+                id
+            );
+        }
+    }
+
+    /// Single-call batches at the boundary never triggered the destructive
+    /// interaction; the fix must not regress that shape.
+    #[test]
+    fn test_pipeline_single_call_batch_straddling_survives() {
+        let mut messages = vec![
+            assistant_with_tool_call("old"),
+            tool_result("old", "old result"),
+            assistant_with_tool_call("new"),
+            tool_result("new", "new result"),
+        ];
+        hygiene_pipeline(&mut messages, 1);
+
+        let survivor_ids: Vec<String> = messages
+            .iter()
+            .filter_map(|m| get_tool_result_id(m))
+            .collect();
+        assert_eq!(survivor_ids, vec!["new".to_string()]);
+        assert!(
+            messages.iter().any(|m| {
+                get_role(m) == "assistant"
+                    && m.get("tool_calls")
+                        .and_then(|tc| tc.as_array())
+                        .is_some_and(|a| !a.is_empty())
+            }),
+            "newest single-call assistant must survive; messages: {:?}",
+            messages
+        );
     }
 
     #[test]
