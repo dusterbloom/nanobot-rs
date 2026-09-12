@@ -1117,11 +1117,16 @@ pub(crate) async fn execute_tools_delegated(
     }
 
     // Behavioral response-boundary arming (mirrors execute_tools_inline).
-    // `response` is the main-model response that requested delegation.
+    // `response` is the main-model response that requested delegation. Only
+    // routed, successful, non-staged-write reportable calls arm — the same
+    // filter the inline path applies via `completed_reportable_tool`. A failed
+    // delegated side-effect call and a staged `write_file(state="more")` chunk
+    // must NOT arm, so a legitimate retry / continuation chunk is not rejected
+    // once with `response boundary: … was not executed`.
     let executed: Vec<&str> = run_result
         .tool_results
         .iter()
-        .map(|outcome| outcome.tool_name.as_str())
+        .filter_map(|outcome| completed_reportable_delegated(outcome, routed_tool_calls))
         .collect();
     if should_arm_boundary(response.content.as_deref(), &executed) {
         ctx.flow.boundary = ResponseBoundary::Pending;
@@ -1249,6 +1254,46 @@ fn completed_reportable_tool(result: &SingleToolResult) -> Option<&str> {
         return None;
     }
     Some(&result.tool_name)
+}
+
+/// Mirror of [`completed_reportable_tool`] for the delegated (tool-runner)
+/// path, so both arming sites agree on what arms the response boundary. A
+/// delegated outcome arms only when it is routed (not a runner scratch-pad
+/// call), it succeeded, it is reportable, and it is not a staged
+/// `write_file(state="more")` chunk — the classes the inline path exempts.
+/// Runner-internal scratch-pad outcomes are excluded too: they carry no
+/// `ok`/`arguments` and cannot be classified, and any reportable scratch-pad
+/// name is already counted through its own routed outcome. Success uses the
+/// canonical [`tool_result_ok`] (the same check the storage/render sites in
+/// `execute_tools_delegated` apply to `outcome.data`), not a narrow `Error:`
+/// prefix, so `response boundary:`, `No stored output …`, and `(no result)`
+/// payloads count as failures too.
+fn completed_reportable_delegated<'a>(
+    outcome: &'a tool_runner::ToolRunOutcome,
+    routed_tool_calls: &[ToolCallRequest],
+) -> Option<&'a str> {
+    if !is_routed_call(&outcome.tool_call_id, routed_tool_calls) {
+        return None;
+    }
+    if !tool_result_ok(&outcome.data) {
+        return None;
+    }
+    if !requires_result_report(&outcome.tool_name) {
+        return None;
+    }
+    let tc = routed_tool_calls
+        .iter()
+        .find(|tc| tc.id == outcome.tool_call_id)?;
+    if outcome.tool_name == "write_file"
+        && tc
+            .arguments
+            .get("state")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("more"))
+    {
+        return None;
+    }
+    Some(outcome.tool_name.as_str())
 }
 
 /// Execute one tool call: emit CallStart, run heartbeat, call the tool,
@@ -2638,6 +2683,138 @@ mod tests {
             Some("write_file")
         );
         assert_eq!(completed_reportable_tool(&result(None)), Some("write_file"));
+    }
+
+    /// The delegated arming path must mirror the inline path's filter: a
+    /// failed routed side-effect call and a staged `write_file(state="more")`
+    /// chunk must NOT arm, and runner scratch-pad calls must not arm either.
+    /// Guards the regression where `execute_tools_delegated` fed every
+    /// `ToolRunOutcome` name into `should_arm_boundary` with no filtering.
+    #[test]
+    fn completed_reportable_delegated_excludes_failures_and_staged_writes() {
+        use crate::agent::tool_runner::ToolRunOutcome;
+
+        let outcome = |name: &str, id: &str, data: &str| ToolRunOutcome {
+            tool_call_id: id.to_string(),
+            tool_name: name.to_string(),
+            data: data.to_string(),
+            duration_ms: 0,
+        };
+        let tc_with_state = |name: &str, id: &str, state: Option<&str>| {
+            let mut arguments = HashMap::new();
+            if let Some(state) = state {
+                arguments.insert("state".to_string(), json!(state));
+            }
+            ToolCallRequest {
+                id: id.to_string(),
+                name: name.to_string(),
+                arguments,
+            }
+        };
+
+        // A failed delegated side-effect call must not arm — retrying is the
+        // model's legitimate next move (mirrors the inline exemption).
+        let routed_exec = vec![make_tc("exec", "r_exec")];
+        assert_eq!(
+            completed_reportable_delegated(
+                &outcome("exec", "r_exec", "Error: command exited 1"),
+                &routed_exec,
+            ),
+            None
+        );
+        // `response boundary:` / `(no result)` payloads count as failures too
+        // (canonical `tool_result_ok`, not a narrow `Error:` prefix).
+        assert_eq!(
+            completed_reportable_delegated(
+                &outcome("exec", "r_exec", "response boundary: exec was not executed"),
+                &routed_exec,
+            ),
+            None
+        );
+        assert_eq!(
+            completed_reportable_delegated(&outcome("exec", "r_exec", "(no result)"), &routed_exec),
+            None
+        );
+        assert_eq!(
+            completed_reportable_delegated(
+                &outcome("exec", "r_exec", "No stored output for tool_call_id=r_exec"),
+                &routed_exec,
+            ),
+            None
+        );
+        // A successful delegated reportable call arms.
+        assert_eq!(
+            completed_reportable_delegated(&outcome("exec", "r_exec", "exit 0\n"), &routed_exec),
+            Some("exec")
+        );
+
+        // A staged `write_file(state="more")` chunk must not arm — the next
+        // piece must be allowed in (mirrors the inline exemption).
+        assert_eq!(
+            completed_reportable_delegated(
+                &outcome("write_file", "r_write", "ok"),
+                &[tc_with_state("write_file", "r_write", Some("more"))],
+            ),
+            None
+        );
+        assert_eq!(
+            completed_reportable_delegated(
+                &outcome("write_file", "r_write", "ok"),
+                &[tc_with_state("write_file", "r_write", Some(" MORE "))],
+            ),
+            None
+        );
+        assert_eq!(
+            completed_reportable_delegated(
+                &outcome("write_file", "r_write", "ok"),
+                &[tc_with_state("write_file", "r_write", Some("MoRe"))],
+            ),
+            None
+        );
+        // A failed staged write is excluded on the failure axis alone.
+        assert_eq!(
+            completed_reportable_delegated(
+                &outcome("write_file", "r_write", "Error: disk full"),
+                &[tc_with_state("write_file", "r_write", Some("more"))],
+            ),
+            None
+        );
+        // A final / one-call write arms.
+        assert_eq!(
+            completed_reportable_delegated(
+                &outcome("write_file", "r_write", "ok"),
+                &[tc_with_state("write_file", "r_write", Some("complete"))],
+            ),
+            Some("write_file")
+        );
+        assert_eq!(
+            completed_reportable_delegated(
+                &outcome("write_file", "r_write", "ok"),
+                &[tc_with_state("write_file", "r_write", None)],
+            ),
+            Some("write_file")
+        );
+
+        // A runner scratch-pad (non-routed) outcome never arms, even with a
+        // reportable name and a successful payload.
+        assert_eq!(
+            completed_reportable_delegated(&outcome("exec", "sp0000001", "exit 0\n"), &routed_exec),
+            None
+        );
+        // A routed outcome whose id is not in the routed batch (stale / id
+        // mismatch) does not arm.
+        assert_eq!(
+            completed_reportable_delegated(&outcome("exec", "r_orphan", "exit 0\n"), &routed_exec),
+            None
+        );
+        // A non-reportable routed tool never arms.
+        assert_eq!(
+            completed_reportable_delegated(
+                &outcome("read_file", "r_read", "file body"),
+                &[make_tc("read_file", "r_read")],
+            ),
+            None
+        );
     }
 
     #[tokio::test]
