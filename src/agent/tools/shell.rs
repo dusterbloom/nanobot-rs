@@ -58,6 +58,7 @@ fn pipefail_shell_command(shell: &str, command: &str) -> Command {
 use super::base::{require_param, PermissionLevel, Tool, ToolContext, ToolResult};
 use crate::agent::audit::ToolEvent;
 use crate::errors::ToolError;
+use crate::utils::helpers::expand_tilde;
 
 /// Default deny patterns for dangerous shell commands.
 fn default_deny_patterns() -> Vec<String> {
@@ -233,6 +234,231 @@ impl ExecTool {
         segments
     }
 
+    /// Tokenize a single command segment into whitespace-delimited words,
+    /// respecting single and double quotes (quotes are stripped from the
+    /// resulting word). This mirrors `split_compound`'s quote discipline so
+    /// write-destination detection sees the same word boundaries `sh` would.
+    fn tokenize(segment: &str) -> Vec<String> {
+        let mut tokens: Vec<String> = Vec::new();
+        let mut current = String::new();
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut has_chars = false;
+
+        for ch in segment.chars() {
+            match ch {
+                '\'' if !in_double_quote => {
+                    in_single_quote = !in_single_quote;
+                    has_chars = true;
+                }
+                '"' if !in_single_quote => {
+                    in_double_quote = !in_double_quote;
+                    has_chars = true;
+                }
+                c if c.is_whitespace() && !in_single_quote && !in_double_quote => {
+                    if has_chars {
+                        tokens.push(std::mem::take(&mut current));
+                        has_chars = false;
+                    }
+                }
+                c => {
+                    current.push(c);
+                    has_chars = true;
+                }
+            }
+        }
+        if has_chars {
+            tokens.push(current);
+        }
+        tokens
+    }
+
+    /// Resolve a write-destination argument to an absolute path and return its
+    /// canonicalized form if it lies outside `cwd_path`. A destination that the
+    /// shell *creates* at write time does not yet exist, so `canonicalize()` on
+    /// the destination returns `Err(NotFound)`. We therefore walk up the
+    /// destination's ancestor chain until we find an existing ancestor (the
+    /// filesystem root always exists, bounding the walk), canonicalize *that*,
+    /// and compare it against `cwd_path`. Tilde is expanded first; this makes
+    /// the check existence-independent for the destination itself while still
+    /// resolving symlinks on the part of the path that does exist.
+    fn destination_outside_workspace(raw: &str, cwd_path: &Path) -> Option<PathBuf> {
+        let expanded = expand_tilde(raw);
+        let candidate = if expanded.is_absolute() {
+            expanded
+        } else {
+            Path::new(cwd_path).join(&expanded)
+        };
+        if candidate == cwd_path || candidate.starts_with(cwd_path) {
+            return None;
+        }
+        // First try the destination itself (existing-destination fast path).
+        if let Ok(p) = candidate.canonicalize() {
+            if p != cwd_path && !p.starts_with(cwd_path) {
+                return Some(p);
+            }
+            return None;
+        }
+        // Walk up the ancestor chain until an existing ancestor canonicalizes.
+        // The filesystem root always exists, so this always terminates. We use
+        // the canonicalized ancestor's relation to cwd_path as a proxy for the
+        // (possibly not-yet-existing) leaf's relation — if the deepest existing
+        // ancestor is outside the workspace, the leaf under it is outside too.
+        let mut ancestor = candidate.as_path();
+        while let Some(parent) = ancestor.parent() {
+            if let Ok(canonical) = parent.canonicalize() {
+                if canonical != cwd_path && !canonical.starts_with(cwd_path) {
+                    return Some(canonical);
+                }
+                // Ancestors inside cwd ⇒ the leaf (descended from them via the
+                // non-canonicalical trailing components) is also inside.
+                return None;
+            }
+            ancestor = parent;
+        }
+        // Fell through to the root without canonicalizing — conservatively
+        // treat it as outside (the candidate was already checked to not be
+        // inside cwd_path above).
+        Some(candidate)
+    }
+
+    /// Extract write destinations from a single (non-compound) command
+    /// segment, expanded and absolute. Covers:
+    /// - unquoted `>`/`>>` redirect targets (file writes; excludes `-` and
+    ///   `&N` fd redirections which do not target a file)
+    /// - `cp`/`mv`/`install`/`rsync` trailing destination operand
+    /// - `dd of=...` operand
+    /// - `tee` write operands
+    /// - `find -exec <writer> ... \;` (recursively vets the embedded writer)
+    ///
+    /// Flags that consume the next argument are treated as non-operands for
+    /// the trailing-destination rule only; this is best-effort detection of
+    /// the common cases.
+    fn collect_write_destinations(segment: &str) -> Vec<String> {
+        let tokens = Self::tokenize(segment);
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        let binary = tokens
+            .first()
+            .map_or("", |b| b.rsplit('/').next().unwrap_or(b))
+            .to_lowercase();
+
+        let mut dests: Vec<String> = Vec::new();
+
+        // Redirects: scan the raw segment (not tokens) so we see `>` placement
+        // even inside compound tokens. Only unquoted redirects are writes.
+        dests.extend(Self::collect_redirect_targets(segment));
+
+        match binary.as_str() {
+            "cp" | "mv" | "install" | "rsync" => {
+                // Trailing non-flag operand is the destination.
+                let operands: Vec<&String> = tokens
+                    .iter()
+                    .skip(1)
+                    .filter(|t| !t.starts_with('-'))
+                    .collect();
+                if let Some(dest) = operands.last() {
+                    dests.push((*dest).clone());
+                }
+            }
+            "dd" => {
+                for t in tokens.iter().skip(1) {
+                    if let Some(rest) = t.strip_prefix("of=") {
+                        if !rest.is_empty() {
+                            dests.push(rest.to_string());
+                        }
+                    }
+                }
+            }
+            "tee" => {
+                for t in tokens.iter().skip(1) {
+                    if !t.starts_with('-') && !t.is_empty() {
+                        dests.push(t.clone());
+                    }
+                }
+            }
+            "find" => {
+                dests.extend(Self::collect_find_exec_destinations(&tokens));
+            }
+            _ => {}
+        }
+        dests
+    }
+
+    /// Collect unquoted `>`/`>>` redirect targets from a raw segment. A redirect
+    /// is only a file write when `>` is *not* inside quotes and the following
+    /// word is neither `-` (stdout) nor `&N` (file descriptor).
+    fn collect_redirect_targets(segment: &str) -> Vec<String> {
+        let mut dests: Vec<String> = Vec::new();
+        let mut in_single_quote = false;
+        let mut in_double_quote = false;
+        let mut chars = segment.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\'' if !in_double_quote => {
+                    in_single_quote = !in_single_quote;
+                }
+                '"' if !in_single_quote => {
+                    in_double_quote = !in_double_quote;
+                }
+                '>' if !in_single_quote && !in_double_quote => {
+                    // Consume a second '>' for append (>>).
+                    if chars.peek() == Some(&'>') {
+                        chars.next();
+                    }
+                    // Skip whitespace between '>' and the target word.
+                    while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                        chars.next();
+                    }
+                    match chars.peek() {
+                        Some(&first) if first != '&' && first != '|' => {
+                            let mut word = String::new();
+                            while let Some(&pc) = chars.peek() {
+                                if pc.is_whitespace() || pc == '|' {
+                                    break;
+                                }
+                                word.push(pc);
+                                chars.next();
+                            }
+                            if !word.is_empty() && word != "-" {
+                                dests.push(word);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        dests
+    }
+
+    /// For `find ... -exec <writer> ... \\;` patterns, recursively vet the
+    /// embedded writer's own write destinations (e.g. `find . -exec cp {} /etc/x \\;`
+    /// names `/etc/x` via `cp`'s trailing-operand rule).
+    fn collect_find_exec_destinations(tokens: &[String]) -> Vec<String> {
+        let mut dests: Vec<String> = Vec::new();
+        for (idx, tok) in tokens.iter().enumerate() {
+            if tok == "-exec" || tok == "-execdir" {
+                // `split_compound` does not understand backslash-escaping of
+                // `;`, so a trailing `\;` arrives as a lone `\` token; treat
+                // `\`, `;`, and `+` as the `-exec` terminator.
+                let rest: Vec<String> = tokens
+                    .iter()
+                    .skip(idx + 1)
+                    .take_while(|tk| *tk != ";" && *tk != "+" && *tk != "\\")
+                    .cloned()
+                    .collect();
+                if !rest.is_empty() {
+                    let embedded = rest.join(" ");
+                    dests.extend(Self::collect_write_destinations(&embedded));
+                }
+            }
+        }
+        dests
+    }
+
     /// Best-effort safety guard for potentially destructive commands.
     ///
     /// Returns an error message if the command is blocked, or `None` if allowed.
@@ -289,48 +515,88 @@ impl ExecTool {
 
         // Workspace restriction checks (on the original command).
         if self.restrict_to_workspace {
-            if cmd.contains("../") || cmd.contains("..\\") {
-                return Some(
-                    "Error: Command blocked by safety guard (path traversal detected)".to_string(),
-                );
+            if let Some(err) = Self::check_workspace_restriction(cmd, &segments, cwd) {
+                return Some(err);
             }
+        }
 
-            // Allow read-only commands to access absolute paths outside the workspace.
-            // These commands cannot write or delete files, so there is no safety
-            // risk in letting them read arbitrary absolute paths (traversal is
-            // still blocked above).
-            let first_word = cmd.split_whitespace().next().unwrap_or("");
-            let binary = first_word.rsplit('/').next().unwrap_or(first_word);
-            let read_only = [
-                "grep", "rg", "cat", "head", "tail", "wc", "find", "ls", "file", "stat", "du",
-                "which",
-            ];
-            if read_only.contains(&binary) {
-                return None;
+        None
+    }
+
+    /// Workspace-restriction enforcement for `restrict_to_workspace`.
+    ///
+    /// Three layers, in order:
+    /// 1. Path-traversal deny (`..`).
+    /// 2. **Write-destination check** — parses redirect targets and the
+    ///    destination operands of `cp`/`mv`/`install`/`tee`/`dd`/`rsync` (and the
+    ///    writer embedded in `find -exec`), expands `~`, and resolves the
+    ///    target's *parent* against `cwd` so a file the shell creates at write
+    ///    time is caught even though it does not exist yet. This runs before the
+    ///    read-only short-circuit so a read-only binary with a redirect (e.g.
+    ///    `cat x > /etc/cron.d/p`) cannot escape.
+    /// 3. Read-only exemption — pure reads of outside-workspace paths remain
+    ///    allowed (traversal is already blocked in layer 1).
+    /// 4. Existing-path membership test — the legacy `canonicalize` loop, kept
+    ///    as a second layer for pre-existing paths the destination parser does
+    ///    not surface.
+    fn check_workspace_restriction(cmd: &str, segments: &[String], cwd: &str) -> Option<String> {
+        if cmd.contains("../") || cmd.contains("..\\") {
+            return Some(
+                "Error: Command blocked by safety guard (path traversal detected)".to_string(),
+            );
+        }
+
+        let cwd_path = match Path::new(cwd).canonicalize() {
+            Ok(p) => p,
+            Err(_) => PathBuf::from(cwd),
+        };
+
+        for segment in segments {
+            for raw_dest in Self::collect_write_destinations(segment) {
+                if Self::destination_outside_workspace(&raw_dest, &cwd_path).is_some() {
+                    return Some(
+                        "Error: Command blocked by safety guard (path outside working dir)"
+                            .to_string(),
+                    );
+                }
             }
+        }
 
-            let cwd_path = match Path::new(cwd).canonicalize() {
-                Ok(p) => p,
-                Err(_) => PathBuf::from(cwd),
-            };
+        // Allow read-only commands to access absolute paths outside the
+        // workspace for *reading*, because they cannot write. The global
+        // write-destination check above has already vetoed any redirect or
+        // embedded writer, so a read-only binary is no longer an escape
+        // hatch for writes (traversal is still blocked above).
+        let first_word = cmd.split_whitespace().next().unwrap_or("");
+        let binary = first_word.rsplit('/').next().unwrap_or(first_word);
+        let read_only = [
+            "grep", "rg", "cat", "head", "tail", "wc", "find", "ls", "file", "stat", "du", "which",
+        ];
+        if read_only.contains(&binary) {
+            return None;
+        }
 
-            // Extract absolute paths from the command.
-            let mut paths: Vec<String> = Vec::new();
-            for m in RE_POSIX_PATH.find_iter(cmd) {
-                paths.push(m.as_str().to_string());
-            }
-            for m in RE_WIN_PATH.find_iter(cmd) {
-                paths.push(m.as_str().to_string());
-            }
+        // Second layer: block any pre-existing absolute path outside the
+        // workspace. This catches existing sources/destinations the
+        // destination parser does not surface (e.g. a non-write command that
+        // touches an outside-workspace file), and is intentionally
+        // existence-dependent — the destination check above covers the
+        // not-yet-existing targets that this loop cannot see.
+        let mut paths: Vec<String> = Vec::new();
+        for m in RE_POSIX_PATH.find_iter(cmd) {
+            paths.push(m.as_str().to_string());
+        }
+        for m in RE_WIN_PATH.find_iter(cmd) {
+            paths.push(m.as_str().to_string());
+        }
 
-            for raw in paths {
-                if let Ok(p) = Path::new(&raw).canonicalize() {
-                    if p != cwd_path && !p.starts_with(&cwd_path) {
-                        return Some(
-                            "Error: Command blocked by safety guard (path outside working dir)"
-                                .to_string(),
-                        );
-                    }
+        for raw in paths {
+            if let Ok(p) = Path::new(&raw).canonicalize() {
+                if p != cwd_path && !p.starts_with(&cwd_path) {
+                    return Some(
+                        "Error: Command blocked by safety guard (path outside working dir)"
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -998,6 +1264,471 @@ mod tests {
             "cp with path outside workspace should be blocked"
         );
         assert!(result.unwrap().contains("path outside working dir"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Write-destination enforcement (restrict_to_workspace=true)
+    //
+    // The guard must block writes the shell *creates* at write time, not just
+    // paths that already exist. These tests pin the canonicalize-gap and
+    // tilde-expansion-gap fixes; each names a non-existent / tilde destination
+    // that the old `canonicalize()`-only check silently allowed.
+    // -----------------------------------------------------------------------
+
+    fn guard_blocked(cmd: &str) -> bool {
+        guard(cmd).is_some()
+    }
+
+    #[test]
+    fn test_cp_nonexistent_dest_outside_workspace_blocked() {
+        // Canonicalize gap: /tmp/redirect_probe does not exist, so the old
+        // check's `canonicalize()` returned Err(NotFound) and silently allowed.
+        assert!(
+            guard_blocked("cp src/x /tmp/redirect_probe"),
+            "write to a new outside-workspace file must be blocked (canonicalize gap)"
+        );
+    }
+
+    #[test]
+    fn test_cp_nonexistent_dest_blocked_msg() {
+        let result = guard("cp src/x /tmp/redirect_probe");
+        assert!(result.is_some());
+        assert!(
+            result.unwrap().contains("path outside working dir"),
+            "should report path-outside-working-dir"
+        );
+    }
+
+    #[test]
+    fn test_mv_nonexistent_dest_outside_workspace_blocked() {
+        assert!(
+            guard_blocked("mv src/x /tmp/mv_dest_probe"),
+            "mv to a new outside-workspace file must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_install_nonexistent_dest_outside_workspace_blocked() {
+        assert!(
+            guard_blocked("install src/x /tmp/install_dest_probe"),
+            "install to a new outside-workspace file must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_rsync_dest_outside_workspace_blocked() {
+        assert!(
+            guard_blocked("rsync src/x /tmp/rsync_dest_probe"),
+            "rsync to a new outside-workspace path must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_dd_of_outside_workspace_blocked() {
+        assert!(
+            guard_blocked("dd if=src/x of=/tmp/dd_dest_probe"),
+            "dd of= to a new outside-workspace file must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_tee_outside_workspace_blocked() {
+        assert!(
+            guard_blocked("echo payload | tee /tmp/tee_dest_probe"),
+            "tee to a new outside-workspace file must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_redirect_nonexistent_dest_blocked_nonreadonly() {
+        // Non-read-only word (awk) + redirect to a new outside-workspace file.
+        // Only the canonicalize gap explains the old allow.
+        assert!(
+            guard_blocked("awk '{print}' x > /tmp/awk_out_probe"),
+            "non-read-only redirect to a new outside-workspace file must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_append_redirect_nonexistent_dest_blocked() {
+        // >> is also a write mechanism.
+        assert!(
+            guard_blocked("echo x >> /tmp/append_probe"),
+            ">> redirect to a new outside-workspace file must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_redirect_quoted_dest_not_treated_as_write() {
+        // A quoted `>` inside an argument must NOT be parsed as a redirect.
+        // `echo "a > b"` writes nothing; the command is benign and reads no
+        // outside-workspace path, so it must be allowed.
+        assert!(
+            guard(r#"echo "a > b""#).is_none(),
+            "quoted '>' in an argument must not be treated as a redirect"
+        );
+    }
+
+    #[test]
+    fn test_redirect_to_stdout_fd_allowed() {
+        // `>&2` / `>&1` are fd redirections, not file writes; with no
+        // outside-workspace write target the command must be allowed (echo is
+        // also non-writing).
+        assert!(
+            guard("echo hi >&2").is_none(),
+            "fd redirection must not be parsed as a file write target"
+        );
+    }
+
+    #[test]
+    fn test_redirect_to_dash_allowed_when_in_workspace() {
+        // `> -` means stdout in some shells; with no outside path it must not
+        // be blocked as a write destination.
+        assert!(
+            guard("echo hi > -").is_none(),
+            "'-' redirect target must not be treated as a file write"
+        );
+    }
+
+    #[test]
+    fn test_readonly_redirect_existing_outside_blocked() {
+        // Probe 4 from the report: `cat` is read-only, but a redirect turns it
+        // into a write to an existing outside-workspace file. The read-only
+        // exemption must not short-circuit past the write-destination check.
+        assert!(
+            guard_blocked("cat src/x > /etc/hostname"),
+            "read-only binary with a redirect to an outside-workspace file must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_readonly_redirect_nonexistent_outside_blocked() {
+        // Probe 6: `cat` (read-only) + redirect to a NEW outside-workspace file.
+        assert!(
+            guard_blocked("cat src/x > /tmp/cat_redirect_probe"),
+            "read-only binary with a redirect to a new outside-workspace file must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_tilde_dest_existing_home_file_blocked() {
+        // Tilde-expansion gap: `~/.bashrc` pre-exists for most users; an
+        // expanded `~` would canonicalize successfully and be blocked. The old
+        // code never expanded `~`, so it matched the wrong substring and skipped.
+        assert!(
+            guard_blocked("cp src/x ~/.bashrc"),
+            "write to an existing ~-relative outside-workspace file must be blocked (~ expansion gap)"
+        );
+    }
+
+    #[test]
+    fn test_tilde_dest_nonexistent_blocked() {
+        // A new ~-relative destination (both the ~ gap and canonicalize gap
+        // must be closed for this to block).
+        assert!(
+            guard_blocked("cp src/x ~/nanobot_tilde_probe"),
+            "write to a new ~-relative outside-workspace file must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_tilde_redirect_blocked() {
+        // Redirect target with a tilde.
+        assert!(
+            guard_blocked("echo x > ~/nanobot_redirect_probe"),
+            "redirect to a ~-relative outside-workspace file must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_find_exec_cp_outside_workspace_blocked() {
+        // Probe 7: `find -exec cp {} /tmp/exfil \;` — the embedded writer's
+        // destination must be vetted.
+        assert!(
+            guard_blocked("find . -exec cp {} /tmp/exfil_probe \\;"),
+            "find -exec with an outside-workspace cp destination must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_find_exec_mv_outside_workspace_blocked() {
+        assert!(
+            guard_blocked("find . -exec mv {} /tmp/mv_exfil_probe \\;"),
+            "find -exec with an outside-workspace mv destination must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_find_exec_redirect_outside_workspace_blocked() {
+        // The redirect sits inside a single-quoted `sh -c '...'` argument, so
+        // `collect_redirect_targets` correctly treats it as quoted (not a
+        // redirect at the find level). The block still fires because `find` is
+        // a read-only binary and the legacy canonicalize loop... actually `find`
+        // gets the read-only exemption. Verify behaviorally that the command is
+        // blocked; the precise mechanism is the embedded-writer `sh` (not
+        // read-only) whose redirect target `/tmp/out_probe` is collected and
+        // blocked via the parent-canonicalize path.
+        let r = guard("find . -exec sh -c 'echo {} > /tmp/out_probe' \\;");
+        assert!(
+            r.is_some(),
+            "find -exec sh -c with a redirect to an outside-workspace file must be blocked, got: {r:?}"
+        );
+    }
+
+    #[test]
+    fn test_find_exec_plus_terminator_blocked() {
+        // `find -exec ... {} +` uses `+` as the terminator; the embedded
+        // writer's destination must still be vetted.
+        assert!(
+            guard_blocked("find . -exec cp {} /tmp/plus_exfil_probe +"),
+            "find -exec with `+` terminator and outside-workspace dest must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_cp_tilde_to_tilde_authorized_keys_blocked() {
+        // Exploit scenario: `cp ~/.ssh/id_ed25519.pub ~/.ssh/authorized_keys`
+        // — destination under `~/.ssh` (outside the workspace) must be blocked
+        // even if the file does not yet exist.
+        let r = guard("cp ~/.ssh/id_ed25519.pub ~/.ssh/authorized_keys_probe");
+        assert!(
+            r.is_some(),
+            "cp of a ~-relative file to a new ~-relative outside-workspace file must be blocked, got: {r:?}"
+        );
+    }
+
+    #[test]
+    fn test_piped_redirect_outside_workspace_blocked() {
+        // A redirect on the right-hand side of a pipe must still be caught.
+        assert!(
+            guard_blocked("echo payload | grep x > /tmp/pipe_redirect_probe"),
+            "redirect target after a pipe to an outside-workspace file must be blocked"
+        );
+    }
+
+    #[test]
+    fn test_compound_redirect_outside_workspace_blocked() {
+        // A redirect after `&&` must still be caught.
+        assert!(
+            guard_blocked("echo ok && echo payload > /tmp/compound_redirect_probe"),
+            "redirect target after `&&` to an outside-workspace file must be blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exec_with_workspace_restriction_blocks_redirect() {
+        // End-to-end: execute() must turn the guard's block into a
+        // PermissionDenied error for a redirect to an outside-workspace file.
+        let tool = make_exec_tool(true);
+        let mut params = HashMap::new();
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String("echo payload > /tmp/exec_redirect_probe".to_string()),
+        );
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+        assert!(
+            result.contains("blocked"),
+            "execute must surface the guard's block for an outside-workspace redirect, got: {result}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Non-regression: in-workspace writes must still be allowed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cp_inside_workspace_allowed() {
+        // A write into the current working directory must not be blocked.
+        assert!(
+            guard("cp README.md copy_of_readme.md").is_none(),
+            "in-workspace cp must be allowed, got: {:?}",
+            guard("cp README.md copy_of_readme.md")
+        );
+    }
+
+    #[test]
+    fn test_redirect_inside_workspace_allowed() {
+        // `cargo build > build.log` writes build.log into cwd; allowed.
+        assert!(
+            guard("cargo build > build.log").is_none(),
+            "in-workspace redirect must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_redirect_to_existing_in_workspace_subdir_allowed() {
+        // ./src exists inside the workspace; writing into it is allowed.
+        assert!(
+            guard("echo hi > src/out_probe.txt").is_none(),
+            "in-workspace subdirectory redirect must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_tee_in_workspace_allowed() {
+        assert!(
+            guard("echo x | tee in_workspace_tee_probe").is_none(),
+            "in-workspace tee must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_dd_in_workspace_allowed() {
+        // `dd` is blocked by the deny-list pattern `\bdd\s+if=`, so this is
+        // exercised via the destination-parser unit test instead (see
+        // `test_collect_write_destinations_dd_of`). Here we only assert that
+        // the in-workspace `of=` operand, parsed in isolation, is NOT flagged
+        // by `destination_outside_workspace`.
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        assert!(
+            ExecTool::destination_outside_workspace("in_workspace_dd_probe", &cwd).is_none(),
+            "in-workspace dd of= operand must not be flagged as outside"
+        );
+    }
+
+    #[test]
+    fn test_readonly_read_outside_workspace_still_allowed() {
+        // The read-only exemption for pure reads (no redirect) must still work.
+        assert!(
+            guard("cat /etc/os-release").is_none(),
+            "read-only cat of an outside-workspace file must remain allowed"
+        );
+        assert!(
+            guard("grep -r pattern /etc/").is_none(),
+            "read-only grep of an outside-workspace path must remain allowed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tokenizer / destination-parser unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_tokenize_basic() {
+        let t = ExecTool::tokenize("cp src/x /tmp/y");
+        assert_eq!(t, vec!["cp", "src/x", "/tmp/y"]);
+    }
+
+    #[test]
+    fn test_tokenize_strips_quotes() {
+        let t = ExecTool::tokenize(r#"awk '{print}' "a b" x"#);
+        assert_eq!(t, vec!["awk", "{print}", "a b", "x"]);
+    }
+
+    #[test]
+    fn test_tokenize_collapses_whitespace() {
+        let t = ExecTool::tokenize("cp   a\tb");
+        assert_eq!(t, vec!["cp", "a", "b"]);
+    }
+
+    #[test]
+    fn test_collect_redirect_targets_unquoted() {
+        let d = ExecTool::collect_redirect_targets("echo hi > /tmp/x");
+        assert_eq!(d, vec!["/tmp/x"]);
+    }
+
+    #[test]
+    fn test_collect_redirect_targets_append() {
+        let d = ExecTool::collect_redirect_targets("echo hi >> /tmp/x");
+        assert_eq!(d, vec!["/tmp/x"]);
+    }
+
+    #[test]
+    fn test_collect_redirect_targets_quoted_not_redirect() {
+        let d = ExecTool::collect_redirect_targets(r#"echo "a > b""#);
+        assert!(d.is_empty(), "quoted '>' must not be a redirect, got {d:?}");
+    }
+
+    #[test]
+    fn test_collect_redirect_targets_fd_not_file() {
+        let d = ExecTool::collect_redirect_targets("echo hi >&2");
+        assert!(
+            d.is_empty(),
+            "fd redirect must not yield a file target, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn test_collect_write_destinations_cp() {
+        let d = ExecTool::collect_write_destinations("cp a /tmp/x");
+        assert!(d.contains(&"/tmp/x".to_string()), "got {d:?}");
+    }
+
+    #[test]
+    fn test_collect_write_destinations_dd_of() {
+        let d = ExecTool::collect_write_destinations("dd if=a of=/tmp/x");
+        assert!(d.contains(&"/tmp/x".to_string()), "got {d:?}");
+    }
+
+    #[test]
+    fn test_collect_write_destinations_tee() {
+        // `collect_write_destinations` operates on a single (non-compound)
+        // segment; the pipe is split upstream by `split_compound`.
+        let d = ExecTool::collect_write_destinations("tee /tmp/t");
+        assert!(d.contains(&"/tmp/t".to_string()), "got {d:?}");
+    }
+
+    #[test]
+    fn test_destination_outside_workspace_existing_parent() {
+        // /tmp exists (parent of /tmp/newfile), so the parent-canonicalize path
+        // must fire even though /tmp/newfile does not exist.
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let outside = ExecTool::destination_outside_workspace("/tmp/newfile_probe_xyz", &cwd);
+        assert!(
+            outside.is_some(),
+            "non-existent dest under /tmp must be detected"
+        );
+    }
+
+    #[test]
+    fn test_destination_outside_workspace_deep_nonexistent_parent() {
+        // A destination whose parent does not exist either must still be
+        // caught by walking up to the first existing ancestor (e.g. `/`).
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let outside = ExecTool::destination_outside_workspace(
+            "/tmp/nonexistent_dir_probe_xyz/deep/deeper/file",
+            &cwd,
+        );
+        assert!(
+            outside.is_some(),
+            "dest with a non-existent parent dir must be detected via ancestor walk"
+        );
+    }
+
+    #[test]
+    fn test_destination_outside_workspace_tilde_deep() {
+        // ~/.ssh likely does not exist in CI, but `~` does — the ancestor walk
+        // must catch a destination under a non-existent `~/.ssh` subdir.
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let outside = ExecTool::destination_outside_workspace("~/.ssh/authorized_keys_probe", &cwd);
+        assert!(
+            outside.is_some(),
+            "dest under a ~-relative subdir (possibly non-existent) must be detected"
+        );
+    }
+
+    #[test]
+    fn test_destination_outside_workspace_in_workspace_none() {
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let local = ExecTool::destination_outside_workspace("local_file.txt", &cwd);
+        assert!(
+            local.is_none(),
+            "in-workspace relative path must not be flagged"
+        );
+    }
+
+    #[test]
+    fn test_destination_outside_workspace_existing_path() {
+        let cwd = std::env::current_dir().unwrap().canonicalize().unwrap();
+        // /etc/hostname exists; the direct canonicalize arm must fire.
+        let outside = ExecTool::destination_outside_workspace("/etc/hostname", &cwd);
+        assert!(
+            outside.is_some(),
+            "/etc/hostname must be detected as outside"
+        );
     }
 
     // -----------------------------------------------------------------------
