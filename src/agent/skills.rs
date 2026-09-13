@@ -296,13 +296,18 @@ impl SkillsLoader {
         if skill_records.is_empty() {
             return String::new();
         }
-        let mut lines = vec![
-            "Available skills. Before reading any SKILL.md file by hand, \
-             call `get_skills __list__` first to get canonical file paths — \
-             editing by a guessed path will hit the wrong file. Then use \
-             `get_skills <name>` for full content."
-                .to_string(),
-        ];
+        // Keep a few real entries on the first line: large results can be
+        // represented by a short receipt preview, and a generic opener alone
+        // leaves the model with no usable discovery signal.
+        let preview = skill_records
+            .iter()
+            .take(3)
+            .map(Self::compact_line)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut lines = vec![format!(
+            "Installed skills preview: {preview} Use the canonical names below. Load a known skill's full instructions with `get_skills` and its `name`. If this catalog is represented by a result handle, inspect that handle for names not displayed in the preview."
+        )];
         for record in &skill_records {
             lines.push(Self::compact_line(record));
         }
@@ -327,7 +332,20 @@ impl SkillsLoader {
             .version()
             .map(|v| format!(" (v{})", v))
             .unwrap_or_default();
-        format!("- {}{}: {}", record.info.name, version_suffix, display)
+        let availability = if _check_requirements(&record.skill_meta) {
+            "available".to_string()
+        } else {
+            let missing = _get_missing_requirements(&record.skill_meta);
+            if missing.is_empty() {
+                "unavailable".to_string()
+            } else {
+                format!("unavailable: {missing}")
+            }
+        };
+        format!(
+            "- {}{}: {} [{}]",
+            record.info.name, version_suffix, display, availability
+        )
     }
 
     /// Render compact one-line entries for a specific set of skill names.
@@ -1086,7 +1104,7 @@ mod tests {
         let index = loader.build_compact_index();
         // Must start with the header line.
         assert!(
-            index.starts_with("Available skills"),
+            index.starts_with("Installed skills"),
             "index should start with header: {}",
             index
         );
@@ -1099,29 +1117,47 @@ mod tests {
     }
 
     #[test]
+    fn test_compact_index_labels_unmet_requirements() {
+        let frontmatter = concat!(
+            "description: Needs unavailable dependencies\n",
+            "metadata: {\"nanobot\":{\"requires\":{",
+            "\"bins\":[\"nanobot-test-definitely-missing-bin\"],",
+            "\"env\":[\"NANOBOT_TEST_DEFINITELY_MISSING_ENV_19F4C2\"]}}}"
+        );
+        let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), "body");
+        let index = loader.build_compact_index();
+
+        assert!(index.starts_with("Installed skills preview:"), "{index}");
+        assert!(index.contains("[unavailable:"), "{index}");
+        assert!(
+            index.contains("CLI: nanobot-test-definitely-missing-bin"),
+            "{index}"
+        );
+        assert!(
+            index.contains("ENV: NANOBOT_TEST_DEFINITELY_MISSING_ENV_19F4C2"),
+            "{index}"
+        );
+    }
+
+    #[test]
     fn test_compact_index_preamble_is_imperative() {
-        // The header must tell the model to call `get_skills __list__`
-        // BEFORE reading any SKILL.md file by hand. A parenthetical hint
-        // is not enough — small local models routinely skip hints and
-        // re-read skill files from guessed paths, which is how Qwen3.6
-        // ended up editing the wrong file.
+        // The listing itself must describe the load path without recursively
+        // asking the model to list the same catalog again.
         let frontmatter = "description: A skill";
         let (_tmp, loader) = make_workspace_with_skill(Some(frontmatter), "body");
         let index = loader.build_compact_index();
         let lower = index.to_lowercase();
         assert!(
-            lower.contains("get_skills __list__"),
-            "preamble must name the get_skills __list__ tool call: {index}"
+            lower.contains("canonical") && lower.contains("get_skills"),
+            "preamble must identify canonical names and the load call: {index}"
         );
-        // The preamble must frame __list__ as a prerequisite, not an option.
         assert!(
-            lower.contains("before") || lower.contains("first") || lower.contains("mandatory"),
-            "preamble must be imperative (before/first/mandatory), got: {index}"
+            lower.contains("handle") && lower.contains("inspect"),
+            "preamble must explain how to recover names hidden by a catalog handle: {index}"
         );
-        // And it must warn against editing by guessed path.
         assert!(
-            lower.contains("guess") || lower.contains("wrong file") || lower.contains("canonical"),
-            "preamble must warn about guessed paths / wrong file: {index}"
+            !lower.contains("get_skills __list__"),
+            "the list result must not tell the model to list it again: {index}"
         );
     }
 
@@ -1147,7 +1183,9 @@ mod tests {
         // After "- test-skill: " (15 chars), description should be <= 60 chars.
         let desc_part = entry_line
             .strip_prefix("- test-skill: ")
-            .expect("entry should start with '- test-skill: '");
+            .expect("entry should start with '- test-skill: '")
+            .strip_suffix(" [available]")
+            .expect("entry should carry availability");
         assert!(
             desc_part.len() <= 60,
             "description part '{}' should be <= 60 chars, got {}",

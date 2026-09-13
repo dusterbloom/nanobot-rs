@@ -400,6 +400,11 @@ impl ExecTool {
         } else {
             let code = status.code().unwrap_or(-1);
             parts.push(format!("Exit code: {}", code));
+            if code == 141 {
+                parts.push(
+                    "Hint: exit 141 may indicate SIGPIPE from a downstream consumer closing early. The command remains failed; prefer producer-native limits such as git log -n 50 or rg -m and inspect the preserved output.".to_string(),
+                );
+            }
             format!("Error: Command failed\n{}", parts.join("\n"))
         }
     }
@@ -415,6 +420,8 @@ impl Tool for ExecTool {
         "Execute a shell command and return its output. \
          Shell is zsh on macOS with BSD userland: grep has no -P (use -E), \
          sed is BSD sed, date flags differ from GNU. \
+         Pipelines use pipefail: a nonzero producer or downstream early close (SIGPIPE, often exit 141) remains a failed command. \
+         Prefer producer-native output limits such as git log -n 50 and rg -m instead of piping into head when possible; raw stdout, stderr, and exit status are preserved. \
          Skills (installed in the workspace) are invoked through exec. Call get_skills first to read a skill's instructions, then follow its Quick start command. \
          Other patterns: cargo build, git status, python script.py. \
          Blocked: rm -rf, sudo, eval, shred (destructive commands rejected). \
@@ -757,6 +764,55 @@ mod tests {
         );
         assert!(!result.ok());
         assert!(result.data().contains("Exit code: 7"), "{}", result.data());
+    }
+
+    #[tokio::test]
+    async fn sigpipe_failure_keeps_status_and_adds_narrow_diagnostic() {
+        let tool = make_exec_tool(false);
+        let mut params = HashMap::new();
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String("yes producer | head -n 1".to_string()),
+        );
+        let result = crate::agent::tools::base::ToolExecutionResult::from(
+            tool.execute(params, &ToolContext::sandbox()).await,
+        );
+        assert!(!result.ok(), "SIGPIPE must remain a failed command");
+        assert!(
+            result.data().contains("Exit code: 141"),
+            "{}",
+            result.data()
+        );
+        assert!(
+            result.data().contains("SIGPIPE") && result.data().contains("producer-native"),
+            "failed pipelines need a narrow diagnostic: {}",
+            result.data()
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_exit_141_stays_failed_without_asserting_sigpipe_cause() {
+        let tool = make_exec_tool(false);
+        let mut params = HashMap::new();
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String("exit 141".to_string()),
+        );
+        let result = crate::agent::tools::base::ToolExecutionResult::from(
+            tool.execute(params, &ToolContext::sandbox()).await,
+        );
+        assert!(!result.ok(), "explicit exit 141 must remain a failure");
+        assert!(
+            result.data().contains("Exit code: 141"),
+            "{}",
+            result.data()
+        );
+        assert!(
+            result.data().contains("may indicate SIGPIPE")
+                && !result.data().contains("pipeline ended with SIGPIPE"),
+            "141 alone must not prove a SIGPIPE cause: {}",
+            result.data()
+        );
     }
 
     #[tokio::test]

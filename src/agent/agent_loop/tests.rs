@@ -7679,8 +7679,12 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
             WireRecordingProvider::text_response("UNREACHABLE post-conflict answer"),
         ],
     ));
-    let (agent_loop, _harness_workspace) =
-        build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    let (agent_loop, _harness_workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "local-qwen-test",
+        32_768,
+        LcmSchemaConfig::default(),
+    );
     let session_key = format!("stash-conflict-{}", uuid::Uuid::new_v4());
 
     // Pre-stash body A under "tc_conflict" by running a PRIOR turn that
@@ -7724,12 +7728,18 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
     }
 
     // Seed turn: stashes body A under tc_conflict (force=true, 2-call batch).
-    let _seed = tokio::time::timeout(
+    let seed = tokio::time::timeout(
         std::time::Duration::from_secs(15),
         agent_loop.process_direct("seed file_a read", &session_key, "test", "offline"),
     )
     .await
     .expect("seed turn must terminate");
+    assert_eq!(seed, "seeded");
+    assert_eq!(
+        provider.calls().len(),
+        2,
+        "the seed turn must not consume the queued conflict batch"
+    );
 
     // Confirm body A was stashed under tc_conflict.
     {
@@ -7770,6 +7780,11 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
         conflict_turn.to_lowercase().contains("abort")
             || conflict_turn.to_lowercase().contains("error"),
         "conflict turn must surface the abort/error to the user; got: {conflict_turn}"
+    );
+    assert_eq!(
+        provider.calls().len(),
+        3,
+        "stash conflict must abort before requesting a post-conflict answer"
     );
 
     // The stash retains body A — never overwritten by body B.
@@ -8031,6 +8046,539 @@ impl LLMProvider for DuplicateTerminalProvider {
     }
 }
 
+fn exec_tool_response(
+    id: &str,
+    command: &str,
+    working_dir: Option<&std::path::Path>,
+) -> crate::providers::base::LLMResponse {
+    let mut arguments = std::collections::HashMap::from([("command".to_string(), json!(command))]);
+    if let Some(dir) = working_dir {
+        arguments.insert("working_dir".to_string(), json!(dir.to_string_lossy()));
+    }
+    crate::providers::base::LLMResponse {
+        content: Some("Running the requested command.".to_string()),
+        tool_calls: vec![crate::providers::base::ToolCallRequest {
+            id: id.to_string(),
+            name: "exec".to_string(),
+            arguments,
+        }],
+        finish_reason: FinishReason::ToolCalls,
+        usage: std::collections::HashMap::new(),
+    }
+}
+
+fn build_unrestricted_exec_harness(
+    provider: Arc<dyn LLMProvider>,
+    workspace: std::path::PathBuf,
+) -> AgentLoop {
+    build_unrestricted_exec_harness_with_context(provider, workspace, 4_096)
+}
+
+fn build_unrestricted_exec_harness_with_context(
+    provider: Arc<dyn LLMProvider>,
+    workspace: std::path::PathBuf,
+    max_context_tokens: usize,
+) -> AgentLoop {
+    let core = build_swappable_core(SwappableCoreConfig {
+        provider,
+        workspace,
+        model: "local-tool-recovery".to_string(),
+        max_iterations: 8,
+        max_continuations: 2,
+        max_tokens: 512,
+        temperature: 0.0,
+        max_context_tokens,
+        brave_api_key: None,
+        search_provider: "searxng".to_string(),
+        searxng_url: "http://localhost:8888".to_string(),
+        crw_url: String::new(),
+        search_max_results: 5,
+        exec_timeout: 30,
+        restrict_to_workspace: false,
+        memory_config: MemoryConfig::default(),
+        is_local: true,
+        lane: Lane::default(),
+        tool_delegation: ToolDelegationConfig::default(),
+        provenance: ProvenanceConfig::default(),
+        max_tool_result_chars: 2000,
+        delegation_provider: None,
+        specialist_provider: None,
+        trio_config: TrioConfig::default(),
+        model_capabilities_overrides: std::collections::HashMap::new(),
+        reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        code_execution: CodeExecutionConfig::default(),
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
+        adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: Some(
+            std::env::temp_dir().join(format!("nanobot-replay-{}.sqlite", uuid::Uuid::new_v4())),
+        ),
+    });
+    let core_handle = AgentHandle::new(core, test_runtime_counters(max_context_tokens));
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+    AgentLoop::new(
+        core_handle,
+        inbound_rx,
+        outbound_tx,
+        inbound_tx,
+        None,
+        1,
+        None,
+        None,
+        None,
+        ProprioceptionConfig::default(),
+        LcmSchemaConfig::default(),
+        None,
+    )
+}
+
+async fn assert_three_identical_execs_run_once(explicit_cwd: bool) {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let marker = workspace.join(if explicit_cwd { "explicit" } else { "default" });
+    let command = format!("printf x >> {}", marker.to_string_lossy());
+    let cwd = explicit_cwd.then_some(workspace.as_path());
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-tool-recovery",
+        vec![
+            exec_tool_response("exec-1", &command, cwd),
+            exec_tool_response("exec-2", &command, cwd),
+            exec_tool_response("exec-3", &command, cwd),
+            WireRecordingProvider::text_response("finished after replay"),
+        ],
+    ));
+    let agent_loop = build_unrestricted_exec_harness(
+        provider.clone() as Arc<dyn LLMProvider>,
+        workspace.clone(),
+    );
+    let session_key = format!("three-exec-{}-{}", explicit_cwd, uuid::Uuid::new_v4());
+
+    let reply = agent_loop
+        .process_direct("run exactly once", &session_key, "test", "offline")
+        .await;
+    assert_eq!(reply, "finished after replay");
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "x");
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .unwrap();
+    let events = core
+        .sessions
+        .load_session_events(&session.id)
+        .await
+        .unwrap();
+    let executions = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.payload,
+                crate::session::db::SessionEventPayload::ToolExecute { .. }
+            )
+        })
+        .count();
+    assert_eq!(executions, 1, "cached calls must not create executions");
+    let cached = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            crate::session::db::SessionEventPayload::ToolPreExecute {
+                decision:
+                    crate::session::db::ToolPreExecuteDecision::CachedReplay {
+                        source_tool_call_id,
+                        result_digest,
+                    },
+                ..
+            } => Some((source_tool_call_id.as_str(), result_digest.as_str())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cached.len(), 2);
+    assert!(cached
+        .iter()
+        .all(|(source, digest)| *source == "exec-1" && !digest.is_empty()));
+    assert_eq!(provider.call_count(), 4);
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn repeated_explicit_cwd_exec_is_a_durable_cached_replay() {
+    assert_three_identical_execs_run_once(true).await;
+}
+
+#[tokio::test]
+async fn near_inline_limit_cached_receipt_is_byte_stable_across_history_reloads() {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let marker = workspace.join("large-replay-side-effect");
+    let command = format!(
+        "printf y >> {}; awk 'BEGIN {{ for (i = 0; i < 4000; i++) printf \"x\" }}'",
+        marker.to_string_lossy()
+    );
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-tool-recovery",
+        vec![
+            exec_tool_response("large-source", &command, Some(&workspace)),
+            exec_tool_response("large-replay", &command, Some(&workspace)),
+            WireRecordingProvider::text_response("large replay finished"),
+        ],
+    ));
+    let agent_loop = build_unrestricted_exec_harness_with_context(
+        provider.clone() as Arc<dyn LLMProvider>,
+        workspace.clone(),
+        16_384,
+    );
+    let session_key = format!("large-cached-replay-{}", uuid::Uuid::new_v4());
+
+    assert_eq!(
+        agent_loop
+            .process_direct(
+                "run the large command once",
+                &session_key,
+                "test",
+                "offline"
+            )
+            .await,
+        "large replay finished"
+    );
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "y");
+    assert_eq!(provider.call_count(), 3);
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .unwrap();
+    let raw = core.sessions.get_all_messages(&session.id).await;
+    let persisted = raw
+        .iter()
+        .find(|message| {
+            message.get("role").and_then(Value::as_str) == Some("tool")
+                && message.get("tool_call_id").and_then(Value::as_str) == Some("large-replay")
+        })
+        .and_then(|message| message.get("content").and_then(Value::as_str))
+        .unwrap()
+        .to_string();
+    assert!(
+        persisted.len() > 4_096,
+        "fixture must cross reload threshold"
+    );
+    assert!(persisted.contains("source_tool_call_id=\"large-source\""));
+
+    for _ in 0..2 {
+        let history = core.sessions.get_history(&session.id, 0, 0).await;
+        let reloaded = history
+            .iter()
+            .find(|message| {
+                message.get("role").and_then(Value::as_str) == Some("tool")
+                    && message.get("tool_call_id").and_then(Value::as_str) == Some("large-replay")
+            })
+            .and_then(|message| message.get("content").and_then(Value::as_str))
+            .unwrap();
+        assert_eq!(reloaded, persisted);
+    }
+    assert!(
+        core.sessions
+            .load_tool_result(&session.id, "large-replay")
+            .await
+            .is_none(),
+        "history reload must not fabricate a stored result for a cached receipt"
+    );
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn omitted_cwd_is_materialized_before_guard_lookup() {
+    assert_three_identical_execs_run_once(false).await;
+}
+
+#[tokio::test]
+async fn same_command_in_distinct_working_directories_executes_twice() {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let first = workspace.join("first");
+    let second = workspace.join("second");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let command = "printf x >> marker";
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-tool-recovery",
+        vec![
+            exec_tool_response("cwd-1", command, Some(&first)),
+            exec_tool_response("cwd-2", command, Some(&second)),
+            WireRecordingProvider::text_response("both finished"),
+        ],
+    ));
+    let agent_loop =
+        build_unrestricted_exec_harness(provider as Arc<dyn LLMProvider>, workspace.clone());
+    let session_key = format!("distinct-cwd-{}", uuid::Uuid::new_v4());
+    assert_eq!(
+        agent_loop
+            .process_direct("run in both", &session_key, "test", "offline")
+            .await,
+        "both finished"
+    );
+    assert_eq!(std::fs::read_to_string(first.join("marker")).unwrap(), "x");
+    assert_eq!(std::fs::read_to_string(second.join("marker")).unwrap(), "x");
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn completed_turn_does_not_replay_a_new_user_requested_exec() {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let marker = workspace.join("cross-turn");
+    let command = format!("printf x >> {}", marker.to_string_lossy());
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-tool-recovery",
+        vec![
+            exec_tool_response("turn-1-exec", &command, Some(&workspace)),
+            WireRecordingProvider::text_response("first done"),
+            exec_tool_response("turn-2-exec", &command, Some(&workspace)),
+            WireRecordingProvider::text_response("second done"),
+        ],
+    ));
+    let agent_loop =
+        build_unrestricted_exec_harness(provider as Arc<dyn LLMProvider>, workspace.clone());
+    let session_key = format!("new-turn-exec-{}", uuid::Uuid::new_v4());
+
+    assert_eq!(
+        agent_loop
+            .process_direct("first", &session_key, "test", "offline")
+            .await,
+        "first done"
+    );
+    assert_eq!(
+        agent_loop
+            .process_direct("second", &session_key, "test", "offline")
+            .await,
+        "second done"
+    );
+    assert_eq!(std::fs::read_to_string(&marker).unwrap(), "xx");
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn different_empty_directory_reads_are_both_executed() {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let first = workspace.join("empty-a");
+    let second = workspace.join("empty-b");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+    let call = |id: &str, path: &std::path::Path| crate::providers::base::ToolCallRequest {
+        id: id.to_string(),
+        name: "list_dir".to_string(),
+        arguments: std::collections::HashMap::from([(
+            "path".to_string(),
+            json!(path.to_string_lossy()),
+        )]),
+    };
+    let provider = Arc::new(ResponseSequenceProvider::new(
+        "local-tool-recovery",
+        vec![
+            crate::providers::base::LLMResponse {
+                content: Some("Inspecting both directories.".to_string()),
+                tool_calls: vec![call("empty-a", &first), call("empty-b", &second)],
+                finish_reason: FinishReason::ToolCalls,
+                usage: std::collections::HashMap::new(),
+            },
+            WireRecordingProvider::text_response("both are empty"),
+        ],
+    ));
+    let agent_loop =
+        build_unrestricted_exec_harness(provider as Arc<dyn LLMProvider>, workspace.clone());
+    let session_key = format!("empty-reads-{}", uuid::Uuid::new_v4());
+    assert_eq!(
+        agent_loop
+            .process_direct("inspect both", &session_key, "test", "offline")
+            .await,
+        "both are empty"
+    );
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .unwrap();
+    let events = core
+        .sessions
+        .load_session_events(&session.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event.payload,
+                crate::session::db::SessionEventPayload::ToolExecute { .. }
+            ))
+            .count(),
+        2,
+        "equal empty evidence from different queries must not be semantically deduplicated"
+    );
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn repeated_read_evidence_executes_every_variant_then_adds_one_neutral_nudge() {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let path = workspace.join("same.txt");
+    std::fs::write(&path, "same evidence\n").unwrap();
+    let mut calls = Vec::new();
+    for index in 0..3 {
+        calls.push(crate::providers::base::ToolCallRequest {
+            id: format!("read-{index}"),
+            name: "read_file".to_string(),
+            arguments: std::collections::HashMap::from([
+                ("path".to_string(), json!(path.to_string_lossy())),
+                ("max_lines".to_string(), json!(1000 + index)),
+            ]),
+        });
+    }
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-read-evidence",
+        vec![
+            crate::providers::base::LLMResponse {
+                content: Some("Reading three files.".to_string()),
+                tool_calls: calls,
+                finish_reason: FinishReason::ToolCalls,
+                usage: std::collections::HashMap::new(),
+            },
+            WireRecordingProvider::text_response("evidence assessed"),
+        ],
+    ));
+    let agent_loop = build_unrestricted_exec_harness(
+        provider.clone() as Arc<dyn LLMProvider>,
+        workspace.clone(),
+    );
+    let session_key = format!("read-evidence-{}", uuid::Uuid::new_v4());
+    assert_eq!(
+        agent_loop
+            .process_direct("compare all three", &session_key, "test", "offline")
+            .await,
+        "evidence assessed"
+    );
+
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .unwrap();
+    let events = core
+        .sessions
+        .load_session_events(&session.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event.payload,
+                crate::session::db::SessionEventPayload::ToolExecute { .. }
+            ))
+            .count(),
+        3,
+        "evidence similarity is advisory and must never skip execution"
+    );
+    let next_request = provider.calls().get(1).cloned().unwrap();
+    let guidance = next_request
+        .iter()
+        .filter_map(|message| message.get("content").and_then(Value::as_str))
+        .filter(|content| content.contains("Three successful read-only calls"))
+        .collect::<Vec<_>>();
+    assert_eq!(guidance.len(), 1);
+    assert!(guidance[0].contains("Every call executed; no result was inferred or skipped"));
+    assert!(guidance[0].contains("identify the remaining gap"));
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
+async fn repeated_exec_output_executes_every_variant_then_adds_one_neutral_nudge() {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let mut calls = Vec::new();
+    let mut markers = Vec::new();
+    for index in 0..3 {
+        let marker = workspace.join(format!("exec-variant-{index}"));
+        let command = format!(
+            "printf x > {}; printf 'same output'",
+            marker.to_string_lossy()
+        );
+        markers.push(marker);
+        calls.push(crate::providers::base::ToolCallRequest {
+            id: format!("exec-variant-{index}"),
+            name: "exec".to_string(),
+            arguments: std::collections::HashMap::from([
+                ("command".to_string(), json!(command)),
+                (
+                    "working_dir".to_string(),
+                    json!(workspace.to_string_lossy()),
+                ),
+            ]),
+        });
+    }
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-exec-evidence",
+        vec![
+            crate::providers::base::LLMResponse {
+                content: Some("Running three distinct commands.".to_string()),
+                tool_calls: calls,
+                finish_reason: FinishReason::ToolCalls,
+                usage: std::collections::HashMap::new(),
+            },
+            WireRecordingProvider::text_response("exec evidence assessed"),
+        ],
+    ));
+    let agent_loop = build_unrestricted_exec_harness(
+        provider.clone() as Arc<dyn LLMProvider>,
+        workspace.clone(),
+    );
+    let session_key = format!("exec-evidence-{}", uuid::Uuid::new_v4());
+
+    assert_eq!(
+        agent_loop
+            .process_direct("run all variants", &session_key, "test", "offline")
+            .await,
+        "exec evidence assessed"
+    );
+    for marker in markers {
+        assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
+    }
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .unwrap();
+    let events = core
+        .sessions
+        .load_session_events(&session.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event.payload,
+                crate::session::db::SessionEventPayload::ToolExecute { .. }
+            ))
+            .count(),
+        3,
+        "matching output is advisory and must never skip distinct executions"
+    );
+    let next_request = provider.calls().get(1).cloned().unwrap();
+    let guidance = next_request
+        .iter()
+        .filter_map(|message| message.get("content").and_then(Value::as_str))
+        .filter(|content| content.contains("independently executed calls returned identical"))
+        .collect::<Vec<_>>();
+    assert_eq!(guidance.len(), 1);
+    assert!(guidance[0].contains("No command equivalence was inferred"));
+    assert!(guidance[0].contains("continue executing if another action is required"));
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
 #[tokio::test]
 async fn cached_duplicate_rounds_use_one_terminal_none_without_scaffold_or_static_break() {
     let duplicate_call = |id: usize| {
@@ -8134,9 +8682,23 @@ fn stale_read_write_context_parts(
 
     let mut guard = crate::agent::tool_guard::ToolGuard::new(1);
     assert!(guard.allow("read_file", &read_args).is_ok());
-    guard.record_result_with_status("read_file", &read_args, "old\n".to_string(), true);
+    guard.record_result_with_status(
+        "read_file",
+        &read_args,
+        "old\n".to_string(),
+        true,
+        "old-read",
+        "old-digest",
+    );
     assert!(guard.allow("write_file", &write_args).is_ok());
-    guard.record_result_with_status("write_file", &write_args, "written".to_string(), true);
+    guard.record_result_with_status(
+        "write_file",
+        &write_args,
+        "written".to_string(),
+        true,
+        "write",
+        "write-digest",
+    );
     assert_eq!(
         guard.get_cached_result(&crate::agent::tool_guard::ToolGuard::key(
             "read_file",
@@ -8330,9 +8892,11 @@ async fn duplicate_recovery_is_persisted_after_carrier_and_receipt() {
     assert_eq!(appended[1]["role"], "tool");
     assert_eq!(appended[1]["tool_call_id"], "tc_blocked_recovery");
     assert_eq!(appended[2]["role"], "user");
-    assert!(appended[2]["content"]
-        .as_str()
-        .is_some_and(|content| content.contains("Write your final answer now")));
+    assert!(appended[2]["content"].as_str().is_some_and(|content| {
+        content.contains("give an honest partial answer")
+            && content.contains("identify unresolved gaps")
+            && !content.contains("already have the data you need")
+    }));
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -14816,6 +15380,7 @@ mod interrupted {
 
     async fn drive(
         failure: CapacityFailure,
+        fail_interrupted_write: bool,
     ) -> (
         Arc<CapacityFailingProvider>,
         std::sync::Arc<crate::session::db::SessionDb>,
@@ -14885,6 +15450,14 @@ mod interrupted {
             None,
         );
         let session_key = "cap-int";
+        if fail_interrupted_write {
+            agent_loop
+                .shared
+                .core_handle
+                .swappable()
+                .sessions
+                .fail_model_interrupted_writes_for_tests(1);
+        }
         let reply = agent_loop
             .process_direct("please answer", session_key, "test", "capacity-interrupted")
             .await;
@@ -14902,7 +15475,7 @@ mod interrupted {
     #[tokio::test]
     async fn interrupted_stream_persists_partial_artifact_never_success() {
         let (provider, sessions, session_id, reply, events, _history) =
-            drive(CapacityFailure::Interrupted).await;
+            drive(CapacityFailure::Interrupted, false).await;
 
         assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
         assert!(
@@ -14931,9 +15504,25 @@ mod interrupted {
     }
 
     #[tokio::test]
+    async fn interrupted_stream_does_not_claim_a_failed_artifact_write() {
+        let (provider, _sessions, _session_id, reply, events, _history) =
+            drive(CapacityFailure::Interrupted, true).await;
+
+        assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
+        assert!(reply.contains("could not be durably saved"), "{reply}");
+        assert!(
+            !reply.contains("was saved as an incomplete artifact"),
+            "{reply}"
+        );
+        assert!(!events
+            .iter()
+            .any(|event| event.payload.kind() == "model_interrupted"));
+    }
+
+    #[tokio::test]
     async fn allocation_failure_ends_turn_without_parking() {
         let (provider, _sessions, _session_id, reply, events, _history) =
-            drive(CapacityFailure::Unavailable).await;
+            drive(CapacityFailure::Unavailable, false).await;
         assert_eq!(provider.requests.load(Ordering::SeqCst), 1);
         assert!(!reply.contains("resume automatically"), "{reply}");
         assert!(!events

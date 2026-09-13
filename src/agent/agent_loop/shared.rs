@@ -2477,7 +2477,7 @@ impl AgentLoopShared {
                 partial_stream_bytes,
                 ..
             } => {
-                if let Err(record_error) = ctx
+                let persistence_error = match ctx
                     .core
                     .sessions
                     .record_model_interrupted(
@@ -2491,8 +2491,12 @@ impl AgentLoopShared {
                     )
                     .await
                 {
-                    warn!(error = %record_error, "capacity_interrupted_artifact_persist_failed");
-                }
+                    Ok(()) => None,
+                    Err(record_error) => {
+                        warn!(error = %record_error, "capacity_interrupted_artifact_persist_failed");
+                        Some(record_error)
+                    }
+                };
                 // Retract whatever the client already saw stream by.
                 if ctx.flow.content_was_streamed {
                     send_retract_reply_marker(&ctx.text_delta_tx);
@@ -2503,9 +2507,15 @@ impl AgentLoopShared {
                     partial_tokens = partial_output_tokens,
                     "higgs_generation_interrupted"
                 );
-                Some(StepResult::Done(IterationOutcome::Complete {
-                    content: "[Model Error] Generation was interrupted. Partial output was saved as an incomplete artifact."
+                let content = match persistence_error {
+                    None => "[Model Error] Generation was interrupted. Partial output was saved as an incomplete artifact."
                         .to_owned(),
+                    Some(error) => format!(
+                        "[Model Error] Generation was interrupted, and its partial output could not be durably saved: {error}"
+                    ),
+                };
+                Some(StepResult::Done(IterationOutcome::Complete {
+                    content,
                     outcome: TurnOutcome::Error,
                 }))
             }
@@ -5361,20 +5371,6 @@ impl AgentLoopShared {
             crate::agent::router::RouteResult::Execute(batch) => batch,
         };
 
-        // Inject working_dir into exec tool calls when missing.
-        // Local models often omit working_dir, causing commands to run in
-        // the wrong directory. Default to the process's current directory.
-        for routed in &mut routed_batch.calls {
-            let tc = &mut routed.call;
-            if tc.name == "exec" && !tc.arguments.contains_key("working_dir") {
-                if let Ok(cwd) = std::env::current_dir() {
-                    tc.arguments.insert(
-                        "working_dir".to_string(),
-                        serde_json::Value::String(cwd.to_string_lossy().to_string()),
-                    );
-                }
-            }
-        }
         let carrier_calls: Vec<_> = routed_batch
             .calls
             .iter()
@@ -5389,6 +5385,12 @@ impl AgentLoopShared {
         let return_after_router_rejections = routed_batch.return_after_rejections;
         let post_rejection_instruction = routed_batch.post_rejection_instruction.take();
         let mut routed_tool_calls = Vec::new();
+        let mut cached_replays: Vec<(
+            crate::providers::base::ToolCallRequest,
+            String,
+            String,
+            String,
+        )> = Vec::new();
         let mut rejected_calls: Vec<(crate::providers::base::ToolCallRequest, String, String)> =
             Vec::new();
         let mut router_rejections = 0usize;
@@ -5397,17 +5399,17 @@ impl AgentLoopShared {
                 crate::agent::router::RoutedToolDisposition::Execute => {
                     routed_tool_calls.push(routed.call);
                 }
-                crate::agent::router::RoutedToolDisposition::Replay { receipt } => {
+                crate::agent::router::RoutedToolDisposition::Replay {
+                    receipt,
+                    source_tool_call_id,
+                    result_digest,
+                } => {
                     // A cached success is a non-blocking, idempotent replay.
                     // Keep it in the carrier's result slot so the provider
                     // sees one result per call ID, but never send it through
                     // the tool executor or lease accounting.
                     router_rejections += 1;
-                    rejected_calls.push((
-                        routed.call,
-                        "tool_guard:cached_replay".to_string(),
-                        receipt,
-                    ));
+                    cached_replays.push((routed.call, receipt, source_tool_call_id, result_digest));
                 }
                 crate::agent::router::RoutedToolDisposition::Reject { reason, receipt } => {
                     router_rejections += 1;
@@ -5447,9 +5449,9 @@ impl AgentLoopShared {
                 );
                 let receipt = format!(
                     "lease exhausted: {} was not executed — your per-turn \
-                 tool budget is used up. Write a renewal checkpoint \
-                 (findings:/next:/will:) to continue with more tools, or \
-                 write your final answer.",
+                 successful-execution or admitted-attempt budget is used up. State the evidence \
+                 established so far and any unresolved gaps, then give an honest partial answer \
+                 without claiming this call succeeded.",
                     tc.name
                 );
                 lease_rejections += 1;
@@ -5457,9 +5459,16 @@ impl AgentLoopShared {
             }
         }
 
-        // Rejected calls become model-visible receipts before persistence so
+        // Cached successes and rejected calls become model-visible receipts before persistence so
         // this pending group contains the complete carrier/receipt/raw-row
         // protocol prefix. No decision event is written until it commits.
+        for (call, receipt, _, _) in &cached_replays {
+            ctx.messages.with_draft(|draft| {
+                ContextBuilder::add_tool_result_immutable_with_status(
+                    draft, &call.id, &call.name, receipt, true,
+                )
+            });
+        }
         for (call, _, receipt) in &rejected_calls {
             ctx.messages.with_draft(|draft| {
                 ContextBuilder::add_tool_result_immutable_with_status(
@@ -5494,6 +5503,32 @@ impl AgentLoopShared {
         // Decisions are durable only after their protocol bytes are paired.
         // A later decision fault leaves a replayable carrier/receipt/raw group
         // while still preventing every allowed member from reaching Ready.
+        for (call, _, source_tool_call_id, result_digest) in &cached_replays {
+            if let Err(error) = ctx
+                .core
+                .sessions
+                .record_tool_pre_execute(
+                    &ctx.session_id,
+                    &ctx.request_id,
+                    ctx.turn_count,
+                    &call.id,
+                    &call.name,
+                    &call.arguments,
+                    crate::session::db::ToolPreExecuteDecision::CachedReplay {
+                        source_tool_call_id: source_tool_call_id.clone(),
+                        result_digest: result_digest.clone(),
+                    },
+                )
+                .await
+            {
+                ctx.flow.lease.release_pending(allowed_calls.len() as u32);
+                ctx.emit_pending_request_metrics(0);
+                return StepResult::Done(IterationOutcome::Error(format!(
+                    "cached replay {} could not be recorded: {error}",
+                    call.id
+                )));
+            }
+        }
         for (call, reason, _) in &rejected_calls {
             if let Err(error) = ctx
                 .core

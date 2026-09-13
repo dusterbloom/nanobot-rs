@@ -330,7 +330,14 @@ pub(crate) struct RecordedProviderResponse {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ToolPreExecuteDecision {
     Ready,
-    Rejected { reason: String },
+    Rejected {
+        reason: String,
+    },
+    /// Reuses an earlier durable success; this call does not execute a tool.
+    CachedReplay {
+        source_tool_call_id: String,
+        result_digest: String,
+    },
 }
 
 impl From<&crate::providers::base::LLMResponse> for RecordedProviderResponse {
@@ -1058,6 +1065,7 @@ pub(crate) struct JournalFaultsForTests {
     turn_finished: AtomicUsize,
     model_request: AtomicUsize,
     model_response: AtomicUsize,
+    model_interrupted: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -1080,6 +1088,13 @@ impl SessionDb {
     pub(crate) fn fail_model_response_writes_for_tests(&self, count: usize) {
         self.test_journal_faults
             .model_response
+            .store(count, AtomicOrdering::SeqCst);
+    }
+
+    /// Fail the next interrupted-result journal writes before recording artifacts.
+    pub(crate) fn fail_model_interrupted_writes_for_tests(&self, count: usize) {
+        self.test_journal_faults
+            .model_interrupted
             .store(count, AtomicOrdering::SeqCst);
     }
 
@@ -1509,6 +1524,8 @@ impl SessionDb {
         partial_output: &[u8],
         partial_output_tokens: u64,
     ) -> Result<(), ReplayError> {
+        #[cfg(test)]
+        self.consume_test_fault(&self.test_journal_faults.model_interrupted)?;
         let error_digest = self
             .store_replay_artifact(session_id, "text/plain; charset=utf-8", error.as_bytes())
             .await?;
@@ -1566,7 +1583,11 @@ impl SessionDb {
         arguments: &HashMap<String, Value>,
         decision: ToolPreExecuteDecision,
     ) -> Result<(), ReplayError> {
-        let bytes = serde_json::to_vec(arguments)?;
+        // Canonicalize object order only. Strings (especially shell commands),
+        // array order, and scalar values remain exactly as requested.
+        let mut canonical = serde_json::to_value(arguments)?;
+        canonical.sort_all_objects();
+        let bytes = serde_json::to_vec(&canonical)?;
         let arguments_digest = self
             .store_replay_artifact(session_id, "application/json", &bytes)
             .await?;
@@ -1743,9 +1764,12 @@ impl SessionDb {
             Rejected,
             Executed,
             Posted,
+            CachedReplay,
         }
         let mut tool_phases = HashMap::<String, ToolPhase>::new();
         let mut tool_order = Vec::<String>::new();
+        let mut tool_identities = HashMap::<String, (String, String, String)>::new();
+        let mut tool_results = HashMap::<String, (String, bool)>::new();
         let mut turn_finished = HashMap::<String, bool>::new();
         let mut turn_order = Vec::<String>::new();
         for event in &events {
@@ -1901,29 +1925,62 @@ impl SessionDb {
                 }
                 SessionEventPayload::ToolPreExecute {
                     tool_call_id,
+                    tool_name,
                     arguments_digest,
                     decision,
-                    ..
                 } => {
                     if tool_phases.contains_key(tool_call_id) {
                         return Err(ReplayError::InvalidTransition {
                             detail: format!("duplicate tool pre-execute {tool_call_id}"),
                         });
                     }
-                    self.resolve_replay_artifact(session_id, arguments_digest)
-                        .await?;
-                    tool_phases.insert(
-                        tool_call_id.clone(),
-                        match decision {
-                            ToolPreExecuteDecision::Ready => ToolPhase::Ready,
-                            ToolPreExecuteDecision::Rejected { .. } => ToolPhase::Rejected,
-                        },
+                    let mut arguments: Value = serde_json::from_slice(
+                        &self
+                            .resolve_replay_artifact(session_id, arguments_digest)
+                            .await?,
+                    )?;
+                    arguments.sort_all_objects();
+                    // Older journals serialized HashMap insertion order. Compare
+                    // semantic object identity while preserving their raw artifact.
+                    let identity = (
+                        tool_name.clone(),
+                        sha256_hex(&serde_json::to_vec(&arguments)?),
+                        event.turn_request_id.clone(),
                     );
+                    let phase = match decision {
+                        ToolPreExecuteDecision::Ready => ToolPhase::Ready,
+                        ToolPreExecuteDecision::Rejected { .. } => ToolPhase::Rejected,
+                        ToolPreExecuteDecision::CachedReplay {
+                            source_tool_call_id,
+                            result_digest,
+                        } => {
+                            // A receipt is terminal without execution, but only a
+                            // prior completed success with the same call identity
+                            // can supply it. Corrupt/missing evidence fails closed.
+                            if !matches!(
+                                tool_phases.get(source_tool_call_id),
+                                Some(ToolPhase::Posted)
+                            ) || tool_identities.get(source_tool_call_id) != Some(&identity)
+                                || tool_results.get(source_tool_call_id)
+                                    != Some(&(result_digest.clone(), true))
+                            {
+                                return Err(ReplayError::InvalidTransition {
+                                    detail: format!("cached replay {tool_call_id} has no matching completed successful source {source_tool_call_id}"),
+                                });
+                            }
+                            self.resolve_replay_artifact(session_id, result_digest)
+                                .await?;
+                            ToolPhase::CachedReplay
+                        }
+                    };
+                    tool_identities.insert(tool_call_id.clone(), identity);
+                    tool_phases.insert(tool_call_id.clone(), phase);
                     tool_order.push(tool_call_id.clone());
                 }
                 SessionEventPayload::ToolExecute {
                     tool_call_id,
                     raw_result_digest,
+                    ok,
                     ..
                 } => {
                     if !matches!(tool_phases.get(tool_call_id), Some(ToolPhase::Ready)) {
@@ -1935,6 +1992,7 @@ impl SessionDb {
                     }
                     self.resolve_replay_artifact(session_id, raw_result_digest)
                         .await?;
+                    tool_results.insert(tool_call_id.clone(), (raw_result_digest.clone(), *ok));
                     tool_phases.insert(tool_call_id.clone(), ToolPhase::Executed);
                 }
                 SessionEventPayload::ToolPostExecute {
@@ -1972,7 +2030,8 @@ impl SessionDb {
                         Some(ToolPhase::Executed) => Some(ReplayAvailability::Incomplete {
                             reason: format!("tool call {tool_call_id} has no post-execute event"),
                         }),
-                        Some(ToolPhase::Rejected | ToolPhase::Posted) | None => None,
+                        Some(ToolPhase::Rejected | ToolPhase::Posted | ToolPhase::CachedReplay)
+                        | None => None,
                     })
             })
             .or_else(|| {
@@ -7232,5 +7291,182 @@ mod tests {
             .unwrap();
         assert_eq!(foreign_keys, 0);
         assert_eq!(records, 1);
+    }
+    #[tokio::test]
+    async fn tool_recovery_argument_artifact_is_canonical_without_rewriting_strings() {
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:canonical-tool-args").await;
+        let args = HashMap::from([
+            ("working_dir".to_string(), json!("/tmp/with space")),
+            ("command".to_string(), json!("printf '%s' '$HOME'")),
+            ("nested".to_string(), json!({"z": [2, 1], "a": true})),
+        ]);
+        db.record_tool_pre_execute(
+            &meta.id,
+            "turn",
+            1,
+            "call",
+            "exec",
+            &args,
+            ToolPreExecuteDecision::Ready,
+        )
+        .await
+        .unwrap();
+        let events = db.load_session_events(&meta.id).await.unwrap();
+        let digest = events
+            .iter()
+            .find_map(|e| match &e.payload {
+                SessionEventPayload::ToolPreExecute {
+                    arguments_digest, ..
+                } => Some(arguments_digest),
+                _ => None,
+            })
+            .unwrap();
+        let bytes = db.resolve_replay_artifact(&meta.id, digest).await.unwrap();
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            r#"{"command":"printf '%s' '$HOME'","nested":{"a":true,"z":[2,1]},"working_dir":"/tmp/with space"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_recovery_cached_replay_is_terminal_and_requires_success_provenance() {
+        for (valid_source, same_turn) in [(true, true), (false, true), (true, false)] {
+            let (db, _dir) = make_db();
+            let meta = db.create_session("cli:cached-replay-provenance").await;
+            let args = HashMap::from([("command".to_string(), json!("printf evidence"))]);
+            db.record_tool_pre_execute(
+                &meta.id,
+                "turn",
+                1,
+                "original",
+                "exec",
+                &args,
+                ToolPreExecuteDecision::Ready,
+            )
+            .await
+            .unwrap();
+            db.record_tool_execute(&meta.id, "turn", 1, "original", "evidence", valid_source, 1)
+                .await
+                .unwrap();
+            db.record_tool_post_execute(&meta.id, "turn", 1, "original", "evidence", 1)
+                .await
+                .unwrap();
+            let decision: ToolPreExecuteDecision = serde_json::from_value(json!({
+                "status": "cached_replay", "source_tool_call_id": "original",
+                "result_digest": sha256_hex(b"evidence")
+            }))
+            .expect("cached replay must remain distinct from rejection and execution");
+            let replay_turn = if same_turn { "turn" } else { "new-user-turn" };
+            db.record_tool_pre_execute(&meta.id, replay_turn, 1, "reused", "exec", &args, decision)
+                .await
+                .unwrap();
+            db.record_turn_finished(&meta.id, "turn", 1, "finished")
+                .await
+                .unwrap();
+            let replay = db.load_session_replay(&meta.id).await;
+            if valid_source && same_turn {
+                let replay = replay.unwrap();
+                assert_eq!(replay.availability, ReplayAvailability::Exact);
+                assert_eq!(
+                    replay
+                        .events
+                        .iter()
+                        .filter(|e| matches!(e.payload, SessionEventPayload::ToolExecute { .. }))
+                        .count(),
+                    1
+                );
+            } else {
+                assert!(
+                    matches!(replay, Err(ReplayError::InvalidTransition { .. })),
+                    "failed tools and previous user turns cannot supply a successful in-turn replay"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_recovery_interrupted_write_failure_is_reported() {
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:interrupted-write-fault").await;
+        db.fail_model_interrupted_writes_for_tests(1);
+        let outcome = db
+            .record_model_interrupted(&meta.id, "turn", 1, "call", "interrupted", b"partial", 1)
+            .await;
+        assert!(
+            outcome.is_err(),
+            "a failed interruption journal write cannot claim durable partial output"
+        );
+        assert!(db.load_session_events(&meta.id).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_recovery_replay_accepts_old_argument_order_without_reexecution() {
+        let (db, _dir) = make_db();
+        let meta = db.create_session("cli:old-argument-order").await;
+        let old_bytes = br#"{"working_dir":"/tmp","command":"printf evidence"}"#;
+        let digest = db
+            .store_replay_artifact(&meta.id, "application/json", old_bytes)
+            .await
+            .unwrap();
+        db.ensure_turn_started(&meta.id, "before", 1).await.unwrap();
+        db.append_session_event(
+            &meta.id,
+            "before",
+            1,
+            &SessionEventPayload::ToolPreExecute {
+                tool_call_id: "original".into(),
+                tool_name: "exec".into(),
+                arguments_digest: digest,
+                decision: ToolPreExecuteDecision::Ready,
+            },
+        )
+        .await
+        .unwrap();
+        db.record_tool_execute(&meta.id, "before", 1, "original", "evidence", true, 1)
+            .await
+            .unwrap();
+        db.record_tool_post_execute(&meta.id, "before", 1, "original", "evidence", 1)
+            .await
+            .unwrap();
+        let args = HashMap::from([
+            ("command".into(), json!("printf evidence")),
+            ("working_dir".into(), json!("/tmp")),
+        ]);
+        db.record_tool_pre_execute(
+            &meta.id,
+            "before",
+            1,
+            "reused",
+            "exec",
+            &args,
+            ToolPreExecuteDecision::CachedReplay {
+                source_tool_call_id: "original".into(),
+                result_digest: sha256_hex(b"evidence"),
+            },
+        )
+        .await
+        .unwrap();
+        let replay = db.load_session_replay(&meta.id).await.unwrap();
+        assert!(matches!(
+            replay.availability,
+            ReplayAvailability::Incomplete { .. }
+        ));
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|e| matches!(e.payload, SessionEventPayload::ToolExecute { .. }))
+                .count(),
+            1
+        );
+        // A receipt must never authorize a second execution under the new ID.
+        db.record_tool_execute(&meta.id, "before", 1, "reused", "evidence", true, 1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.load_session_replay(&meta.id).await,
+            Err(ReplayError::InvalidTransition { .. })
+        ));
     }
 }

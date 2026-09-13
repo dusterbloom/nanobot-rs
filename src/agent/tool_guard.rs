@@ -30,11 +30,28 @@ pub struct ToolGuard {
     cache_hits: HashMap<String, u32>,
     max_same_call: u32,
     tool_limits: HashMap<String, u32>,
-    results: HashMap<String, String>,
+    results: HashMap<String, CachedToolResult>,
+    read_evidence_counts: HashMap<String, u32>,
+    read_evidence_nudge_pending: bool,
+    read_evidence_nudge_sent: bool,
+    last_exec_result_digest: Option<String>,
+    exec_same_output_streak: u32,
+    exec_output_nudge_pending: bool,
+    exec_output_nudge_sent: bool,
     /// True if any tool call was blocked this turn. Used to suppress
     /// ClaimedButNotExecuted validation — the model wanted to use tools
     /// but was prevented, so "let me search" text is expected, not a hallucination.
     pub had_blocked_calls: bool,
+}
+
+/// Model-visible result bytes plus the durable execution that produced them.
+/// Replaying this value is a terminal disposition for a new call ID, not a
+/// claim that the tool executed again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CachedToolResult {
+    pub(crate) result: String,
+    pub(crate) source_tool_call_id: String,
+    pub(crate) result_digest: String,
 }
 
 /// Disposition of a normalized tool call. A completed success is replayable
@@ -43,7 +60,7 @@ pub struct ToolGuard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolGuardDecision {
     Execute,
-    Replay(String),
+    Replay(CachedToolResult),
     Reject(String),
 }
 
@@ -62,6 +79,13 @@ impl ToolGuard {
             max_same_call: max_same_call.max(1),
             tool_limits,
             results: HashMap::new(),
+            read_evidence_counts: HashMap::new(),
+            read_evidence_nudge_pending: false,
+            read_evidence_nudge_sent: false,
+            last_exec_result_digest: None,
+            exec_same_output_streak: 0,
+            exec_output_nudge_pending: false,
+            exec_output_nudge_sent: false,
             had_blocked_calls: false,
         }
     }
@@ -69,7 +93,7 @@ impl ToolGuard {
     /// Store a tool result keyed by (name, args) so it can be replayed on duplicates.
     #[cfg(test)]
     pub fn record_result(&mut self, name: &str, args: &HashMap<String, Value>, result: String) {
-        self.record_result_with_status(name, args, result, true);
+        self.record_result_with_status(name, args, result, true, "test-source", "test-digest");
     }
 
     /// Store only successful results while still letting writes invalidate stale reads.
@@ -79,15 +103,57 @@ impl ToolGuard {
         args: &HashMap<String, Value>,
         result: String,
         ok: bool,
+        source_tool_call_id: &str,
+        result_digest: &str,
     ) {
         if READ_CACHE_INVALIDATORS.contains(&name) {
             self.invalidate_read_cache();
         }
+        if name == "exec" {
+            if !ok || result.trim().is_empty() {
+                self.last_exec_result_digest = None;
+                self.exec_same_output_streak = 0;
+                self.exec_output_nudge_pending = false;
+            } else if self.last_exec_result_digest.as_deref() == Some(result_digest) {
+                self.exec_same_output_streak = self.exec_same_output_streak.saturating_add(1);
+            } else {
+                self.last_exec_result_digest = Some(result_digest.to_owned());
+                self.exec_same_output_streak = 1;
+                self.exec_output_nudge_pending = false;
+            }
+            if self.exec_same_output_streak == 3 && !self.exec_output_nudge_sent {
+                self.exec_output_nudge_pending = true;
+                self.exec_output_nudge_sent = true;
+            }
+        }
         if !ok {
             return;
         }
+        if READ_TOOLS.contains(&name) && !result.trim().is_empty() {
+            let evidence_key = format!("{name}:{result_digest}");
+            let repeats = self.read_evidence_counts.entry(evidence_key).or_insert(0);
+            *repeats = repeats.saturating_add(1);
+            if *repeats == 3 && !self.read_evidence_nudge_sent {
+                self.read_evidence_nudge_pending = true;
+                self.read_evidence_nudge_sent = true;
+            }
+        }
         let key = Self::key(name, args);
-        self.results.insert(key, result);
+        tracing::debug!(
+            tool = name,
+            call_key_digest = %Self::key_digest(&key),
+            source_tool_call_id,
+            result_digest,
+            "tool_guard_cache_recorded"
+        );
+        self.results.insert(
+            key,
+            CachedToolResult {
+                result,
+                source_tool_call_id: source_tool_call_id.to_owned(),
+                result_digest: result_digest.to_owned(),
+            },
+        );
     }
 
     fn invalidate_read_cache(&mut self) {
@@ -95,6 +161,8 @@ impl ToolGuard {
         self.seen.retain(|key, _| !Self::is_read_tool_key(key));
         self.cache_hits
             .retain(|key, _| !Self::is_read_tool_key(key));
+        self.read_evidence_counts.clear();
+        self.read_evidence_nudge_pending = false;
     }
 
     fn is_read_tool_key(key: &str) -> bool {
@@ -111,8 +179,13 @@ impl ToolGuard {
     }
 
     /// Retrieve a previously cached result for the given call signature.
+    #[cfg(test)]
     pub fn get_cached_result(&self, key: &str) -> Option<&str> {
-        self.results.get(key).map(|s| s.as_str())
+        self.results.get(key).map(|cached| cached.result.as_str())
+    }
+
+    pub(crate) fn get_cached_result_entry(&self, key: &str) -> Option<&CachedToolResult> {
+        self.results.get(key)
     }
 
     /// Classify a call without making duplicate success a blocking error.
@@ -124,7 +197,15 @@ impl ToolGuard {
     ) -> ToolGuardDecision {
         let key = Self::key(name, args);
         if Self::uses_cached_result(name) {
-            if let Some(result) = self.results.get(&key).cloned() {
+            let cached = self.results.get(&key).cloned();
+            tracing::debug!(
+                tool = name,
+                call_key_digest = %Self::key_digest(&key),
+                hit = cached.is_some(),
+                source_tool_call_id = cached.as_ref().map(|entry| entry.source_tool_call_id.as_str()),
+                "tool_guard_cache_lookup"
+            );
+            if let Some(result) = cached {
                 *self.cache_hits.entry(key).or_insert(0) += 1;
                 return ToolGuardDecision::Replay(result);
             }
@@ -153,8 +234,29 @@ impl ToolGuard {
         self.cache_hits.get(key).copied().unwrap_or(0)
     }
 
+    /// Return the one bounded advisory raised by three independently executed
+    /// reads with the same non-empty result bytes.
+    pub(crate) fn take_read_evidence_nudge(&mut self) -> bool {
+        std::mem::take(&mut self.read_evidence_nudge_pending)
+    }
+
+    /// Return one bounded advisory after three independently executed `exec`
+    /// calls produce the same non-empty output bytes. This never changes call
+    /// admission or claims that different commands are equivalent.
+    pub(crate) fn take_exec_output_nudge(&mut self) -> bool {
+        std::mem::take(&mut self.exec_output_nudge_pending)
+    }
+
     pub fn key(name: &str, args: &HashMap<String, Value>) -> String {
         crate::agent::tool_runner::normalize_call_key(name, args)
+    }
+
+    fn key_digest(key: &str) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(key.as_bytes());
+        format!("{:x}", hasher.finalize())
     }
 
     #[cfg(test)]
@@ -206,6 +308,139 @@ mod tests {
     }
 
     #[test]
+    fn cached_success_carries_durable_source_provenance() {
+        let mut g = ToolGuard::new(1);
+        let call_args = args(&[("command", "printf evidence"), ("working_dir", "/tmp")]);
+
+        g.record_result_with_status(
+            "exec",
+            &call_args,
+            "evidence".to_string(),
+            true,
+            "source-call",
+            "raw-result-digest",
+        );
+
+        assert_eq!(
+            g.decide("exec", &call_args),
+            ToolGuardDecision::Replay(CachedToolResult {
+                result: "evidence".to_string(),
+                source_tool_call_id: "source-call".to_string(),
+                result_digest: "raw-result-digest".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn advancing_a_read_cursor_is_a_distinct_call() {
+        let mut guard = ToolGuard::new(1);
+        let first = args(&[("tool_call_id", "large-result"), ("start_char", "0")]);
+        let next = args(&[("tool_call_id", "large-result"), ("start_char", "1000")]);
+        guard.record_result("inspect_tool_result", &first, "page one".to_string());
+
+        assert_eq!(
+            guard.decide("inspect_tool_result", &next),
+            ToolGuardDecision::Execute
+        );
+    }
+
+    #[test]
+    fn repeated_nonempty_read_evidence_raises_one_advisory_without_blocking_variants() {
+        let mut guard = ToolGuard::new(1);
+        for index in 0..4 {
+            let call_args = args(&[("path", &format!("/tmp/file-{index}"))]);
+            assert_eq!(
+                guard.decide("read_file", &call_args),
+                ToolGuardDecision::Execute
+            );
+            guard.record_result_with_status(
+                "read_file",
+                &call_args,
+                "same evidence".to_string(),
+                true,
+                &format!("read-{index}"),
+                "same-raw-digest",
+            );
+            assert_eq!(guard.take_read_evidence_nudge(), index == 2);
+        }
+    }
+
+    #[test]
+    fn repeated_exec_output_is_advisory_and_changed_output_resets_the_streak() {
+        let mut guard = ToolGuard::new(1);
+        let record = |guard: &mut ToolGuard, index: usize, digest: &str| {
+            let call_args = args(&[("command", &format!("variant-{index}"))]);
+            assert_eq!(guard.decide("exec", &call_args), ToolGuardDecision::Execute);
+            guard.record_result_with_status(
+                "exec",
+                &call_args,
+                "same visible output".to_string(),
+                true,
+                &format!("exec-{index}"),
+                digest,
+            );
+        };
+
+        record(&mut guard, 0, "same-digest");
+        record(&mut guard, 1, "same-digest");
+        record(&mut guard, 2, "changed-digest");
+        record(&mut guard, 3, "same-digest");
+        record(&mut guard, 4, "same-digest");
+        assert!(!guard.take_exec_output_nudge());
+        record(&mut guard, 5, "same-digest");
+        assert!(guard.take_exec_output_nudge());
+        assert!(!guard.take_exec_output_nudge());
+    }
+
+    #[test]
+    fn empty_evidence_and_changed_state_do_not_raise_recovery_advice() {
+        let mut guard = ToolGuard::new(1);
+        for index in 0..3 {
+            let call_args = args(&[("path", &format!("/tmp/empty-{index}"))]);
+            guard.record_result_with_status(
+                "read_file",
+                &call_args,
+                String::new(),
+                true,
+                &format!("empty-{index}"),
+                "empty-digest",
+            );
+        }
+        assert!(!guard.take_read_evidence_nudge());
+
+        for index in 0..2 {
+            let call_args = args(&[("path", &format!("/tmp/before-{index}"))]);
+            guard.record_result_with_status(
+                "read_file",
+                &call_args,
+                "same evidence".to_string(),
+                true,
+                &format!("before-{index}"),
+                "same-digest",
+            );
+        }
+        let write_args = args(&[("path", "/tmp/changed"), ("content", "new")]);
+        guard.record_result_with_status(
+            "write_file",
+            &write_args,
+            "written".to_string(),
+            true,
+            "mutation",
+            "mutation-digest",
+        );
+        let after = args(&[("path", "/tmp/after")]);
+        guard.record_result_with_status(
+            "read_file",
+            &after,
+            "same evidence".to_string(),
+            true,
+            "after",
+            "same-digest",
+        );
+        assert!(!guard.take_read_evidence_nudge());
+    }
+
+    #[test]
     fn test_tool_guard_cache_miss_without_recording() {
         let g = ToolGuard::new(1);
         let mut args = HashMap::new();
@@ -225,6 +460,8 @@ mod tests {
             &read_args,
             "Error: missing file".to_string(),
             false,
+            "failed-read",
+            "failed-digest",
         );
 
         assert_eq!(g.get_cached_result(&key), None);
@@ -294,10 +531,21 @@ mod tests {
     fn successful_write_is_replayed_without_execution_budget_or_block() {
         let mut g = ToolGuard::new(1);
         let write_args = args(&[("path", "/tmp/a.txt"), ("content", "new")]);
-        g.record_result_with_status("write_file", &write_args, "written".into(), true);
+        g.record_result_with_status(
+            "write_file",
+            &write_args,
+            "written".into(),
+            true,
+            "test-source",
+            "test-digest",
+        );
         assert_eq!(
             g.decide("write_file", &write_args),
-            ToolGuardDecision::Replay("written".into())
+            ToolGuardDecision::Replay(CachedToolResult {
+                result: "written".into(),
+                source_tool_call_id: "test-source".into(),
+                result_digest: "test-digest".into(),
+            })
         );
         assert_eq!(g.cache_hits(&ToolGuard::key("write_file", &write_args)), 1);
     }
@@ -306,7 +554,14 @@ mod tests {
     fn failed_and_rejected_calls_remain_retryable() {
         let mut g = ToolGuard::new(1);
         let call_args = args(&[("path", "/tmp/missing")]);
-        g.record_result_with_status("write_file", &call_args, "failed".into(), false);
+        g.record_result_with_status(
+            "write_file",
+            &call_args,
+            "failed".into(),
+            false,
+            "failed-write",
+            "failed-digest",
+        );
         assert_eq!(
             g.decide("write_file", &call_args),
             ToolGuardDecision::Execute
@@ -465,6 +720,8 @@ mod tests {
             &empty,
             "Available tools: a, b".to_string(),
             true,
+            "catalog-1",
+            "catalog-digest-1",
         );
         assert!(guard.allow("get_tools", &empty).is_ok());
         guard.record_result_with_status(
@@ -472,6 +729,8 @@ mod tests {
             &empty,
             "Available tools: a, b".to_string(),
             true,
+            "catalog-2",
+            "catalog-digest-2",
         );
 
         // The cached result is retrievable even though get_tools isn't a

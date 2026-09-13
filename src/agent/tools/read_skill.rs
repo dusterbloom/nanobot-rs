@@ -34,8 +34,8 @@ impl Tool for ReadSkillTool {
     }
 
     fn description(&self) -> &str {
-        "List available skills (call with no arguments) or read a skill's full instructions by name. \
-         Always call this first to discover what skills are installed before trying to use a skill."
+        "List available skills when name is omitted, or load a known skill's full instructions by name. \
+         Use the bounded listing for discovery; once the skill name is known, call get_skills with that name to load SKILL.md."
     }
 
     fn concurrency(&self) -> ToolConcurrency {
@@ -66,7 +66,7 @@ impl Tool for ReadSkillTool {
         let want_list = name.is_empty() || name == "__list__";
 
         if want_list {
-            let summary = SkillsLoader::new(&self.workspace, None).build_skills_summary();
+            let summary = SkillsLoader::new(&self.workspace, None).build_compact_index();
             return Ok(if summary.is_empty() {
                 "No skills are installed.".into()
             } else {
@@ -155,10 +155,84 @@ mod tests {
                 .await,
         );
         assert!(
-            result.starts_with("<skills>"),
-            "missing name should list skills, got: {result}"
+            result.starts_with("Installed skills preview:"),
+            "got: {result}"
         );
         assert!(result.contains("test"));
+    }
+
+    #[tokio::test]
+    async fn test_skill_listing_is_useful_without_xml_opener() {
+        let (_tmp, tool) = make_workspace_with_skill(
+            "coding",
+            "---\ndescription: Write and review code\n---\nbody",
+        );
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::new(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
+        assert!(
+            !result.starts_with("<skills>"),
+            "listing should expose entries directly, got: {result}"
+        );
+        assert!(
+            result.contains("coding"),
+            "listing omitted skill name: {result}"
+        );
+        assert!(
+            result.contains("Write and review code"),
+            "listing omitted skill description: {result}"
+        );
+        assert!(
+            result.contains("get_skills") && result.contains("coding"),
+            "listing must explain how to load a known skill: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_large_skill_listing_keeps_bounded_entries_visible() {
+        let tmp = TempDir::new().unwrap();
+        for index in 0..80 {
+            let name = format!("skill-{index:02}");
+            let skill_dir = tmp.path().join("skills").join(&name);
+            fs::create_dir_all(&skill_dir).unwrap();
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!(
+                    "---\ndescription: Skill {index} explains a bounded operational workflow for reliable discovery\n---\nbody"
+                ),
+            )
+            .unwrap();
+        }
+        let tool = ReadSkillTool::new(tmp.path());
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::new(),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
+        assert!(
+            result.chars().count() > 4096,
+            "fixture must exercise a large listing"
+        );
+        assert!(result.starts_with("Installed skills preview:"));
+        assert!(
+            result.contains("- skill-00:"),
+            "first entry was lost: {result}"
+        );
+        assert!(
+            result.contains("- skill-79:"),
+            "last entry was lost: {result}"
+        );
+        assert!(
+            result.contains("get_skills"),
+            "load guidance was lost: {result}"
+        );
+        assert!(!result.starts_with("<skills>"));
     }
 
     #[test]
@@ -172,7 +246,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_skill_list_returns_xml() {
+    async fn test_read_skill_list_returns_bounded_index() {
         // Set up a workspace with a skill that has a description.
         let (_tmp, tool) = make_workspace_with_skill(
             "my-skill",
@@ -184,20 +258,12 @@ mod tests {
             tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
                 .await,
         );
-        // Should return the XML summary format.
         assert!(
-            result.starts_with("<skills>"),
-            "list should return XML starting with <skills>: {}",
-            result
+            result.starts_with("Installed skills preview:"),
+            "got: {result}"
         );
-        assert!(
-            result.contains("<name>my-skill</name>"),
-            "list should include skill name"
-        );
-        assert!(
-            result.ends_with("</skills>"),
-            "list should end with </skills>"
-        );
+        assert!(result.contains("- my-skill: My skill description"));
+        assert!(result.contains("get_skills"));
     }
 
     #[tokio::test]

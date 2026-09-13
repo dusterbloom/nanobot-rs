@@ -2,9 +2,9 @@
 //!
 //! See `docs/superpowers/specs/2026-07-27-tool-leases-design.md`.
 //!
-//! Each user turn has one 96-success execution budget. A call reserves a slot,
-//! and only a durably persisted successful result consumes it. Failed calls
-//! release their reservation so recovery can retry without lease ceremonies.
+//! Each user turn has one 96-success execution budget plus a bounded admitted
+//! attempt budget. A call reserves both until its durable result arrives, so
+//! repeated failures cannot bypass the turn bound.
 
 /// One turn budget. This is deliberately a single number: a tool-heavy turn
 /// should not have to negotiate a sequence of subleases with the model.
@@ -36,6 +36,7 @@ pub struct Lease {
     /// here prevents a parallel batch from exceeding the cap.
     in_flight: u32,
     successful_executions: u32,
+    admitted_attempts: u32,
     renewals_used: u32,
     /// Checkpoint-free renewals spent on read-only tools. Separate from
     /// `renewals_used` so exploration can't starve the write path.
@@ -130,15 +131,15 @@ impl Lease {
             max_renewals,
             in_flight: 0,
             successful_executions: 0,
+            admitted_attempts: 0,
             renewals_used: 0,
             read_only_renewals_used: 0,
         }
     }
 
-    /// Reserve one tool call against the single successful-execution budget.
-    /// The reservation is settled with [`record_tool_result`]. Failed calls
-    /// release their reservation and can be retried; only successfully
-    /// persisted results consume the turn budget.
+    /// Reserve one call against both the successful-execution budget and a
+    /// failure-inclusive attempt budget. Two attempts per success slot leave
+    /// room for one ordinary correction while bounding persistent failures.
     ///
     /// There is NO consecutive-same-family cap anymore: it over-fired on
     /// legitimate exploration (N different greps) and busted the prompt-prefix
@@ -148,7 +149,10 @@ impl Lease {
     /// budget plus the no-progress hard stop. See
     /// docs/superpowers/plans/2026-07-30-reuse-not-rerun-tool-dedup.md.
     pub fn record_tool_call(&mut self) -> ToolCallResult {
-        if self.successful_executions.saturating_add(self.in_flight) >= self.lease_size {
+        let max_attempts = self.lease_size.saturating_mul(2);
+        if self.successful_executions.saturating_add(self.in_flight) >= self.lease_size
+            || self.admitted_attempts.saturating_add(self.in_flight) >= max_attempts
+        {
             return ToolCallResult::blocked("lease_exhausted");
         }
         self.in_flight += 1;
@@ -156,9 +160,11 @@ impl Lease {
     }
 
     /// Settle a previously reserved call after its result has been durably
-    /// persisted. A failed result is retryable and therefore does not count.
+    /// persisted. Every admitted outcome consumes the attempt budget; only a
+    /// successful outcome consumes the separate success budget.
     pub fn record_tool_result(&mut self, ok: bool) {
         self.in_flight = self.in_flight.saturating_sub(1);
+        self.admitted_attempts = self.admitted_attempts.saturating_add(1);
         if ok {
             self.successful_executions = self.successful_executions.saturating_add(1);
         }
@@ -178,6 +184,8 @@ impl Lease {
     #[cfg(test)]
     pub fn is_exhausted(&self) -> bool {
         self.successful_executions.saturating_add(self.in_flight) >= self.lease_size
+            || self.admitted_attempts.saturating_add(self.in_flight)
+                >= self.lease_size.saturating_mul(2)
     }
 
     #[cfg(test)]
@@ -225,6 +233,7 @@ impl Lease {
         self.renewals_used += 1;
         self.in_flight = 0;
         self.successful_executions = 0;
+        self.admitted_attempts = 0;
         RenewalResult::accepted()
     }
 
@@ -247,6 +256,7 @@ impl Lease {
         self.read_only_renewals_used += 1;
         self.in_flight = 0;
         self.successful_executions = 0;
+        self.admitted_attempts = 0;
         true
     }
 
@@ -262,14 +272,16 @@ impl Lease {
     /// adds the result). For the first call this is 1, etc.
     pub fn progress_signal(&self) -> String {
         let current_call = self.successful_executions.saturating_add(self.in_flight);
+        let current_attempt = self.admitted_attempts.saturating_add(self.in_flight);
+        let max_attempts = self.lease_size.saturating_mul(2);
         let checkpoint_remaining = self.max_renewals.saturating_sub(self.renewals_used);
         let read_only_remaining = self
             .max_renewals
             .saturating_sub(self.read_only_renewals_used);
         let leases_remaining = std::cmp::min(checkpoint_remaining, read_only_remaining);
         format!(
-            "[Tool call {} of {} this lease — {} leases remaining]",
-            current_call, self.lease_size, leases_remaining
+            "[Tool call {} of {} this lease; attempt {} of {} — {} leases remaining]",
+            current_call, self.lease_size, current_attempt, max_attempts, leases_remaining
         )
     }
 }
@@ -529,18 +541,18 @@ mod tests {
     }
 
     #[test]
-    fn failed_execution_releases_budget_and_can_be_retried() {
+    fn failed_executions_consume_the_bounded_attempt_budget() {
         let mut lease = Lease::new(1, 0);
         assert!(lease.record_tool_call().allowed);
         lease.record_tool_result(false);
         assert_eq!(lease.successful_executions(), 0);
         assert!(lease.record_tool_call().allowed);
-        lease.record_tool_result(true);
+        lease.record_tool_result(false);
         assert!(!lease.record_tool_call().allowed);
     }
 
     #[test]
-    fn mixed_batch_reserves_only_the_successful_budget() {
+    fn mixed_batch_preserves_reservations_and_success_budget() {
         let mut lease = Lease::new(2, 0);
         assert!(lease.record_tool_call().allowed);
         assert!(lease.record_tool_call().allowed);

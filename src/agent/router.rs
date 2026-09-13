@@ -1281,6 +1281,8 @@ pub(crate) enum RoutedToolDisposition {
     /// into a dead end or consume the turn execution budget.
     Replay {
         receipt: String,
+        source_tool_call_id: String,
+        result_digest: String,
     },
     Reject {
         reason: String,
@@ -1322,9 +1324,13 @@ pub(crate) fn duplicate_receipt(
     name: &str,
     hits: u32,
     cached: Option<&str>,
+    source_tool_call_id: Option<&str>,
     cached_chars: usize,
     progress: &str,
 ) -> String {
+    let source = source_tool_call_id
+        .map(|id| format!(" source_tool_call_id={}", serde_json::json!(id)))
+        .unwrap_or_default();
     // A handle excerpt is not a page: its rendered length is never a source
     // cursor. Recover the original immutable artifact ID (including legacy
     // handles), and always start the first inspection at source offset zero.
@@ -1350,13 +1356,16 @@ pub(crate) fn duplicate_receipt(
         .unwrap_or_default();
     match cached {
         Some(data) if hits <= 1 => {
-            format!("[cached result from earlier identical call — {cached_chars} chars]\n{data}{recovery}\n{progress}")
+            format!(
+                "{} [cached result from earlier identical call{source} — {cached_chars} chars; no new execution occurred]\n{data}{recovery}\n{progress}",
+                crate::agent::tool_engine::TOOL_CACHED_REPLAY_MARKER
+            )
         }
         _ => format!(
-            "[duplicate {name} call #{hits} this turn — the identical arguments were already \
-             answered above; the cached result is already in this conversation. Do NOT repeat \
-             this call. Vary the query meaningfully, use inspect_tool_result to re-read a \
-             stashed result, or write your final answer from the evidence you have.]{recovery}\n{progress}"
+            "{} [duplicate {name} call #{hits} this turn{source} — no new execution occurred. Synthesize \
+             what the earlier result establishes and state any unresolved gap. If more evidence \
+             is needed, change the query, range, cursor, or target meaningfully.]{recovery}\n{progress}"
+            , crate::agent::tool_engine::TOOL_CACHED_REPLAY_MARKER
         ),
     }
 }
@@ -1371,6 +1380,23 @@ fn canonicalize_proxy_execution(
     tc.name = name;
     tc.arguments = arguments;
     tc
+}
+
+/// Fill execution defaults before guard classification so the lookup key,
+/// durable decision, and executor all see the same semantic arguments. The
+/// command string itself is never rewritten.
+fn materialize_execution_defaults(calls: &mut [ToolCallRequest]) {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let cwd = Value::String(cwd.to_string_lossy().into_owned());
+    for call in calls {
+        if call.name == "exec" {
+            call.arguments
+                .entry("working_dir".to_string())
+                .or_insert_with(|| cwd.clone());
+        }
+    }
 }
 
 /// Route tool calls through the strict router / toolplan / fallback pipeline.
@@ -1661,6 +1687,7 @@ pub(crate) async fn route_tool_calls(
         .into_iter()
         .map(|tc| canonicalize_proxy_execution(&ctx.tools, tc))
         .collect();
+    materialize_execution_defaults(&mut routed_tool_calls);
 
     // Preserve every call in the carrier, including same-batch duplicates and
     // guard rejections. A model-visible tool call must always receive exactly
@@ -1695,13 +1722,18 @@ pub(crate) async fn route_tool_calls(
                 let receipt = duplicate_receipt(
                     &tc.name,
                     ctx.flow.tool_guard.cache_hits(&guard_key),
-                    Some(&cached),
-                    cached.chars().count(),
+                    Some(&cached.result),
+                    Some(&cached.source_tool_call_id),
+                    cached.result.chars().count(),
                     &ctx.flow.lease.progress_signal(),
                 );
                 calls.push(RoutedToolCall {
                     call: tc,
-                    disposition: RoutedToolDisposition::Replay { receipt },
+                    disposition: RoutedToolDisposition::Replay {
+                        receipt,
+                        source_tool_call_id: cached.source_tool_call_id,
+                        result_digest: cached.result_digest,
+                    },
                 });
                 blocked_count += 1;
                 all_blocked_uncached = false;
@@ -1710,14 +1742,15 @@ pub(crate) async fn route_tool_calls(
                 warn!("{}", reason);
                 blocked_count += 1;
                 let guard_key = ToolGuard::key(&tc.name, &tc.arguments);
-                let cached = ctx.flow.tool_guard.get_cached_result(&guard_key);
+                let cached = ctx.flow.tool_guard.get_cached_result_entry(&guard_key);
                 all_blocked_uncached &= cached.is_none();
                 let receipt = if let Some(cached) = cached {
                     duplicate_receipt(
                         &tc.name,
                         ctx.flow.tool_guard.cache_hits(&guard_key),
-                        Some(cached),
-                        cached.chars().count(),
+                        Some(&cached.result),
+                        Some(&cached.source_tool_call_id),
+                        cached.result.chars().count(),
                         &ctx.flow.lease.progress_signal(),
                     )
                 } else {
@@ -1748,9 +1781,9 @@ pub(crate) async fn route_tool_calls(
             let post_rejection_instruction =
                 (all_blocked_uncached && ctx.flow.consecutive_all_blocked == 2).then(|| {
                     "[system] Your last several tool calls were duplicates or blocked. \
-                     You already have the data you need from your previous tool results. \
-                     Do NOT call any more tools. Write your final answer now using the \
-                     information you gathered."
+                     State what the available evidence establishes, identify unresolved gaps, \
+                     and give an honest partial answer. Do not claim that an unexecuted call \
+                     succeeded."
                         .to_string()
                 });
             // A cached duplicate produces only a compact protocol receipt; it
@@ -1951,7 +1984,13 @@ mod tests {
     #[tokio::test]
     async fn circuit_breaker_recovery_does_not_rewrite_routed_prefix() {
         let mut ctx = test_turn_context();
-        let arguments = HashMap::from([("command".to_string(), json!("pwd"))]);
+        let arguments = HashMap::from([
+            ("command".to_string(), json!("pwd")),
+            (
+                "working_dir".to_string(),
+                json!(std::env::current_dir().unwrap().to_string_lossy()),
+            ),
+        ]);
         assert!(ctx.flow.tool_guard.allow("exec", &arguments).is_ok());
         let original_messages: Vec<Value> = ctx.messages.iter().cloned().collect();
 
@@ -1973,6 +2012,9 @@ mod tests {
             if id == "blocked-2" {
                 assert!(batch.post_rejection_instruction.is_some_and(|instruction| {
                     instruction.contains("Your last several tool calls were duplicates or blocked")
+                        && instruction.contains("give an honest partial answer")
+                        && instruction.contains("identify unresolved gaps")
+                        && !instruction.contains("already have the data you need")
                 }));
             }
         }
@@ -1990,22 +2032,41 @@ mod tests {
     fn test_duplicate_receipt_replays_once_then_directs() {
         let progress = "[Tool call 5 of 8 this lease — 2 leases remaining]";
 
-        let first = duplicate_receipt("recall", 1, Some("found: PHASEONE data"), 22, progress);
-        assert!(first.contains("[cached result from earlier identical call — 22 chars]"));
+        let first = duplicate_receipt(
+            "recall",
+            1,
+            Some("found: PHASEONE data"),
+            Some("source-1"),
+            22,
+            progress,
+        );
+        assert!(first.contains("[cached result from earlier identical call"));
+        assert!(first.contains("source_tool_call_id=\"source-1\""));
+        assert!(first.contains("22 chars; no new execution occurred"));
         assert!(first.contains("found: PHASEONE data"));
         assert!(first.contains(progress));
 
-        let repeat = duplicate_receipt("recall", 2, Some("found: PHASEONE data"), 22, progress);
+        let repeat = duplicate_receipt(
+            "recall",
+            2,
+            Some("found: PHASEONE data"),
+            Some("source-1"),
+            22,
+            progress,
+        );
         assert!(
             !repeat.contains("found: PHASEONE data"),
             "repeat must not re-dump bytes"
         );
         assert!(repeat.contains("duplicate recall call #2"));
-        assert!(repeat.contains("Do NOT repeat this call"));
+        assert!(repeat.contains("no new execution occurred"));
+        assert!(repeat.contains("state any unresolved gap"));
+        assert!(!repeat.contains("already have the data you need"));
+        assert!(repeat.contains("source_tool_call_id=\"source-1\""));
         assert!(repeat.contains(progress));
 
         // Defensive arm: classified blocked-with-result but cache vanished.
-        let none = duplicate_receipt("recall", 1, None, 0, progress);
+        let none = duplicate_receipt("recall", 1, None, None, 0, progress);
         assert!(none.contains("duplicate recall call #1"));
     }
 
@@ -2020,7 +2081,14 @@ mod tests {
             serde_json::to_string(id).unwrap()
         );
         for hit in [1, 2, 4] {
-            let receipt = duplicate_receipt("exec", hit, Some(&handle), handle.len(), "budget");
+            let receipt = duplicate_receipt(
+                "exec",
+                hit,
+                Some(&handle),
+                Some("source-exec"),
+                handle.len(),
+                "budget",
+            );
             let call = receipt.split("inspect_tool_result(").nth(1).unwrap();
             let args: Value = serde_json::from_str(call.split(")\n").next().unwrap()).unwrap();
             assert_eq!(args["tool_call_id"], id);
@@ -2035,7 +2103,14 @@ mod tests {
             "TOOL_RESULT_HANDLE v1 | id:broken",
             "TOOL_RESULT_HANDLE v1 | id:\"\"",
         ] {
-            let receipt = duplicate_receipt("exec", 1, Some(data), data.len(), "budget");
+            let receipt = duplicate_receipt(
+                "exec",
+                1,
+                Some(data),
+                Some("source-exec"),
+                data.len(),
+                "budget",
+            );
             assert!(!receipt.contains("inspect_tool_result("), "{receipt}");
         }
     }

@@ -554,13 +554,17 @@ impl ToolRegistry {
         defs
     }
 
-    /// Truncate tool descriptions to their first sentence to save tokens.
+    /// Condense ordinary tool descriptions while retaining contracts whose
+    /// operational rules are needed before the first call.
     fn condense_definitions(defs: &mut [serde_json::Value]) {
         for def in defs.iter_mut() {
             if let Some(func) = def.get_mut("function") {
+                let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 if let Some(desc) = func.get("description").and_then(|d| d.as_str()) {
-                    let condensed = Self::condense_description(desc);
-                    func["description"] = serde_json::Value::String(condensed);
+                    if !matches!(name, "exec" | "get_skills" | "inspect_tool_result") {
+                        let condensed = Self::condense_description(desc);
+                        func["description"] = serde_json::Value::String(condensed);
+                    }
                 }
             }
         }
@@ -2746,6 +2750,47 @@ mod tests {
         // The important thing: condense IS applied (verified by the multi-
         // sentence test below).
         assert_eq!(desc, "A mock tool for testing");
+    }
+
+    #[test]
+    fn test_local_defs_preserve_operational_tool_contracts() {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ExecTool::new(30, None, None, None, false, 30_000)));
+        registry.register(Box::new(ReadSkillTool::new(std::path::Path::new("."))));
+        registry.register(Box::new(
+            crate::agent::tools::stash_search::SearchToolResultTool::with_db(
+                std::path::PathBuf::from("/tmp/sessions.db"),
+                "session".to_string(),
+            ),
+        ));
+
+        let defs = registry.get_local_definitions();
+        let description = |name: &str| {
+            defs.iter()
+                .find(|def| def["function"]["name"] == name)
+                .and_then(|def| def["function"]["description"].as_str())
+                .unwrap_or("")
+        };
+
+        let exec = description("exec");
+        assert!(
+            exec.contains("pipefail"),
+            "exec contract was truncated: {exec}"
+        );
+        assert!(
+            exec.contains("producer-native"),
+            "exec contract must explain bounded producer output: {exec}"
+        );
+        let skills = description("get_skills");
+        assert!(
+            skills.contains("known skill") && skills.contains("list"),
+            "skill discovery/loading contract was truncated: {skills}"
+        );
+        let inspect = description("inspect_tool_result");
+        assert!(
+            inspect.contains("stored") && inspect.contains("next_char"),
+            "stored-result paging contract was truncated: {inspect}"
+        );
     }
 
     /// Verify condensation truncates to two sentences (not one, not all).

@@ -145,8 +145,14 @@ pub(crate) const TOOL_RESULT_HANDLE_MARKER: &str = "TOOL_RESULT_HANDLE v1 |";
 /// must never be shaped again with a different cap.
 pub(crate) const TOOL_RESULT_EXCERPT_MARKER: &str = "TOOL_RESULT_EXCERPT v1 |";
 
+/// A durable receipt for a cache hit within the same tool-call turn. The
+/// receipt may include the original inline result, so it can exceed the
+/// ordinary inline threshold even though no new result was executed or
+/// stored under the replay call ID.
+pub(crate) const TOOL_CACHED_REPLAY_MARKER: &str = "TOOL_CACHED_REPLAY v1 |";
+
 pub(crate) fn is_stable_tool_result_representation(content: &str) -> bool {
-    content.starts_with(TOOL_RESULT_HANDLE_MARKER)
+    content.starts_with(TOOL_RESULT_HANDLE_MARKER) || content.starts_with(TOOL_CACHED_REPLAY_MARKER)
 }
 
 /// Inspection is the only operation allowed to show selected result content
@@ -1111,6 +1117,8 @@ async fn append_cua_screenshot_turn(
 /// This function must run sequentially (one result at a time) because it
 /// mutates `ctx`.
 async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult, prompt_cap: usize) {
+    use sha2::{Digest, Sha256};
+
     if let Some(record_error) = &r.replay_error {
         ctx.flow.infra_error = Some(format!(
             "tool execution result for {} could not be recorded: {record_error}",
@@ -1210,12 +1218,50 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult, prompt_
         ));
         return;
     }
+    let raw_result_digest = {
+        let mut hasher = Sha256::new();
+        hasher.update(r.result.data().as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
     ctx.flow.tool_guard.record_result_with_status(
         &r.tool_name,
         &r.arguments,
         data.clone(),
         r.result.ok(),
+        &r.tool_id,
+        &raw_result_digest,
     );
+    let recovery_guidance = if ctx.flow.tool_guard.take_read_evidence_nudge() {
+        Some((
+            "read-only",
+            "[system] Three successful read-only calls returned the same non-empty content. \
+             Every call executed; no result was inferred or skipped. State what the repeated \
+             evidence establishes and identify the remaining gap before changing the target or \
+             query, or give an honest partial answer.",
+        ))
+    } else if ctx.flow.tool_guard.take_exec_output_nudge() {
+        Some((
+            "exec-output",
+            "[system] Three independently executed calls returned identical non-empty exec \
+             output. Every call executed. No command equivalence was inferred and no call was \
+             skipped. Identify what new information or action is still needed; continue executing \
+             if another action is required. Otherwise return an honest partial result with \
+             unresolved gaps.",
+        ))
+    } else {
+        None
+    };
+    if let Some((kind, guidance)) = recovery_guidance {
+        ctx.messages
+            .push_draft(crate::agent::markers::scaffold_user(guidance.to_string()));
+        if let Err(error) = ctx.persist_pending_protocol_messages().await {
+            ctx.flow.infra_error = Some(format!(
+                "{kind} recovery guidance could not be recorded after {}: {error}",
+                r.tool_id,
+            ));
+            return;
+        }
+    }
 
     // Emit CallEnd.
     if let Some(ref tx) = ctx.tool_event_tx {

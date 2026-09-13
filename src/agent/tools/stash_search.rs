@@ -283,7 +283,7 @@ fn render_char_page_with_budget(
     }
     if start_char == total {
         return format!(
-            "[source={artifact_tool_call_id} chars {total}..{total}/{total} end]\n[END OF SOURCE — no more stored output. Do not request further pages.]"
+            "[source={artifact_tool_call_id} chars {total}..{total}/{total} end]\n[END OF STORED RESULT — no more stored output. This does not imply the original file or source is complete.]"
         )
         .chars()
         .take(max_chars)
@@ -329,10 +329,10 @@ fn render_char_page_with_budget(
 
     let footer = if end_char < total {
         format!(
-            "\n[MORE CONTENT AHEAD — this page stops mid-source. To read the rest, call again with start_char={end_char}.]"
+            "\n[MORE CONTENT AHEAD — this page stops mid-stored-result. To read the rest, call again with start_char={end_char}.]"
         )
     } else {
-        "\n[END OF SOURCE — you have now read the complete stored output. Do not request further pages of this source; answer from what you have.]".to_string()
+        "\n[END OF STORED RESULT — you have now read the complete stored result. This does not imply the original file or source is complete; follow any continuation metadata.]".to_string()
     };
 
     format!("{}{text}{footer}", header(end_char))
@@ -388,7 +388,7 @@ fn render_slice_page_with_budget(
 
     if clamped_start > total {
         return format!(
-            "[source={artifact_tool_call_id} lines {clamped_start}-{total}/{total} end]\n[END OF SOURCE — no more stored output. Do not request further pages.]"
+            "[source={artifact_tool_call_id} lines {clamped_start}-{total}/{total} end]\n[END OF STORED RESULT — no more stored output. This does not imply the original file or source is complete.]"
         )
         .chars()
         .take(max_chars)
@@ -419,12 +419,12 @@ fn render_slice_page_with_budget(
         Some(last_line) => {
             let footer = if last_line < total {
                 format!(
-                    "\n[MORE CONTENT AHEAD — this page stops at line {last_line} of {total}. To read the rest, call again with start_line={}.]",
+                    "\n[MORE CONTENT AHEAD — this page stops at line {last_line} of the {total}-line stored result. To read the rest, call again with start_line={}.]",
                     last_line + 1
                 )
             } else {
                 format!(
-                    "\n[END OF SOURCE — you have now read all {total} lines of the stored output. Do not request further pages of this source; answer from what you have.]"
+                    "\n[END OF STORED RESULT — you have now read all {total} lines of the stored result. This does not imply the original file or source is complete; follow any continuation metadata.]"
                 )
             };
             format!("{}{}{}", header(last_line), rows.join("\n"), footer)
@@ -557,8 +557,9 @@ impl Tool for SearchToolResultTool {
          TOOL_RESULT_HANDLE. Add query to find matching lines, or start_line \
          and end_line to read a range. If a page returns next_char, pass that \
          zero-based offset as start_char to continue a long line. Output is \
-         always bounded; the complete source remains stored for another \
-         narrower inspection."
+         always bounded; the complete stored result remains available for \
+         another narrower inspection. If it contains a file continuation \
+         receipt, follow that receipt with read_file."
     }
 
     fn parameters(&self) -> Value {
@@ -1030,7 +1031,7 @@ mod tests {
             "partial page must warn there is more: {partial}"
         );
 
-        // Page reaching the end: must say END OF SOURCE loudly.
+        // Page reaching the end: must say END OF STORED RESULT loudly.
         let last = crate::agent::tools::base::render_result(
             tool.execute(
                 HashMap::from([
@@ -1043,12 +1044,47 @@ mod tests {
             .await,
         );
         assert!(
-            last.contains("[END OF SOURCE"),
+            last.contains("[END OF STORED RESULT"),
             "final page must announce the end: {last}"
         );
         assert!(
             last.chars().count() <= MAX_OUTPUT_CHARS,
             "guidance must fit inside the output cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_completion_marks_stored_result_only() {
+        let (_dir, db_path, sid) = make_db().await;
+        let stored = "one\n[139 more lines; next: read_file lines=\"167:305\"]\ntwo\n";
+        seed(&db_path, &sid, "stored_file_read", stored).await;
+
+        let tool = SearchToolResultTool::with_db(db_path, sid);
+        let out = crate::agent::tools::base::render_result(
+            tool.execute(
+                HashMap::from([
+                    ("tool_call_id".to_string(), json!("stored_file_read")),
+                    ("start_line".to_string(), json!(1)),
+                ]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
+        assert!(
+            out.contains("END OF STORED RESULT"),
+            "completion must be scoped to the stored result: {out}"
+        );
+        assert!(
+            !out.contains("END OF SOURCE"),
+            "stored-result completion must not imply source/file completion: {out}"
+        );
+        assert!(
+            out.contains("[139 more lines; next: read_file lines=\"167:305\"]"),
+            "the exact file continuation receipt must survive wrapping: {out}"
+        );
+        assert!(
+            !out.contains("answer from what you have") && !out.contains("complete file"),
+            "stored-result completion must not tell the model the file is complete: {out}"
         );
     }
 
@@ -1239,7 +1275,7 @@ mod tests {
             for cursor in [total] {
                 let page = render_char_page(body, "original", cursor, true);
                 assert!(page.contains(&format!("chars {total}..{total}/{total} end]")));
-                assert!(page.contains("END OF SOURCE"));
+                assert!(page.contains("END OF STORED RESULT"));
                 assert!(!page.contains("next_char="));
                 assert!(!page.contains("out of range"));
                 assert!(page.chars().count() <= MAX_OUTPUT_CHARS);
@@ -1262,7 +1298,7 @@ mod tests {
     fn line_cursor_beyond_eof_is_terminal() {
         let page = render_slice_page("", &[], "original", usize::MAX, usize::MAX);
         assert!(page.contains(" end]"));
-        assert!(page.contains("END OF SOURCE"));
+        assert!(page.contains("END OF STORED RESULT"));
         assert!(!page.contains("out of range"));
     }
 
