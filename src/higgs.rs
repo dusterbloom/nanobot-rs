@@ -899,6 +899,7 @@ pub(crate) async fn switch_runtime_model(
     //    collected (not silently discarded) so the 409 the user would otherwise
     //    get is replaced with a clear "couldn't unload X: reason" message.
     let loaded = list_available_served_models_at(api_base, api_key).await;
+    let preloaded_name = loaded_model_name(&loaded, name);
     let unload_url = models_url_from_base(api_base);
     let mut unload_errors: Vec<String> = Vec::new();
     for id in &loaded {
@@ -954,6 +955,10 @@ pub(crate) async fn switch_runtime_model(
         }
     }
 
+    if let Some(loaded_name) = preloaded_name {
+        return Ok(loaded_name);
+    }
+
     // 2. Load the requested model. Body mirrors a higgs [[models]] entry.
     let mut body = serde_json::json!({ "path": path });
     if !name.is_empty() {
@@ -967,6 +972,15 @@ pub(crate) async fn switch_runtime_model(
 
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::CONFLICT {
+        // Another switch may have won the race between our initial listing
+        // and this load. Accept the conflict only after confirming the target
+        // is resident, and return Higgs's canonical runtime id.
+        let confirmed = list_available_served_models_at(api_base, api_key).await;
+        if let Some(loaded_name) = loaded_model_name(&confirmed, name) {
+            return Ok(loaded_name);
+        }
+    }
     if !status.is_success() {
         return Err(format!(
             "Higgs load failed (HTTP {status}): {}",
@@ -979,6 +993,13 @@ pub(crate) async fn switch_runtime_model(
         .and_then(|json| json.get("id").and_then(|id| id.as_str()).map(String::from))
         .unwrap_or_else(|| name.to_string());
     Ok(loaded_name)
+}
+
+fn loaded_model_name(loaded: &[String], requested: &str) -> Option<String> {
+    loaded
+        .iter()
+        .find(|id| !requested.is_empty() && requested.eq_ignore_ascii_case(id))
+        .cloned()
 }
 
 /// Percent-encode a model id for use in a DELETE path segment. higgs ids are
@@ -1212,6 +1233,182 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{Barrier, Mutex};
+
+    const SWITCH_TEST_TARGET: &str = "target-model";
+    const SWITCH_TEST_CANONICAL_TARGET: &str = "Target-Model";
+
+    struct SwitchTestState {
+        loaded: Vec<String>,
+        load_requests: usize,
+        unload_requests: usize,
+        conflict_next_load: bool,
+        add_target_on_conflict: bool,
+        snapshot_reads_remaining: usize,
+        snapshot_barrier: Option<Arc<Barrier>>,
+    }
+
+    async fn spawn_switch_test_server(
+        loaded: &[&str],
+        conflict_next_load: bool,
+        add_target_on_conflict: bool,
+        synchronize_initial_reads: bool,
+    ) -> (
+        String,
+        Arc<Mutex<SwitchTestState>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = Arc::new(Mutex::new(SwitchTestState {
+            loaded: loaded.iter().map(|id| (*id).to_string()).collect(),
+            load_requests: 0,
+            unload_requests: 0,
+            conflict_next_load,
+            add_target_on_conflict,
+            snapshot_reads_remaining: if synchronize_initial_reads { 2 } else { 0 },
+            snapshot_barrier: synchronize_initial_reads.then(|| Arc::new(Barrier::new(2))),
+        }));
+        let server_state = Arc::clone(&state);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(handle_switch_test_connection(
+                    stream,
+                    Arc::clone(&server_state),
+                ));
+            }
+        });
+        (format!("http://{address}/v1"), state, task)
+    }
+
+    async fn handle_switch_test_connection(
+        mut stream: TcpStream,
+        state: Arc<Mutex<SwitchTestState>>,
+    ) {
+        let Some((method, path, body)) = read_switch_test_request(&mut stream).await else {
+            return;
+        };
+
+        let barrier = if method == "GET" && path == "/v1/models" {
+            let mut state = state.lock().await;
+            if state.snapshot_reads_remaining == 0 {
+                None
+            } else {
+                state.snapshot_reads_remaining -= 1;
+                state.snapshot_barrier.clone()
+            }
+        } else {
+            None
+        };
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+        }
+
+        let (status, response_body) = {
+            let mut state = state.lock().await;
+            match (method.as_str(), path.as_str()) {
+                ("GET", "/v1/models") => {
+                    let data: Vec<_> = state
+                        .loaded
+                        .iter()
+                        .map(|id| serde_json::json!({ "id": id }))
+                        .collect();
+                    (200, serde_json::json!({ "data": data }).to_string())
+                }
+                ("GET", "/health") => (200, r#"{"models":[]}"#.to_string()),
+                ("DELETE", path) if path.starts_with("/v1/models/") => {
+                    state.unload_requests += 1;
+                    let id = path.trim_start_matches("/v1/models/");
+                    state.loaded.retain(|loaded| loaded != id);
+                    (200, r#"{"ok":true}"#.to_string())
+                }
+                ("POST", "/v1/models") => {
+                    state.load_requests += 1;
+                    let requested_name = serde_json::from_str::<serde_json::Value>(&body)
+                        .ok()
+                        .and_then(|json| {
+                            json.get("name")
+                                .and_then(|name| name.as_str())
+                                .map(str::to_string)
+                        })
+                        .unwrap_or_else(|| SWITCH_TEST_TARGET.to_string());
+                    let already_loaded = state
+                        .loaded
+                        .iter()
+                        .any(|id| id.eq_ignore_ascii_case(&requested_name));
+                    if state.conflict_next_load || already_loaded {
+                        state.conflict_next_load = false;
+                        if state.add_target_on_conflict && !already_loaded {
+                            state.loaded.push(SWITCH_TEST_CANONICAL_TARGET.to_string());
+                        }
+                        (
+                            409,
+                            format!(
+                                r#"{{"error":{{"message":"model '{}' is already loaded"}}}}"#,
+                                requested_name
+                            ),
+                        )
+                    } else {
+                        state.loaded.push(SWITCH_TEST_CANONICAL_TARGET.to_string());
+                        (200, format!(r#"{{"id":"{SWITCH_TEST_CANONICAL_TARGET}"}}"#))
+                    }
+                }
+                _ => (404, r#"{"error":"not found"}"#.to_string()),
+            }
+        };
+
+        let reason = if status == 200 { "OK" } else { "Conflict" };
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+            response_body.len()
+        );
+        let _ = stream.write_all(response.as_bytes()).await;
+    }
+
+    async fn read_switch_test_request(stream: &mut TcpStream) -> Option<(String, String, String)> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let headers_end = loop {
+            let read = stream.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+            if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..headers_end]).into_owned();
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        while bytes.len() < headers_end + content_length {
+            let read = stream.read(&mut chunk).await.ok()?;
+            if read == 0 {
+                return None;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        let mut request_line = headers.lines().next()?.split_whitespace();
+        let method = request_line.next()?.to_string();
+        let path = request_line.next()?.to_string();
+        let body =
+            String::from_utf8_lossy(&bytes[headers_end..headers_end + content_length]).into_owned();
+        Some((method, path, body))
+    }
 
     #[test]
     fn capacity_url_normalizes_root_and_v1_bases() {
@@ -1251,6 +1448,74 @@ mod tests {
     async fn test_wait_for_ready_unreachable_returns_false() {
         let result = wait_for_ready(19998, 1).await;
         assert!(!result, "unreachable port should return false");
+    }
+
+    #[tokio::test]
+    async fn switch_runtime_model_adopts_preloaded_target_without_reloading() {
+        let (base, state, server) = spawn_switch_test_server(
+            &["old-model", SWITCH_TEST_CANONICAL_TARGET],
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        let result =
+            switch_runtime_model(&base, "", "/models/target-model", SWITCH_TEST_TARGET, 1).await;
+
+        server.abort();
+        assert_eq!(result.unwrap(), SWITCH_TEST_CANONICAL_TARGET);
+        let state = state.lock().await;
+        assert_eq!(state.load_requests, 0);
+        assert_eq!(state.unload_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn switch_runtime_model_accepts_confirmed_target_after_conflict() {
+        let (base, state, server) =
+            spawn_switch_test_server(&["old-model"], true, true, false).await;
+
+        let result =
+            switch_runtime_model(&base, "", "/models/target-model", SWITCH_TEST_TARGET, 1).await;
+
+        server.abort();
+        assert_eq!(result.unwrap(), SWITCH_TEST_CANONICAL_TARGET);
+        let state = state.lock().await;
+        assert_eq!(state.load_requests, 1);
+        assert_eq!(state.unload_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_switches_to_same_target_both_succeed() {
+        let (base, state, server) =
+            spawn_switch_test_server(&["old-model"], false, false, true).await;
+
+        let first = switch_runtime_model(&base, "", "/models/target-model", SWITCH_TEST_TARGET, 1);
+        let second = switch_runtime_model(&base, "", "/models/target-model", SWITCH_TEST_TARGET, 1);
+        let (first, second) = tokio::join!(first, second);
+
+        server.abort();
+        assert_eq!(first.unwrap(), SWITCH_TEST_CANONICAL_TARGET);
+        assert_eq!(second.unwrap(), SWITCH_TEST_CANONICAL_TARGET);
+        let state = state.lock().await;
+        assert_eq!(state.load_requests, 2);
+        assert_eq!(state.loaded, vec![SWITCH_TEST_CANONICAL_TARGET]);
+    }
+
+    #[tokio::test]
+    async fn switch_runtime_model_keeps_unconfirmed_conflict_as_error() {
+        let (base, state, server) =
+            spawn_switch_test_server(&["old-model"], true, false, false).await;
+
+        let result =
+            switch_runtime_model(&base, "", "/models/target-model", SWITCH_TEST_TARGET, 1).await;
+
+        server.abort();
+        let error = result.unwrap_err();
+        assert!(error.contains("HTTP 409"), "unexpected error: {error}");
+        let state = state.lock().await;
+        assert_eq!(state.load_requests, 1);
+        assert!(state.loaded.is_empty());
     }
 
     #[test]
