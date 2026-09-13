@@ -56,8 +56,9 @@ use crate::providers::base::{FinishReason, LLMResponse, StreamChunk, ToolChoice}
 use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProviderResponse};
 
 use crate::agent::agent_core::{
-    apply_compaction_result, ExpansionCheckpoint, PendingCompaction, RuntimeCounters,
-    SessionRetirement, SharedCoreHandle, SwappableCore, ToolPresentationMode,
+    apply_compaction_result, prompt_prefix_len, ExpansionCheckpoint, PendingCompaction,
+    RuntimeCounters, SessionRetirement, SharedCoreHandle, StablePromptAnchor, SwappableCore,
+    ToolPresentationMode,
 };
 
 use super::{last_user_message, render_via_protocol, should_strip_tools_for_trio};
@@ -2981,9 +2982,10 @@ impl AgentLoopShared {
         candidate
     }
 
-    /// Install a finished compaction result only when it cannot invalidate a
-    /// warm cached prefix, or when the caller already made an explicit
-    /// checkpoint/reset. Otherwise leave the background result pending.
+    /// Install a finished LCM result at a safe checkpoint boundary. The swap
+    /// replaces only the conversation suffix after the immutable
+    /// system/developer prefix; cache bookkeeping is re-anchored to that
+    /// unchanged prefix instead of issuing a full prompt reset.
     async fn install_pending_compaction(
         &self,
         ctx: &mut TurnContext,
@@ -3026,78 +3028,35 @@ impl AgentLoopShared {
             return false;
         }
         // `pending` was moved out of the slot; the guard is only needed for the
-        // deferral put-back above. Drop it so the rewrite below can take
-        // `&mut ctx` (invalidate_prompt_cache_for_rewrite) without borrowing it.
+        // deferral put-back above. Drop it before the active-window swap.
         drop(guard);
 
-        // Always clear the prompt fingerprint/watermark before
-        // `apply_compaction_result` rewrites the wire. The old gate
-        // (`if rewrites_prompt`) compared the compaction RESULT to the
-        // SNAPSHOT — but `apply_compaction_result` rewrites the LIVE
-        // wire against the snapshot, which can diverge from the result
-        // comparison when the wire grew between trigger and install.
-        // The result: compaction installs without firing
-        // `prompt_cache_watermark_invalidated_by_lcm_checkpoint`, and
-        // the next iteration's fingerprint check sees the rewritten
-        // prefix as an unsanctioned `Diverged` (cache reset, ~60s
-        // re-prefill on Higgs). Clearing unconditionally is safe —
-        // worst case the fingerprint was already cleared and this is a
-        // no-op; the next call recomputes it as `First` instead of
-        // `AppendOnly` (a one-time cheap re-prefill, not an unsanctioned
-        // divergence).
+        // LCM changes only the suffix after the stable system/developer
+        // prefix. Keep an exact prefix anchor while rotating the retained
+        // session id: the old id cannot accept a shorter prompt, but the
+        // provider's content-addressed prefix cache can reuse unchanged bytes.
+        let snapshot_watermark = pending.watermark();
+        let current_prefix_len = prompt_prefix_len(&ctx.messages);
+        let snapshot_prefix_len = prompt_prefix_len(&pending.snapshot);
+        let stable_prefix_unchanged = current_prefix_len == snapshot_prefix_len
+            && ctx.messages[..current_prefix_len] == pending.snapshot[..snapshot_prefix_len];
         let higgs_capable =
             ctx.core.mode().is_local() && ctx.core.provider.supports_higgs_session_cache();
-        let rotated = if higgs_capable {
-            let frozen_tool_hash = ctx
-                .counters
-                .prompt_tool_hashes
-                .lock()
-                .get(&ctx.session_key)
-                .copied()
-                .unwrap_or(0);
-            let checkpoint_context = ctx.counters.expansion_checkpoint_context(
-                &ctx.session_key,
-                &ctx.core.model,
-                frozen_tool_hash,
-                RuntimeCounters::now_epoch_ms().saturating_add(300_000),
-            );
-            let retirement = checkpoint_context
-                .and_then(|context| pending.expansion_retirement(context))
-                .unwrap_or(SessionRetirement::Drop);
-            ctx.counters
-                .retire_higgs_session(&ctx.session_key, retirement);
-            ctx.counters
-                .note_cache_reset(&ctx.session_key, CacheResetReason::LcmCheckpoint.as_wire());
-            send_cache_reset_marker(&ctx.text_delta_tx, CacheResetReason::LcmCheckpoint);
-            true
-        } else {
-            invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::LcmCheckpoint)
-        };
-        if rotated {
-            warn!(
-                session = %ctx.session_key,
-                frozen_prefix,
-                compacted_messages = pending.result.messages.len(),
-                watermark = pending.watermark(),
-                "prompt_cache_watermark_invalidated_by_lcm_checkpoint"
-            );
-        } else {
-            // Even without Higgs session rotation, the local fingerprint
-            // clear happened. Log at INFO so this path is visible in the
-            // daemon log without WARN filtering.
-            info!(
-                session = %ctx.session_key,
-                compacted_messages = pending.result.messages.len(),
-                watermark = pending.watermark(),
-                "prompt_cache_cleared_for_lcm_checkpoint_no_rotation"
-            );
-        }
+        let frozen_tool_hash = ctx
+            .counters
+            .prompt_tool_hashes
+            .lock()
+            .get(&ctx.session_key)
+            .copied()
+            .unwrap_or(0);
+        // The compacted checkpoint is already losslessly recoverable via
+        // lcm_expand. Do not retain a second full-history Higgs lease.
 
         debug!(
             "Compaction swap: {} msgs -> {} compacted + {} new",
-            pending.watermark(),
+            snapshot_watermark,
             pending.result.messages.len(),
-            ctx.messages.len().saturating_sub(pending.watermark())
+            ctx.messages.len().saturating_sub(snapshot_watermark)
         );
         // Record stats for `/lcm stats`: tokens of the replaced prefix vs its
         // compacted form (estimates, same estimator as budget accounting).
@@ -3112,6 +3071,69 @@ impl AgentLoopShared {
             return false;
         };
         ctx.messages.install(swapped);
+
+        // Re-anchor on the bytes that are actually stable after the swap.
+        // This keeps the next comparison append-only and makes the provider's
+        // prefill estimate equal to the summary/current-turn suffix.
+        let stable_logical_len = ctx
+            .messages
+            .iter()
+            .take_while(|message| {
+                matches!(
+                    message.get("role").and_then(Value::as_str),
+                    Some("system" | "developer")
+                )
+            })
+            .count();
+        let rendered = render_via_protocol(&*ctx.protocol, &ctx.messages);
+        let stable_rendered_len = rendered
+            .iter()
+            .take_while(|message| {
+                matches!(
+                    message.get("role").and_then(Value::as_str),
+                    Some("system" | "developer")
+                )
+            })
+            .count();
+        let anchor = StablePromptAnchor {
+            fingerprint: crate::agent::prompt_fingerprint::fingerprint(
+                &rendered[..stable_rendered_len],
+            ),
+            watermark: stable_logical_len,
+            tool_hash: frozen_tool_hash,
+        };
+        if !stable_prefix_unchanged {
+            let rotated = invalidate_prompt_cache_for_rewrite(ctx, CacheResetReason::LcmCheckpoint);
+            warn!(
+                session = %ctx.session_key,
+                frozen_prefix,
+                rotated,
+                "lcm_checkpoint_prefix_changed — sanctioned cache reset"
+            );
+        } else if higgs_capable {
+            ctx.counters.retire_higgs_session_preserving_prefix(
+                &ctx.session_key,
+                SessionRetirement::Drop,
+                anchor,
+            );
+            info!(
+                session = %ctx.session_key,
+                frozen_prefix,
+                compacted_messages = ctx.messages.len(),
+                watermark = stable_logical_len,
+                "lcm_checkpoint_preserved_prompt_prefix"
+            );
+        } else {
+            ctx.counters
+                .reanchor_local_prompt_cache(&ctx.session_key, anchor);
+            info!(
+                session = %ctx.session_key,
+                frozen_prefix,
+                compacted_messages = ctx.messages.len(),
+                watermark = stable_logical_len,
+                "lcm_checkpoint_preserved_local_prompt_prefix"
+            );
+        }
         // Compaction rewrites only the in-memory active window. Raw protocol
         // messages remain durable in SQLite and are identified by `_db_id`.
         ctx.new_start = ctx.messages.len();

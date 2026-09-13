@@ -569,31 +569,12 @@ fn test_rebuild_from_db_nodes_preserves_summaries() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Prefix-preserving compaction: the kept verbatim head of the compacted
-// block stays byte-identical so the server-side prompt cache retains its
-// prefix, and the summary is inserted AT the cut point (not at the head).
+// Stable-prefix compaction: the immutable system prompt stays byte-identical,
+// while old conversation history is replaced by one bounded checkpoint.
 // ─────────────────────────────────────────────────────────────
 
-fn rendered_prefix_tokens(engine: &LcmEngine) -> (Vec<Value>, usize) {
-    let mut rendered = Vec::new();
-    let mut tokens = 0usize;
-    for entry in engine.active_entries() {
-        let message = entry.message().clone();
-        tokens += TokenBudget::estimate_message_tokens(&message);
-        rendered.push(message);
-    }
-    (rendered, tokens)
-}
-
-fn longest_common_prefix_len(a: &[Value], b: &[Value]) -> usize {
-    a.iter()
-        .zip(b.iter())
-        .take_while(|(x, y)| x == y)
-        .count()
-}
-
 #[tokio::test]
-async fn test_compaction_keeps_verbatim_prefix_head() {
+async fn test_compaction_keeps_stable_system_prefix_and_current_tail() {
     let mut engine = LcmEngine::new(LcmConfig {
         tau_soft: 0.3,
         tau_hard: 0.6,
@@ -606,9 +587,30 @@ async fn test_compaction_keeps_verbatim_prefix_head() {
         ingest(&mut engine, 2 + 2 * i, "user", &user_turn(i));
         ingest(&mut engine, 3 + 2 * i, "assistant", &assistant_turn(i));
     }
-
-    let (before, _before_tokens) = rendered_prefix_tokens(&engine);
-    let before_tokens = TokenBudget::estimate_tokens(&before);
+    let before_tokens = TokenBudget::estimate_tokens(
+        &engine
+            .active_entries()
+            .iter()
+            .map(|entry| entry.message().clone())
+            .collect::<Vec<_>>(),
+    );
+    let current_user = json!({
+        "role": "user",
+        "content": "CURRENT_TURN_TAIL user request",
+        "_db_id": 100,
+    });
+    let current_assistant = json!({
+        "role": "assistant",
+        "content": "CURRENT_TURN_TAIL assistant response",
+        "_db_id": 101,
+    });
+    ingest(&mut engine, 100, "user", "CURRENT_TURN_TAIL user request");
+    ingest(
+        &mut engine,
+        101,
+        "assistant",
+        "CURRENT_TURN_TAIL assistant response",
+    );
 
     let budget = TokenBudget::new(4096, 2048);
     let compactor = ContextCompactor::new(
@@ -631,47 +633,28 @@ async fn test_compaction_keeps_verbatim_prefix_head() {
         _ => panic!("Expected Summary"),
     };
 
-    let (after, _after_tokens) = rendered_prefix_tokens(&engine);
-
-    // 1. The summary must NOT sit at the head of history: the kept verbatim
-    //    head precedes it and is byte-identical to the original.
-    let common = longest_common_prefix_len(&before, &after);
-    assert!(
-        common >= 3,
-        "expected a multi-message verbatim prefix, common={common}"
-    );
-    assert!(
-        !after[common..].iter().any(|m| m == &before[common]),
-        "divergence expected at the cut point"
-    );
-
-    // 2. The divergence point is the summary message (summary at the cut,
-    //    not at the head of history).
-    let cut_message = &after[common];
-    let cut_is_summary = cut_message.get("_lcm_summary").is_some();
-    assert!(
-        cut_is_summary,
-        "expected the summary at the cut point, got {cut_message}"
-    );
-
-    // 3. The summarized span's sources exclude the kept head: source ids of
-    //    the summary must all be strictly greater than the last kept db id.
-    let kept_db_ids: Vec<usize> = before[..common]
+    let after: Vec<Value> = engine
+        .active_entries()
         .iter()
-        .filter_map(|m| m.get("_db_id").and_then(Value::as_u64))
-        .map(|v| v as usize)
+        .map(|entry| entry.message().clone())
         .collect();
-    if let Some(&last_kept) = kept_db_ids.last() {
-        assert!(
-            summary_source_ids.iter().all(|id| *id > last_kept),
-            "summary must cover only the summarized tail, sources={summary_source_ids:?} last_kept={last_kept}"
-        );
-    }
-
-    // 4. Context actually shrank.
-    let after_tokens = TokenBudget::estimate_tokens(&after);
-    assert!(
-        after_tokens < before_tokens,
-        "compaction must shrink context: {before_tokens} -> {after_tokens}"
+    assert_eq!(
+        after.first(),
+        Some(&json!({
+            "role": "system",
+            "content": "System",
+            "_db_id": 1,
+        }))
     );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|message| message.get("_lcm_summary").is_some())
+            .count(),
+        1
+    );
+    assert!(after.contains(&current_user));
+    assert!(after.contains(&current_assistant));
+    assert!(summary_source_ids.iter().all(|id| *id < 100));
+    assert!(TokenBudget::estimate_tokens(&after) < before_tokens);
 }

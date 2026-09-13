@@ -2136,7 +2136,7 @@ fn default_lcm_tau_hard() -> f64 {
 }
 
 fn default_lcm_deterministic_target() -> usize {
-    512
+    2_048
 }
 
 fn default_lcm_keep_prefix_fraction() -> f64 {
@@ -2160,12 +2160,11 @@ pub struct LcmSchemaConfig {
     /// Triggers blocking compaction. Default: 0.85 (85%).
     #[serde(default = "default_lcm_tau_hard")]
     pub tau_hard: f64,
-    /// Target tokens for Level 3 deterministic truncation (default: 512).
+    /// Maximum tokens for one deterministic LCM checkpoint (default: 2048).
     #[serde(default = "default_lcm_deterministic_target")]
     pub deterministic_target: usize,
-    /// Fraction of the oldest compactable block kept verbatim at the head of
-    /// history so the server-side prompt cache retains its prefix across
-    /// compactions (summary inserted at the cut point). Default: 0.35.
+    /// Deprecated compatibility field. Pressure folds now keep only the
+    /// immutable system/developer prefix; this value is ignored. Default: 0.35.
     #[serde(default = "default_lcm_keep_prefix_fraction")]
     pub keep_prefix_fraction: f64,
 }
@@ -3329,7 +3328,7 @@ mod tests {
         let lcm = LcmSchemaConfig::default();
         assert!((lcm.tau_soft - 0.5).abs() < f64::EPSILON);
         assert!((lcm.tau_hard - 0.85).abs() < f64::EPSILON);
-        assert_eq!(lcm.deterministic_target, 512);
+        assert_eq!(lcm.deterministic_target, 2_048);
     }
 
     #[test]
@@ -3351,7 +3350,7 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!((cfg.lcm.tau_soft - 0.7).abs() < f64::EPSILON);
         assert!((cfg.lcm.tau_hard - 0.9).abs() < f64::EPSILON);
-        assert_eq!(cfg.lcm.deterministic_target, 512); // default
+        assert_eq!(cfg.lcm.deterministic_target, 2_048); // default
     }
 
     #[test]

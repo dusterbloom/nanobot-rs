@@ -478,11 +478,8 @@ pub struct LcmConfig {
     pub tau_hard: f64,
     /// Maximum target for the bounded deterministic recovery index.
     pub deterministic_target: usize,
-    /// Fraction of the oldest compactable block kept verbatim at the head of
-    /// history, with the summary inserted at the cut point. The server-side
-    /// prompt cache then retains the longest common prefix and the next
-    /// request only re-prefills from the cut instead of the whole rewritten
-    /// context. 0.0 restores head-rewriting compaction. Default: 0.35.
+    /// Deprecated compatibility field. Pressure folds now keep only the
+    /// immutable system/developer prefix; this value is ignored. Default: 0.35.
     pub keep_prefix_fraction: f64,
 }
 
@@ -491,7 +488,7 @@ impl Default for LcmConfig {
         Self {
             tau_soft: 0.5,
             tau_hard: 0.85,
-            deterministic_target: 512,
+            deterministic_target: 2_048,
             keep_prefix_fraction: 0.35,
         }
     }
@@ -512,15 +509,6 @@ impl From<&LcmSchemaConfig> for LcmConfig {
 /// matching the production protect target so post-compaction lands ~1–2k).
 #[cfg(test)]
 const DEFAULT_PROTECT_TOKENS: usize = 1024;
-
-/// Merge accumulated summaries once their mass becomes material to the prompt.
-const SUMMARY_MERGE_BUDGET_FRACTION: f64 = 0.25;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BlockSelection {
-    AppendOnly,
-    MergeSummaries,
-}
 
 /// Token budget for the recent raw messages kept verbatim (not summarized),
 /// scaled to the available context. ~5% of the budget, clamped to [512, 2048]:
@@ -796,18 +784,11 @@ impl LcmEngine {
         failure_mode: CompactionFailureMode,
     ) -> Option<Turn> {
         let available = budget.available_budget(tool_def_tokens);
-        // Cache reuse cannot make durable history permanently uncompactable:
-        // either compaction mode may run after the live envelope contracts.
-        // Ignore the pin under pressure, committing its release only with the
-        // new summary so a failed attempt preserves the previous projection.
-        let preserve_prefix = self.conversation_tokens() <= available;
-        let pinned_prefix = if preserve_prefix {
-            self.pinned_prefix_entries
-        } else {
-            0
-        };
+        // The system/developer prefix is immutable. Everything after it is
+        // eligible for one fold; preserving an arbitrary historical head only
+        // moves the divergence earlier on the next compaction.
         self.pending_pinned_prefix = None;
-        let target = (available as f64 * self.config.tau_soft * 0.8) as usize;
+        let target = self.config.deterministic_target.max(1);
 
         // Token-budgeted protection: keep ~1k tokens of the most recent raw
         // turns verbatim (the rest summarized), so post-compaction active
@@ -816,28 +797,18 @@ impl LcmEngine {
         // (matters when messages are small relative to the protect target).
         let protect_tokens =
             protect_tokens_for_budget(available).min(self.conversation_tokens().max(1) / 2);
-        let selection = self.block_selection(available);
 
         // Find the oldest contiguous block of raw messages to compact. The
-        // pinned head is exempt: keeping it byte-identical is what lets the
-        // server-side prompt cache retain the prefix across compactions.
-        let (mut block_start, mut block_end) =
-            match self.find_oldest_raw_block_impl(protect_tokens, selection) {
-                Some((start, end)) => (start.max(pinned_prefix), end),
-                None => (0, 0),
-            };
-        // Inside AppendOnly selection a Summary entry is a span boundary:
-        // past the pin, the span starts at the first raw entry so a new
-        // summary APPENDS instead of dropping a prior one unmerged.
-        if selection == BlockSelection::AppendOnly {
-            while block_start < block_end
-                && matches!(&self.active[block_start], ContextEntry::Summary { .. })
-            {
-                block_start += 1;
-            }
-        }
+        // stable system/developer prefix is exempt; summaries are included so
+        // repeated pressure replaces one checkpoint instead of accumulating
+        // a chain of warm-but-growing summaries.
+        let (mut block_start, mut block_end) = match self.find_oldest_raw_block_impl(protect_tokens)
+        {
+            Some((start, end)) => (start, end),
+            None => (0, 0),
+        };
         if block_start >= block_end {
-            debug!("LCM: no compactable block outside the pinned prefix");
+            debug!("LCM: no compactable block outside the stable prefix");
             self.async_compaction_pending = false;
             return None;
         }
@@ -905,70 +876,18 @@ impl LcmEngine {
             );
         }
 
-        // Prefix-preserving cut: keep a verbatim head of the block so the
-        // server-side prompt cache retains the longest common prefix and the
-        // next request only re-prefills from the cut point (summary + recent
-        // tail) instead of the whole rewritten context. The cut snaps back
-        // to the largest complete-turn boundary at or before the target
-        // fraction, so no tool-call carrier is separated from its result;
-        // with no usable boundary the block compacts whole (the previous
-        // head-rewriting behavior).
-        let mut pre_cut_block_tokens = 0usize;
-        if block_end > block_start {
-            let mut prefix_tokens = Vec::with_capacity(block_end - block_start + 1);
-            prefix_tokens.push(0usize);
-            for entry in &self.active[block_start..block_end] {
-                let last = prefix_tokens.last().copied().unwrap_or(0);
-                prefix_tokens.push(last + TokenBudget::estimate_message_tokens(entry.message()));
-            }
-            let block_token_total = prefix_tokens.last().copied().unwrap_or(0);
-            pre_cut_block_tokens = block_token_total;
-            // A pinned head is exempt from further cuts: they would only
-            // churn the wire mid-span without deepening cache reuse.
-            let head_already_pinned = self.pinned_prefix_entries > 0;
-            if preserve_prefix && self.config.keep_prefix_fraction > 0.0 && !head_already_pinned {
-                let keep_target_tokens = (block_token_total as f64
-                    * self.config.keep_prefix_fraction.clamp(0.0, 0.9))
-                    as usize;
-                let mut cut = block_start;
-                for len in self.complete_compaction_boundaries(block_start, block_end) {
-                    // The cut must leave a tail to summarize — a boundary covering
-                    // the whole block defeats the purpose.
-                    if len >= block_end - block_start {
-                        break;
-                    }
-                    if prefix_tokens[len] <= keep_target_tokens {
-                        cut = block_start + len;
-                    } else {
-                        break;
-                    }
-                }
-                // A Summary entry must never be kept verbatim in the head: it
-                // would never merge, and summary mass would grow unbounded across
-                // compactions. Collapse the cut to the first summary so it is
-                // folded (merged) with the tail.
-                if cut > block_start {
-                    if let Some(first_summary) = (block_start..cut)
-                        .find(|&i| matches!(&self.active[i], ContextEntry::Summary { .. }))
-                    {
-                        cut = first_summary;
-                    }
-                }
-                if cut > block_start {
-                    debug!(
-                        kept_messages = cut - block_start,
-                        kept_tokens = prefix_tokens[cut - block_start],
-                        "LCM: keeping verbatim prefix head for cache reuse"
-                    );
-                    block_start = cut;
-                    self.pending_pinned_prefix = Some(cut);
-                }
-            }
-        }
+        // The whole eligible span is summarized in one pass. This is the key
+        // cache invariant: after the swap, the only changed bytes are the
+        // compact checkpoint and the protected current-turn tail; the stable
+        // system/developer prefix remains byte-identical.
+        let mut retired_wire_tokens = self.active[block_start..block_end]
+            .iter()
+            .map(|entry| TokenBudget::estimate_message_tokens(entry.message()))
+            .sum::<usize>();
 
         // Collect messages and source ids from the block. Merge mode may
-        // include prior Summary entries; append mode never does. Entries are
-        // taken whole — never a partial child summary's row subset.
+        // include prior Summary entries. Entries are taken whole — never a
+        // partial child summary's row subset.
         let mut source_ids: Vec<MessageId> = Vec::new();
         let mut block_messages = Vec::new();
         let mut merged_node_ids: Vec<usize> = Vec::new();
@@ -995,14 +914,14 @@ impl LcmEngine {
             return None;
         }
 
-        let mut block_tokens = TokenBudget::estimate_tokens(&block_messages);
+        let block_tokens = TokenBudget::estimate_tokens(&block_messages);
 
         // Skip compaction when the block is too small to be worth an LLM call.
         // An LLM summarization of <200 tokens wastes more GPU time than it saves.
         // The floor gates only model-driven compaction; the deterministic
         // fold needs no provider request and proceeds whenever its wire shrinks.
         const MIN_COMPACTION_TOKENS: usize = 200;
-        if pre_cut_block_tokens.max(block_tokens) < MIN_COMPACTION_TOKENS
+        if retired_wire_tokens.max(block_tokens) < MIN_COMPACTION_TOKENS
             && failure_mode == CompactionFailureMode::PreserveContext
         {
             self.async_compaction_pending = false;
@@ -1027,97 +946,79 @@ impl LcmEngine {
             }
             _ => Ok(None),
         };
-        let (summary_text, fresh_manifest, level) = match model_summary {
-            Ok(Some(summary)) => summary,
-            Ok(None) | Err(_) => {
-                // Boundary-safe shrink over the candidate: retry earlier
-                // complete boundaries with the entire active prefix
-                // recollected, never a partial child summary's row subset.
-                let mut installed = None;
-                for len in self
-                    .complete_compaction_boundaries(block_start, candidate_end)
-                    .into_iter()
-                    .rev()
-                {
-                    let end = block_start + len;
-                    let mut ids = Vec::new();
-                    let mut msgs = Vec::new();
-                    let mut merged = Vec::new();
-                    let mut raws = 0usize;
-                    self.collect_compaction_span(
-                        block_start,
-                        end,
-                        &mut ids,
-                        &mut msgs,
-                        &mut merged,
-                        &mut raws,
-                    );
-                    if raws == 0 || msgs.is_empty() {
-                        continue;
-                    }
-                    let tokens = TokenBudget::estimate_tokens(&msgs);
-                    let mut unique_ids = ids.clone();
-                    unique_ids.sort_unstable();
-                    unique_ids.dedup();
-                    let recovery: Option<Vec<(MessageId, Value)>> = unique_ids
+        let model_summary = match model_summary {
+            Ok(Some((text, fresh_manifest, level))) => {
+                let manifest = if level == 0 {
+                    SummaryManifest::default()
+                } else {
+                    let child_manifests: Vec<SummaryManifest> = merged_node_ids
                         .iter()
-                        .map(|id| self.store.get(id).cloned().map(|message| (*id, message)))
+                        .filter_map(|node_id| self.dag.get(*node_id))
+                        .map(|node| node.manifest.clone())
                         .collect();
-                    let Some(recovery) = recovery else {
-                        continue;
-                    };
-                    let retired_wire_tokens = self.active[block_start..end]
-                        .iter()
-                        .map(|entry| TokenBudget::estimate_message_tokens(entry.message()))
-                        .sum();
-                    if let Some(index) = deterministic_recovery_index(
-                        &ids,
-                        &recovery,
-                        retired_wire_tokens,
-                        self.config.deterministic_target,
-                    ) {
-                        block_end = end;
-                        block_tokens = tokens;
-                        source_ids = ids;
-                        merged_node_ids = merged;
-                        installed = Some((index, SummaryManifest::default(), 0));
-                        break;
-                    }
-                }
-                let Some(index) = installed else {
-                    self.async_compaction_pending = false;
-                    return None;
+                    let mut manifest_parts: Vec<&SummaryManifest> =
+                        child_manifests.iter().collect();
+                    manifest_parts.push(&fresh_manifest);
+                    SummaryManifest::merge(&manifest_parts)
                 };
-                index
+                if model_summary_fits_checkpoint(
+                    &source_ids,
+                    &text,
+                    &manifest,
+                    level,
+                    target,
+                    retired_wire_tokens,
+                ) {
+                    Some((text, manifest, level))
+                } else {
+                    let wire = summary_wire_message(&source_ids, &text, &manifest, level);
+                    info!(
+                        summary_wire_tokens = TokenBudget::estimate_message_tokens(&wire),
+                        target,
+                        retired_wire_tokens,
+                        "LCM model summary is not a smaller bounded checkpoint; using deterministic index"
+                    );
+                    None
+                }
             }
+            Ok(None) | Err(_) => None,
         };
-
-        let manifest = if level == 0 {
-            SummaryManifest::default()
+        let (summary_text, manifest, level) = if let Some(summary) = model_summary {
+            summary
         } else {
-            let child_manifests: Vec<SummaryManifest> = merged_node_ids
+            let Some((end, _tokens, ids, _merged, index)) =
+                self.deterministic_compaction_fallback(block_start, candidate_end, target)
+            else {
+                self.async_compaction_pending = false;
+                return None;
+            };
+            block_end = end;
+            source_ids = ids;
+            retired_wire_tokens = self.active[block_start..block_end]
                 .iter()
-                .filter_map(|node_id| self.dag.get(*node_id))
-                .map(|node| node.manifest.clone())
-                .collect();
-            let mut manifest_parts: Vec<&SummaryManifest> = child_manifests.iter().collect();
-            manifest_parts.push(&fresh_manifest);
-            SummaryManifest::merge(&manifest_parts)
+                .map(|entry| TokenBudget::estimate_message_tokens(entry.message()))
+                .sum();
+            (index, SummaryManifest::default(), 0)
         };
-        let summary_tokens = TokenBudget::estimate_str_tokens(&summary_text);
 
-        // Only accept if summary is smaller than original.
-        if summary_tokens >= block_tokens {
+        let summary_wire = summary_wire_message(&source_ids, &summary_text, &manifest, level);
+        let summary_wire_tokens = TokenBudget::estimate_message_tokens(&summary_wire);
+        if summary_wire_tokens > target || summary_wire_tokens >= retired_wire_tokens {
+            info!(
+                summary_wire_tokens,
+                target,
+                retired_wire_tokens,
+                "LCM checkpoint did not shrink the retired wire; leaving context unchanged"
+            );
             self.async_compaction_pending = false;
             return None;
         }
-
         info!(
-            "LCM: compacted {} -> {} tokens (level {}, {:.0}% reduction)",
-            block_tokens,
-            summary_tokens,
+            "LCM: compacted {} -> {} wire tokens (level {}, {:.0}% reduction)",
+            retired_wire_tokens,
+            summary_wire_tokens,
             level,
-            (1.0 - summary_tokens as f64 / block_tokens as f64) * 100.0
+            (1.0 - summary_wire_tokens as f64 / retired_wire_tokens as f64) * 100.0
         );
 
         // Create summary node in DAG, recording the subsumed children so the
@@ -1159,11 +1060,19 @@ impl LcmEngine {
         }
         self.active = new_active;
         self.async_compaction_pending = false;
-        if !preserve_prefix {
-            self.pinned_prefix_entries = 0;
-        } else if let Some(pin) = self.pending_pinned_prefix.take() {
-            self.pinned_prefix_entries = self.pinned_prefix_entries.max(pin);
-        }
+        self.pending_pinned_prefix = None;
+        self.pinned_prefix_entries = self
+            .active
+            .iter()
+            .take_while(|entry| {
+                matches!(
+                    entry,
+                    ContextEntry::Raw { message, .. }
+                        if matches!(message.get("role").and_then(Value::as_str),
+                            Some("system" | "developer"))
+                )
+            })
+            .count();
 
         Some(Turn::Summary {
             text: summary_text,
@@ -1280,10 +1189,63 @@ impl LcmEngine {
         complete_boundaries
     }
 
-    /// Select the largest oldest prefix whose complete model request fits.
-    /// A prefix never ends between an assistant tool call and its recorded
-    /// results. If no useful complete prefix fits, the caller preserves all
-    /// raw entries so a later compaction can retry without losing evidence.
+    /// Build the one deterministic replacement for a selected span. If the
+    /// full span's mandatory receipt cannot fit, walk back only to a complete
+    /// boundary; never install an over-budget or half-tool checkpoint.
+    fn deterministic_compaction_fallback(
+        &self,
+        block_start: usize,
+        candidate_end: usize,
+        target: usize,
+    ) -> Option<(usize, usize, Vec<MessageId>, Vec<usize>, String)> {
+        for len in self
+            .complete_compaction_boundaries(block_start, candidate_end)
+            .into_iter()
+            .rev()
+        {
+            let end = block_start + len;
+            let mut ids = Vec::new();
+            let mut msgs = Vec::new();
+            let mut merged = Vec::new();
+            let mut raws = 0usize;
+            self.collect_compaction_span(
+                block_start,
+                end,
+                &mut ids,
+                &mut msgs,
+                &mut merged,
+                &mut raws,
+            );
+            if raws == 0 || msgs.is_empty() {
+                continue;
+            }
+            let tokens = TokenBudget::estimate_tokens(&msgs);
+            let mut unique_ids = ids.clone();
+            unique_ids.sort_unstable();
+            unique_ids.dedup();
+            let recovery: Option<Vec<(MessageId, Value)>> = unique_ids
+                .iter()
+                .map(|id| self.store.get(id).cloned().map(|message| (*id, message)))
+                .collect();
+            let Some(recovery) = recovery else {
+                continue;
+            };
+            let retired_wire_tokens = self.active[block_start..end]
+                .iter()
+                .map(|entry| TokenBudget::estimate_message_tokens(entry.message()))
+                .sum();
+            if let Some(index) =
+                deterministic_recovery_index(&ids, &recovery, retired_wire_tokens, target)
+            {
+                return Some((end, tokens, ids, merged, index));
+            }
+        }
+        None
+    }
+
+    /// Check whether the complete eligible span fits one model request.
+    /// Partial model folds are deliberately not allowed: they would leave a
+    /// rewritten historical prefix behind and make the next checkpoint colder.
     fn largest_fitting_compaction_end(
         &self,
         block_start: usize,
@@ -1295,74 +1257,31 @@ impl LcmEngine {
             messages.push(self.compaction_input_message(&self.active[index]));
         }
         let complete_boundaries = self.complete_compaction_boundaries(block_start, block_end);
-
-        let &last_complete = complete_boundaries.last()?;
-        if last_complete == messages.len()
+        if complete_boundaries.last().copied() == Some(messages.len())
             && compactor.lcm_request_fits(&messages, "preserve_details")
         {
             return Some(block_end);
         }
-
-        // Request cost is monotonic as messages are appended. Binary-search
-        // the complete boundaries so a large block needs O(log n) transcript
-        // tokenizations instead of rebuilding every growing prefix.
-        let mut low = 0usize;
-        let mut high = complete_boundaries.len();
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let boundary = complete_boundaries[mid];
-            if compactor.lcm_request_fits(&messages[..boundary], "preserve_details") {
-                low = mid + 1;
-            } else {
-                high = mid;
-            }
-        }
-
-        (low > 0).then(|| block_start + complete_boundaries[low - 1])
+        None
     }
 
-    fn block_selection(&self, available: usize) -> BlockSelection {
-        let summary_tokens = self
-            .active
-            .iter()
-            .filter_map(|entry| match entry {
-                ContextEntry::Summary { node_id, .. } => {
-                    self.dag.get(*node_id).map(|node| node.tokens)
-                }
-                ContextEntry::Raw { .. } => None,
-            })
-            .fold(0usize, usize::saturating_add);
-
-        if summary_tokens as f64 > available as f64 * SUMMARY_MERGE_BUDGET_FRACTION {
-            BlockSelection::MergeSummaries
-        } else {
-            BlockSelection::AppendOnly
-        }
-    }
-
-    /// Find the block to compact: either the oldest raw-only run or everything
-    /// from the first compactible entry up to the recent-protect boundary.
-    ///
-    /// `AppendOnly` leaves existing summaries byte-stable at the prompt front.
-    /// `MergeSummaries` includes them in the block, bounding summary mass by
-    /// replacing all accumulated summaries with one new node.
+    /// Find everything after the stable system/developer prefix up to the
+    /// recent-protect boundary. Existing summaries are included so repeated
+    /// pressure replaces one checkpoint instead of accumulating a chain.
     ///
     /// Protection is TOKEN-based (not message-count): walk back from the end
     /// accumulating tokens of real raw messages (2× for tool results, which are
     /// retrievable via recall_tool_result); the boundary where we cross
     /// `protect_tokens` is the oldest still-protected index. Summaries are
     /// compactible only in `MergeSummaries` mode.
-    fn find_oldest_raw_block_impl(
-        &self,
-        protect_tokens: usize,
-        selection: BlockSelection,
-    ) -> Option<(usize, usize)> {
+    fn find_oldest_raw_block_impl(&self, protect_tokens: usize) -> Option<(usize, usize)> {
         let start = (0..self.active.len()).find(|&i| match &self.active[i] {
             ContextEntry::Raw { message, .. } => {
                 let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                role != "system" && !crate::agent::markers::is_synthetic(message)
+                !matches!(role, "system" | "developer")
+                    && !crate::agent::markers::is_synthetic(message)
             }
-            ContextEntry::Summary { .. } => selection == BlockSelection::MergeSummaries,
+            ContextEntry::Summary { .. } => true,
         })?;
 
         // Protect the most recent RAW messages (token-based, 2× tool weighting).
@@ -1464,13 +1383,12 @@ impl LcmEngine {
         &self.active
     }
 
-    /// Find the oldest contiguous block of raw messages with an explicit
-    /// protect-token budget (for testing the token-based boundary).
+    /// Find the oldest contiguous block with an explicit protect-token budget.
     pub fn find_oldest_raw_block_with_tokens(
         &self,
         protect_tokens: usize,
     ) -> Option<(usize, usize)> {
-        self.find_oldest_raw_block_impl(protect_tokens, BlockSelection::AppendOnly)
+        self.find_oldest_raw_block_impl(protect_tokens)
     }
 
     /// Plan summaries that are relevant to the latest user message.
@@ -1962,7 +1880,7 @@ pub enum CompactionFailureMode {
 /// round rather than silently degrading it.
 async fn escalated_summary(
     messages: &[Value],
-    _target_tokens: usize,
+    target_tokens: usize,
     compactor: Option<&ContextCompactor>,
 ) -> Result<Option<(String, SummaryManifest, u8)>> {
     let original_tokens = TokenBudget::estimate_tokens(messages);
@@ -1971,6 +1889,7 @@ async fn escalated_summary(
         debug!("LCM escalation: no compactor available, leaving context uncompacted");
         return Ok(None);
     };
+    let compactor = compactor.with_summary_cap(target_tokens);
 
     // Level 1: Preserve details. Only a completed but insufficient summary may
     // escalate. A transport or fidelity-gate error is indeterminate and must
@@ -2124,6 +2043,19 @@ fn summary_is_acceptable(summary: &str, original_tokens: usize, level: u8) -> Re
         level, original_tokens, tokens
     );
     Ok(true)
+}
+
+fn model_summary_fits_checkpoint(
+    source_ids: &[MessageId],
+    text: &str,
+    manifest: &SummaryManifest,
+    level: u8,
+    target: usize,
+    retired_wire_tokens: usize,
+) -> bool {
+    let wire = summary_wire_message(source_ids, text, manifest, level);
+    let wire_tokens = TokenBudget::estimate_message_tokens(&wire);
+    wire_tokens <= target && wire_tokens < retired_wire_tokens
 }
 
 /// Check if text contains an LLM refusal pattern.
@@ -2365,6 +2297,51 @@ mod tests {
     }
 
     struct ManifestSummarizerMock;
+
+    struct GrowingManifestMock {
+        calls: Arc<AtomicUsize>,
+    }
+
+    fn growing_manifest_reply(index: usize) -> String {
+        let manifest = json!({
+            "open_loops": [{
+                "text": format!("Unique checkpoint state {index}"),
+                "sources": [index + 1]
+            }],
+            "failed_approaches": [],
+            "decisions": []
+        });
+        format!(
+            "- Preserve checkpoint state {index}.\n\n```json\n{}\n```",
+            manifest
+        )
+    }
+
+    #[async_trait]
+    impl LLMProvider for GrowingManifestMock {
+        async fn chat(
+            &self,
+            _messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<LLMResponse> {
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(LLMResponse {
+                content: Some(growing_manifest_reply(index)),
+                tool_calls: vec![],
+                finish_reason: FinishReason::Stop,
+                usage: std::collections::HashMap::new(),
+            })
+        }
+
+        fn get_default_model(&self) -> &str {
+            "mock-growing-manifest"
+        }
+    }
 
     #[async_trait]
     impl LLMProvider for ManifestSummarizerMock {
@@ -2739,11 +2716,8 @@ mod tests {
         bytes
     }
 
-    /// Append-by-default must still self-regulate: over a long run the engine
-    /// has to reach the merge threshold on its own and collapse accumulated
-    /// summaries, without a test forcing the mode. If `block_selection` never
-    /// returned `MergeSummaries`, summary mass would grow without bound and
-    /// every other compaction test would still pass.
+    /// Repeated pressure replaces the prior visible summary instead of
+    /// accumulating a summary chain in the active prompt.
     #[tokio::test]
     async fn summary_mass_stays_bounded_across_many_compactions() {
         let mut engine = LcmEngine::new(LcmConfig {
@@ -2759,8 +2733,6 @@ mod tests {
             16_384,
         );
         let body = "bounded summary mass over a long agentic session with many compactions ";
-        let ceiling = (budget.available_budget(0) as f64 * SUMMARY_MERGE_BUDGET_FRACTION) as usize;
-
         let summary_tokens = |engine: &LcmEngine| -> usize {
             engine
                 .active_entries()
@@ -2777,7 +2749,7 @@ mod tests {
         ingest(&mut engine, 1, "system", "System");
         let mut next_id = 2;
         let mut merge_observed = false;
-        let mut peak_mass = 0usize;
+        let mut peak_summary_count = 0usize;
 
         let summary_node_ids = |engine: &LcmEngine| -> Vec<usize> {
             engine
@@ -2814,6 +2786,7 @@ mod tests {
                 .await;
             let after = summary_tokens(&engine);
             let ids_after = summary_node_ids(&engine);
+            let summary_count = ids_after.len();
             eprintln!(
                 "round: summaries={} mass={} -> {}",
                 engine
@@ -2830,20 +2803,16 @@ mod tests {
             merge_observed |= ids_before != ids_after && ids_after.len() <= ids_before.len();
             // A merge is also the only way accumulated summary mass goes down.
             merge_observed |= after < before;
-            peak_mass = peak_mass.max(after);
+            peak_summary_count = peak_summary_count.max(summary_count);
         }
 
         assert!(
             merge_observed,
-            "engine never merged on its own across 120 compactions — summary mass \
-             is not self-regulating (peak {peak_mass} tokens, ceiling {ceiling})"
+            "engine never replaced the prior summary across 120 compactions"
         );
-        // One summary may push past the threshold before the next call merges,
-        // so the bound is the ceiling plus a single summary's worth.
-        let slack = ceiling * 2;
         assert!(
-            peak_mass <= slack,
-            "summary mass peaked at {peak_mass} tokens, unbounded past {slack}"
+            peak_summary_count <= 1,
+            "active context exposed more than one checkpoint: {peak_summary_count}"
         );
     }
 
@@ -3008,6 +2977,176 @@ mod tests {
             rebuilt.active_context(),
             "restart must preserve the complete live wire ordering"
         );
+    }
+
+    #[tokio::test]
+    async fn merged_model_checkpoint_is_bounded_after_manifest_merge() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            deterministic_target: 2_048,
+            ..LcmConfig::default()
+        });
+        let budget = TokenBudget::new(32_768, 0);
+        let compactor = ContextCompactor::new(
+            Arc::new(GrowingManifestMock {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            "mock".to_string(),
+            32_768,
+        );
+
+        ingest(&mut engine, 1, "system", "Stable system instructions.");
+        for i in 0..40 {
+            ingest(
+                &mut engine,
+                2 + 2 * i,
+                "user",
+                &format!("Earlier state {i}: {}", "durable context ".repeat(30)),
+            );
+            ingest(
+                &mut engine,
+                3 + 2 * i,
+                "assistant",
+                &format!("Earlier result {i}: {}", "verified outcome ".repeat(30)),
+            );
+        }
+        assert!(engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                0,
+                CompactionFailureMode::PreserveContext,
+            )
+            .await
+            .is_some());
+        let first = engine.dag().newest().unwrap().clone();
+        assert_eq!(first.level, 1);
+
+        for i in 0..40 {
+            ingest(
+                &mut engine,
+                100 + 2 * i,
+                "user",
+                &format!("New state {i}: {}", "durable context ".repeat(30)),
+            );
+            ingest(
+                &mut engine,
+                101 + 2 * i,
+                "assistant",
+                &format!("New result {i}: {}", "verified outcome ".repeat(30)),
+            );
+        }
+
+        let protect_tokens = protect_tokens_for_budget(budget.available_budget(0));
+        let (block_start, block_end) = engine
+            .find_oldest_raw_block_with_tokens(protect_tokens)
+            .expect("second fold must have a compactable block");
+        let mut source_ids = Vec::new();
+        let mut block_messages = Vec::new();
+        let mut merged_node_ids = Vec::new();
+        let mut raw_count = 0;
+        engine.collect_compaction_span(
+            block_start,
+            block_end,
+            &mut source_ids,
+            &mut block_messages,
+            &mut merged_node_ids,
+            &mut raw_count,
+        );
+        assert!(raw_count > 0);
+        let fresh_manifest = SummaryManifest {
+            open_loops: vec![ManifestItem {
+                text: "Unique checkpoint state 1".to_string(),
+                sources: vec![2],
+            }],
+            ..SummaryManifest::default()
+        };
+        let probe_text = "- Preserve checkpoint state 1.";
+        let fresh_wire = TokenBudget::estimate_message_tokens(&summary_wire_message(
+            &source_ids,
+            probe_text,
+            &fresh_manifest,
+            1,
+        ));
+        let merged_manifest = SummaryManifest::merge(&[&first.manifest, &fresh_manifest]);
+        let merged_wire = TokenBudget::estimate_message_tokens(&summary_wire_message(
+            &source_ids,
+            probe_text,
+            &merged_manifest,
+            1,
+        ));
+        assert!(
+            merged_wire > fresh_wire,
+            "fixture must make child manifest growth visible: fresh={fresh_wire}, merged={merged_wire}"
+        );
+        engine.config.deterministic_target = fresh_wire;
+
+        let result = engine
+            .compact(
+                Some(&compactor),
+                &budget,
+                0,
+                CompactionFailureMode::PreserveContext,
+            )
+            .await
+            .expect("unsafe model checkpoint should use deterministic fallback");
+        let Turn::Summary { level, .. } = result else {
+            panic!("expected summary turn");
+        };
+        assert_eq!(
+            level, 0,
+            "merged model wire must fall back when it exceeds target"
+        );
+        let node = engine.dag().newest().unwrap();
+        let wire = engine
+            .active_entries()
+            .iter()
+            .find_map(|entry| match entry {
+                ContextEntry::Summary { node_id, message } if *node_id == node.id => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .expect("replacement summary must be active");
+        assert!(TokenBudget::estimate_message_tokens(&wire) <= fresh_wire);
+    }
+
+    #[test]
+    fn model_summary_acceptance_checks_rendered_wire_and_retired_size() {
+        let manifest = SummaryManifest {
+            open_loops: vec![ManifestItem {
+                text: "A rendered manifest item".to_string(),
+                sources: vec![7],
+            }],
+            ..SummaryManifest::default()
+        };
+        let text = "A short semantic summary.";
+        let wire_tokens =
+            TokenBudget::estimate_message_tokens(&summary_wire_message(&[7], text, &manifest, 1));
+
+        assert!(model_summary_fits_checkpoint(
+            &[7],
+            text,
+            &manifest,
+            1,
+            wire_tokens,
+            wire_tokens + 1,
+        ));
+        assert!(!model_summary_fits_checkpoint(
+            &[7],
+            text,
+            &manifest,
+            1,
+            wire_tokens,
+            wire_tokens,
+        ));
+        assert!(!model_summary_fits_checkpoint(
+            &[7],
+            text,
+            &manifest,
+            1,
+            wire_tokens,
+            wire_tokens - 1,
+        ));
     }
 
     #[test]
@@ -3417,9 +3556,6 @@ mod tests {
             next_id += 1;
         }
 
-        let compactible = engine
-            .find_oldest_raw_block_with_tokens(512)
-            .expect("fixture must have a compactible block");
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let compactor = ContextCompactor::new(
             Arc::new(RecordingSummarizerMock {
@@ -3437,7 +3573,7 @@ mod tests {
                 CompactionFailureMode::PreserveContext,
             )
             .await
-            .expect("an old prefix should fit even when the full block does not");
+            .expect("the full fold should fall back to a bounded deterministic index");
         let Turn::Summary {
             source_ids, level, ..
         } = summary
@@ -3445,12 +3581,12 @@ mod tests {
             panic!("expected summary turn");
         };
 
-        assert!(matches!(level, 1 | 2));
-        assert_eq!(requests.lock().unwrap().len(), 1);
-        assert!(
-            source_ids.len() < compactible.1 - compactible.0,
-            "only the model-covered prefix may be retired"
+        assert_eq!(
+            level, 0,
+            "an over-capacity full request uses the deterministic index"
         );
+        assert_eq!(requests.lock().unwrap().len(), 0);
+        assert!(!source_ids.is_empty(), "the checkpoint must cover history");
         assert!(
             engine.active_context().len() > 1,
             "unsummarized suffix must remain raw"
@@ -3633,8 +3769,7 @@ mod tests {
             );
         }
 
-        let block =
-            engine.find_oldest_raw_block_impl(DEFAULT_PROTECT_TOKENS, BlockSelection::AppendOnly);
+        let block = engine.find_oldest_raw_block_impl(DEFAULT_PROTECT_TOKENS);
         assert!(block.is_some());
 
         let (start, end) = block.unwrap();
@@ -3918,7 +4053,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefix_recovery_releases_pin_when_capacity_contracts() {
+    async fn prefix_recovery_remains_bounded_when_capacity_contracts() {
         for mode in [
             CompactionFailureMode::Deterministic,
             CompactionFailureMode::PreserveContext,
@@ -3929,9 +4064,9 @@ mod tests {
                 .compact(None, &wide, 0, CompactionFailureMode::Deterministic)
                 .await
                 .is_some());
-            assert!(
-                engine.pinned_prefix_entries > 0,
-                "fitting folds retain the cache prefix"
+            assert_eq!(
+                engine.pinned_prefix_entries, 0,
+                "historical heads are not pinned; only the real system prefix is stable"
             );
             let narrow = TokenBudget::new(4_000, 1_000);
             for _ in 0..8 {
@@ -3974,7 +4109,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prefix_recovery_rollback_restores_committed_pin() {
+    async fn prefix_recovery_rollback_restores_committed_state() {
         let mut engine = prefix_recovery_fixture(LcmConfig::default());
         let snapshot = engine.compaction_state();
         let original = engine.active_context();
@@ -3987,18 +4122,18 @@ mod tests {
             )
             .await
             .is_some());
-        assert!(engine.pinned_prefix_entries > 0);
+        assert_eq!(engine.pinned_prefix_entries, 0);
         engine.restore_compaction_state(snapshot);
         assert_eq!(engine.active_context(), original);
         assert!(engine.dag().is_empty());
         assert_eq!(
             engine.pinned_prefix_entries, 0,
-            "a rejected checkpoint cannot leave an uncommitted prefix pinned"
+            "a rejected checkpoint cannot leave an uncommitted historical pin"
         );
     }
 
     #[tokio::test]
-    async fn prefix_recovery_rollback_restores_pending_pin() {
+    async fn rejected_checkpoint_does_not_leave_a_legacy_pending_pin() {
         let mut engine = prefix_recovery_fixture(LcmConfig {
             deterministic_target: 1,
             ..LcmConfig::default()
@@ -4013,10 +4148,7 @@ mod tests {
             )
             .await
             .is_none());
-        assert!(
-            engine.pending_pinned_prefix.is_some(),
-            "the cut was planned before its summary failed"
-        );
+        assert!(engine.pending_pinned_prefix.is_none());
         engine.restore_compaction_state(snapshot);
         assert_eq!(
             engine.pending_pinned_prefix, None,
@@ -4113,6 +4245,73 @@ mod tests {
         assert!(engine.complete_compaction_boundaries(3, 4).is_empty());
         // Carrier plus result together is complete.
         assert_eq!(engine.complete_compaction_boundaries(2, 4), vec![2]);
+    }
+
+    /// A pressure fold replaces the entire eligible history in one pass. The
+    /// only raw conversation left is the protected current-turn tail; the
+    /// leading system prompt remains byte-identical and outside the fold.
+    #[tokio::test]
+    async fn deterministic_pressure_fold_replaces_all_history_before_tail() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            deterministic_target: 2_048,
+            ..LcmConfig::default()
+        });
+        let stable_system = msg(1, "system", "IMMUTABLE SYSTEM PREFIX");
+        assert_eq!(engine.ingest(stable_system.clone()), Some(1));
+
+        let mut historical_ids = Vec::new();
+        for turn in 0..6 {
+            let user_id = 10 + turn * 10;
+            let assistant_id = user_id + 1;
+            let user = format!(
+                "historical user turn {turn} {}",
+                "durable evidence ".repeat(120)
+            );
+            let assistant = format!(
+                "historical assistant turn {turn} {}",
+                "recorded decision ".repeat(120)
+            );
+            ingest(&mut engine, user_id, "user", &user);
+            historical_ids.push(user_id);
+            ingest(&mut engine, assistant_id, "assistant", &assistant);
+            historical_ids.push(assistant_id);
+        }
+        ingest_tool_pair(
+            &mut engine,
+            100,
+            "call_historical",
+            "durable tool result ".repeat(120),
+        );
+        historical_ids.extend([101, 102]);
+        let current_tail = msg(999, "user", &"CURRENT_TURN_TAIL ".repeat(900));
+        assert_eq!(engine.ingest(current_tail.clone()), Some(999));
+
+        let result = engine
+            .compact(
+                None,
+                &TokenBudget::new(16_384, 1_024),
+                0,
+                CompactionFailureMode::Deterministic,
+            )
+            .await;
+        assert!(matches!(result, Some(Turn::Summary { .. })));
+
+        let active = engine.active_context();
+        assert_eq!(active.first(), Some(&stable_system));
+        assert_eq!(
+            active
+                .iter()
+                .filter(|message| message.get("_lcm_summary").is_some())
+                .count(),
+            1
+        );
+        assert!(active.contains(&current_tail));
+        for id in historical_ids {
+            assert!(
+                !active.iter().any(|message| message["_db_id"] == id),
+                "historical message {id} leaked outside the checkpoint"
+            );
+        }
     }
 
     /// Fragmented carriers/results plus newest request: the fold retires
@@ -4246,7 +4445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deterministic_fold_requires_every_source_row() {
+    async fn deterministic_fold_retries_an_earlier_complete_boundary_when_a_row_is_missing() {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.1,
             tau_hard: 0.3,
@@ -4262,11 +4461,9 @@ mod tests {
                 &format!("source {id} {}", "durable evidence ".repeat(80)),
             );
         }
-        // The fold covers the summarized span after the kept head. Every
-        // complete boundary of that span includes its first raw row, so a
-        // missing row there must abort the fold entirely (recovery cannot
-        // shrink past it), while rows later in the span degrade to a shorter
-        // boundary that leaves them raw.
+        // The full span is not recoverable because row 3 is missing. The
+        // deterministic path must retreat to the last complete boundary that
+        // has every source row, leaving the missing-row suffix raw.
         engine.store.remove(&3);
 
         let result = engine
@@ -4278,12 +4475,13 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_none());
-        assert!(engine.dag().is_empty());
+        assert!(result.is_some());
+        assert_eq!(engine.dag().len(), 1);
+        assert_eq!(engine.dag().newest().unwrap().source_ids, vec![2]);
         assert!(engine
             .active_context()
             .iter()
-            .any(|message| message["_db_id"] == 2));
+            .any(|message| message["_db_id"] == 3));
     }
 
     // -----------------------------------------------------------------------
@@ -4634,7 +4832,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_keeps_existing_wire_prefix_until_summary_merge_is_needed() {
+    async fn compaction_replaces_history_while_keeping_the_stable_system_prefix() {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,
@@ -4669,12 +4867,7 @@ mod tests {
             )
             .await
             .is_some());
-        let last_summary = engine
-            .active_entries()
-            .iter()
-            .rposition(|entry| matches!(entry, ContextEntry::Summary { .. }))
-            .unwrap();
-        let stable_after_first = serialize_wire(&engine.active_entries()[..=last_summary]);
+        let stable_system = engine.active_context()[0].clone();
 
         for i in 0..12 {
             ingest(
@@ -4701,20 +4894,17 @@ mod tests {
             .is_some());
         let after_second = serialize_wire(engine.active_entries());
 
-        assert!(
-            after_second.starts_with(&stable_after_first),
-            "the first compacted prompt, excluding its protected raw tail, \
-             must remain a byte-prefix after the next append-only compaction"
-        );
+        assert_eq!(engine.active_context()[0], stable_system);
         assert_eq!(
             engine
                 .active_entries()
                 .iter()
                 .filter(|entry| matches!(entry, ContextEntry::Summary { .. }))
                 .count(),
-            2,
-            "low summary mass should append instead of merge"
+            1,
+            "one pressure event must leave one replacement checkpoint"
         );
+        assert!(!after_second.is_empty());
     }
 
     #[test]
@@ -4743,7 +4933,7 @@ mod tests {
         let mut engine = LcmEngine::new(LcmConfig {
             tau_soft: 0.3,
             tau_hard: 0.6,
-            deterministic_target: 64,
+            deterministic_target: 2_048,
             keep_prefix_fraction: 0.35,
         });
         let budget = TokenBudget::new(4096, 1024);
@@ -4778,12 +4968,6 @@ mod tests {
             )
             .await;
         assert!(r1.is_some());
-        engine.dag.nodes[0].tokens =
-            (budget.available_budget(0) as f64 * SUMMARY_MERGE_BUDGET_FRACTION) as usize + 1;
-        assert_eq!(
-            engine.block_selection(budget.available_budget(0)),
-            BlockSelection::MergeSummaries
-        );
 
         // Round 2: merge the prior summary with new raws.
         for i in 0..12 {
@@ -4888,13 +5072,6 @@ mod tests {
                 "content": "Earlier compacted state."
             }),
         };
-        let available = budget.available_budget(0);
-        engine.dag.nodes[prior_node_id].tokens = (available as f64 * 0.25) as usize + 1;
-
-        assert_eq!(
-            engine.block_selection(available),
-            BlockSelection::MergeSummaries
-        );
         let result = engine
             .compact(
                 Some(&compactor),

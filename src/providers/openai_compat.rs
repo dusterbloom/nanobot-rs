@@ -2859,6 +2859,64 @@ mod tests {
     }
 
     #[test]
+    fn lcm_suffix_rewrite_keeps_higgs_wire_prefix_byte_stable() {
+        let provider =
+            OpenAICompatProvider::new("local", Some("http://127.0.0.1:9000/v1"), Some("bonsai"))
+                .with_higgs_session_cache(true);
+        let stable = serde_json::json!({
+            "role": "system",
+            "content": "immutable system prompt",
+        });
+        let before = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": "immutable system prompt",
+                NANOBOT_HIGGS_SESSION_ID_FIELD: 41_u64,
+            }),
+            serde_json::json!({"role": "user", "content": "old history"}),
+        ];
+        let after = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": "immutable system prompt",
+                NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
+            }),
+            serde_json::json!({"role": "user", "content": "bounded checkpoint"}),
+            serde_json::json!({"role": "user", "content": "current tail"}),
+        ];
+
+        let (_, before_body) = provider.build_chat_request(
+            &before,
+            None,
+            Some("bonsai"),
+            256,
+            0.0,
+            None,
+            None,
+            RequestKind::Blocking {
+                tool_choice: ToolChoice::Auto,
+            },
+        );
+        let (_, after_body) = provider.build_chat_request(
+            &after,
+            None,
+            Some("bonsai"),
+            256,
+            0.0,
+            None,
+            None,
+            RequestKind::Blocking {
+                tool_choice: ToolChoice::Auto,
+            },
+        );
+
+        assert_eq!(before_body["session_id"], serde_json::json!(41));
+        assert_eq!(after_body["session_id"], serde_json::json!(42));
+        assert_eq!(before_body["messages"][0], stable);
+        assert_eq!(after_body["messages"][0], stable);
+    }
+
+    #[test]
     fn test_build_chat_request_sends_exact_higgs_lease_control_when_enabled() {
         let provider =
             OpenAICompatProvider::new("local", Some("http://127.0.0.1:9000/v1"), Some("bonsai"))

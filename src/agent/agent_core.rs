@@ -26,6 +26,7 @@ use crate::agent::circuit_breaker::CircuitBreaker;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context::ContextBuilder;
 use crate::agent::lane::Lane;
+use crate::agent::prompt_fingerprint::PromptFingerprint;
 use crate::agent::runtime_mode::RuntimeMode;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::working_memory::WorkingMemoryStore;
@@ -169,6 +170,21 @@ enum PromptResetScope {
     PromptRewrite,
 }
 
+/// The only prompt bytes that survive an LCM rewrite. The provider can reuse
+/// this exact prefix even though the retained session id is rotated.
+#[derive(Clone, Debug)]
+pub(crate) struct StablePromptAnchor {
+    pub(crate) fingerprint: PromptFingerprint,
+    pub(crate) watermark: usize,
+    pub(crate) tool_hash: u64,
+}
+
+#[derive(Clone, Debug)]
+enum PromptCacheBookkeeping {
+    Clear,
+    Preserve(StablePromptAnchor),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HiggsSessionLease {
     pub(crate) session_id: u64,
@@ -240,6 +256,9 @@ struct HiggsSessionState {
     claimed_lease_id: Option<u64>,
     expansion_checkpoint: Option<ExpansionCheckpoint>,
     in_flight_active_ids: std::collections::HashMap<u64, usize>,
+    /// One-shot exception for the intentional LCM session rotation: the next
+    /// request may reuse the stable prefix anchor instead of looking cold.
+    preserved_prefix_epoch: Option<u64>,
 }
 
 pub(crate) struct HiggsSessionRequestReservation {
@@ -765,6 +784,26 @@ impl RuntimeCounters {
         had_fingerprint || had_watermark
     }
 
+    /// Publish the unchanged prefix after a non-Higgs LCM rewrite. The next
+    /// request compares its new summary/tail against this anchor and charges
+    /// only the changed suffix as prefill.
+    pub(crate) fn reanchor_local_prompt_cache(
+        &self,
+        session_key: &str,
+        anchor: StablePromptAnchor,
+    ) {
+        let _transition = self.prompt_cache_transition.lock();
+        self.prompt_fingerprints
+            .lock()
+            .insert(session_key.to_string(), anchor.fingerprint);
+        self.prompt_tool_hashes
+            .lock()
+            .insert(session_key.to_string(), anchor.tool_hash);
+        self.prompt_cache_watermark
+            .lock()
+            .insert(session_key.to_string(), anchor.watermark);
+    }
+
     /// Consolidated cache invalidation for a sanctioned prompt rewrite (trim,
     /// compaction). When `rotate` is set (the provider supports the higgs
     /// retained-session protocol), rotates the retained session — epoch bump +
@@ -852,10 +891,12 @@ impl RuntimeCounters {
         }
         let prior_route_identity = (state.active_id, state.epoch);
         let active_id = Self::activate_higgs_session_state(state, durable_session_id);
-        if prior_route_identity != (Some(active_id), state.epoch) {
+        let preserve_prefix = state.preserved_prefix_epoch == Some(state.epoch);
+        if prior_route_identity != (Some(active_id), state.epoch) && !preserve_prefix {
             self.prompt_fingerprints.lock().remove(session_key);
             self.prompt_cache_watermark.lock().remove(session_key);
         }
+        state.preserved_prefix_epoch = None;
         *state.in_flight_active_ids.entry(active_id).or_default() += 1;
         let session_lease = if state.claimed_lease_id.is_none() {
             state.pending_lease.take().inspect(|lease| {
@@ -1061,13 +1102,36 @@ impl RuntimeCounters {
         session_key: &str,
         retirement: SessionRetirement,
     ) -> u64 {
-        self.retire_higgs_session_inner(session_key, retirement, || {})
+        self.retire_higgs_session_inner(
+            session_key,
+            retirement,
+            PromptCacheBookkeeping::Clear,
+            || {},
+        )
+    }
+
+    /// Rotate the retained session after an LCM fold while keeping the exact
+    /// stable-prefix anchor for the next request. This is a route transition,
+    /// not a prompt-cache reset: the changed suffix is new, the prefix is not.
+    pub(crate) fn retire_higgs_session_preserving_prefix(
+        &self,
+        session_key: &str,
+        retirement: SessionRetirement,
+        anchor: StablePromptAnchor,
+    ) -> u64 {
+        self.retire_higgs_session_inner(
+            session_key,
+            retirement,
+            PromptCacheBookkeeping::Preserve(anchor),
+            || {},
+        )
     }
 
     fn retire_higgs_session_inner<F>(
         &self,
         session_key: &str,
         retirement: SessionRetirement,
+        bookkeeping: PromptCacheBookkeeping,
         observe_transaction: F,
     ) -> u64
     where
@@ -1075,9 +1139,24 @@ impl RuntimeCounters {
     {
         let _transition = self.prompt_cache_transition.lock();
         let mut sessions = self.higgs_sessions.lock();
-        self.prompt_fingerprints.lock().remove(session_key);
-        self.prompt_tool_hashes.lock().remove(session_key);
-        self.prompt_cache_watermark.lock().remove(session_key);
+        match &bookkeeping {
+            PromptCacheBookkeeping::Clear => {
+                self.prompt_fingerprints.lock().remove(session_key);
+                self.prompt_tool_hashes.lock().remove(session_key);
+                self.prompt_cache_watermark.lock().remove(session_key);
+            }
+            PromptCacheBookkeeping::Preserve(anchor) => {
+                self.prompt_fingerprints
+                    .lock()
+                    .insert(session_key.to_string(), anchor.fingerprint.clone());
+                self.prompt_tool_hashes
+                    .lock()
+                    .insert(session_key.to_string(), anchor.tool_hash);
+                self.prompt_cache_watermark
+                    .lock()
+                    .insert(session_key.to_string(), anchor.watermark);
+            }
+        }
         let state = sessions.entry(session_key.to_string()).or_default();
         let prior_checkpoint = state.expansion_checkpoint.take();
         let prior_lease = state.pending_lease.take();
@@ -1142,6 +1221,10 @@ impl RuntimeCounters {
         }
 
         state.epoch = state.epoch.saturating_add(1);
+        state.preserved_prefix_epoch = match bookkeeping {
+            PromptCacheBookkeeping::Clear => None,
+            PromptCacheBookkeeping::Preserve(_) => Some(state.epoch),
+        };
         state.epoch
     }
 
@@ -1155,7 +1238,12 @@ impl RuntimeCounters {
     where
         F: FnOnce(),
     {
-        self.retire_higgs_session_inner(session_key, retirement, observe_transaction)
+        self.retire_higgs_session_inner(
+            session_key,
+            retirement,
+            PromptCacheBookkeeping::Clear,
+            observe_transaction,
+        )
     }
 
     #[cfg(test)]
@@ -1739,7 +1827,7 @@ pub(crate) struct PendingCompaction {
     pub summary_node_id: usize,
 }
 
-fn prompt_prefix_len(messages: &[Value]) -> usize {
+pub(crate) fn prompt_prefix_len(messages: &[Value]) -> usize {
     messages
         .iter()
         .take_while(|message| {
@@ -3108,6 +3196,68 @@ mod tests {
     }
 
     #[test]
+    fn lcm_rotation_keeps_prefix_anchor_without_sanctioned_reset() {
+        let counters = Arc::new(RuntimeCounters::new_with_config(
+            16_384,
+            &CircuitBreakerConfig::default(),
+        ));
+        let session = "cli:lcm-prefix-anchor";
+        let durable = "sqlite:lcm-prefix-anchor";
+        let fingerprint = crate::agent::prompt_fingerprint::fingerprint(&[
+            serde_json::json!({"role": "system", "content": "stable"}),
+        ]);
+        let anchor = StablePromptAnchor {
+            fingerprint: fingerprint.clone(),
+            watermark: 1,
+            tool_hash: 77,
+        };
+
+        assert!(counters.record_higgs_session_id(session, 10));
+        counters
+            .prompt_fingerprints
+            .lock()
+            .insert(session.to_string(), fingerprint);
+        counters
+            .prompt_cache_watermark
+            .lock()
+            .insert(session.to_string(), 9);
+        counters
+            .prompt_tool_hashes
+            .lock()
+            .insert(session.to_string(), 77);
+
+        let epoch = counters.retire_higgs_session_preserving_prefix(
+            session,
+            SessionRetirement::Drop,
+            anchor.clone(),
+        );
+        assert_eq!(epoch, 1);
+        assert_eq!(counters.take_cache_reset(session), None);
+        assert_eq!(
+            counters.prompt_fingerprints.lock().get(session),
+            Some(&anchor.fingerprint)
+        );
+        assert_eq!(
+            counters.prompt_cache_watermark.lock().get(session),
+            Some(&1)
+        );
+        assert_eq!(counters.prompt_tool_hashes.lock().get(session), Some(&77));
+
+        let request =
+            counters.reserve_higgs_session_request(session, durable, "bonsai", 77, 16_000, 0);
+        assert_ne!(request.control().active_id, 10);
+        assert_eq!(
+            counters.prompt_fingerprints.lock().get(session),
+            Some(&anchor.fingerprint),
+            "intentional route rotation must not turn the next request cold"
+        );
+        assert_eq!(
+            counters.prompt_cache_watermark.lock().get(session),
+            Some(&1)
+        );
+    }
+
+    #[test]
     fn test_trio_state_transitions() {
         let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
 
@@ -3341,8 +3491,7 @@ mod higgs_drop_flusher_tests {
         // A live retained session (as the wire-lease flow would have left it).
         assert!(counters.record_higgs_session_id("flush-hook", 777));
 
-        let epoch =
-            counters.retire_higgs_session("flush-hook", SessionRetirement::Drop);
+        let epoch = counters.retire_higgs_session("flush-hook", SessionRetirement::Drop);
         assert!(epoch >= 1);
         assert_eq!(
             flushed.lock().unwrap().as_slice(),
@@ -3355,8 +3504,7 @@ mod higgs_drop_flusher_tests {
     fn drop_retirement_without_flusher_is_a_clean_noop() {
         let counters = RuntimeCounters::new_with_config(32_768, &CircuitBreakerConfig::default());
         assert!(counters.record_higgs_session_id("no-flush", 555));
-        let epoch =
-            counters.retire_higgs_session("no-flush", SessionRetirement::Drop);
+        let epoch = counters.retire_higgs_session("no-flush", SessionRetirement::Drop);
         assert!(epoch >= 1, "rotation proceeds with no flusher wired");
     }
 }

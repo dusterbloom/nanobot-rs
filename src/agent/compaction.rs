@@ -115,6 +115,7 @@ const SUMMARY_COMPRESSION_RATIO_BULLET_POINTS: usize = 8;
 /// row (session 20260727_094539_eeab48, 2026-07-27 12:10–12:22).
 const SUMMARY_COMPRESSION_RATIO_PRESERVE_DETAILS: usize = 4;
 
+const DEFAULT_SUMMARY_TOKEN_CAP: u32 = 2_048;
 const MAX_SUMMARY_TOKENS: u32 = 4_096;
 
 fn compression_ratio_for_mode(mode: &str) -> usize {
@@ -138,6 +139,9 @@ pub struct ContextCompactor {
     model: String,
     /// Minimum response allowance for short summarization requests.
     summary_max_tokens: u32,
+    /// Hard response ceiling for one LCM checkpoint. Keeping this small makes
+    /// the post-fold cold prefill a short suffix instead of another context.
+    summary_token_cap: u32,
     /// Maximum context accepted by the compaction model (tokens).
     compaction_context_size: usize,
     /// Maximum prompt accepted by the current runtime (tokens).
@@ -159,6 +163,7 @@ impl ContextCompactor {
             provider,
             model,
             summary_max_tokens: 512,
+            summary_token_cap: DEFAULT_SUMMARY_TOKEN_CAP,
             compaction_context_size,
             compaction_prompt_size: compaction_context_size,
         }
@@ -169,6 +174,7 @@ impl ContextCompactor {
             provider,
             model: self.model.clone(),
             summary_max_tokens: self.summary_max_tokens,
+            summary_token_cap: self.summary_token_cap,
             compaction_context_size: self.compaction_context_size,
             compaction_prompt_size: self.compaction_prompt_size,
         }
@@ -182,12 +188,22 @@ impl ContextCompactor {
             provider: Arc::clone(&self.provider),
             model: self.model.clone(),
             summary_max_tokens: self.summary_max_tokens,
+            summary_token_cap: self.summary_token_cap,
             compaction_context_size: context_size,
             compaction_prompt_size: self
                 .compaction_prompt_size
                 .min(prompt_size)
                 .min(context_size),
         }
+    }
+
+    /// Bound one LCM generation to the checkpoint target. The cap is also
+    /// used by preflight and the length-retry path, so neither can silently
+    /// turn a small checkpoint into a large one.
+    pub(crate) fn with_summary_cap(&self, cap: usize) -> Self {
+        let mut bounded = self.clone();
+        bounded.summary_token_cap = cap.clamp(1, MAX_SUMMARY_TOKENS as usize) as u32;
+        bounded
     }
 
     #[cfg(test)]
@@ -198,13 +214,12 @@ impl ContextCompactor {
     fn summary_token_limit(&self, input: &str, ratio: usize) -> u32 {
         let input_tokens = TokenBudget::estimate_str_tokens(input);
         let scaled = input_tokens.saturating_add(ratio - 1) / ratio;
+        let upper = self.summary_token_cap.min(MAX_SUMMARY_TOKENS).max(1) as usize;
+        let lower = (self.summary_max_tokens as usize).min(upper);
         scaled
-            .clamp(
-                self.summary_max_tokens as usize,
-                MAX_SUMMARY_TOKENS as usize,
-            )
+            .clamp(lower, upper)
             .try_into()
-            .unwrap_or(MAX_SUMMARY_TOKENS)
+            .unwrap_or(upper as u32)
     }
 
     fn request_token_usage(&self, input: &str, prompt: &str, ratio: usize) -> (usize, usize) {
@@ -391,7 +406,7 @@ impl ContextCompactor {
         }
 
         // Retry-on-length: when the model hits max_tokens before finishing,
-        // retry once with 2× the budget (capped at MAX_SUMMARY_TOKENS).
+        // retry once with 2× the budget, capped at this compactor's LCM ceiling.
         // Per codex review (2026-07-27): "length" is a completed,
         // unambiguous provider response — not the transport uncertainty
         // that the no-retry rule guards against. The model just needs
@@ -401,7 +416,15 @@ impl ContextCompactor {
         // User's principle: "I rather wait but not have broken summaries
         // that defeat the purpose of durability."
         if response.finish_reason == FinishReason::Length {
-            let retry_max = (max_tokens.saturating_mul(2)).min(MAX_SUMMARY_TOKENS);
+            let retry_max = (max_tokens.saturating_mul(2))
+                .min(self.summary_token_cap)
+                .min(MAX_SUMMARY_TOKENS);
+            if retry_max <= max_tokens {
+                anyhow::bail!(
+                    "Summarization hit finish_reason=length but max_tokens is already capped at \
+                     {max_tokens}; cannot retry without exceeding the checkpoint ceiling"
+                );
+            }
             let retry_required = prompt_tokens.saturating_add(retry_max as usize);
             if retry_required > self.compaction_context_size {
                 anyhow::bail!(
@@ -1014,6 +1037,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lcm_summary_request_has_a_two_thousand_token_ceiling() {
+        let provider = Arc::new(RecordingProvider::responding("- bounded summary."));
+        let compactor = ContextCompactor::new(provider.clone(), "qwen".into(), 262_144);
+        let messages = vec![json!({
+            "role": "user",
+            "content": "durable evidence ".repeat(10_000)
+        })];
+
+        compactor
+            .summarize_for_lcm(&messages, "preserve_details")
+            .await
+            .unwrap();
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].max_tokens <= 2_048,
+            "LCM summary request allowed {} output tokens",
+            calls[0].max_tokens
+        );
+    }
+
+    #[tokio::test]
     async fn compaction_places_domain_neutral_contract_after_complete_transcript() {
         let provider = Arc::new(RecordingProvider::responding("- State retained."));
         let compactor = ContextCompactor::new(provider.clone(), "qwen".into(), 262_144);
@@ -1089,12 +1135,9 @@ mod tests {
         assert!(calls[0].max_tokens <= 4_096);
     }
 
-    /// Reproduces the live 2026-07-27 12:10:51 failure: Level-1
-    /// (`preserve_details`) summarization on an ~11506-token block received
-    /// `max_tokens=1439` under the shared 8:1 ratio and hit
-    /// `finish_reason="length"`. Level-1 must use a more generous ratio than
-    /// Level-2 (`bullet_points`) so a faithful handoff + optional manifest
-    /// fits in a single attempt.
+    /// The LCM checkpoint is deliberately bounded even when the source block
+    /// is large: compaction must keep the stable prefix cached and fold the
+    /// conversation into one small, deterministic-size handoff.
     #[tokio::test]
     async fn compaction_level1_max_tokens_accommodates_faithful_handoff() {
         let provider = Arc::new(RecordingProvider::responding("- State retained."));
@@ -1118,18 +1161,18 @@ mod tests {
             .unwrap();
         let level2_max = provider.calls()[1].max_tokens;
 
-        // Level-1 must give the model at least input/4 tokens. For the live
-        // 11506-token block that is 2876; the 8:1 ratio produced 1439 and
-        // forced `finish_reason="length"` 5 times in a row.
-        let level1_floor: u32 = (transcript_tokens / 4).try_into().unwrap();
         assert!(
-            level1_max >= level1_floor,
-            "Level-1 max_tokens={} must be >= input/4={} (transcript={} tokens); \
-             8:1 ratio gave {} and forced length truncation in production",
+            level1_max <= DEFAULT_SUMMARY_TOKEN_CAP,
+            "Level-1 max_tokens={} must respect the LCM checkpoint cap={} (transcript={} tokens)",
             level1_max,
-            level1_floor,
+            DEFAULT_SUMMARY_TOKEN_CAP,
             transcript_tokens,
-            transcript_tokens / 8,
+        );
+        assert!(
+            level2_max <= DEFAULT_SUMMARY_TOKEN_CAP,
+            "Level-2 max_tokens={} must respect the LCM checkpoint cap={}",
+            level2_max,
+            DEFAULT_SUMMARY_TOKEN_CAP,
         );
         // Level-2 stays aggressive (8:1 unchanged) — strictly less than Level-1.
         assert!(
@@ -1287,6 +1330,33 @@ mod tests {
         assert!(
             !text.contains("Partial summary"),
             "should NOT contain the discarded first-attempt output"
+        );
+    }
+
+    #[tokio::test]
+    async fn summarize_text_does_not_retry_when_length_hits_the_summary_cap() {
+        let provider = Arc::new(SequentialProvider::new(vec![LLMResponse {
+            content: Some("Partial summary".to_string()),
+            tool_calls: vec![],
+            finish_reason: FinishReason::Length,
+            usage: HashMap::new(),
+        }]));
+        let compactor = ContextCompactor::new(provider.clone(), "test".into(), 65_536);
+
+        let error = compactor
+            .summarize_text(
+                &"source material ".repeat(12_000),
+                SUMMARIZE_PROMPT,
+                SUMMARY_COMPRESSION_RATIO_PRESERVE_DETAILS,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("already capped"), "{error}");
+        assert!(
+            provider.responses.lock().unwrap().is_empty(),
+            "a capped length response must not cause a second provider request"
         );
     }
 
