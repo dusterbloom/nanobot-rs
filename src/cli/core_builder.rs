@@ -27,10 +27,11 @@ use tokio::sync::mpsc;
 
 use super::*;
 use crate::agent::agent_core::{
-    build_swappable_core, AgentHandle, RuntimeCounters, SwappableCoreConfig,
+    build_swappable_core, AgentHandle, RuntimeCounters, SwappableCore, SwappableCoreConfig,
 };
 use crate::agent::agent_loop::{AgentLoop, SharedCoreHandle};
 use crate::agent::lane::Lane;
+use crate::agent::model_capabilities::RuntimeModelContract;
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::config::schema::{is_higgs_backend, AdaptiveTokenConfig, Config};
 use crate::cron::service::CronService;
@@ -168,6 +169,7 @@ pub(super) struct LocalProviders {
     pub delegation: Option<Arc<dyn LLMProvider>>,
     pub specialist: Option<Arc<dyn LLMProvider>>,
     pub max_context_tokens: usize,
+    pub runtime_contract: Option<RuntimeModelContract>,
 }
 
 fn shared_local_role_model<'a>(configured_role_model: &'a str, main_model_id: &'a str) -> &'a str {
@@ -259,7 +261,14 @@ pub(super) fn make_local_providers(
         config.agents.defaults.presence_penalty,
     );
 
-    let main: Arc<dyn LLMProvider> = factory::create_openai_compat(
+    // Higgs owns the model/template/parser pairing. Read its additive
+    // contract once at startup or switch time; never put these facts in the
+    // prompt, where they would invalidate the stable prefix cache.
+    let runtime_contract = is_higgs_backend(&config.agents.defaults.local_backend)
+        .then(|| crate::higgs::runtime_model_contract_at(&base_url, api_key, &semantic_model_id))
+        .flatten();
+
+    let main: Arc<dyn LLMProvider> = factory::create_openai_compat_with_contract(
         factory::ProviderSpec::local_with_key(&base_url, Some(&model_id), api_key)
             .with_jit_gate_opt(jit_gate.clone())
             .with_timeout_config(&config.timeouts)
@@ -270,17 +279,23 @@ pub(super) fn make_local_providers(
             // Higgs backend; LM Studio and cloud-compatible endpoints keep the
             // OpenAI-compatible request body.
             .with_higgs_session_cache(is_higgs_backend(&config.agents.defaults.local_backend)),
+        runtime_contract.clone(),
     );
 
     // Auto-detect context size from the active server; fall back to config default.
     // The cluster path (custom base, possibly remote) needs a URL-aware probe so
     // peers exposing /props (llama-server) get their real n_ctx instead of the
     // 32k schema default.
-    let detected_context_tokens = if has_custom_base {
-        crate::server::query_context_size_from_url(&base_url)
-    } else {
-        crate::server::query_local_context_size(local_port)
-    };
+    let detected_context_tokens = runtime_contract
+        .as_ref()
+        .and_then(|contract| contract.context_tokens.filter(|tokens| *tokens > 0))
+        .or_else(|| {
+            if has_custom_base {
+                crate::server::query_context_size_from_url(&base_url)
+            } else {
+                crate::server::query_local_context_size(local_port)
+            }
+        });
     let max_context_tokens = resolved_local_context_tokens(
         &model_id,
         detected_context_tokens,
@@ -390,7 +405,26 @@ pub(super) fn make_local_providers(
         delegation,
         specialist,
         max_context_tokens,
+        runtime_contract,
     }
+}
+
+/// Apply server-owned facts to the core after the shared core constructor has
+/// built its normal heuristic capabilities. Rebuild the typed runtime mode so
+/// its capability snapshot stays in sync with the public core snapshot.
+fn adopt_runtime_contract(
+    mut core: SwappableCore,
+    runtime_contract: Option<&RuntimeModelContract>,
+) -> SwappableCore {
+    if let Some(contract) = runtime_contract {
+        contract.apply_to(&mut core.model_capabilities);
+        if core.mode().is_local() {
+            core.mode = crate::agent::runtime_mode::RuntimeMode::from_caps(Some(Arc::new(
+                core.model_capabilities.clone(),
+            )));
+        }
+    }
+    core
 }
 
 /// Build a `SwappableCoreConfig` from shared config + per-call overrides.
@@ -469,7 +503,7 @@ pub(crate) fn build_core_handle(
     specialist_port: Option<&str>,
     is_local: bool,
 ) -> SharedCoreHandle {
-    let (provider, model, max_context_tokens, dp, sp) = if is_local {
+    let (provider, model, max_context_tokens, dp, sp, runtime_contract) = if is_local {
         let lp = make_local_providers(
             config,
             local_port,
@@ -481,23 +515,33 @@ pub(crate) fn build_core_handle(
         // Use lp.max_context_tokens directly — model_context_size would override
         // the memory-safe cap with .max(131072) for Qwen3.6, breaking compaction.
         let ctx = lp.max_context_tokens;
-        (lp.main, model, ctx, lp.delegation, lp.specialist)
+        (
+            lp.main,
+            model,
+            ctx,
+            lp.delegation,
+            lp.specialist,
+            lp.runtime_contract,
+        )
     } else {
         let provider = create_provider(config);
         let model = config.agents.defaults.model.clone();
         let ctx = model_context_size(&model, config.agents.defaults.max_context_tokens);
-        (provider, model, ctx, None, None)
+        (provider, model, ctx, None, None, None)
     };
 
-    let core = build_swappable_core(core_config_from(
-        config,
-        provider,
-        model,
-        max_context_tokens,
-        is_local,
-        dp,
-        sp,
-    ));
+    let core = adopt_runtime_contract(
+        build_swappable_core(core_config_from(
+            config,
+            provider,
+            model,
+            max_context_tokens,
+            is_local,
+            dp,
+            sp,
+        )),
+        runtime_contract.as_ref(),
+    );
     let counters =
         RuntimeCounters::new_with_config(max_context_tokens, &config.trio.circuit_breaker);
     // When main_no_think is enabled, suppress thinking display from the start
@@ -522,7 +566,7 @@ pub(crate) fn rebuild_core(
     specialist_port: Option<&str>,
     is_local: bool,
 ) {
-    let (provider, model, max_context_tokens, dp, sp) = if is_local {
+    let (provider, model, max_context_tokens, dp, sp, runtime_contract) = if is_local {
         let lp = make_local_providers(
             config,
             local_port,
@@ -533,23 +577,33 @@ pub(crate) fn rebuild_core(
         let model = format!("local:{}", lp.semantic_model_id);
         // Use lp.max_context_tokens directly (same fix as build_core_handle).
         let ctx = lp.max_context_tokens;
-        (lp.main, model, ctx, lp.delegation, lp.specialist)
+        (
+            lp.main,
+            model,
+            ctx,
+            lp.delegation,
+            lp.specialist,
+            lp.runtime_contract,
+        )
     } else {
         let provider = create_provider(config);
         let model = config.agents.defaults.model.clone();
         let ctx = model_context_size(&model, config.agents.defaults.max_context_tokens);
-        (provider, model, ctx, None, None)
+        (provider, model, ctx, None, None, None)
     };
 
-    let new_core = build_swappable_core(core_config_from(
-        config,
-        provider,
-        model,
-        max_context_tokens,
-        is_local,
-        dp,
-        sp,
-    ));
+    let new_core = adopt_runtime_contract(
+        build_swappable_core(core_config_from(
+            config,
+            provider,
+            model,
+            max_context_tokens,
+            is_local,
+            dp,
+            sp,
+        )),
+        runtime_contract.as_ref(),
+    );
     // Swap only the core; counters survive.
     handle.swap_core(new_core);
     // Update max context since the new model may have a different size.

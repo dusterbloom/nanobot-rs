@@ -828,6 +828,72 @@ pub(crate) async fn list_served_models_at(api_base: &str, api_key: &str) -> Vec<
     model_ids_from_models_json(&json)
 }
 
+/// Read the additive runtime contract for one served model. This is a startup
+/// or model-switch probe, not a per-turn request, so the model's stable prompt
+/// prefix is unaffected and older Higgs builds simply return `None`.
+pub(crate) fn runtime_model_contract_at(
+    api_base: &str,
+    api_key: &str,
+    requested_model: &str,
+) -> Option<crate::agent::model_capabilities::RuntimeModelContract> {
+    let url = models_url_from_base(api_base);
+    let fetch = || {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .ok()?;
+        let mut request = client.get(&url);
+        if !api_key.is_empty() {
+            request = request.header("Authorization", format!("Bearer {api_key}"));
+        }
+        request.send().ok()?.json::<serde_json::Value>().ok()
+    };
+    let json = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| {
+            let client = reqwest::Client::new();
+            handle.block_on(async {
+                let mut request = client.get(&url).timeout(std::time::Duration::from_secs(3));
+                if !api_key.is_empty() {
+                    request = request.header("Authorization", format!("Bearer {api_key}"));
+                }
+                request
+                    .send()
+                    .await
+                    .ok()?
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+            })
+        })
+    } else {
+        fetch()
+    }?;
+    runtime_model_contract_from_models_json(&json, requested_model)
+}
+
+fn runtime_model_contract_from_models_json(
+    json: &serde_json::Value,
+    requested_model: &str,
+) -> Option<crate::agent::model_capabilities::RuntimeModelContract> {
+    json.get("data")
+        .and_then(|data| data.as_array())
+        .and_then(|models| {
+            models.iter().find(|model| {
+                model
+                    .get("id")
+                    .and_then(|id| id.as_str())
+                    .is_some_and(|id| model_id_matches(id, requested_model))
+            })
+        })
+        .and_then(|model| model.get("capabilities"))
+        .and_then(|capabilities| {
+            serde_json::from_value::<crate::agent::model_capabilities::RuntimeModelContract>(
+                capabilities.clone(),
+            )
+            .ok()
+        })
+}
+
 /// List resident model ids, dropping entries the endpoint health marks unavailable.
 pub(crate) async fn list_available_served_models_at(api_base: &str, api_key: &str) -> Vec<String> {
     let served = list_served_models_at(api_base, api_key).await;
@@ -1768,6 +1834,40 @@ mod tests {
             model_ids_from_models_json(&json),
             vec!["qwen".to_string(), "llama".to_string()]
         );
+    }
+
+    #[test]
+    fn test_runtime_model_contract_from_models_json() {
+        let json = serde_json::json!({
+            "data": [{
+                "id": "Qwen3-0.6B",
+                "capabilities": {
+                    "toolMode": "native",
+                    "thinking": "optional",
+                    "contextTokens": 65536,
+                    "vision": false
+                }
+            }]
+        });
+        let contract = runtime_model_contract_from_models_json(&json, "qwen3-0.6b").unwrap();
+        assert_eq!(
+            contract.tool_mode,
+            Some(crate::agent::model_capabilities::ToolCallMode::Native)
+        );
+        assert_eq!(
+            contract.thinking,
+            Some(crate::agent::model_capabilities::ThinkingMode::Optional)
+        );
+        assert_eq!(contract.context_tokens, Some(65_536));
+        assert_eq!(contract.vision, Some(false));
+    }
+
+    #[test]
+    fn test_runtime_model_contract_ignores_old_model_objects() {
+        let json = serde_json::json!({
+            "data": [{"id": "old-model", "object": "model"}]
+        });
+        assert!(runtime_model_contract_from_models_json(&json, "old-model").is_none());
     }
 
     #[test]

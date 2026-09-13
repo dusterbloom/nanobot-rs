@@ -40,6 +40,55 @@ pub enum ReaderTier {
     Advanced,
 }
 
+/// Wire-level tool protocol reported by a local inference server.
+///
+/// The harness only needs to know how to present tools; parser details stay in
+/// the server that owns the model's chat template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolCallMode {
+    Native,
+    Textual,
+}
+
+/// Whether a local model's template can be asked to emit reasoning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThinkingMode {
+    Disabled,
+    Optional,
+    Always,
+}
+
+/// Additive metadata advertised by Higgs in `GET /v1/models`.
+///
+/// Every field is optional so nanobot can safely talk to older Higgs builds or
+/// any other OpenAI-compatible server that does not publish this extension.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RuntimeModelContract {
+    pub tool_mode: Option<ToolCallMode>,
+    pub thinking: Option<ThinkingMode>,
+    pub context_tokens: Option<usize>,
+    pub vision: Option<bool>,
+}
+
+impl RuntimeModelContract {
+    /// Overlay only authoritative runtime facts; name-based defaults remain
+    /// in force for fields an older server omitted.
+    pub fn apply_to(&self, caps: &mut ModelCapabilities) {
+        if let Some(tool_mode) = self.tool_mode {
+            caps.tool_calling = matches!(tool_mode, ToolCallMode::Native);
+        }
+        if let Some(thinking) = self.thinking {
+            caps.thinking = !matches!(thinking, ThinkingMode::Disabled);
+        }
+        if let Some(vision) = self.vision {
+            caps.vision = vision;
+        }
+    }
+}
+
 /// Capabilities of a model, looked up once and stored on SwappableCore.
 #[derive(Debug, Clone)]
 pub struct ModelCapabilities {
@@ -818,5 +867,39 @@ mod tests {
         assert_eq!(caps.max_reliable_output, 4096);
         assert_eq!(caps.scratch_pad_rounds, 10);
         assert_eq!(caps.reader_tier, ReaderTier::Standard);
+    }
+
+    #[test]
+    fn runtime_contract_overrides_only_present_facts() {
+        let mut caps = lookup("qwen3-0.6b", &empty_overrides());
+        let contract = RuntimeModelContract {
+            tool_mode: Some(ToolCallMode::Textual),
+            thinking: Some(ThinkingMode::Optional),
+            context_tokens: Some(32_768),
+            vision: Some(true),
+        };
+
+        contract.apply_to(&mut caps);
+
+        assert!(!caps.tool_calling);
+        assert!(caps.thinking);
+        assert!(caps.vision);
+        assert_eq!(caps.size_class, ModelSizeClass::Medium);
+    }
+
+    #[test]
+    fn runtime_contract_is_backward_compatible_when_partial() {
+        let json = serde_json::json!({"toolMode": "native"});
+        let contract: RuntimeModelContract = serde_json::from_value(json).unwrap();
+        assert_eq!(contract.tool_mode, Some(ToolCallMode::Native));
+        assert_eq!(contract.thinking, None);
+        assert_eq!(contract.context_tokens, None);
+        assert_eq!(contract.vision, None);
+    }
+
+    #[test]
+    fn malformed_runtime_contract_is_rejected_without_partial_adoption() {
+        let json = serde_json::json!({"toolMode": "future-protocol"});
+        assert!(serde_json::from_value::<RuntimeModelContract>(json).is_err());
     }
 }

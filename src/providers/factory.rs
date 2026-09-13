@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::agent::model_capabilities::RuntimeModelContract;
 use crate::config::schema::{ProviderConfig, RetryConfig};
 use crate::providers::base::{LLMProvider, LLMResponse};
 use crate::providers::jit_gate::JitGate;
@@ -142,6 +143,16 @@ impl ProviderSpec {
 
 /// Create an OpenAI-compatible provider from a spec.
 pub fn create_openai_compat(spec: ProviderSpec) -> Arc<dyn LLMProvider> {
+    create_openai_compat_with_contract(spec, None)
+}
+
+/// Create an OpenAI-compatible provider with authoritative runtime facts for a
+/// Higgs-served model. The ordinary constructor remains unchanged for every
+/// other provider and for tests that use heuristic defaults.
+pub(crate) fn create_openai_compat_with_contract(
+    spec: ProviderSpec,
+    contract: Option<RuntimeModelContract>,
+) -> Arc<dyn LLMProvider> {
     let mut prov = OpenAICompatProvider::new(
         &spec.api_key,
         spec.api_base.as_deref(),
@@ -169,6 +180,7 @@ pub fn create_openai_compat(spec: ProviderSpec) -> Arc<dyn LLMProvider> {
     );
     prov = prov.with_constrained_tool_calls(spec.constrained_tool_calls);
     prov = prov.with_higgs_session_cache(spec.higgs_session_cache);
+    prov = prov.with_runtime_model_contract(contract);
     Arc::new(prov)
 }
 

@@ -36,6 +36,7 @@ use super::constants::{
 use super::jit_gate::JitGate;
 use super::retry;
 use crate::agent::capacity::{HiggsCapacityFetch, HiggsCapacityProfile};
+use crate::agent::model_capabilities::{RuntimeModelContract, ThinkingMode};
 
 /// An LLM provider that talks to any OpenAI-compatible chat completions endpoint.
 pub struct OpenAICompatProvider {
@@ -68,6 +69,9 @@ pub struct OpenAICompatProvider {
     frequency_penalty: Option<f64>,
     /// Optional OpenAI-compatible presence penalty override.
     presence_penalty: Option<f64>,
+    /// Immutable facts reported by Higgs for the selected runtime model.
+    /// `None` keeps the existing provider heuristics for non-Higgs endpoints.
+    runtime_model_contract: Option<RuntimeModelContract>,
 }
 
 pub(crate) const NANOBOT_HIGGS_SESSION_ID_FIELD: &str = "_nanobot_higgs_session_id";
@@ -194,6 +198,7 @@ impl OpenAICompatProvider {
             repetition_penalty: None,
             frequency_penalty: None,
             presence_penalty: None,
+            runtime_model_contract: None,
         }
     }
 
@@ -209,6 +214,16 @@ impl OpenAICompatProvider {
     /// Enable Higgs' cache-resident continuation extension for this provider.
     pub fn with_higgs_session_cache(mut self, enabled: bool) -> Self {
         self.higgs_session_cache = enabled;
+        self
+    }
+
+    /// Attach the selected Higgs model's runtime contract. The contract is
+    /// fetched on model adoption and reused for every request in this core.
+    pub(crate) fn with_runtime_model_contract(
+        mut self,
+        contract: Option<RuntimeModelContract>,
+    ) -> Self {
+        self.runtime_model_contract = contract;
         self
     }
 
@@ -569,6 +584,7 @@ fn apply_local_reasoning_controls(
     api_base: &str,
     model: &str,
     thinking_budget: Option<u32>,
+    runtime_contract: Option<&RuntimeModelContract>,
 ) {
     if !is_local_api_base(api_base) {
         return;
@@ -580,6 +596,20 @@ fn apply_local_reasoning_controls(
         });
         body["reasoning_budget"] = serde_json::json!(budget);
         body["reasoning_format"] = serde_json::json!("deepseek");
+    } else if let Some(thinking) = runtime_contract.and_then(|c| c.thinking) {
+        match thinking {
+            ThinkingMode::Always => {
+                body["chat_template_kwargs"] = serde_json::json!({
+                    "enable_thinking": true
+                });
+                body["reasoning_format"] = serde_json::json!("deepseek");
+            }
+            ThinkingMode::Optional | ThinkingMode::Disabled => {
+                body["chat_template_kwargs"] = serde_json::json!({
+                    "enable_thinking": false
+                });
+            }
+        }
     } else if model_prefers_hidden_reasoning(model) {
         body["chat_template_kwargs"] = serde_json::json!({
             "enable_thinking": true
@@ -1183,7 +1213,13 @@ impl OpenAICompatProvider {
             drop_session_ids_value = ?higgs_control.drop_session_ids,
             "higgs_session_cache_request"
         );
-        apply_local_reasoning_controls(&mut body, &self.api_base, policy_model, thinking_budget);
+        apply_local_reasoning_controls(
+            &mut body,
+            &self.api_base,
+            policy_model,
+            thinking_budget,
+            self.runtime_model_contract.as_ref(),
+        );
 
         // Forced tool calls ("required") only engage for local backends with
         // constrained tool calls enabled; elsewhere this is "auto" (unchanged).
@@ -4069,6 +4105,7 @@ mod tests {
             "http://localhost:18080/v1",
             "qwen3-1.7b",
             Some(4096),
+            None,
         );
         assert_eq!(local_body["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(local_body["reasoning_budget"], 4096);
@@ -4080,6 +4117,7 @@ mod tests {
             "https://api.openai.com/v1",
             "gpt-4o",
             Some(4096),
+            None,
         );
         assert!(remote_body.get("chat_template_kwargs").is_none());
         assert!(remote_body.get("reasoning_budget").is_none());
@@ -4095,7 +4133,7 @@ mod tests {
         // sent unconditionally; templates without the flag ignore it.
         for model in ["nanbeige-16b", "qwythos-9b"] {
             let mut body = serde_json::json!({"model": model, "messages": []});
-            apply_local_reasoning_controls(&mut body, "http://localhost:1234", model, None);
+            apply_local_reasoning_controls(&mut body, "http://localhost:1234", model, None, None);
             assert!(body.get("reasoning_budget").is_none());
             assert!(body.get("reasoning_format").is_none());
             assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
@@ -4111,6 +4149,7 @@ mod tests {
             "http://localhost:1234",
             "qwen3-1.7b",
             Some(1024),
+            None,
         );
         assert_eq!(body["reasoning_budget"], 1024);
         assert_eq!(body["reasoning_format"], "deepseek");
@@ -4120,7 +4159,13 @@ mod tests {
     #[test]
     fn test_reasoning_disabled_for_thinking_model() {
         let mut body = serde_json::json!({"model": "qwen3-1.7b", "messages": []});
-        apply_local_reasoning_controls(&mut body, "http://localhost:1234", "qwen3-1.7b", None);
+        apply_local_reasoning_controls(
+            &mut body,
+            "http://localhost:1234",
+            "qwen3-1.7b",
+            None,
+            None,
+        );
         assert!(
             body.get("reasoning_budget").is_none(),
             "reasoning_budget should not be sent"
@@ -4129,6 +4174,38 @@ mod tests {
             body.get("reasoning_format").is_none(),
             "reasoning_format should not be sent"
         );
+    }
+
+    #[test]
+    fn test_runtime_contract_controls_thinking_without_model_name_matching() {
+        let contract = RuntimeModelContract {
+            thinking: Some(ThinkingMode::Optional),
+            ..RuntimeModelContract::default()
+        };
+        let mut body = serde_json::json!({"model": "opaque-served-alias"});
+        apply_local_reasoning_controls(
+            &mut body,
+            "http://localhost:1234",
+            "opaque-served-alias",
+            None,
+            Some(&contract),
+        );
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+
+        let always = RuntimeModelContract {
+            thinking: Some(ThinkingMode::Always),
+            ..RuntimeModelContract::default()
+        };
+        let mut body = serde_json::json!({"model": "opaque-served-alias"});
+        apply_local_reasoning_controls(
+            &mut body,
+            "http://localhost:1234",
+            "opaque-served-alias",
+            None,
+            Some(&always),
+        );
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["reasoning_format"], "deepseek");
     }
 
     #[test]
@@ -4142,6 +4219,7 @@ mod tests {
             &mut body,
             "http://127.0.0.1:8000/v1",
             "VibeThinker-3B-mlx-8Bit",
+            None,
             None,
         );
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
@@ -4222,6 +4300,7 @@ mod tests {
             &mut body,
             "http://127.0.0.1:8001/v1",
             "Bonsai-8B-mlx-1bit",
+            None,
             None,
         );
         apply_repetition_controls(&mut body, "http://127.0.0.1:8001/v1", "Bonsai-8B-mlx-1bit");

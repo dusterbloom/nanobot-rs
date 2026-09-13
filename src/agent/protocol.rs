@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use std::sync::LazyLock;
 
 use super::turn::{ToolCall, Turn};
-use crate::agent::model_capabilities::lookup_default;
+use crate::agent::model_capabilities::{lookup_default, ModelCapabilities};
 
 // Matches the outer `[I called: ...]` or `[Called: ...]` or `[called ...]` or
 // `[Calling tool: ...]` bracket. Captures the inner content.
@@ -219,6 +219,13 @@ impl LocalProtocol {
 
     pub fn auto_for_model(model: &str) -> Self {
         let caps = lookup_default(model);
+        Self::auto_for_capabilities(&caps)
+    }
+
+    /// Select the local replay protocol from the resolved core capabilities.
+    /// Higgs metadata is merged into those capabilities at model adoption, so
+    /// the main agent never re-derives a wire protocol from a served alias.
+    pub fn auto_for_capabilities(caps: &ModelCapabilities) -> Self {
         if !caps.tool_calling {
             Self::textual()
         } else {
@@ -1331,6 +1338,13 @@ mod tests {
     #[test]
     fn local_protocol_is_derived_from_native_model_capabilities() {
         assert!(!LocalProtocol::auto_for_model("qwen3.5-35b-a3b").is_textual_replay());
+    }
+
+    #[test]
+    fn local_protocol_can_use_runtime_capabilities_for_aliases() {
+        let mut caps = crate::agent::model_capabilities::lookup_default("served-alias");
+        caps.tool_calling = false;
+        assert!(LocalProtocol::auto_for_capabilities(&caps).is_textual_replay());
     }
 
     // ---- parse_textual_tool_calls() ----

@@ -661,9 +661,9 @@ impl AgentLoopShared {
         // MLX models are in-process and speak cloud protocol (proper tool_calls),
         // so they use CloudProtocol even though mode=Local for context sizing.
         let protocol: Arc<dyn ConversationProtocol> = match core.mode() {
-            RuntimeMode::Local { .. } if !core.model.starts_with("mlx:") => {
-                Arc::new(LocalProtocol::auto_for_model(&core.model))
-            }
+            RuntimeMode::Local { .. } if !core.model.starts_with("mlx:") => Arc::new(
+                LocalProtocol::auto_for_capabilities(&core.model_capabilities),
+            ),
             RuntimeMode::Local { .. } | RuntimeMode::Cloud => Arc::new(CloudProtocol),
         };
 
