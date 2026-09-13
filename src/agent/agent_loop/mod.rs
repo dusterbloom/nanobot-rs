@@ -665,6 +665,11 @@ impl AgentLoop {
             .await
     }
 
+    /// Force a foreground LCM checkpoint for the selected session.
+    pub(crate) async fn compact_session_now(&self, session_key: &str) -> CompactionReport {
+        self.shared.compact_session_now(session_key).await
+    }
+
     /// Like `process_direct` but allows passing a detected language code
     /// (e.g. "it", "es") so the LLM responds in that language.
     pub async fn process_direct_with_lang(

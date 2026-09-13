@@ -4127,6 +4127,60 @@ async fn published_soft_checkpoint_replays_and_installs_on_next_turn() {
 }
 
 #[tokio::test]
+async fn manual_compaction_does_not_create_a_fake_turn() {
+    let provider = Arc::new(ReplayStableSoftProvider {
+        foreground_calls: std::sync::Mutex::new(Vec::new()),
+        foreground_max_tokens: std::sync::Mutex::new(Vec::new()),
+        force_recovery_on_second: false,
+    });
+    let lcm_config = LcmSchemaConfig {
+        tau_soft: 0.0001,
+        tau_hard: 10.0,
+        deterministic_target: 64,
+        ..Default::default()
+    };
+    let (agent_loop, workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "manual-compact-test",
+        1_000_000,
+        lcm_config,
+    );
+    let session_key = format!("manual-compact-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    seed_compaction_history(&core, &session.id, 12, 40).await;
+    let before_rows = core.sessions.get_all_messages(&session.id).await;
+
+    let report = agent_loop.shared.compact_session_now(&session_key).await;
+
+    assert!(
+        report.after_tokens < report.before_tokens,
+        "manual compaction should reduce the rendered prompt: {report:?}"
+    );
+    let after_rows = core.sessions.get_all_messages(&session.id).await;
+    assert_eq!(
+        after_rows.len(),
+        before_rows.len(),
+        "manual compaction must not persist a synthetic user turn"
+    );
+    assert!(
+        after_rows.iter().all(|message| {
+            message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| !content.is_empty())
+        }),
+        "manual compaction must not persist an empty maintenance message"
+    );
+    assert!(
+        provider.foreground_calls().is_empty(),
+        "manual compaction must not send a foreground user turn"
+    );
+
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[tokio::test]
 async fn soft_checkpoint_survives_turn_finish_journal_failure() {
     // Break caught: a durably-checkpointed LCM compaction was discarded when
     // the final replay journal write failed, so the compacted context never

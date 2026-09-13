@@ -714,6 +714,7 @@ pub(crate) fn print_help() {
     println!("  /kill <id>      - Cancel a background agent");
     println!("  /status, /s     - Show current mode, model, and channel info");
     println!("  /context        - Show context breakdown (tokens, messages, memory)");
+    println!("  /compact        - Compact the current session now");
     println!("  /memory         - Show working memory for current session");
     println!("  /learn          - Distill completed sessions into workspace/memory/MEMORY.md now");
     println!("  /clear, /c      - Clear working memory for current session");

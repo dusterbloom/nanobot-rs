@@ -757,6 +757,23 @@ impl LcmEngine {
         // that cannot be compacted and must not trigger the threshold.
         let current = self.conversation_tokens();
 
+        self.check_thresholds_for(available, current)
+    }
+
+    /// Check thresholds using the exact provider-prompt estimate.
+    ///
+    /// This is the admission path for a rendered request. Unlike the legacy
+    /// conversation-only estimate, `current` includes the immutable system
+    /// prefix and any tool definitions already accounted for by the caller.
+    pub fn check_thresholds_with_prompt_tokens(
+        &self,
+        available: usize,
+        prompt_tokens: usize,
+    ) -> CompactionAction {
+        self.check_thresholds_for(available, prompt_tokens)
+    }
+
+    fn check_thresholds_for(&self, available: usize, current: usize) -> CompactionAction {
         let hard_limit = (available as f64 * self.config.tau_hard) as usize;
         let soft_limit = (available as f64 * self.config.tau_soft) as usize;
 
@@ -3333,6 +3350,24 @@ mod tests {
             engine.check_thresholds(&budget, 0),
             CompactionAction::Async,
             "Conversation tokens over soft threshold should trigger async compaction"
+        );
+    }
+
+    #[test]
+    fn test_exact_prompt_tokens_trigger_hard_compaction_including_fixed_prefix() {
+        let engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.5,
+            tau_hard: 0.85,
+            deterministic_target: 512,
+            keep_prefix_fraction: 0.35,
+        });
+
+        // The exact provider prompt is the input to this decision. This is
+        // deliberately larger than the conversation-only estimate so a large
+        // rendered system/tool prefix cannot hide an over-budget request.
+        assert_eq!(
+            engine.check_thresholds_with_prompt_tokens(10_000, 8_500),
+            CompactionAction::Blocking
         );
     }
 

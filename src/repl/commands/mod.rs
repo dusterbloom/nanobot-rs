@@ -948,6 +948,9 @@ impl ReplContext {
             "/context" => {
                 self.cmd_context().await;
             }
+            "/compact" => {
+                self.cmd_compact().await;
+            }
             "/memory" => {
                 self.cmd_memory().await;
             }

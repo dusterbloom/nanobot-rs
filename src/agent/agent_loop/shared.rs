@@ -70,12 +70,11 @@ use crate::turn_stream::{BackendActivity, CacheResetReason, CacheStatus, Control
 
 use super::budget::{
     advertised_tool_names, attach_higgs_session_control, clear_prompt_cache_state,
-    conversation_token_count, divergent_message_digest, history_window_near,
-    invalidate_prompt_cache_for_rewrite, overflow_recovery_fallback_budget,
-    overflow_trim_threshold, proactive_grounding_preserves_prefix_cache, send_cache_reset_marker,
-    send_compaction_marker, send_retract_reply_marker, should_allow_checkpoint,
-    should_inject_heartbeat_grounding, strip_higgs_session_lease_control, MAX_OVERFLOW_RECOVERIES,
-    OVERFLOW_RECOVERY_HEADROOM,
+    divergent_message_digest, history_window_near, invalidate_prompt_cache_for_rewrite,
+    overflow_recovery_fallback_budget, overflow_trim_threshold,
+    proactive_grounding_preserves_prefix_cache, send_cache_reset_marker, send_compaction_marker,
+    send_retract_reply_marker, should_allow_checkpoint, should_inject_heartbeat_grounding,
+    strip_higgs_session_lease_control, MAX_OVERFLOW_RECOVERIES, OVERFLOW_RECOVERY_HEADROOM,
 };
 use super::compaction::execute_lcm_compaction;
 use super::local_stream::{
@@ -1751,6 +1750,17 @@ pub(crate) async fn resolve_live_capacity(
     capacity.effective_budget(configured, 0)
 }
 
+fn rendered_prompt_tokens(ctx: &TurnContext, tool_def_tokens: usize) -> usize {
+    TokenBudget::estimate_tokens(&render_via_protocol(&*ctx.protocol, &ctx.messages))
+        .saturating_add(tool_def_tokens)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CompactionReport {
+    pub(crate) before_tokens: usize,
+    pub(crate) after_tokens: usize,
+}
+
 impl AgentLoopShared {
     pub(crate) async fn compaction_handle_for_session(&self, session_id: &str) -> CompactionHandle {
         let mut handles = self.compaction_handles.lock().await;
@@ -1771,6 +1781,48 @@ impl AgentLoopShared {
             .is_some_and(|current| current.same_owner(candidate))
         {
             handles.remove(session_id);
+        }
+    }
+
+    /// Compact the current session without creating or persisting a fake user
+    /// turn. This deliberately reuses the normal context, budget, checkpoint,
+    /// and cache-preservation path so `/compact` cannot drift from automatic
+    /// compaction behavior.
+    pub(crate) async fn compact_session_now(&self, session_key: &str) -> CompactionReport {
+        // Match the normal REPL turn identity so the maintenance context has
+        // the same stable prompt prefix as the next user message.
+        let mut msg = crate::bus::events::InboundMessage::new("cli", "user", "direct", "");
+        msg.metadata
+            .insert("session_key".to_string(), json!(session_key));
+        let mut ctx = self.prepare_context(&msg, None, None, None, None).await;
+
+        // `prepare_context` always appends the current user as the first
+        // unsaved item. Remove that empty maintenance turn before measuring or
+        // compacting, including any ephemeral scaffold inserted beside it.
+        ctx.messages.truncate(ctx.new_start);
+        ctx.new_start = ctx.messages.len();
+        ctx.effective_budget = resolve_live_capacity(
+            &ctx.capacity,
+            ctx.core.provider.as_ref(),
+            &ctx.core.model,
+            &ctx.core.token_budget,
+            &ctx.counters,
+            &ctx.session_key,
+        )
+        .await;
+        let tool_def_tokens =
+            TokenBudget::estimate_tool_def_tokens(&ctx.tools.get_core_plus_proxy_definitions());
+        let before_tokens = rendered_prompt_tokens(&ctx, tool_def_tokens);
+        self.manage_compaction(
+            &mut ctx,
+            tool_def_tokens,
+            CompactionFailureMode::PreserveContext,
+            true,
+        )
+        .await;
+        CompactionReport {
+            before_tokens,
+            after_tokens: rendered_prompt_tokens(&ctx, tool_def_tokens),
         }
     }
 
@@ -2636,8 +2688,13 @@ impl AgentLoopShared {
             ) => budget,
         };
 
-        self.manage_compaction(ctx, tool_def_tokens, CompactionFailureMode::PreserveContext)
-            .await;
+        self.manage_compaction(
+            ctx,
+            tool_def_tokens,
+            CompactionFailureMode::PreserveContext,
+            false,
+        )
+        .await;
         if ctx.is_cancelled() {
             return StepResult::Done(IterationOutcome::Complete {
                 content: String::new(),
@@ -3233,10 +3290,13 @@ impl AgentLoopShared {
         ctx: &mut TurnContext,
         tool_def_tokens: usize,
         admission_mode: CompactionFailureMode,
+        force: bool,
     ) {
         let Some(admission) = ctx.compaction.admit().await else {
             return;
         };
+        // Yield only still-generating background work. The publication phase
+        // is atomic, so a finished checkpoint cannot be discarded here.
         ctx.compaction.cancel_and_reap().await;
         {
             // LCM path: get or create per-session engine, check thresholds.
@@ -3291,24 +3351,54 @@ impl AgentLoopShared {
                 ctx.effective_budget.max_context(),
                 ctx.effective_budget.response_reserve(),
             );
-            let (mut action, conv_tokens, available, hard_limit, soft_limit) = {
+            let (
+                mut conversation_action,
+                mut exact_action,
+                mut prompt_tokens,
+                conversation_available,
+                prompt_available,
+                hard_limit,
+                soft_limit,
+            ) = {
                 let engine = lcm_engine.lock().await;
-                let available = budget.available_budget(tool_def_tokens);
+                let conversation_available = budget.available_budget(tool_def_tokens);
+                // `prompt_tokens` below already includes tool definitions, so
+                // reserve only the response for the exact hard-cap check.
+                let prompt_available = budget.available_budget(0);
+                let prompt_tokens = rendered_prompt_tokens(ctx, tool_def_tokens);
                 (
-                    engine.check_thresholds_with_available(available),
-                    engine.conversation_tokens(),
-                    available,
-                    (available as f64 * engine.tau_hard()) as usize,
-                    (available as f64 * engine.tau_soft()) as usize,
+                    engine.check_thresholds_with_available(conversation_available),
+                    engine.check_thresholds_with_prompt_tokens(prompt_available, prompt_tokens),
+                    prompt_tokens,
+                    conversation_available,
+                    prompt_available,
+                    (prompt_available as f64 * engine.tau_hard()) as usize,
+                    (conversation_available as f64 * engine.tau_soft()) as usize,
                 )
             };
 
+            // A completed background result is already the desired automatic
+            // checkpoint. Install it before deciding whether another fold is
+            // needed, otherwise the same turn can compact stale raw history.
+            let mut checkpoint_installed = self.install_pending_compaction(ctx, true).await;
+
+            if checkpoint_installed {
+                prompt_tokens = rendered_prompt_tokens(ctx, tool_def_tokens);
+                let engine = lcm_engine.lock().await;
+                conversation_action =
+                    engine.check_thresholds_with_available(conversation_available);
+                exact_action =
+                    engine.check_thresholds_with_prompt_tokens(prompt_available, prompt_tokens);
+            }
+
             // Immutable instructions and current-turn rows consume the same
             // prompt room as history; they must also force blocking recovery.
-            let full_wire_limit = budget.available_budget(tool_def_tokens);
+            let full_wire_limit = budget.available_budget(0);
+            let protocol = ctx.protocol.clone();
             let exceeds_hard_budget = |messages: &[Value]| {
-                conversation_token_count(messages) > hard_limit
-                    || TokenBudget::estimate_tokens(messages) > full_wire_limit
+                TokenBudget::estimate_tokens(&render_via_protocol(&*protocol, messages))
+                    .saturating_add(tool_def_tokens)
+                    > full_wire_limit
             };
             let mut raw_hard = exceeds_hard_budget(&ctx.messages);
             // The hard message/turn window binding at the next reload is the
@@ -3320,17 +3410,26 @@ impl AgentLoopShared {
             let mut window_near =
                 history_window_near(ctx.turn_count, budget_core.max_history_turns);
             if raw_hard || window_near {
-                self.install_pending_compaction(ctx, true).await;
+                checkpoint_installed |= self.install_pending_compaction(ctx, true).await;
                 raw_hard = exceeds_hard_budget(&ctx.messages);
                 window_near = history_window_near(ctx.turn_count, budget_core.max_history_turns);
-                action = {
+                prompt_tokens = rendered_prompt_tokens(ctx, tool_def_tokens);
+                conversation_action = {
                     let engine = lcm_engine.lock().await;
-                    engine.check_thresholds_with_available(available)
+                    engine.check_thresholds_with_available(conversation_available)
+                };
+                exact_action = {
+                    let engine = lcm_engine.lock().await;
+                    engine.check_thresholds_with_prompt_tokens(prompt_available, prompt_tokens)
                 };
             }
 
             let has_pending = ctx.compaction.has_pending().await;
-            let must_block = raw_hard || action == CompactionAction::Blocking || window_near;
+            let must_block = raw_hard
+                || conversation_action == CompactionAction::Blocking
+                || exact_action == CompactionAction::Blocking
+                || window_near
+                || (force && !checkpoint_installed);
             if must_block {
                 ctx.soft_compaction_requested = false;
             }
@@ -3339,8 +3438,8 @@ impl AgentLoopShared {
                 tracing::info!(
                     compaction_type = "lcm_blocking",
                     msg_count = ctx.messages.len(),
-                    conv_tokens,
-                    available,
+                    prompt_tokens,
+                    available = prompt_available,
                     hard_limit,
                     soft_limit,
                     "lcm_compaction_triggered"
@@ -3397,12 +3496,12 @@ impl AgentLoopShared {
                     })
                     .await;
                 Some(started)
-            } else if action == CompactionAction::Async && !has_pending {
+            } else if conversation_action == CompactionAction::Async && !has_pending {
                 tracing::info!(
                     compaction_type = "lcm_async",
                     msg_count = ctx.messages.len(),
-                    conv_tokens,
-                    available,
+                    prompt_tokens,
+                    available = conversation_available,
                     hard_limit,
                     soft_limit,
                     "lcm_compaction_triggered"

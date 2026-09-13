@@ -21,11 +21,31 @@
     clippy::string_add
 )]
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::*;
 
 impl ReplContext {
+    /// /compact — force one lossless foreground checkpoint for this session.
+    pub(super) async fn cmd_compact(&self) {
+        println!("\n  Compacting the current session...");
+        let started = Instant::now();
+        let report = self.agent_loop.compact_session_now(&self.session_id).await;
+        let elapsed = started.elapsed().as_secs_f32();
+        if report.after_tokens < report.before_tokens {
+            println!(
+                "  Compacted {} → {} prompt tokens in {elapsed:.1}s; cached prefix preserved.\n",
+                tui::format_thousands(report.before_tokens),
+                tui::format_thousands(report.after_tokens),
+            );
+        } else {
+            println!(
+                "  Nothing to compact ({} prompt tokens; {elapsed:.1}s).\n",
+                tui::format_thousands(report.after_tokens),
+            );
+        }
+    }
+
     /// /think, /t — toggle extended thinking / reasoning mode.
     /// /think <budget> — enable with specific token budget (e.g. /think 16000).
     pub(super) fn cmd_think(&self, arg: &str) {

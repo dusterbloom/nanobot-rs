@@ -304,6 +304,9 @@ impl AgentLoopShared {
             self.remove_compaction_handle_if_owned(&session_id, &candidate)
                 .await;
         };
+        // Let an in-flight generation yield to the new foreground turn, but
+        // never interrupt publication: CompactionPublication's atomic phase
+        // makes an already-publishable checkpoint finish and remain installable.
         compaction.cancel_and_reap().await;
         if tools.contains("recall") {
             // recall absorbed session_search; re-register it bound to the

@@ -142,6 +142,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/mode", "cycle calm / inspect / deep"),
     ("/status", "mode, model, channels"),
     ("/context", "context window usage"),
+    ("/compact", "compact the current session now"),
     ("/sessions", "resume a past session"),
     ("/clear", "clear the transcript"),
     ("/voice", "toggle voice mode"),
@@ -4103,6 +4104,13 @@ mod tests {
     use crate::turn_stream::{CapacityAction, CapacityBasisLabel, CapacityPressureLabel};
 
     #[test]
+    fn slash_commands_include_manual_compaction() {
+        assert!(SLASH_COMMANDS
+            .iter()
+            .any(|(command, _)| *command == "/compact"));
+    }
+
+    #[test]
     fn palette_index_0_is_monochrome() {
         // The default scheme is intentionally black/grey/white — color is opt-in.
         let p = Palette::from_index(0);
@@ -5590,6 +5598,7 @@ mod tests {
             "/nothink",
             "/status",
             "/context",
+            "/compact",
             "/memory",
             "/sessions",
             "/clear",
