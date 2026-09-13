@@ -744,9 +744,15 @@ impl ReplContext {
                     let size_mb = std::fs::metadata(path)
                         .map(|m| m.len() / 1_048_576)
                         .unwrap_or(0);
-                    println!("    [{}] {} ({} MB){}", i + 1, entry.id, size_mb, marker);
+                    println!(
+                        "    [{}] {} ({} MB){}",
+                        i + 1,
+                        entry.display_name(),
+                        size_mb,
+                        marker
+                    );
                 } else {
-                    println!("    [{}] {}{}", i + 1, entry.id, marker);
+                    println!("    [{}] {}{}", i + 1, entry.display_name(), marker);
                 }
             }
 

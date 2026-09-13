@@ -157,6 +157,29 @@ impl ModelEntry {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_higgs(id: &str, name: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            source: ModelSource::Higgs {
+                endpoint: "http://127.0.0.1:9000/v1".to_string(),
+                path: Some(id.to_string()),
+                name: name.to_string(),
+            },
+            is_active: false,
+            is_loaded: false,
+        }
+    }
+
+    /// Human-facing model label; Higgs ids can be path-derived while `name`
+    /// is the runtime model name users expect to see.
+    pub(crate) fn display_name(&self) -> &str {
+        match &self.source {
+            ModelSource::Higgs { name, .. } if !name.is_empty() => name,
+            _ => &self.id,
+        }
+    }
+
     /// Short, human label for the model's source (for the TUI picker).
     pub(crate) fn source_tag(&self) -> String {
         match &self.source {

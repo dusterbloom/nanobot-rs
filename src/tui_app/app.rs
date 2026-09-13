@@ -754,7 +754,7 @@ impl App {
                 entry: e.clone(),
                 label: format!(
                     "{}   {}{}",
-                    e.id,
+                    e.display_name(),
                     e.source_tag(),
                     if e.is_loaded { " · loaded" } else { "" }
                 ),
@@ -6898,6 +6898,18 @@ mod tests {
         assert!(text.contains("alpha"), "models listed:\n{text}");
         assert!(text.contains("gamma"));
         assert!(text.contains("select model"));
+    }
+
+    #[test]
+    fn model_picker_shows_higgs_name_not_folder_id() {
+        let mut app = App::new();
+        app.open_model_picker(vec![ModelEntry::test_higgs(
+            "EschaLabs/Qwen3.6-35B-A3B-Escha-W2",
+            "Qwen3.6-35B-A3B-Escha-W2",
+        )]);
+        let label = &app.picker.as_ref().unwrap().rows[0].label;
+        assert!(label.starts_with("Qwen3.6-35B-A3B-Escha-W2"));
+        assert!(!label.contains("EschaLabs/"));
     }
 
     #[test]
