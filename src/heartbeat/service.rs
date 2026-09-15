@@ -129,11 +129,6 @@ impl HeartbeatService {
         }
     }
 
-    /// Access the health probe registry.
-    pub fn registry(&self) -> Option<&Arc<super::health::HealthRegistry>> {
-        self.health_registry.as_ref()
-    }
-
     /// Start the heartbeat background loop.
     pub async fn start(&self) {
         if !self.enabled {
@@ -182,17 +177,6 @@ impl HeartbeatService {
         if let Some(h) = guard.take() {
             h.abort();
         }
-    }
-
-    /// Manually trigger a heartbeat right now, bypassing the interval.
-    ///
-    /// Returns the agent response (if any).
-    pub async fn trigger_now(&self) -> Option<String> {
-        if let Some(ref cb) = self.on_heartbeat {
-            let result = cb(HEARTBEAT_PROMPT.to_string()).await;
-            return result;
-        }
-        None
     }
 
     // -----------------------------------------------------------------------
