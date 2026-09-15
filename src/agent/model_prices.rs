@@ -4,11 +4,8 @@
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
 #![allow(clippy::as_conversions)]
-//! Model price fetching and caching from OpenRouter.
-//!
-//! Fetches per-token pricing for all models from the OpenRouter public API
-//! (no auth required) and caches locally. Used by the tool runner to enforce
-//! cost budgets on RLM delegation loops.
+//! Per-token model pricing used by the tool runner to enforce cost
+//! budgets on RLM delegation loops.
 
 use std::collections::HashMap;
 
@@ -23,27 +20,6 @@ pub struct ModelPrices {
     pub fetched_at: i64,
 }
 
-/// OpenRouter API response structures (minimal).
-#[derive(Deserialize)]
-#[cfg(test)]
-struct OpenRouterModelsResponse {
-    data: Vec<OpenRouterModel>,
-}
-
-#[derive(Deserialize)]
-#[cfg(test)]
-struct OpenRouterModel {
-    id: String,
-    pricing: Option<OpenRouterPricing>,
-}
-
-#[derive(Deserialize)]
-#[cfg(test)]
-struct OpenRouterPricing {
-    prompt: Option<String>,
-    completion: Option<String>,
-}
-
 impl ModelPrices {
     /// Create an empty price map.
     #[cfg(test)]
@@ -52,55 +28,6 @@ impl ModelPrices {
             prices: HashMap::new(),
             fetched_at: 0,
         }
-    }
-
-    /// Fetch prices from OpenRouter API.
-    #[cfg(test)]
-    pub async fn fetch() -> Result<Self, String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .map_err(|e| format!("HTTP client error: {}", e))?;
-
-        let resp = client
-            .get("https://openrouter.ai/api/v1/models")
-            .header("User-Agent", "nanobot")
-            .send()
-            .await
-            .map_err(|e| format!("Request failed: {}", e))?;
-
-        if !resp.status().is_success() {
-            return Err(format!("HTTP {}", resp.status()));
-        }
-
-        let body: OpenRouterModelsResponse = resp
-            .json()
-            .await
-            .map_err(|e| format!("Parse error: {}", e))?;
-
-        let mut prices = HashMap::new();
-        for model in body.data {
-            if let Some(pricing) = model.pricing {
-                let prompt = pricing
-                    .prompt
-                    .as_deref()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0)
-                    .max(0.0); // Clamp negative prices (e.g. credit/reward models)
-                let completion = pricing
-                    .completion
-                    .as_deref()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .unwrap_or(0.0)
-                    .max(0.0);
-                prices.insert(model.id, (prompt, completion));
-            }
-        }
-
-        Ok(Self {
-            prices,
-            fetched_at: chrono::Utc::now().timestamp(),
-        })
     }
 
     /// Calculate cost for a given model and token counts.
@@ -184,40 +111,5 @@ mod tests {
         assert_eq!(parsed.prices.len(), 2);
         assert_eq!(parsed.prices["test/a"], (0.001, 0.002));
         assert_eq!(parsed.fetched_at, 1700000000);
-    }
-
-    #[tokio::test]
-    async fn test_fetch_live() {
-        // Integration test — actually hits OpenRouter API.
-        // Skip in CI by checking env var.
-        if std::env::var("CI").is_ok() {
-            return;
-        }
-
-        let result = ModelPrices::fetch().await;
-        match result {
-            Ok(prices) => {
-                assert!(
-                    prices.prices.len() > 100,
-                    "Expected 100+ models, got {}",
-                    prices.prices.len()
-                );
-                // Verify a known model exists.
-                assert!(
-                    prices.prices.contains_key("anthropic/claude-opus-4.6")
-                        || prices.prices.contains_key("anthropic/claude-3.5-sonnet"),
-                    "Should contain at least one Anthropic model"
-                );
-                // Verify prices are non-negative.
-                for (model, (p, c)) in &prices.prices {
-                    assert!(*p >= 0.0, "Negative prompt price for {}", model);
-                    assert!(*c >= 0.0, "Negative completion price for {}", model);
-                }
-            }
-            Err(e) => {
-                // Network might not be available — don't fail hard.
-                eprintln!("Fetch failed (expected in offline env): {}", e);
-            }
-        }
     }
 }
