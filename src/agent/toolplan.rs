@@ -22,8 +22,6 @@ pub struct ToolPlan {
     #[serde(default)]
     pub args: Value,
     pub confidence: f64,
-    #[serde(default)]
-    pub idempotency_key: String,
 }
 
 impl ToolPlan {
@@ -68,23 +66,11 @@ fn normalize_action(raw: &str) -> Option<ToolPlanAction> {
 pub fn from_router_decision(decision: RouterDecision) -> Result<ToolPlan, String> {
     let action = normalize_action(&decision.action)
         .ok_or_else(|| format!("invalid tool plan action: {}", decision.action))?;
-    let idempotency_key = format!(
-        "{}:{}:{}",
-        match action {
-            ToolPlanAction::Tool => "tool",
-            ToolPlanAction::Subagent => "subagent",
-            ToolPlanAction::Specialist => "specialist",
-            ToolPlanAction::AskUser => "ask_user",
-        },
-        decision.target,
-        serde_json::to_string(&decision.args).unwrap_or_default()
-    );
     let plan = ToolPlan {
         action,
         target: decision.target,
         args: decision.args,
         confidence: decision.confidence,
-        idempotency_key,
     };
     plan.validate()?;
     Ok(plan)
