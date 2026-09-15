@@ -12,7 +12,6 @@
 //! - **JitGate**: A single-permit semaphore that serialises all LLM requests to
 //!   one JIT server, preventing concurrent model loading.
 //! - **warmup_jit_models**: Pre-loads models one at a time with minimal requests.
-//! - **is_jit_loading_error**: Detects JIT-specific error strings in responses.
 
 use std::sync::Arc;
 
@@ -44,20 +43,6 @@ impl JitGate {
             .await
             .expect("JitGate semaphore closed unexpectedly")
     }
-}
-
-/// Detect JIT-specific loading errors in response text.
-///
-/// LM Studio returns these when a model is still loading or failed to load.
-/// Retryability is now handled by `ProviderError::is_retryable()` in `errors.rs`.
-#[cfg(test)]
-pub fn is_jit_loading_error(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    lower.contains("no models loaded")
-        || lower.contains("failed to load model")
-        || lower.contains("error loading model")
-        || lower.contains("model is loading")
-        || lower.contains("model not found")
 }
 
 /// Send a minimal `max_tokens:1` request to force JIT model loading.
@@ -165,26 +150,6 @@ fn jit_model_matches(loaded: &str, model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_jit_loading_error_positive() {
-        assert!(is_jit_loading_error("No models loaded"));
-        assert!(is_jit_loading_error(
-            "Error: no models loaded on this server"
-        ));
-        assert!(is_jit_loading_error("Failed to load model xyz"));
-        assert!(is_jit_loading_error("error loading model"));
-        assert!(is_jit_loading_error("Model is loading, please wait"));
-        assert!(is_jit_loading_error("model not found"));
-    }
-
-    #[test]
-    fn test_is_jit_loading_error_negative() {
-        assert!(!is_jit_loading_error("The answer is 42."));
-        assert!(!is_jit_loading_error("HTTP 200 OK"));
-        assert!(!is_jit_loading_error("rate limit exceeded"));
-        assert!(!is_jit_loading_error(""));
-    }
 
     #[tokio::test]
     async fn test_jit_gate_serialises_access() {
