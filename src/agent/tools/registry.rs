@@ -285,24 +285,6 @@ impl ToolRegistry {
         }
     }
 
-    /// Create a registry with a permission ceiling.
-    ///
-    /// Tools whose [`PermissionLevel`] exceeds `max` will be denied at
-    /// execution time.
-    pub fn with_max_permission(max: PermissionLevel) -> Self {
-        Self {
-            tools: HashMap::new(),
-            max_permission: max,
-            hooks: None,
-            host: None,
-        }
-    }
-
-    /// Set the maximum permission level for this registry.
-    pub fn set_max_permission(&mut self, max: PermissionLevel) {
-        self.max_permission = max;
-    }
-
     /// Inject the typed host bridge (spawn/pipeline/loop/message). Builder
     /// style so the registry stays immutable after construction; the single
     /// production injection point is `tool_wiring::build_tools`.
@@ -495,11 +477,6 @@ impl ToolRegistry {
         self.get(name)
             .map(Tool::concurrency)
             .unwrap_or(ToolConcurrency::Sequential)
-    }
-
-    /// Check if a tool is registered.
-    pub fn has(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
     }
 
     /// Get all tool definitions in OpenAI format.
@@ -1863,15 +1840,6 @@ mod tests {
     }
 
     #[test]
-    fn test_has_tool() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(MockTool::new("alpha")));
-
-        assert!(registry.has("alpha"));
-        assert!(!registry.has("beta"));
-    }
-
-    #[test]
     fn test_contains_tool() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockTool::new("alpha")));
@@ -1896,10 +1864,10 @@ mod tests {
     fn test_unregister_tool() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockTool::new("to_remove")));
-        assert!(registry.has("to_remove"));
+        assert!(registry.contains("to_remove"));
 
         registry.unregister("to_remove");
-        assert!(!registry.has("to_remove"));
+        assert!(!registry.contains("to_remove"));
         assert!(registry.is_empty());
     }
 
@@ -2322,7 +2290,7 @@ mod tests {
         let registry =
             ToolRegistry::with_standard_tools(&ToolConfig::new(std::path::Path::new(".")));
         assert!(
-            !registry.has("batch"),
+            !registry.contains("batch"),
             "native multi-tool responses are the single batching path"
         );
     }
@@ -2332,9 +2300,9 @@ mod tests {
         let registry =
             ToolRegistry::with_standard_tools(&ToolConfig::new(std::path::Path::new(".")));
 
-        assert!(registry.has("write_file"));
+        assert!(registry.contains("write_file"));
         assert!(
-            !registry.has("write_file_chunk"),
+            !registry.contains("write_file_chunk"),
             "write_file must own both complete and staged writes"
         );
     }
@@ -3630,72 +3598,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Permission enforcement tests
-    // -----------------------------------------------------------------------
-
-    struct ExecuteTool;
-
-    #[async_trait]
-    impl Tool for ExecuteTool {
-        fn name(&self) -> &str {
-            "exec_mock"
-        }
-        fn description(&self) -> &str {
-            "mock execute-level tool"
-        }
-        fn parameters(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object", "properties": {}})
-        }
-        fn permission(&self) -> PermissionLevel {
-            PermissionLevel::Execute
-        }
-        async fn execute(
-            &self,
-            _params: HashMap<String, serde_json::Value>,
-            _ctx: &ToolContext,
-        ) -> ToolResult {
-            Ok("executed".into())
-        }
-    }
-
-    #[tokio::test]
-    async fn test_permission_denied_when_above_ceiling() {
-        let mut registry = ToolRegistry::with_max_permission(PermissionLevel::ReadOnly);
-        registry.register(Box::new(ExecuteTool));
-
-        let result = registry.execute("exec_mock", HashMap::new()).await;
-        assert!(!result.ok());
-        assert!(result.data().contains("Permission denied"));
-    }
-
-    #[tokio::test]
-    async fn test_permission_allowed_at_ceiling() {
-        let mut registry = ToolRegistry::with_max_permission(PermissionLevel::Execute);
-        registry.register(Box::new(ExecuteTool));
-
-        let result = registry.execute("exec_mock", HashMap::new()).await;
-        assert!(result.ok());
-        assert_eq!(result.data(), "executed");
-    }
-
-    #[tokio::test]
-    async fn test_permission_allowed_above_ceiling() {
-        let mut registry = ToolRegistry::with_max_permission(PermissionLevel::System);
-        registry.register(Box::new(ExecuteTool));
-
-        let result = registry.execute("exec_mock", HashMap::new()).await;
-        assert!(result.ok());
-    }
-
-    #[test]
-    fn test_set_max_permission() {
-        let mut registry = ToolRegistry::new();
-        assert_eq!(registry.max_permission, PermissionLevel::System);
-        registry.set_max_permission(PermissionLevel::Write);
-        assert_eq!(registry.max_permission, PermissionLevel::Write);
-    }
-
-    // -----------------------------------------------------------------------
     // cua registration gating (register behind config.cua.enabled)
     // -----------------------------------------------------------------------
 
@@ -3705,7 +3607,7 @@ mod tests {
         let mut cfg = ToolConfig::new(ws);
         cfg.cua.enabled = true;
         let reg = ToolRegistry::with_standard_tools(&cfg);
-        assert!(reg.has("cua"), "cua should be registered when enabled");
+        assert!(reg.contains("cua"), "cua should be registered when enabled");
     }
 
     #[test]
@@ -3714,7 +3616,7 @@ mod tests {
         let mut cfg = ToolConfig::new(ws);
         cfg.cua.enabled = false;
         let reg = ToolRegistry::with_standard_tools(&cfg);
-        assert!(!reg.has("cua"), "cua should be absent when disabled");
+        assert!(!reg.contains("cua"), "cua should be absent when disabled");
     }
 
     #[test]
@@ -3723,6 +3625,6 @@ mod tests {
         let mut cfg = ToolConfig::new(ws);
         cfg.tools_filter = Some(vec!["read_file".to_string()]);
         let reg = ToolRegistry::with_standard_tools(&cfg);
-        assert!(!reg.has("cua"));
+        assert!(!reg.contains("cua"));
     }
 }
