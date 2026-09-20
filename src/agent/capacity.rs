@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::token_budget::TokenBudget;
 
-const CAPACITY_SCHEMA_VERSION: u32 = 1;
+const LEGACY_CAPACITY_SCHEMA_VERSION: u32 = 1;
+const FAST_SESSION_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -27,9 +28,9 @@ pub(crate) enum CapacityBasis {
     Learned,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RawHiggsCapacityProfile {
+pub(crate) struct HiggsCapacityProfileV1 {
     schema_version: u32,
     model: String,
     model_fingerprint: String,
@@ -47,22 +48,87 @@ struct RawHiggsCapacityProfile {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", try_from = "RawHiggsCapacityProfile")]
-pub(crate) struct HiggsCapacityProfile {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct FastSessionContractV2 {
     schema_version: u32,
     model: String,
-    model_fingerprint: String,
-    boot_id: String,
-    generation: u64,
-    availability: CapacityAvailability,
-    pressure: CapacityPressure,
-    safe_total_tokens: u64,
-    recommended_output_tokens: u64,
-    max_prompt_tokens: u64,
-    retained_session_tokens: u64,
-    retained_bytes: u64,
-    prefix_cache_bytes: u64,
-    basis: CapacityBasis,
+    contract_revision: String,
+    max_context_tokens: u64,
+    max_output_tokens: u64,
+    retained_budget_bytes: u64,
+    guaranteed_fast_prompt_tokens: u64,
+    soft_compaction_prompt_tokens: u64,
+    target_after_compaction_tokens: u64,
+    guaranteed_sessions: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+enum RawHiggsCapacityProfile {
+    V1(HiggsCapacityProfileV1),
+    V2(FastSessionContractV2),
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(try_from = "RawHiggsCapacityProfile", untagged)]
+pub(crate) enum HiggsCapacityProfile {
+    V1(HiggsCapacityProfileV1),
+    V2(FastSessionContractV2),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RetainedCapability<'a> {
+    Unavailable,
+    LegacyStatelessOnly,
+    Guaranteed {
+        contract_revision: &'a str,
+        hard_prompt_tokens: usize,
+        soft_prompt_tokens: usize,
+        target_prompt_tokens: usize,
+    },
+}
+
+impl RetainedCapability<'_> {
+    #[cfg(test)]
+    pub(crate) fn contract_revision(&self) -> Option<&str> {
+        match self {
+            Self::Guaranteed {
+                contract_revision, ..
+            } => Some(contract_revision),
+            Self::Unavailable | Self::LegacyStatelessOnly => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hard_prompt_tokens(&self) -> Option<usize> {
+        match self {
+            Self::Guaranteed {
+                hard_prompt_tokens, ..
+            } => Some(*hard_prompt_tokens),
+            Self::Unavailable | Self::LegacyStatelessOnly => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn soft_prompt_tokens(&self) -> Option<usize> {
+        match self {
+            Self::Guaranteed {
+                soft_prompt_tokens, ..
+            } => Some(*soft_prompt_tokens),
+            Self::Unavailable | Self::LegacyStatelessOnly => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn target_prompt_tokens(&self) -> Option<usize> {
+        match self {
+            Self::Guaranteed {
+                target_prompt_tokens,
+                ..
+            } => Some(*target_prompt_tokens),
+            Self::Unavailable | Self::LegacyStatelessOnly => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,42 +199,106 @@ pub(crate) enum CapacityError {
 impl HiggsCapacityProfile {
     #[cfg(test)]
     pub(crate) fn schema_version(&self) -> u32 {
-        self.schema_version
+        match self {
+            Self::V1(profile) => profile.schema_version,
+            Self::V2(contract) => contract.schema_version,
+        }
     }
 
     pub(crate) fn model(&self) -> &str {
-        &self.model
+        match self {
+            Self::V1(profile) => &profile.model,
+            Self::V2(contract) => &contract.model,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn model_fingerprint(&self) -> &str {
-        &self.model_fingerprint
+        match self {
+            Self::V1(profile) => &profile.model_fingerprint,
+            Self::V2(contract) => contract
+                .contract_revision
+                .rsplit_once(':')
+                .map_or("", |(_, fingerprint)| fingerprint),
+        }
     }
 
     pub(crate) fn boot_id(&self) -> &str {
-        &self.boot_id
+        match self {
+            Self::V1(profile) => &profile.boot_id,
+            Self::V2(contract) => contract
+                .contract_revision
+                .split_once(':')
+                .map_or("", |(boot_id, _)| boot_id),
+        }
     }
 
     pub(crate) fn generation(&self) -> u64 {
-        self.generation
+        match self {
+            Self::V1(profile) => profile.generation,
+            Self::V2(contract) => contract
+                .contract_revision
+                .split(':')
+                .nth(1)
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_default(),
+        }
     }
 
     pub(crate) fn availability(&self) -> CapacityAvailability {
-        self.availability
+        match self {
+            Self::V1(profile) => profile.availability,
+            Self::V2(_) => CapacityAvailability::Available,
+        }
     }
 
     pub(crate) fn pressure(&self) -> CapacityPressure {
-        self.pressure
+        match self {
+            Self::V1(profile) => profile.pressure,
+            Self::V2(_) => CapacityPressure::Normal,
+        }
     }
 
     pub(crate) fn basis(&self) -> CapacityBasis {
-        self.basis
+        match self {
+            Self::V1(profile) => profile.basis,
+            Self::V2(_) => CapacityBasis::Configured,
+        }
+    }
+
+    pub(crate) fn retained_capability(&self) -> RetainedCapability<'_> {
+        match self {
+            Self::V1(_) => RetainedCapability::LegacyStatelessOnly,
+            Self::V2(contract) => {
+                let Ok(hard_prompt_tokens) =
+                    usize::try_from(contract.guaranteed_fast_prompt_tokens)
+                else {
+                    return RetainedCapability::Unavailable;
+                };
+                let Ok(soft_prompt_tokens) =
+                    usize::try_from(contract.soft_compaction_prompt_tokens)
+                else {
+                    return RetainedCapability::Unavailable;
+                };
+                let Ok(target_prompt_tokens) =
+                    usize::try_from(contract.target_after_compaction_tokens)
+                else {
+                    return RetainedCapability::Unavailable;
+                };
+                RetainedCapability::Guaranteed {
+                    contract_revision: &contract.contract_revision,
+                    hard_prompt_tokens,
+                    soft_prompt_tokens,
+                    target_prompt_tokens,
+                }
+            }
+        }
     }
 
     /// Capacity generations are comparable only within one Higgs process boot.
     #[cfg(test)]
     pub(crate) fn is_same_revision(&self, other: &Self) -> bool {
-        self.boot_id == other.boot_id && self.generation == other.generation
+        self.boot_id() == other.boot_id() && self.generation() == other.generation()
     }
 
     pub(crate) fn effective_capacity(
@@ -178,18 +308,32 @@ impl HiggsCapacityProfile {
     ) -> Result<EffectiveCapacity, CapacityError> {
         // Older endpoints expose pressure/learned windows. Those are telemetry,
         // never a model context contract: only a configured profile may cap us.
-        if self.basis != CapacityBasis::Configured
-            || self.availability == CapacityAvailability::Unavailable
-        {
-            return EffectiveCapacity::legacy_higgs(configured, immutable_prefix_tokens);
-        }
-
-        let safe_total =
-            usize::try_from(self.safe_total_tokens).map_err(|_| CapacityError::Overflow)?;
+        let (safe_total, recommended_output, server_prompt) = match self {
+            Self::V1(profile) => {
+                if profile.basis != CapacityBasis::Configured
+                    || profile.availability == CapacityAvailability::Unavailable
+                {
+                    return EffectiveCapacity::legacy_higgs(configured, immutable_prefix_tokens);
+                }
+                (
+                    profile.safe_total_tokens,
+                    profile.recommended_output_tokens,
+                    profile.max_prompt_tokens,
+                )
+            }
+            Self::V2(contract) => (
+                contract
+                    .guaranteed_fast_prompt_tokens
+                    .checked_add(contract.max_output_tokens)
+                    .ok_or(CapacityError::Overflow)?,
+                contract.max_output_tokens,
+                contract.guaranteed_fast_prompt_tokens,
+            ),
+        };
+        let safe_total = usize::try_from(safe_total).map_err(|_| CapacityError::Overflow)?;
         let recommended_output =
-            usize::try_from(self.recommended_output_tokens).map_err(|_| CapacityError::Overflow)?;
-        let server_prompt =
-            usize::try_from(self.max_prompt_tokens).map_err(|_| CapacityError::Overflow)?;
+            usize::try_from(recommended_output).map_err(|_| CapacityError::Overflow)?;
+        let server_prompt = usize::try_from(server_prompt).map_err(|_| CapacityError::Overflow)?;
         effective_capacity_from_limits(
             safe_total,
             recommended_output,
@@ -265,6 +409,30 @@ impl CapacityRuntime {
         std::sync::Arc::new(Self::default())
     }
 
+    /// Absolute retained-session walls advertised by a validated V2 contract.
+    /// Older servers intentionally return `None`: their ordinary stateless API
+    /// remains usable, but Nanobot must not claim guaranteed continuation.
+    pub(crate) fn retained_contract(&self) -> Option<(String, usize, usize, usize)> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(InstalledCapacity::Profile(profile)) = &state.installed else {
+            return None;
+        };
+        match profile.retained_capability() {
+            RetainedCapability::Guaranteed {
+                contract_revision,
+                hard_prompt_tokens,
+                soft_prompt_tokens,
+                target_prompt_tokens,
+            } => Some((
+                contract_revision.to_owned(),
+                hard_prompt_tokens,
+                soft_prompt_tokens,
+                target_prompt_tokens,
+            )),
+            RetainedCapability::Unavailable | RetainedCapability::LegacyStatelessOnly => None,
+        }
+    }
+
     /// Whether a live snapshot is already installed for this endpoint+model.
     /// The loop consults this before issuing a fetch: an unchanged tuple
     /// never refetches.
@@ -285,7 +453,13 @@ impl CapacityRuntime {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let refresh = match (&state.key, &state.installed) {
             (Some(key), Some(InstalledCapacity::Profile(previous))) if key.0 == endpoint => {
-                if previous.boot_id() == profile.boot_id() {
+                let same_revision = match (&**previous, &profile) {
+                    (HiggsCapacityProfile::V2(previous), HiggsCapacityProfile::V2(next)) => {
+                        previous.contract_revision == next.contract_revision
+                    }
+                    _ => previous.boot_id() == profile.boot_id(),
+                };
+                if same_revision {
                     CapacityRefresh::Unchanged
                 } else {
                     CapacityRefresh::BootChanged
@@ -437,56 +611,71 @@ impl TryFrom<RawHiggsCapacityProfile> for HiggsCapacityProfile {
     type Error = String;
 
     fn try_from(raw: RawHiggsCapacityProfile) -> Result<Self, Self::Error> {
-        if raw.schema_version != CAPACITY_SCHEMA_VERSION {
-            return Err(format!(
-                "unsupported capacity schemaVersion {}; expected {CAPACITY_SCHEMA_VERSION}",
-                raw.schema_version
-            ));
-        }
-        if raw.model.trim().is_empty() {
-            return Err("capacity model must not be empty".to_owned());
-        }
-        if raw.model_fingerprint.trim().is_empty() {
-            return Err("capacity modelFingerprint must not be empty".to_owned());
-        }
-        if raw.boot_id.trim().is_empty() {
-            return Err("capacity bootId must not be empty".to_owned());
-        }
-        if raw.availability == CapacityAvailability::Available {
-            if raw.safe_total_tokens == 0
-                || raw.recommended_output_tokens == 0
-                || raw.max_prompt_tokens == 0
-                || raw.recommended_output_tokens > raw.safe_total_tokens
-                || raw.max_prompt_tokens > raw.safe_total_tokens - raw.recommended_output_tokens
-                || raw.retained_session_tokens > raw.max_prompt_tokens
-            {
-                return Err("invalid available capacity token relationships".to_owned());
+        match raw {
+            RawHiggsCapacityProfile::V1(profile) => {
+                if profile.schema_version != LEGACY_CAPACITY_SCHEMA_VERSION {
+                    return Err(format!(
+                        "unsupported capacity schemaVersion {}; expected {LEGACY_CAPACITY_SCHEMA_VERSION} or {FAST_SESSION_SCHEMA_VERSION}",
+                        profile.schema_version
+                    ));
+                }
+                if profile.model.trim().is_empty() {
+                    return Err("capacity model must not be empty".to_owned());
+                }
+                if profile.model_fingerprint.trim().is_empty() {
+                    return Err("capacity modelFingerprint must not be empty".to_owned());
+                }
+                if profile.boot_id.trim().is_empty() {
+                    return Err("capacity bootId must not be empty".to_owned());
+                }
+                if profile.availability == CapacityAvailability::Available {
+                    if profile.safe_total_tokens == 0
+                        || profile.recommended_output_tokens == 0
+                        || profile.max_prompt_tokens == 0
+                        || profile.recommended_output_tokens > profile.safe_total_tokens
+                        || profile.max_prompt_tokens
+                            > profile.safe_total_tokens - profile.recommended_output_tokens
+                        || profile.retained_session_tokens > profile.max_prompt_tokens
+                    {
+                        return Err("invalid available capacity token relationships".to_owned());
+                    }
+                } else if profile.safe_total_tokens != 0
+                    || profile.recommended_output_tokens != 0
+                    || profile.max_prompt_tokens != 0
+                    || profile.retained_session_tokens != 0
+                    || profile.retained_bytes != 0
+                    || profile.prefix_cache_bytes != 0
+                {
+                    return Err("unavailable capacity limits must all be zero".to_owned());
+                }
+                Ok(Self::V1(profile))
             }
-        } else if raw.safe_total_tokens != 0
-            || raw.recommended_output_tokens != 0
-            || raw.max_prompt_tokens != 0
-            || raw.retained_session_tokens != 0
-            || raw.retained_bytes != 0
-            || raw.prefix_cache_bytes != 0
-        {
-            return Err("unavailable capacity limits must all be zero".to_owned());
+            RawHiggsCapacityProfile::V2(contract) => {
+                let revision_parts: Vec<_> = contract.contract_revision.splitn(3, ':').collect();
+                if contract.schema_version != FAST_SESSION_SCHEMA_VERSION
+                    || contract.model.trim().is_empty()
+                    || revision_parts.len() != 3
+                    || revision_parts.iter().any(|part| part.trim().is_empty())
+                    || revision_parts[1].parse::<u64>().is_err()
+                    || contract.max_context_tokens == 0
+                    || contract.max_output_tokens == 0
+                    || contract.retained_budget_bytes == 0
+                    || contract.guaranteed_sessions == 0
+                    || contract.target_after_compaction_tokens == 0
+                    || contract.target_after_compaction_tokens
+                        >= contract.soft_compaction_prompt_tokens
+                    || contract.soft_compaction_prompt_tokens
+                        >= contract.guaranteed_fast_prompt_tokens
+                    || contract.guaranteed_fast_prompt_tokens
+                        > contract
+                            .max_context_tokens
+                            .saturating_sub(contract.max_output_tokens)
+                {
+                    return Err("invalid fast-session capacity contract".to_owned());
+                }
+                Ok(Self::V2(contract))
+            }
         }
-        Ok(Self {
-            schema_version: raw.schema_version,
-            model: raw.model,
-            model_fingerprint: raw.model_fingerprint,
-            boot_id: raw.boot_id,
-            generation: raw.generation,
-            availability: raw.availability,
-            pressure: raw.pressure,
-            safe_total_tokens: raw.safe_total_tokens,
-            recommended_output_tokens: raw.recommended_output_tokens,
-            max_prompt_tokens: raw.max_prompt_tokens,
-            retained_session_tokens: raw.retained_session_tokens,
-            retained_bytes: raw.retained_bytes,
-            prefix_cache_bytes: raw.prefix_cache_bytes,
-            basis: raw.basis,
-        })
     }
 }
 
@@ -513,6 +702,104 @@ mod tests {
             "prefixCacheBytes": 1_073_741_824_u64,
             "basis": "configured"
         })
+    }
+
+    fn fast_session_contract_v2() -> serde_json::Value {
+        json!({
+            "schemaVersion": 2,
+            "contractRevision": "boot-2:9:sha256:def",
+            "model": "escha-35b-a3b",
+            "maxContextTokens": 65_536,
+            "maxOutputTokens": 4_096,
+            "retainedBudgetBytes": 4_294_967_296_u64,
+            "guaranteedFastPromptTokens": 24_576,
+            "softCompactionPromptTokens": 16_384,
+            "targetAfterCompactionTokens": 4_096,
+            "guaranteedSessions": 1
+        })
+    }
+
+    #[test]
+    fn retained_contract_v2_exposes_absolute_fast_prompt_walls() {
+        let profile =
+            serde_json::from_value::<HiggsCapacityProfile>(fast_session_contract_v2()).unwrap();
+        let retained = profile.retained_capability();
+
+        assert_eq!(profile.model(), "escha-35b-a3b");
+        assert_eq!(retained.contract_revision(), Some("boot-2:9:sha256:def"));
+        assert_eq!(retained.hard_prompt_tokens(), Some(24_576));
+        assert_eq!(retained.soft_prompt_tokens(), Some(16_384));
+        assert_eq!(retained.target_prompt_tokens(), Some(4_096));
+    }
+
+    #[test]
+    fn retained_contract_v2_caps_the_request_budget_at_the_fast_wall() {
+        let profile =
+            serde_json::from_value::<HiggsCapacityProfile>(fast_session_contract_v2()).unwrap();
+        let effective = profile
+            .effective_capacity(&TokenBudget::new(100_000, 8_192), 0)
+            .unwrap();
+
+        assert_eq!(effective.max_prompt_tokens, 24_576);
+        assert_eq!(effective.output_tokens, 4_096);
+        assert_eq!(effective.total_tokens, 28_672);
+    }
+
+    #[test]
+    fn v2_revision_change_rotates_retained_session_even_with_same_boot() {
+        let runtime = CapacityRuntime::default();
+        let first =
+            serde_json::from_value::<HiggsCapacityProfile>(fast_session_contract_v2()).unwrap();
+        assert_eq!(
+            runtime.install_profile("endpoint", "model", first),
+            CapacityRefresh::Fetched
+        );
+
+        let mut changed = fast_session_contract_v2();
+        changed["contractRevision"] = json!("boot-2:10:sha256:def");
+        let changed = serde_json::from_value::<HiggsCapacityProfile>(changed).unwrap();
+        assert_eq!(
+            runtime.install_profile("endpoint", "model", changed),
+            CapacityRefresh::BootChanged
+        );
+    }
+
+    #[test]
+    fn retained_contract_v2_rejects_malformed_or_unknown_contracts() {
+        for value in [
+            {
+                let mut value = fast_session_contract_v2();
+                value["schemaVersion"] = json!(3);
+                value
+            },
+            {
+                let mut value = fast_session_contract_v2();
+                value["softCompactionPromptTokens"] = json!(24_576);
+                value
+            },
+            {
+                let mut value = fast_session_contract_v2();
+                value["targetAfterCompactionTokens"] = json!(16_384);
+                value
+            },
+            {
+                let mut value = fast_session_contract_v2();
+                value["guaranteedFastPromptTokens"] = json!(62_000);
+                value
+            },
+        ] {
+            assert!(serde_json::from_value::<HiggsCapacityProfile>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn v1_is_explicitly_stateless_only_for_retained_mode() {
+        let profile = serde_json::from_value::<HiggsCapacityProfile>(available_profile()).unwrap();
+
+        assert_eq!(
+            profile.retained_capability(),
+            RetainedCapability::LegacyStatelessOnly
+        );
     }
 
     #[test]

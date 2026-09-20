@@ -1755,6 +1755,41 @@ fn rendered_prompt_tokens(ctx: &TurnContext, tool_def_tokens: usize) -> usize {
         .saturating_add(tool_def_tokens)
 }
 
+fn retained_contract_action(
+    prompt_tokens: usize,
+    hard_prompt_tokens: usize,
+    soft_prompt_tokens: usize,
+) -> CompactionAction {
+    if prompt_tokens >= hard_prompt_tokens {
+        CompactionAction::Blocking
+    } else if prompt_tokens >= soft_prompt_tokens {
+        CompactionAction::Async
+    } else {
+        CompactionAction::None
+    }
+}
+
+#[cfg(test)]
+mod retained_contract_threshold_tests {
+    use super::*;
+
+    #[test]
+    fn absolute_retained_walls_override_logical_context_percentages() {
+        assert_eq!(
+            retained_contract_action(14_699, 14_700, 11_000),
+            CompactionAction::Async
+        );
+        assert_eq!(
+            retained_contract_action(14_700, 14_700, 11_000),
+            CompactionAction::Blocking
+        );
+        assert_eq!(
+            retained_contract_action(10_999, 14_700, 11_000),
+            CompactionAction::None
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CompactionReport {
     pub(crate) before_tokens: usize,
@@ -2596,6 +2631,35 @@ impl AgentLoopShared {
         {
             return false;
         }
+        let retained_compaction_required = matches!(
+            error.downcast_ref::<crate::errors::ProviderError>(),
+            Some(crate::errors::ProviderError::HiggsRetentionCompactionRequired { .. })
+        );
+        if retained_compaction_required {
+            let before = rendered_prompt_tokens(ctx, 0);
+            self.manage_compaction(ctx, 0, CompactionFailureMode::PreserveContext, true)
+                .await;
+            let after_lcm = rendered_prompt_tokens(ctx, 0);
+            let Some((_, hard, _, target)) = ctx.capacity.retained_contract() else {
+                return false;
+            };
+            if after_lcm >= hard && !self.apply_emergency_trim(ctx, target).await {
+                return false;
+            }
+            let after = rendered_prompt_tokens(ctx, 0);
+            if after >= before || after >= hard {
+                return false;
+            }
+            ctx.flow.retries.overflow_trim_recoveries += 1;
+            warn!(
+                session = %ctx.session_key,
+                before_tokens = before,
+                after_tokens = after,
+                hard_prompt_tokens = hard,
+                "retention_compaction_required_retry"
+            );
+            return true;
+        }
         let est_rendered = TokenBudget::estimate_tokens(&ctx.rendered_messages).max(1);
         let parsed = crate::errors::parse_overflow_counts(&error.to_string());
         let message_budget = match parsed {
@@ -3376,6 +3440,10 @@ impl AgentLoopShared {
                     (conversation_available as f64 * engine.tau_soft()) as usize,
                 )
             };
+            if let Some((_, hard, soft, _)) = ctx.capacity.retained_contract() {
+                conversation_action = CompactionAction::None;
+                exact_action = retained_contract_action(prompt_tokens, hard, soft);
+            }
 
             // A completed background result is already the desired automatic
             // checkpoint. Install it before deciding whether another fold is
@@ -3389,6 +3457,10 @@ impl AgentLoopShared {
                     engine.check_thresholds_with_available(conversation_available);
                 exact_action =
                     engine.check_thresholds_with_prompt_tokens(prompt_available, prompt_tokens);
+                if let Some((_, hard, soft, _)) = ctx.capacity.retained_contract() {
+                    conversation_action = CompactionAction::None;
+                    exact_action = retained_contract_action(prompt_tokens, hard, soft);
+                }
             }
 
             // Immutable instructions and current-turn rows consume the same
@@ -3422,6 +3494,10 @@ impl AgentLoopShared {
                     let engine = lcm_engine.lock().await;
                     engine.check_thresholds_with_prompt_tokens(prompt_available, prompt_tokens)
                 };
+                if let Some((_, hard, soft, _)) = ctx.capacity.retained_contract() {
+                    conversation_action = CompactionAction::None;
+                    exact_action = retained_contract_action(prompt_tokens, hard, soft);
+                }
             }
 
             let has_pending = ctx.compaction.has_pending().await;
@@ -4692,7 +4768,29 @@ impl AgentLoopShared {
         ctx.flow.ttft_ms = None;
 
         if let Some(control) = &higgs_control {
-            attach_higgs_session_control(&mut messages_for_llm, control);
+            if let Some((contract_revision, _, _, _)) = ctx.capacity.retained_contract() {
+                attach_higgs_session_control(&mut messages_for_llm, control);
+                if let Some(first) = messages_for_llm
+                    .first_mut()
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    first.insert(
+                        crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD
+                            .to_owned(),
+                        serde_json::json!("require_continuation"),
+                    );
+                    first.insert(
+                        crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_EPOCH_FIELD
+                            .to_owned(),
+                        serde_json::json!(ctx.counters.session_prompt_epoch(&ctx.session_key)),
+                    );
+                    first.insert(
+                        crate::providers::openai_compat::NANOBOT_HIGGS_CONTRACT_REVISION_FIELD
+                            .to_owned(),
+                        serde_json::json!(contract_revision),
+                    );
+                }
+            }
         }
 
         // The provider boundary is the exact model-visible contract: protocol

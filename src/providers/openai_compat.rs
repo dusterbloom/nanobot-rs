@@ -81,6 +81,8 @@ pub(crate) const NANOBOT_HIGGS_SESSION_LEASE_FIELD: &str = "_nanobot_higgs_sessi
 pub(crate) const NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD: &str =
     "_nanobot_higgs_session_cache_policy";
 pub(crate) const NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD: &str = "_nanobot_higgs_max_prompt_tokens";
+pub(crate) const NANOBOT_HIGGS_SESSION_EPOCH_FIELD: &str = "_nanobot_higgs_session_epoch";
+pub(crate) const NANOBOT_HIGGS_CONTRACT_REVISION_FIELD: &str = "_nanobot_higgs_contract_revision";
 
 fn build_http_client(timeout_secs: u64) -> Client {
     let timeout = std::time::Duration::from_secs(timeout_secs);
@@ -473,6 +475,8 @@ struct HiggsRequestControl {
     session_lease: Option<serde_json::Value>,
     session_cache_policy: Option<String>,
     max_prompt_tokens: Option<u32>,
+    session_epoch: Option<u64>,
+    contract_revision: Option<String>,
 }
 
 fn request_messages_and_higgs_session_id(
@@ -528,6 +532,16 @@ fn request_messages_and_higgs_session_id(
                     control.max_prompt_tokens = max_prompt_tokens
                         .and_then(|v| v.as_u64())
                         .and_then(|value| u32::try_from(value).ok());
+                }
+                let session_epoch = obj.remove(NANOBOT_HIGGS_SESSION_EPOCH_FIELD);
+                if index == 0 {
+                    control.session_epoch = session_epoch.and_then(|value| value.as_u64());
+                }
+                let contract_revision = obj.remove(NANOBOT_HIGGS_CONTRACT_REVISION_FIELD);
+                if index == 0 {
+                    control.contract_revision = contract_revision
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .filter(|value| !value.trim().is_empty());
                 }
             }
             msg
@@ -919,6 +933,31 @@ fn parse_higgs_capacity_error(
     let error = value.get("error")?.as_object()?;
     let error_type = error.get("type")?.as_str()?;
     let code = error.get("code")?.as_str()?;
+    match (status_code, error_type, code) {
+        (409, "retention_compaction_required", "retention_compaction_required") => {
+            let contract_revision = error.get("contractRevision")?.as_str()?;
+            return (!contract_revision.trim().is_empty()).then(|| {
+                ProviderError::HiggsRetentionCompactionRequired {
+                    contract_revision: contract_revision.to_owned(),
+                }
+            });
+        }
+        (409, "retained_session_unavailable", "retained_session_unavailable") => {
+            return Some(ProviderError::HiggsRetainedSessionUnavailable {
+                session_id: error.get("sessionId")?.as_u64()?,
+                epoch: error.get("epoch")?.as_u64()?,
+            });
+        }
+        (409, "stale_retention_contract", "stale_retention_contract") => {
+            let contract_revision = error.get("contractRevision")?.as_str()?;
+            return (!contract_revision.trim().is_empty()).then(|| {
+                ProviderError::HiggsStaleRetentionContract {
+                    contract_revision: contract_revision.to_owned(),
+                }
+            });
+        }
+        _ => {}
+    }
     if (status_code, error_type, code) == (404, "higgs_capacity_model_not_found", "model_not_found")
     {
         let model = error.get("model")?.as_str()?;
@@ -1172,8 +1211,27 @@ impl OpenAICompatProvider {
             body["top_p"] = serde_json::json!(tp);
         }
         if self.higgs_session_cache {
-            if let Some(session_id) = higgs_control.session_id {
-                body["session_id"] = serde_json::json!(session_id);
+            let required_v2 = match (
+                higgs_control.session_cache_policy.as_deref(),
+                higgs_control.session_id,
+                higgs_control.session_epoch,
+                higgs_control.contract_revision.as_deref(),
+            ) {
+                (Some("require_continuation"), Some(session_id), Some(epoch), Some(revision)) => {
+                    body["retention"] = serde_json::json!({
+                        "mode": "required",
+                        "sessionId": session_id,
+                        "epoch": epoch,
+                        "contractRevision": revision,
+                    });
+                    true
+                }
+                _ => false,
+            };
+            if !required_v2 {
+                if let Some(session_id) = higgs_control.session_id {
+                    body["session_id"] = serde_json::json!(session_id);
+                }
             }
             match higgs_control.drop_session_ids.as_slice() {
                 [] => {}
@@ -1187,8 +1245,10 @@ impl OpenAICompatProvider {
             if let Some(session_lease) = &higgs_control.session_lease {
                 body["session_lease"] = session_lease.clone();
             }
-            if let Some(session_cache_policy) = &higgs_control.session_cache_policy {
-                body["session_cache_policy"] = serde_json::json!(session_cache_policy);
+            if !required_v2 {
+                if let Some(session_cache_policy) = &higgs_control.session_cache_policy {
+                    body["session_cache_policy"] = serde_json::json!(session_cache_policy);
+                }
             }
             if let Some(max_prompt_tokens) = higgs_control.max_prompt_tokens {
                 body["max_prompt_tokens"] = serde_json::json!(max_prompt_tokens);
@@ -2763,6 +2823,41 @@ mod tests {
             .is_none());
         assert_eq!(cleaned[0]["content"], serde_json::json!("stable prefix"));
         assert_eq!(cleaned[1], messages[1]);
+    }
+
+    #[test]
+    fn required_continuation_becomes_one_v2_retention_object() {
+        let provider =
+            OpenAICompatProvider::new("local", Some("http://127.0.0.1:9000/v1"), Some("bonsai"))
+                .with_higgs_session_cache(true);
+        let messages = vec![serde_json::json!({
+            "role": "system",
+            "content": "stable prefix",
+            NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
+            NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD: "require_continuation",
+            NANOBOT_HIGGS_SESSION_EPOCH_FIELD: 7_u64,
+            NANOBOT_HIGGS_CONTRACT_REVISION_FIELD: "boot-2:9:sha256:def",
+        })];
+
+        let (_, body) = provider.build_chat_request(
+            &messages,
+            None,
+            Some("bonsai"),
+            512,
+            0.0,
+            None,
+            None,
+            RequestKind::Blocking {
+                tool_choice: ToolChoice::Auto,
+            },
+        );
+
+        assert_eq!(body["retention"]["mode"], "required");
+        assert_eq!(body["retention"]["sessionId"], 42);
+        assert_eq!(body["retention"]["epoch"], 7);
+        assert_eq!(body["retention"]["contractRevision"], "boot-2:9:sha256:def");
+        assert!(body.get("session_id").is_none());
+        assert!(body.get("session_cache_policy").is_none());
     }
 
     #[test]
@@ -4907,6 +5002,41 @@ mod tests {
             Some(crate::errors::ProviderError::HiggsCapacityModelNotFound { model })
                 if model == "missing"
         ));
+    }
+
+    #[test]
+    fn exact_v2_retention_errors_are_structural() {
+        let cases = [
+            (
+                409,
+                r#"{"error":{"type":"retention_compaction_required","code":"retention_compaction_required","contractRevision":"boot-2:9:sha256:def"}}"#,
+                crate::errors::ProviderError::HiggsRetentionCompactionRequired {
+                    contract_revision: "boot-2:9:sha256:def".to_owned(),
+                },
+            ),
+            (
+                409,
+                r#"{"error":{"type":"retained_session_unavailable","code":"retained_session_unavailable","sessionId":42,"epoch":7}}"#,
+                crate::errors::ProviderError::HiggsRetainedSessionUnavailable {
+                    session_id: 42,
+                    epoch: 7,
+                },
+            ),
+            (
+                409,
+                r#"{"error":{"type":"stale_retention_contract","code":"stale_retention_contract","contractRevision":"boot-3:1:sha256:ghi"}}"#,
+                crate::errors::ProviderError::HiggsStaleRetentionContract {
+                    contract_revision: "boot-3:1:sha256:ghi".to_owned(),
+                },
+            ),
+        ];
+
+        for (status, body, expected) in cases {
+            assert_eq!(
+                format!("{:?}", parse_higgs_capacity_error(status, body)),
+                format!("{:?}", Some(expected))
+            );
+        }
     }
 
     #[test]

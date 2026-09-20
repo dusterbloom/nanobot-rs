@@ -13923,8 +13923,14 @@ mod capacity_exceeded {
                     self.compaction_requests_after_rejection
                         .fetch_add(1, Ordering::SeqCst);
                 }
+                self.output_limits.lock().unwrap().push(_max_tokens);
+                self.request_tokens.lock().unwrap().push(
+                    TokenBudget::estimate_tokens(_messages)
+                        + TokenBudget::estimate_tool_def_tokens(_tools.unwrap_or(&[])),
+                );
+                self.requests.fetch_add(1, Ordering::SeqCst);
                 return Ok(crate::providers::base::LLMResponse {
-                    content: Some("checkpoint summary".to_string()),
+                    content: Some("recovered answer".to_string()),
                     tool_calls: vec![],
                     finish_reason: FinishReason::Stop,
                     usage: std::collections::HashMap::new(),
@@ -14230,10 +14236,12 @@ mod capacity_exceeded {
     }
 
     #[tokio::test]
-    async fn typed_allocation_limit_does_not_shrink_or_retry() {
+    async fn v1_capacity_server_remains_stateless_and_does_not_claim_retention() {
         let record = drive_typed_turn(1, "hello").await;
         assert_eq!(record.request_tokens.len(), 1);
-        assert_eq!(record.outcome, "error");
+        assert_eq!(record.provider_calls, 1);
+        assert!(record.prompt_limits.is_empty());
+        assert_eq!(record.outcome, "finished");
     }
 }
 

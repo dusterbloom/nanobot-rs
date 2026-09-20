@@ -86,6 +86,15 @@ pub enum ProviderError {
     #[error("Higgs capacity model not found ({model})")]
     HiggsCapacityModelNotFound { model: String },
 
+    #[error("Higgs retained continuation requires compaction ({contract_revision})")]
+    HiggsRetentionCompactionRequired { contract_revision: String },
+
+    #[error("Higgs retained session {session_id} epoch {epoch} is unavailable")]
+    HiggsRetainedSessionUnavailable { session_id: u64, epoch: u64 },
+
+    #[error("Higgs retention contract is stale ({contract_revision})")]
+    HiggsStaleRetentionContract { contract_revision: String },
+
     #[error(
         "Higgs capacity interrupted generation (boot {boot_id}, generation {generation}, partial output {partial_output_tokens} tokens)"
     )]
@@ -122,6 +131,9 @@ impl ProviderError {
             | Self::HiggsCapacityExceeded { .. }
             | Self::HiggsCapacityUnavailable { .. }
             | Self::HiggsCapacityModelNotFound { .. }
+            | Self::HiggsRetentionCompactionRequired { .. }
+            | Self::HiggsRetainedSessionUnavailable { .. }
+            | Self::HiggsStaleRetentionContract { .. }
             | Self::HiggsCapacityInterrupted { .. }
             | Self::Cancelled
             | Self::EmptyStream(_) => false,
@@ -140,6 +152,16 @@ pub(crate) enum RetainedSessionErrorKind {
 pub(crate) fn classify_retained_session_error(
     error: &anyhow::Error,
 ) -> Option<RetainedSessionErrorKind> {
+    match error.downcast_ref::<ProviderError>()? {
+        ProviderError::HiggsRetentionCompactionRequired { .. } => {
+            return Some(RetainedSessionErrorKind::ContextOverflow)
+        }
+        ProviderError::HiggsRetainedSessionUnavailable { .. }
+        | ProviderError::HiggsStaleRetentionContract { .. } => {
+            return Some(RetainedSessionErrorKind::Unavailable)
+        }
+        _ => {}
+    }
     let ProviderError::HttpStatus {
         status,
         code,
@@ -204,6 +226,12 @@ pub fn is_retryable_provider_error(err: &anyhow::Error) -> bool {
 /// servers. Providers do not expose one stable structured code for this yet,
 /// so the hot path recognizes the small set of wire strings we receive.
 pub(crate) fn is_context_overflow_error(err: &anyhow::Error) -> bool {
+    if matches!(
+        err.downcast_ref::<ProviderError>(),
+        Some(ProviderError::HiggsRetentionCompactionRequired { .. })
+    ) {
+        return true;
+    }
     let message = err.to_string().to_lowercase();
     message.contains("exceed_context_size_error")
         || message.contains("exceeds the available context size")

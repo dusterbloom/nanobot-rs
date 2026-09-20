@@ -752,7 +752,6 @@ impl RuntimeCounters {
         self.rotate_prompt_session(session_key, PromptResetScope::LogicalSession)
     }
 
-    #[cfg(test)]
     pub fn session_prompt_epoch(&self, session_key: &str) -> u64 {
         self.higgs_sessions
             .lock()
