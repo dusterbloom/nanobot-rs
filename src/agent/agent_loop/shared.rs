@@ -2677,55 +2677,71 @@ impl AgentLoopShared {
         ctx: &mut TurnContext,
         error: &anyhow::Error,
         effective_max_tokens: u32,
+        tool_def_tokens: usize,
     ) -> bool {
         if ctx.flow.retries.overflow_trim_recoveries >= MAX_OVERFLOW_RECOVERIES {
             return false;
         }
-        match error.downcast_ref::<crate::errors::ProviderError>() {
-            Some(crate::errors::ProviderError::HiggsStaleRetentionContract { .. }) => {
+        let retained_failure = match error.downcast_ref::<crate::errors::ProviderError>() {
+            Some(crate::errors::ProviderError::HiggsStaleRetentionContract { .. }) => Some(true),
+            Some(crate::errors::ProviderError::HiggsRetainedSessionUnavailable { .. })
+            | Some(crate::errors::ProviderError::HiggsRetentionCompactionRequired { .. }) => {
+                Some(false)
+            }
+            _ => None,
+        };
+        if let Some(stale) = retained_failure {
+            // One allowance owns refresh → compact-to-seed-target → rotate.
+            // Increment before any await so no intermediate iteration can
+            // issue an unchanged seed or acquire a second recovery.
+            ctx.flow.retries.overflow_trim_recoveries += 1;
+            if stale {
                 ctx.capacity.invalidate();
-                ctx.counters.invalidate_prompt_cache(&ctx.session_key, true);
-                ctx.flow.retries.overflow_trim_recoveries += 1;
-                return true;
-            }
-            Some(crate::errors::ProviderError::HiggsRetainedSessionUnavailable { .. }) => {
-                ctx.counters.invalidate_prompt_cache(&ctx.session_key, true);
-                ctx.flow.retries.overflow_trim_recoveries += 1;
-                return true;
-            }
-            _ => {}
-        }
-        if !crate::errors::is_context_overflow_error(error) {
-            return false;
-        }
-        let retained_compaction_required = matches!(
-            error.downcast_ref::<crate::errors::ProviderError>(),
-            Some(crate::errors::ProviderError::HiggsRetentionCompactionRequired { .. })
-        );
-        if retained_compaction_required {
-            let before = rendered_prompt_tokens(ctx, 0);
-            self.manage_compaction(ctx, 0, CompactionFailureMode::PreserveContext, true)
+                ctx.effective_budget = resolve_live_capacity(
+                    &ctx.capacity,
+                    ctx.core.provider.as_ref(),
+                    &ctx.core.model,
+                    &ctx.core.token_budget,
+                    &ctx.counters,
+                    &ctx.session_key,
+                )
                 .await;
-            let after_lcm = rendered_prompt_tokens(ctx, 0);
-            let Some((_, hard, _, target)) = ctx.capacity.retained_contract() else {
+            }
+            let before = rendered_prompt_tokens(ctx, tool_def_tokens);
+            self.manage_compaction(
+                ctx,
+                tool_def_tokens,
+                CompactionFailureMode::PreserveContext,
+                true,
+            )
+            .await;
+            let Some((_, _, _, target)) = ctx.capacity.retained_contract() else {
                 return false;
             };
-            if after_lcm >= hard && !self.apply_emergency_trim(ctx, target).await {
+            let mut after = rendered_prompt_tokens(ctx, tool_def_tokens);
+            if after > target {
+                let message_target = target.saturating_sub(tool_def_tokens);
+                if !self.apply_emergency_trim(ctx, message_target).await {
+                    return false;
+                }
+                after = rendered_prompt_tokens(ctx, tool_def_tokens);
+            }
+            if after > target || after >= before {
                 return false;
             }
-            let after = rendered_prompt_tokens(ctx, 0);
-            if after >= before || after >= hard {
-                return false;
-            }
-            ctx.flow.retries.overflow_trim_recoveries += 1;
+            ctx.counters.invalidate_prompt_cache(&ctx.session_key, true);
             warn!(
                 session = %ctx.session_key,
                 before_tokens = before,
                 after_tokens = after,
-                hard_prompt_tokens = hard,
-                "retention_compaction_required_retry"
+                target_prompt_tokens = target,
+                tool_def_tokens,
+                "retained_failure_compact_rotate_seed_retry"
             );
             return true;
+        }
+        if !crate::errors::is_context_overflow_error(error) {
+            return false;
         }
         let est_rendered = TokenBudget::estimate_tokens(&ctx.rendered_messages).max(1);
         let parsed = crate::errors::parse_overflow_counts(&error.to_string());
@@ -3959,6 +3975,16 @@ impl AgentLoopShared {
     }
 
     fn handle_retained_route_error(ctx: &mut TurnContext, error: &anyhow::Error) -> bool {
+        if matches!(
+            error.downcast_ref::<crate::errors::ProviderError>(),
+            Some(
+                crate::errors::ProviderError::HiggsRetentionCompactionRequired { .. }
+                    | crate::errors::ProviderError::HiggsRetainedSessionUnavailable { .. }
+                    | crate::errors::ProviderError::HiggsStaleRetentionContract { .. }
+            )
+        ) {
+            return false;
+        }
         if ctx.higgs_session_route.retained_checkpoint().is_none() {
             return false;
         }
@@ -4954,7 +4980,10 @@ impl AgentLoopShared {
                             return step;
                         }
 
-                        if self.attempt_overflow_recovery(ctx, &e, max_tokens).await {
+                        if self
+                            .attempt_overflow_recovery(ctx, &e, max_tokens, tool_def_tokens)
+                            .await
+                        {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
                         }
@@ -5010,7 +5039,10 @@ impl AgentLoopShared {
                             return step;
                         }
 
-                        if self.attempt_overflow_recovery(ctx, &e, max_tokens).await {
+                        if self
+                            .attempt_overflow_recovery(ctx, &e, max_tokens, tool_def_tokens)
+                            .await
+                        {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
                         }
@@ -5273,7 +5305,10 @@ impl AgentLoopShared {
                         return step;
                     }
 
-                    if self.attempt_overflow_recovery(ctx, &e, max_tokens).await {
+                    if self
+                        .attempt_overflow_recovery(ctx, &e, max_tokens, tool_def_tokens)
+                        .await
+                    {
                         counters.mark_inference_finished();
                         return StepResult::Done(IterationOutcome::Continue);
                     }

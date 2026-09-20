@@ -2469,6 +2469,27 @@ async fn parse_sse_stream_with_retention(
             };
 
             if mode == SseParserMode::HiggsCapacity {
+                if chunk.get("error").is_some() {
+                    if let Some(error) = parse_higgs_capacity_error(409, data) {
+                        return Err(error);
+                    }
+                    let retained_code = chunk
+                        .pointer("/error/code")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|code| {
+                            matches!(
+                                code,
+                                "retention_compaction_required"
+                                    | "retained_session_unavailable"
+                                    | "stale_retention_contract"
+                            )
+                        });
+                    if retained_code {
+                        return Err(crate::errors::ProviderError::JsonParseError(
+                            "malformed streamed Higgs retention error".to_owned(),
+                        ));
+                    }
+                }
                 match classify_higgs_capacity_interruption(&chunk) {
                     HiggsCapacityInterruption::NotCapacity => {}
                     HiggsCapacityInterruption::Valid {
@@ -5242,6 +5263,23 @@ mod tests {
         ] {
             assert!(parse_higgs_capacity_error(status, body).is_none(), "{body}");
         }
+    }
+
+    #[tokio::test]
+    async fn streamed_retention_error_is_typed_before_done_or_eof() {
+        let body = include_str!("../../tests/fixtures/higgs/retention_compaction_required.json");
+        let wire = format!("data: {body}\n\n");
+        let stream = futures_util::stream::iter(vec![Ok(bytes::Bytes::from(wire))]);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let error = parse_sse_stream(stream, tx, SseParserMode::HiggsCapacity)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            crate::errors::ProviderError::HiggsRetentionCompactionRequired {
+                contract_revision
+            } if contract_revision == "boot:7:sha256:model"
+        ));
     }
 
     #[test]
