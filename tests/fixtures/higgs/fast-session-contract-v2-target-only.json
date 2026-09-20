@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 2,
+  "contractRevision": "boot-target:3:sha256:target",
+  "model": "target-only-model",
+  "maxContextTokens": 65536,
+  "maxOutputTokens": 4096,
+  "retainedBudgetBytes": 4294967296,
+  "guaranteedFastPromptTokens": 24576,
+  "softCompactionPromptTokens": 20480,
+  "targetAfterCompactionTokens": 8192,
+  "guaranteedSessions": 1
+}

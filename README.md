@@ -14,6 +14,18 @@ cargo build --release
 
 Configure providers in `~/.nanobot/config.json`; use `/local` to switch to local inference. The default local autostart backend is Higgs. Workspace memory lives in `~/.nanobot/workspace/memory/MEMORY.md`.
 
+### Local Higgs capacity contract
+
+For local Higgs models, Nanobot requests `/v1/capacity?model=…&schemaVersion=2`
+and treats the returned prompt limits as opaque server-owned values. Nanobot
+compacts before the advertised soft wall and targets
+`targetAfterCompactionTokens`; it never derives those values from model
+geometry. A valid V2 contract enables required retained-session continuation.
+V1 and older servers remain usable only through stateless requests. Unknown or
+malformed V2 contracts fail closed instead of silently guessing. A Higgs
+restart, contract-revision change, or model switch rotates the retained-session
+epoch before the next request.
+
 ## Features
 
 - Terminal conversations and messaging-channel adapters, including Telegram and email.

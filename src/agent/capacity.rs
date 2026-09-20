@@ -452,7 +452,9 @@ impl CapacityRuntime {
     ) -> CapacityRefresh {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let refresh = match (&state.key, &state.installed) {
-            (Some(key), Some(InstalledCapacity::Profile(previous))) if key.0 == endpoint => {
+            (Some(key), Some(InstalledCapacity::Profile(previous)))
+                if key.0 == endpoint && key.1 == model =>
+            {
                 let same_revision = match (&**previous, &profile) {
                     (HiggsCapacityProfile::V2(previous), HiggsCapacityProfile::V2(next)) => {
                         previous.contract_revision == next.contract_revision
@@ -717,6 +719,78 @@ mod tests {
             "targetAfterCompactionTokens": 4_096,
             "guaranteedSessions": 1
         })
+    }
+
+    fn golden(name: &str) -> serde_json::Value {
+        let json = match name {
+            "canonical" => include_str!("../../tests/fixtures/higgs/fast_session_contract_v2.json"),
+            "target-only" => {
+                include_str!("../../tests/fixtures/higgs/fast-session-contract-v2-target-only.json")
+            }
+            "paired-layout" => include_str!(
+                "../../tests/fixtures/higgs/fast-session-contract-v2-paired-layout.json"
+            ),
+            "v1" => include_str!("../../tests/fixtures/higgs/capacity-v1.json"),
+            _ => panic!("unknown golden fixture"),
+        };
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn golden_protocol_matrix_consumes_higgs_limits_as_opaque_values() {
+        let canonical = serde_json::from_value::<HiggsCapacityProfile>(golden("canonical"))
+            .expect("canonical Higgs V2 fixture");
+        let target = serde_json::from_value::<HiggsCapacityProfile>(golden("target-only"))
+            .expect("Higgs target-only V2 fixture");
+        let paired = serde_json::from_value::<HiggsCapacityProfile>(golden("paired-layout"))
+            .expect("Higgs paired-layout V2 fixture");
+        let legacy = serde_json::from_value::<HiggsCapacityProfile>(golden("v1"))
+            .expect("old Higgs V1 fixture");
+
+        assert_eq!(canonical.model(), "model");
+        assert_eq!(
+            canonical.retained_capability().hard_prompt_tokens(),
+            Some(28_672)
+        );
+        assert_eq!(
+            target.retained_capability(),
+            RetainedCapability::Guaranteed {
+                contract_revision: "boot-target:3:sha256:target",
+                hard_prompt_tokens: 24_576,
+                soft_prompt_tokens: 20_480,
+                target_prompt_tokens: 8_192,
+            }
+        );
+        assert_eq!(
+            paired.retained_capability(),
+            RetainedCapability::Guaranteed {
+                contract_revision: "boot-paired:4:sha256:paired",
+                hard_prompt_tokens: 12_288,
+                soft_prompt_tokens: 10_240,
+                target_prompt_tokens: 4_096,
+            }
+        );
+        assert_eq!(
+            legacy.retained_capability(),
+            RetainedCapability::LegacyStatelessOnly
+        );
+    }
+
+    #[test]
+    fn model_switch_is_a_new_capacity_install_even_when_revision_matches() {
+        let runtime = CapacityRuntime::default();
+        let first =
+            serde_json::from_value::<HiggsCapacityProfile>(fast_session_contract_v2()).unwrap();
+        let second =
+            serde_json::from_value::<HiggsCapacityProfile>(fast_session_contract_v2()).unwrap();
+        assert_eq!(
+            runtime.install_profile("endpoint", "model-a", first),
+            CapacityRefresh::Fetched
+        );
+        assert_eq!(
+            runtime.install_profile("endpoint", "model-b", second),
+            CapacityRefresh::Fetched
+        );
     }
 
     #[test]

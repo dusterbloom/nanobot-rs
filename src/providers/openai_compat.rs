@@ -246,7 +246,7 @@ impl OpenAICompatProvider {
             .client
             .get(crate::higgs::capacity_url_from_base(&self.api_base))
             .header("Authorization", format!("Bearer {}", self.api_key))
-            .query(&[("model", model)])
+            .query(&[("model", model), ("schemaVersion", "2")])
             .send()
             .await
             .map_err(|error| ProviderError::HttpError(error.to_string()))?;
@@ -933,23 +933,37 @@ fn parse_higgs_capacity_error(
     let error = value.get("error")?.as_object()?;
     let error_type = error.get("type")?.as_str()?;
     let code = error.get("code")?.as_str()?;
-    match (status_code, error_type, code) {
-        (409, "retention_compaction_required", "retention_compaction_required") => {
+    match (status_code, code) {
+        (409, "retention_compaction_required")
+            if matches!(error_type, "conflict" | "retention_compaction_required") =>
+        {
             let contract_revision = error.get("contractRevision")?.as_str()?;
+            let _session_id = error.get("sessionId")?.as_u64()?;
+            let _epoch = error.get("epoch")?.as_u64()?;
             return (!contract_revision.trim().is_empty()).then(|| {
                 ProviderError::HiggsRetentionCompactionRequired {
                     contract_revision: contract_revision.to_owned(),
                 }
             });
         }
-        (409, "retained_session_unavailable", "retained_session_unavailable") => {
+        (409, "retained_session_unavailable")
+            if matches!(error_type, "conflict" | "retained_session_unavailable") =>
+        {
+            let contract_revision = error.get("contractRevision")?.as_str()?;
+            if contract_revision.trim().is_empty() {
+                return None;
+            }
             return Some(ProviderError::HiggsRetainedSessionUnavailable {
                 session_id: error.get("sessionId")?.as_u64()?,
                 epoch: error.get("epoch")?.as_u64()?,
             });
         }
-        (409, "stale_retention_contract", "stale_retention_contract") => {
+        (409, "stale_retention_contract")
+            if matches!(error_type, "conflict" | "stale_retention_contract") =>
+        {
             let contract_revision = error.get("contractRevision")?.as_str()?;
+            let _session_id = error.get("sessionId")?.as_u64()?;
+            let _epoch = error.get("epoch")?.as_u64()?;
             return (!contract_revision.trim().is_empty()).then(|| {
                 ProviderError::HiggsStaleRetentionContract {
                     contract_revision: contract_revision.to_owned(),
@@ -4706,6 +4720,10 @@ mod tests {
         let request_target = request_line.split_whitespace().nth(1).unwrap();
         assert!(request_target.starts_with("/v1/capacity?model="));
         assert!(
+            request_target.contains("schemaVersion=2"),
+            "retained-byte contracts require explicit V2 negotiation: {request_line}"
+        );
+        assert!(
             !request_target.contains(' '),
             "model query must be percent-safe"
         );
@@ -5009,14 +5027,14 @@ mod tests {
         let cases = [
             (
                 409,
-                r#"{"error":{"type":"retention_compaction_required","code":"retention_compaction_required","contractRevision":"boot-2:9:sha256:def"}}"#,
+                include_str!("../../tests/fixtures/higgs/retention_compaction_required.json"),
                 crate::errors::ProviderError::HiggsRetentionCompactionRequired {
-                    contract_revision: "boot-2:9:sha256:def".to_owned(),
+                    contract_revision: "boot:7:sha256:model".to_owned(),
                 },
             ),
             (
                 409,
-                r#"{"error":{"type":"retained_session_unavailable","code":"retained_session_unavailable","sessionId":42,"epoch":7}}"#,
+                include_str!("../../tests/fixtures/higgs/retained_session_unavailable.json"),
                 crate::errors::ProviderError::HiggsRetainedSessionUnavailable {
                     session_id: 42,
                     epoch: 7,
@@ -5024,9 +5042,9 @@ mod tests {
             ),
             (
                 409,
-                r#"{"error":{"type":"stale_retention_contract","code":"stale_retention_contract","contractRevision":"boot-3:1:sha256:ghi"}}"#,
+                include_str!("../../tests/fixtures/higgs/stale_retention_contract.json"),
                 crate::errors::ProviderError::HiggsStaleRetentionContract {
-                    contract_revision: "boot-3:1:sha256:ghi".to_owned(),
+                    contract_revision: "stale:revision".to_owned(),
                 },
             ),
         ];
@@ -5036,6 +5054,38 @@ mod tests {
                 format!("{:?}", parse_higgs_capacity_error(status, body)),
                 format!("{:?}", Some(expected))
             );
+        }
+    }
+
+    #[test]
+    fn v2_retention_errors_reject_wrong_status_type_code_or_identity() {
+        for (status, body) in [
+            (
+                400,
+                r#"{"error":{"type":"conflict","code":"retention_compaction_required","contractRevision":"boot:1:sha256:model"}}"#,
+            ),
+            (
+                409,
+                r#"{"error":{"type":"server_error","code":"retention_compaction_required","contractRevision":"boot:1:sha256:model"}}"#,
+            ),
+            (
+                409,
+                r#"{"error":{"type":"conflict","code":"wrong_code","contractRevision":"boot:1:sha256:model"}}"#,
+            ),
+            (
+                409,
+                r#"{"error":{"type":"conflict","code":"retention_compaction_required"}}"#,
+            ),
+            (
+                409,
+                r#"{"error":{"type":"conflict","code":"retained_session_unavailable","sessionId":42}}"#,
+            ),
+            (
+                409,
+                r#"{"error":{"type":"conflict","code":"stale_retention_contract","contractRevision":" "}}"#,
+            ),
+        ] {
+            assert!(parse_higgs_capacity_error(status, body).is_none(), "{body}");
         }
     }
 

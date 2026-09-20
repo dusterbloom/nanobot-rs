@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 2,
+  "contractRevision": "boot-paired:4:sha256:paired",
+  "model": "paired-layout-model",
+  "maxContextTokens": 65536,
+  "maxOutputTokens": 4096,
+  "retainedBudgetBytes": 4294967296,
+  "guaranteedFastPromptTokens": 12288,
+  "softCompactionPromptTokens": 10240,
+  "targetAfterCompactionTokens": 4096,
+  "guaranteedSessions": 1
+}

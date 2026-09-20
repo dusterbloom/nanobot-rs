@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "model": "legacy-model",
+  "modelFingerprint": "sha256:legacy",
+  "bootId": "legacy-boot",
+  "generation": 1,
+  "availability": "available",
+  "pressure": "normal",
+  "safeTotalTokens": 32768,
+  "recommendedOutputTokens": 4096,
+  "maxPromptTokens": 28672,
+  "retainedSessionTokens": 28672,
+  "retainedBytes": 1073741824,
+  "prefixCacheBytes": 0,
+  "basis": "configured"
+}
