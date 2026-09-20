@@ -524,7 +524,10 @@ fn request_messages_and_higgs_session_id(
                     control.session_cache_policy = policy
                         .and_then(|v| v.as_str().map(ToOwned::to_owned))
                         .filter(|value| {
-                            matches!(value.as_str(), "best_effort" | "require_continuation")
+                            matches!(
+                                value.as_str(),
+                                "best_effort" | "seed" | "require_continuation"
+                            )
                         });
                 }
                 let max_prompt_tokens = obj.remove(NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD);
@@ -923,6 +926,62 @@ enum SseParserMode {
     HiggsCapacity,
 }
 
+#[derive(Clone, Debug)]
+struct RetentionExpectation {
+    outcome: &'static str,
+    session_id: u64,
+    epoch: u64,
+    contract_revision: String,
+}
+
+fn retention_expectation(body: &serde_json::Value) -> Option<RetentionExpectation> {
+    let retention = body.get("retention")?;
+    Some(RetentionExpectation {
+        outcome: match retention.get("mode")?.as_str()? {
+            "seed" => "seeded",
+            "required" => "continued",
+            _ => return None,
+        },
+        session_id: retention.get("sessionId")?.as_u64()?,
+        epoch: retention.get("epoch")?.as_u64()?,
+        contract_revision: retention.get("contractRevision")?.as_str()?.to_owned(),
+    })
+}
+
+fn validate_retention_receipt(
+    expected: Option<&RetentionExpectation>,
+    receipt: Option<&serde_json::Value>,
+) -> Result<(), crate::errors::ProviderError> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let Some(receipt) = receipt else {
+        return Err(crate::errors::ProviderError::JsonParseError(
+            "missing Higgs retention receipt".to_owned(),
+        ));
+    };
+    let valid = receipt.get("outcome").and_then(|v| v.as_str()) == Some(expected.outcome)
+        && receipt.get("sessionId").and_then(|v| v.as_u64()) == Some(expected.session_id)
+        && receipt.get("epoch").and_then(|v| v.as_u64()) == Some(expected.epoch)
+        && receipt.get("contractRevision").and_then(|v| v.as_str())
+            == Some(expected.contract_revision.as_str())
+        && receipt
+            .get("retainedTokens")
+            .and_then(|v| v.as_u64())
+            .is_some()
+        && receipt
+            .get("retainedBytes")
+            .and_then(|v| v.as_u64())
+            .is_some();
+    if valid {
+        Ok(())
+    } else {
+        Err(crate::errors::ProviderError::JsonParseError(
+            "mismatched Higgs retention receipt".to_owned(),
+        ))
+    }
+}
+
 fn parse_higgs_capacity_error(
     status_code: u16,
     response_text: &str,
@@ -1225,7 +1284,7 @@ impl OpenAICompatProvider {
             body["top_p"] = serde_json::json!(tp);
         }
         if self.higgs_session_cache {
-            let required_v2 = match (
+            let retained_v2 = match (
                 higgs_control.session_cache_policy.as_deref(),
                 higgs_control.session_id,
                 higgs_control.session_epoch,
@@ -1240,9 +1299,18 @@ impl OpenAICompatProvider {
                     });
                     true
                 }
+                (Some("seed"), Some(session_id), Some(epoch), Some(revision)) => {
+                    body["retention"] = serde_json::json!({
+                        "mode": "seed",
+                        "sessionId": session_id,
+                        "epoch": epoch,
+                        "contractRevision": revision,
+                    });
+                    true
+                }
                 _ => false,
             };
-            if !required_v2 {
+            if !retained_v2 {
                 if let Some(session_id) = higgs_control.session_id {
                     body["session_id"] = serde_json::json!(session_id);
                 }
@@ -1259,7 +1327,7 @@ impl OpenAICompatProvider {
             if let Some(session_lease) = &higgs_control.session_lease {
                 body["session_lease"] = session_lease.clone();
             }
-            if !required_v2 {
+            if !retained_v2 {
                 if let Some(session_cache_policy) = &higgs_control.session_cache_policy {
                     body["session_cache_policy"] = serde_json::json!(session_cache_policy);
                 }
@@ -1359,6 +1427,7 @@ impl OpenAICompatProvider {
         );
         let url = format!("{}/chat/completions", self.api_base);
         let carries_one_shot_lease = body.get("session_lease").is_some();
+        let retention_expectation = retention_expectation(&body);
         let allow_retry = tool_choice != ToolChoice::None && !carries_one_shot_lease;
 
         // JIT gate: serialise access to JIT-loading servers.
@@ -1397,6 +1466,7 @@ impl OpenAICompatProvider {
             let api_base = api_base.clone();
             let model_str = model_owned.clone();
             let body = body.clone();
+            let retention_expectation = retention_expectation.clone();
             async move {
                 let response = client
                     .post(&url)
@@ -1435,6 +1505,11 @@ impl OpenAICompatProvider {
 
                 let data: serde_json::Value = serde_json::from_str(&response_text)
                     .map_err(|e| ProviderError::JsonParseError(e.to_string()))?;
+
+                validate_retention_receipt(
+                    retention_expectation.as_ref(),
+                    data.pointer("/usage/higgs_retention"),
+                )?;
 
                 parse_response(&data).map_err(|e| match e.downcast::<ProviderError>() {
                     Ok(pe) => pe,
@@ -1553,6 +1628,7 @@ impl LLMProvider for OpenAICompatProvider {
         );
         let url = format!("{}/chat/completions", self.api_base);
         let carries_one_shot_lease = body.get("session_lease").is_some();
+        let retention_expectation = retention_expectation(&body);
 
         // JIT gate: serialise access to JIT-loading servers.
         // For streaming, the permit is moved into the spawned task so it's held
@@ -1661,7 +1737,10 @@ impl LLMProvider for OpenAICompatProvider {
             SseParserMode::Standard
         };
         let abort_on_drop = tokio::spawn(async move {
-            if let Err(error) = parse_sse_stream(byte_stream, tx, parser_mode).await {
+            if let Err(error) =
+                parse_sse_stream_with_retention(byte_stream, tx, parser_mode, retention_expectation)
+                    .await
+            {
                 warn!(%error, "provider_stream_terminal_error");
                 let _ = terminal_error_tx.send(error);
             }
@@ -2203,10 +2282,20 @@ fn extract_usage_numbers(
 /// Emits `TextDelta` for each content delta and `Done` at the end with the
 /// fully assembled response. Tool call argument deltas are accumulated
 /// internally and only emitted in the final `Done`.
+#[cfg(test)]
 async fn parse_sse_stream(
     byte_stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
     tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
     mode: SseParserMode,
+) -> Result<(), crate::errors::ProviderError> {
+    parse_sse_stream_with_retention(byte_stream, tx, mode, None).await
+}
+
+async fn parse_sse_stream_with_retention(
+    byte_stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
+    tx: tokio::sync::mpsc::UnboundedSender<StreamChunk>,
+    mode: SseParserMode,
+    retention_expectation: Option<RetentionExpectation>,
 ) -> Result<(), crate::errors::ProviderError> {
     let mut line_buffer = std::collections::VecDeque::new();
     let mut full_content = String::new();
@@ -2216,6 +2305,7 @@ async fn parse_sse_stream(
     let mut finish_reason = FinishReason::Stop;
     let mut finish_reason_seen = false;
     let mut usage: HashMap<String, i64> = HashMap::new();
+    let mut retention_receipt = None;
     let mut partial_stream_bytes = match mode {
         SseParserMode::Standard => None,
         SseParserMode::HiggsCapacity => Some(Vec::new()),
@@ -2269,6 +2359,10 @@ async fn parse_sse_stream(
             let data = &line[6..];
 
             if data == "[DONE]" {
+                validate_retention_receipt(
+                    retention_expectation.as_ref(),
+                    retention_receipt.as_ref(),
+                )?;
                 let (tail_content, tail_reasoning) = flush_thinking_split_state(&mut split_state);
                 if !tail_reasoning.is_empty() {
                     full_inline_thinking.push_str(&tail_reasoning);
@@ -2513,6 +2607,7 @@ async fn parse_sse_stream(
             // Extract usage if present (some providers include it in the last chunk)
             if let Some(usage_obj) = chunk.get("usage").and_then(|v| v.as_object()) {
                 extract_usage_numbers(usage_obj, &mut usage);
+                retention_receipt = usage_obj.get("higgs_retention").cloned();
             }
         }
     }
@@ -2526,6 +2621,7 @@ async fn parse_sse_stream(
         full_content.push_str(&tail_content);
         let _ = tx.send(StreamChunk::TextDelta(tail_content));
     }
+    validate_retention_receipt(retention_expectation.as_ref(), retention_receipt.as_ref())?;
 
     // Stream ended without [DONE] — SLM may have crashed or dropped connection.
     // Treat an abnormal termination during content generation as "length" so
@@ -2872,6 +2968,65 @@ mod tests {
         assert_eq!(body["retention"]["contractRevision"], "boot-2:9:sha256:def");
         assert!(body.get("session_id").is_none());
         assert!(body.get("session_cache_policy").is_none());
+    }
+
+    #[test]
+    fn seed_becomes_one_v2_retention_object() {
+        let provider =
+            OpenAICompatProvider::new("local", Some("http://127.0.0.1:9000/v1"), Some("bonsai"))
+                .with_higgs_session_cache(true);
+        let messages = vec![serde_json::json!({
+            "role": "system",
+            "content": "stable prefix",
+            NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
+            NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD: "seed",
+            NANOBOT_HIGGS_SESSION_EPOCH_FIELD: 7_u64,
+            NANOBOT_HIGGS_CONTRACT_REVISION_FIELD: "boot-2:9:sha256:def",
+        })];
+        let (_, body) = provider.build_chat_request(
+            &messages,
+            None,
+            Some("bonsai"),
+            512,
+            0.0,
+            None,
+            None,
+            RequestKind::Blocking {
+                tool_choice: ToolChoice::Auto,
+            },
+        );
+        assert_eq!(body["retention"]["mode"], "seed");
+        assert!(body.get("session_id").is_none());
+    }
+
+    #[test]
+    fn retained_receipt_must_exactly_match_the_request() {
+        let expected = RetentionExpectation {
+            outcome: "seeded",
+            session_id: 42,
+            epoch: 7,
+            contract_revision: "boot:7:sha256:model".to_owned(),
+        };
+        let receipt = serde_json::json!({
+            "outcome": "seeded",
+            "sessionId": 42,
+            "epoch": 7,
+            "retainedTokens": 1024,
+            "retainedBytes": 65536,
+            "contractRevision": "boot:7:sha256:model"
+        });
+        assert!(validate_retention_receipt(Some(&expected), Some(&receipt)).is_ok());
+        let wrong_outcome = serde_json::json!({
+            "outcome": "continued",
+            "sessionId": 42,
+            "epoch": 7,
+            "retainedTokens": 1024,
+            "retainedBytes": 65536,
+            "contractRevision": "boot:7:sha256:model"
+        });
+        for bad in [None, Some(&wrong_outcome)] {
+            assert!(validate_retention_receipt(Some(&expected), bad).is_err());
+        }
     }
 
     #[test]

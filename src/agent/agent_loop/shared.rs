@@ -956,16 +956,14 @@ impl SoftCompactionRequest {
             })
             .cloned()
             .collect();
+        let compaction_budget = retained_compaction_budget(ctx);
         Some(Self {
             core: ctx.core.clone(),
             session_id: ctx.session_id.clone(),
             compaction: ctx.compaction.clone(),
             turn_cancellation: ctx.cancellation_token.clone(),
             prompt_prefix,
-            compaction_budget: TokenBudget::new(
-                ctx.effective_budget.max_context(),
-                ctx.effective_budget.response_reserve(),
-            ),
+            compaction_budget,
             tool_def_tokens: ctx
                 .counters
                 .tool_presentation_mode(&ctx.session_key)
@@ -1742,8 +1740,14 @@ pub(crate) async fn resolve_live_capacity(
         }
         Ok(None) => capacity.invalidate(),
         Err(error) => {
-            // Discovery is advisory. Keep the last fixed limit (or configured
-            // budget on first use); the actual request reports model errors.
+            // Transport failures may be transient, so retain the last valid
+            // contract. A malformed/unknown wire contract is different: it
+            // invalidates the guarantee and must fail closed until discovery
+            // succeeds again.
+            if matches!(&error, crate::errors::ProviderError::JsonParseError(_)) {
+                capacity.invalidate();
+                counters.invalidate_prompt_cache(session_key, true);
+            }
             warn!(session = %session_key, error = %error, "higgs_context_discovery_failed");
         }
     }
@@ -1769,6 +1773,33 @@ fn retained_contract_action(
     }
 }
 
+fn should_schedule_async_compaction(
+    conversation: CompactionAction,
+    exact: CompactionAction,
+    has_pending: bool,
+) -> bool {
+    !has_pending && (conversation == CompactionAction::Async || exact == CompactionAction::Async)
+}
+
+fn compaction_budget_for_target(effective: &TokenBudget, target: Option<usize>) -> TokenBudget {
+    let reserve = effective.response_reserve();
+    let max_context = target
+        .and_then(|target| target.checked_add(reserve))
+        .map_or(effective.max_context(), |total| {
+            total.min(effective.max_context())
+        });
+    TokenBudget::new(max_context, reserve.min(max_context))
+}
+
+fn retained_compaction_budget(ctx: &TurnContext) -> TokenBudget {
+    compaction_budget_for_target(
+        &ctx.effective_budget,
+        ctx.capacity
+            .retained_contract()
+            .map(|(_, _, _, target)| target),
+    )
+}
+
 #[cfg(test)]
 mod retained_contract_threshold_tests {
     use super::*;
@@ -1787,6 +1818,27 @@ mod retained_contract_threshold_tests {
             retained_contract_action(10_999, 14_700, 11_000),
             CompactionAction::None
         );
+    }
+
+    #[test]
+    fn retained_soft_wall_schedules_from_the_exact_prompt_decision() {
+        assert!(should_schedule_async_compaction(
+            CompactionAction::None,
+            CompactionAction::Async,
+            false
+        ));
+        assert!(!should_schedule_async_compaction(
+            CompactionAction::None,
+            CompactionAction::Async,
+            true
+        ));
+    }
+
+    #[test]
+    fn retained_target_is_the_absolute_compaction_prompt_room() {
+        let budget = compaction_budget_for_target(&TokenBudget::new(65_536, 4_096), Some(8_192));
+        assert_eq!(budget.available_budget(0), 8_192);
+        assert_eq!(budget.available_budget(1_024), 7_168);
     }
 }
 
@@ -2626,9 +2678,24 @@ impl AgentLoopShared {
         error: &anyhow::Error,
         effective_max_tokens: u32,
     ) -> bool {
-        if ctx.flow.retries.overflow_trim_recoveries >= MAX_OVERFLOW_RECOVERIES
-            || !crate::errors::is_context_overflow_error(error)
-        {
+        if ctx.flow.retries.overflow_trim_recoveries >= MAX_OVERFLOW_RECOVERIES {
+            return false;
+        }
+        match error.downcast_ref::<crate::errors::ProviderError>() {
+            Some(crate::errors::ProviderError::HiggsStaleRetentionContract { .. }) => {
+                ctx.capacity.invalidate();
+                ctx.counters.invalidate_prompt_cache(&ctx.session_key, true);
+                ctx.flow.retries.overflow_trim_recoveries += 1;
+                return true;
+            }
+            Some(crate::errors::ProviderError::HiggsRetainedSessionUnavailable { .. }) => {
+                ctx.counters.invalidate_prompt_cache(&ctx.session_key, true);
+                ctx.flow.retries.overflow_trim_recoveries += 1;
+                return true;
+            }
+            _ => {}
+        }
+        if !crate::errors::is_context_overflow_error(error) {
             return false;
         }
         let retained_compaction_required = matches!(
@@ -3523,10 +3590,7 @@ impl AgentLoopShared {
                 let core = ctx.core.clone();
                 let session_id = ctx.session_id.clone();
                 let messages = ctx.messages.to_vec();
-                let compaction_budget = TokenBudget::new(
-                    ctx.effective_budget.max_context(),
-                    ctx.effective_budget.response_reserve(),
-                );
+                let compaction_budget = retained_compaction_budget(ctx);
                 let failure_mode = admission_mode;
                 // SQLite message_count is a durable, concrete-session sequence.
                 // The process-global learning counter remains telemetry only and
@@ -3572,7 +3636,11 @@ impl AgentLoopShared {
                     })
                     .await;
                 Some(started)
-            } else if conversation_action == CompactionAction::Async && !has_pending {
+            } else if should_schedule_async_compaction(
+                conversation_action,
+                exact_action,
+                has_pending,
+            ) {
                 tracing::info!(
                     compaction_type = "lcm_async",
                     msg_count = ctx.messages.len(),
@@ -4777,7 +4845,7 @@ impl AgentLoopShared {
                     first.insert(
                         crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD
                             .to_owned(),
-                        serde_json::json!("require_continuation"),
+                        serde_json::json!(control.reuse_policy.as_wire()),
                     );
                     first.insert(
                         crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_EPOCH_FIELD
@@ -5306,6 +5374,9 @@ impl AgentLoopShared {
 
         let response_ok = Self::response_status(&response) == "ok";
         if response_ok {
+            if let Some(reservation) = higgs_request_reservation.as_ref() {
+                reservation.publish_exact();
+            }
             if let Some(staged) = ctx.staged_auto_expansion.take() {
                 if let Some(committed) =
                     commit_staged_auto_expansion(staged, &self.lcm_engines, &ctx.session_id).await
@@ -5388,6 +5459,15 @@ impl AgentLoopShared {
                 ctx.flow.tool_guard.had_blocked_calls,
             )
         {
+            return ForcedToolRecoveryOutcome::Response(response);
+        }
+
+        // A V2 retained request has already published or extended one exact
+        // byte sequence. Replaying the whole prompt without its controls would
+        // defeat the retained-byte guarantee, while reusing `required` for the
+        // identical prompt is not a growing continuation. Let the ordinary
+        // validation path handle the original response instead.
+        if ctx.capacity.retained_contract().is_some() {
             return ForcedToolRecoveryOutcome::Response(response);
         }
 

@@ -226,6 +226,7 @@ pub(crate) enum SessionRetirement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HiggsSessionReusePolicy {
     BestEffort,
+    Seed,
     RequireContinuation,
 }
 
@@ -233,6 +234,7 @@ impl HiggsSessionReusePolicy {
     pub(crate) fn as_wire(self) -> &'static str {
         match self {
             Self::BestEffort => "best_effort",
+            Self::Seed => "seed",
             Self::RequireContinuation => "require_continuation",
         }
     }
@@ -251,6 +253,9 @@ pub(crate) struct HiggsSessionControl {
 struct HiggsSessionState {
     epoch: u64,
     active_id: Option<u64>,
+    /// Active ID whose exact bytes were acknowledged by Higgs. A different
+    /// or absent ID is explicitly unseeded and may not require continuation.
+    published_active_id: Option<u64>,
     pending_drop_ids: Vec<u64>,
     pending_lease: Option<HiggsSessionLease>,
     claimed_lease_id: Option<u64>,
@@ -272,6 +277,15 @@ impl HiggsSessionRequestReservation {
     #[cfg(test)]
     pub(crate) fn active_id(&self) -> u64 {
         self.control.active_id
+    }
+
+    pub(crate) fn publish_exact(&self) {
+        let mut sessions = self.counters.higgs_sessions.lock();
+        if let Some(state) = sessions.get_mut(&self.session_key) {
+            if state.active_id == Some(self.control.active_id) {
+                state.published_active_id = Some(self.control.active_id);
+            }
+        }
     }
 
     pub(crate) fn drop_ids(&self) -> &[u64] {
@@ -914,6 +928,11 @@ impl RuntimeCounters {
             .copied()
             .filter(|drop_id| !state.in_flight_active_ids.contains_key(drop_id))
             .collect();
+        let reuse_policy = if state.published_active_id == Some(active_id) {
+            HiggsSessionReusePolicy::RequireContinuation
+        } else {
+            HiggsSessionReusePolicy::Seed
+        };
         HiggsSessionRequestReservation {
             counters: Arc::clone(self),
             session_key: session_key.to_string(),
@@ -921,7 +940,7 @@ impl RuntimeCounters {
                 active_id,
                 drop_ids,
                 session_lease,
-                reuse_policy: HiggsSessionReusePolicy::BestEffort,
+                reuse_policy,
                 max_prompt_tokens,
             },
             lease_finalized: false,
@@ -2530,7 +2549,7 @@ mod tests {
         );
         assert_eq!(
             request.control().reuse_policy,
-            HiggsSessionReusePolicy::BestEffort
+            HiggsSessionReusePolicy::Seed
         );
         assert_eq!(request.control().max_prompt_tokens, 31_744);
         request.resolve_lease(Some(1));
@@ -2608,6 +2627,38 @@ mod tests {
             vec![old_id]
         );
         assert_eq!(counters.active_higgs_session_id(session), Some(fresh_id));
+    }
+
+    #[test]
+    fn fresh_session_seeds_once_then_requires_exact_continuation() {
+        let counters = Arc::new(RuntimeCounters::new_with_config(
+            32_768,
+            &CircuitBreakerConfig::default(),
+        ));
+        let first = counters.reserve_higgs_session_request(
+            "cli:seed",
+            "sqlite:seed",
+            "bonsai",
+            7,
+            24_576,
+            0,
+        );
+        assert_eq!(first.control().reuse_policy, HiggsSessionReusePolicy::Seed);
+        first.publish_exact();
+        drop(first);
+
+        let second = counters.reserve_higgs_session_request(
+            "cli:seed",
+            "sqlite:seed",
+            "bonsai",
+            7,
+            24_576,
+            1,
+        );
+        assert_eq!(
+            second.control().reuse_policy,
+            HiggsSessionReusePolicy::RequireContinuation
+        );
     }
 
     #[test]
