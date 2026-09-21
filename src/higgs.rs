@@ -654,8 +654,6 @@ fn available_models_url_from_base(api_base: &str) -> String {
 
 fn available_model_catalog_from_json(json: &serde_json::Value) -> Option<AvailableModelCatalog> {
     let wire: AvailableModelCatalogWire = serde_json::from_value(json.clone()).ok()?;
-    let mut seen_ids = HashSet::new();
-    let mut seen_stable_ids = HashSet::new();
     let mut seen_paths = HashSet::new();
     let mut models = Vec::with_capacity(wire.data.len());
     for model in wire.data {
@@ -667,15 +665,9 @@ fn available_model_catalog_from_json(json: &serde_json::Value) -> Option<Availab
         {
             return None;
         }
-        if seen_ids.contains(&model.id)
-            || seen_stable_ids.contains(&model.stable_id)
-            || seen_paths.contains(&model.path)
-        {
+        if !seen_paths.insert(model.path.clone()) {
             continue;
         }
-        seen_ids.insert(model.id.clone());
-        seen_stable_ids.insert(model.stable_id.clone());
-        seen_paths.insert(model.path.clone());
         models.push(model);
     }
     Some(AvailableModelCatalog {
@@ -1958,6 +1950,14 @@ mod tests {
                     "model_type": "lfm2",
                     "adapter": "lfm2",
                     "loaded": false
+                },
+                {
+                    "id": "Nanbeige4.1-3B",
+                    "stable_id": "Nanbeige/Nanbeige4.1-3B",
+                    "path": "/another-cache/nanbeige",
+                    "model_type": "nanbeige",
+                    "adapter": "nanbeige",
+                    "loaded": false
                 }
             ]
         });
@@ -1965,11 +1965,12 @@ mod tests {
         let catalog = available_model_catalog_from_json(&json).unwrap();
 
         assert!(catalog.runtime_model_load);
-        assert_eq!(catalog.models.len(), 3);
+        assert_eq!(catalog.models.len(), 4);
         assert_eq!(catalog.models[0].id, "ternary-bonsai2-27b-2bit");
         assert_eq!(catalog.models[1].id, "Nanbeige4.1-3B");
         assert_eq!(catalog.models[1].stable_id, "Nanbeige/Nanbeige4.1-3B");
         assert_eq!(catalog.models[2].id, "LiquidAI/LFM2.5-2.6B-MLX/8bit");
+        assert_eq!(catalog.models[3].path, "/another-cache/nanbeige");
         assert!(catalog.models[0].loaded);
     }
 

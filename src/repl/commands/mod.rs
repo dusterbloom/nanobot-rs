@@ -23,6 +23,7 @@
     clippy::format_push_string,
     clippy::string_add
 )]
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -327,6 +328,19 @@ fn higgs_model_entries(
             }
         })
         .collect()
+}
+
+fn extend_unique_higgs_entries(
+    entries: &mut Vec<ModelEntry>,
+    seen_paths: &mut HashSet<String>,
+    candidates: Vec<ModelEntry>,
+) {
+    entries.extend(candidates.into_iter().filter(|entry| match &entry.source {
+        ModelSource::Higgs {
+            path: Some(path), ..
+        } => seen_paths.insert(path.clone()),
+        _ => true,
+    }));
 }
 
 fn model_direct_match_rank(entry: &ModelEntry, query: &str) -> Option<usize> {
@@ -667,6 +681,13 @@ impl ReplContext {
     }
 
     pub(crate) async fn collect_all_models(&self) -> Vec<ModelEntry> {
+        self.collect_all_models_with_local_files(None).await
+    }
+
+    async fn collect_all_models_with_local_files(
+        &self,
+        local_files: Option<&[PathBuf]>,
+    ) -> Vec<ModelEntry> {
         let mut entries = Vec::new();
         let current_model = if !self.config.agents.defaults.lms_main_model.is_empty() {
             self.config.agents.defaults.lms_main_model.clone()
@@ -788,6 +809,7 @@ impl ReplContext {
                 } else {
                     current_model.as_str()
                 };
+                let mut seen_higgs_paths = HashSet::new();
                 for base in &higgs_bases {
                     let already_covered = covered_endpoint
                         .as_deref()
@@ -799,7 +821,11 @@ impl ReplContext {
                     let catalog = crate::higgs::available_model_catalog_at(base, api_key).await;
                     let resident =
                         crate::higgs::list_available_served_models_at(base, api_key).await;
-                    entries.extend(higgs_model_entries(base, active_hint, catalog, resident));
+                    extend_unique_higgs_entries(
+                        &mut entries,
+                        &mut seen_higgs_paths,
+                        higgs_model_entries(base, active_hint, catalog, resident),
+                    );
                 }
             } else if !base.is_empty() && !already_covered && !covered_by_cluster {
                 let api_key = &self.config.agents.defaults.local_api_key;
@@ -853,10 +879,16 @@ impl ReplContext {
             }
         }
 
-        // 3. Filesystem GGUF fallback (only if no LMS and no cluster models)
-        if !self.srv.lms_managed && entries.is_empty() {
-            let models = crate::server::list_local_models();
-            for path in &models {
+        // 3. Filesystem GGUF fallback for non-Higgs local modes only.
+        if !self.srv.lms_managed && entries.is_empty() && !use_higgs_model_discovery {
+            let discovered;
+            let models = if let Some(files) = local_files {
+                files
+            } else {
+                discovered = crate::server::list_local_models();
+                &discovered
+            };
+            for path in models {
                 let name = path.file_name().unwrap().to_string_lossy().to_string();
                 let is_active = *path == self.current_model_path;
                 entries.push(ModelEntry {
@@ -1102,6 +1134,81 @@ impl ReplContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    async fn spawn_model_catalog_server(
+        catalog: Option<serde_json::Value>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = [0_u8; 4096];
+                let Ok(read) = stream.read(&mut request).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request[..read]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("");
+                let (status, body) = match path {
+                    "/v1/models/available" => catalog
+                        .as_ref()
+                        .map(|value| (200, value.to_string()))
+                        .unwrap_or_else(|| (404, "{}".to_string())),
+                    "/v1/models" => (200, r#"{"data":[]}"#.to_string()),
+                    "/health" => (200, r#"{"models":[]}"#.to_string()),
+                    _ => (404, "{}".to_string()),
+                };
+                let reason = if status == 200 { "OK" } else { "Not Found" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}/v1"), task)
+    }
+
+    fn test_repl_context(config: Config) -> (ReplContext, tempfile::TempDir) {
+        let temp = tempfile::tempdir().unwrap();
+        let core_handle = crate::cli::build_core_handle(&config, "0", None, None, None, false);
+        let agent_loop =
+            crate::cli::create_agent_loop(core_handle.clone(), &config, None, None, None, None);
+        let (display_tx, display_rx) = mpsc::unbounded_channel();
+        let (restart_tx, restart_rx) = mpsc::unbounded_channel();
+        let context = ReplContext {
+            config,
+            core_handle,
+            agent_loop,
+            session_id: "model-catalog-test".to_string(),
+            lang: None,
+            srv: super::super::ServerState::new("0".to_string()),
+            current_model_path: PathBuf::new(),
+            active_channels: Vec::new(),
+            display_tx,
+            display_rx,
+            cron_service: Arc::new(CronService::new(temp.path().join("cron.json"))),
+            email_config: None,
+            rl: None,
+            watchdog_handle: None,
+            restart_tx,
+            restart_rx,
+            health_registry: None,
+            #[cfg(feature = "voice")]
+            voice_session: None,
+            #[cfg(feature = "cluster")]
+            cluster_state: None,
+        };
+        (context, temp)
+    }
 
     #[test]
     fn test_normalize_alias_all_aliases() {
@@ -1319,6 +1426,76 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].id, "resident");
+    }
+
+    #[tokio::test]
+    async fn collect_all_models_old_higgs_never_falls_through_to_local_files() {
+        let (base, server) = spawn_model_catalog_server(None).await;
+        let mut config = Config::default();
+        config.agents.defaults.local_backend = "higgs".to_string();
+        config.agents.defaults.local_api_base = base.clone();
+        config.agents.defaults.higgs_port = base
+            .trim_end_matches("/v1")
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (context, _temp) = test_repl_context(config);
+
+        let entries = context
+            .collect_all_models_with_local_files(Some(&[PathBuf::from("/tmp/orphan.gguf")]))
+            .await;
+
+        server.abort();
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_all_models_deduplicates_catalog_path_across_higgs_bases() {
+        let canonical_path = "/models/shared-canonical";
+        let catalog = |id: &str| {
+            serde_json::json!({
+                "runtime_model_load": true,
+                "data": [{
+                    "id": id,
+                    "stable_id": "publisher/shared",
+                    "path": canonical_path,
+                    "model_type": "qwen3",
+                    "adapter": "qwen3",
+                    "loaded": false
+                }]
+            })
+        };
+        let (first_base, first_server) =
+            spawn_model_catalog_server(Some(catalog("first-base-name"))).await;
+        let (second_base, second_server) =
+            spawn_model_catalog_server(Some(catalog("second-base-name"))).await;
+        let mut config = Config::default();
+        config.agents.defaults.local_backend = "higgs".to_string();
+        config.agents.defaults.local_api_base = first_base.clone();
+        config.agents.defaults.higgs_port = second_base
+            .trim_end_matches("/v1")
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let (context, _temp) = test_repl_context(config);
+
+        let entries = context.collect_all_models_with_local_files(Some(&[])).await;
+
+        first_server.abort();
+        second_server.abort();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "first-base-name");
+        match &entries[0].source {
+            ModelSource::Higgs { endpoint, path, .. } => {
+                assert_eq!(endpoint.as_str(), first_base.as_str());
+                assert_eq!(path.as_deref(), Some(canonical_path));
+            }
+            source => panic!("unexpected source: {source:?}"),
+        }
     }
 
     #[test]
