@@ -820,28 +820,6 @@ mod tests {
         }
     }
 
-    /// Epoch rotation must NOT be expressed in the prompt: the system message
-    /// stays byte-identical across resets. Cache invalidation is driven solely
-    /// by higgs session-id rotation (pinned in `agent_core`), so a compaction
-    /// or trim no longer re-prefills message 0.
-    #[test]
-    fn test_no_epoch_marker_in_prompt_content() {
-        let baseline = json!({"role": "system", "content": "STATIC"});
-        let rendered = vec![baseline.clone(), json!({"role": "user", "content": "hi"})];
-
-        // Simulate the rendered output after a reset: nothing appends an epoch
-        // marker. If anyone reintroduces `[session-reset-epoch:N]` anywhere in
-        // the prepare_context path, this fails.
-        assert_eq!(rendered[0]["content"], baseline["content"]);
-        assert!(
-            !rendered[0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("[session-reset-epoch:"),
-            "epoch must not leak into prompt content"
-        );
-    }
-
     /// Injecting the SAME cached continuity note on every turn keeps the
     /// system prompt byte-identical, so the prompt prefix stays append-only
     /// across turns within the session.
