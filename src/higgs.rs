@@ -364,6 +364,7 @@ pub(crate) struct RuntimeModelCandidate {
 /// Higgs' runtime endpoint accepts either an existing model directory or a
 /// cached Hugging Face id. `mlxModelDir` remains the startup/default model;
 /// for the picker it may also point at a parent folder to scan.
+#[allow(dead_code)]
 pub(crate) fn discover_runtime_model_candidates(
     config: &crate::config::schema::Config,
 ) -> Vec<RuntimeModelCandidate> {
@@ -422,6 +423,7 @@ pub(crate) fn discover_runtime_model_candidates(
     candidates
 }
 
+#[allow(dead_code)]
 fn higgs_config_paths() -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(path) = std::env::var("HIGGS_CONFIG") {
@@ -624,6 +626,88 @@ fn models_url_from_base(api_base: &str) -> String {
     versioned_endpoint_url(api_base, "models")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub(crate) struct AvailableRuntimeModel {
+    pub(crate) id: String,
+    pub(crate) stable_id: String,
+    pub(crate) path: String,
+    pub(crate) model_type: String,
+    pub(crate) adapter: String,
+    pub(crate) loaded: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AvailableModelCatalog {
+    pub(crate) runtime_model_load: bool,
+    pub(crate) models: Vec<AvailableRuntimeModel>,
+}
+
+#[derive(serde::Deserialize)]
+struct AvailableModelCatalogWire {
+    runtime_model_load: bool,
+    data: Vec<AvailableRuntimeModel>,
+}
+
+fn available_models_url_from_base(api_base: &str) -> String {
+    format!("{}/available", models_url_from_base(api_base))
+}
+
+fn available_model_catalog_from_json(json: &serde_json::Value) -> Option<AvailableModelCatalog> {
+    let wire: AvailableModelCatalogWire = serde_json::from_value(json.clone()).ok()?;
+    let mut seen_ids = HashSet::new();
+    let mut seen_stable_ids = HashSet::new();
+    let mut seen_paths = HashSet::new();
+    let mut models = Vec::with_capacity(wire.data.len());
+    for model in wire.data {
+        if model.id.trim().is_empty()
+            || model.stable_id.trim().is_empty()
+            || model.path.trim().is_empty()
+            || model.model_type.trim().is_empty()
+            || model.adapter.trim().is_empty()
+        {
+            return None;
+        }
+        if seen_ids.contains(&model.id)
+            || seen_stable_ids.contains(&model.stable_id)
+            || seen_paths.contains(&model.path)
+        {
+            continue;
+        }
+        seen_ids.insert(model.id.clone());
+        seen_stable_ids.insert(model.stable_id.clone());
+        seen_paths.insert(model.path.clone());
+        models.push(model);
+    }
+    Some(AvailableModelCatalog {
+        runtime_model_load: wire.runtime_model_load,
+        models,
+    })
+}
+
+/// Fetch Higgs' authoritative zero-weight compatibility catalog. `None`
+/// means an older server or unsupported response schema; callers must then
+/// expose resident models only rather than guessing from local directories.
+pub(crate) async fn available_model_catalog_at(
+    api_base: &str,
+    api_key: &str,
+) -> Option<AvailableModelCatalog> {
+    let client = reqwest::Client::new();
+    let mut request = client.get(available_models_url_from_base(api_base));
+    if !api_key.is_empty() {
+        request = request.header("Authorization", format!("Bearer {api_key}"));
+    }
+    let response = request
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let json = response.json::<serde_json::Value>().await.ok()?;
+    available_model_catalog_from_json(&json)
+}
+
 pub(crate) fn versioned_endpoint_url(api_base: &str, endpoint: &str) -> String {
     let base = api_base.trim_end_matches('/');
     if base.ends_with("/v1") {
@@ -754,6 +838,7 @@ fn parse_basic_quoted_string(rest: &str) -> Option<String> {
     None
 }
 
+#[allow(dead_code)]
 fn preferred_runtime_name(config: &crate::config::schema::Config) -> Option<String> {
     let lms = config.agents.defaults.lms_main_model.trim();
     if !lms.is_empty() && lms != "active" {
@@ -914,6 +999,7 @@ pub(crate) async fn list_available_served_models_at(api_base: &str, api_key: &st
 /// because `/switch` is parsed as a model name.) Plain OpenAI-compatible
 /// resident endpoints don't set the flag, so they must not receive filesystem
 /// switch candidates.
+#[allow(dead_code)]
 pub(crate) async fn supports_runtime_model_switch_at(api_base: &str, api_key: &str) -> bool {
     let url = models_url_from_base(api_base);
     let client = reqwest::Client::new();
@@ -1834,6 +1920,66 @@ mod tests {
             model_ids_from_models_json(&json),
             vec!["qwen".to_string(), "llama".to_string()]
         );
+    }
+
+    #[test]
+    fn available_catalog_preserves_server_identity_and_deduplicates_path() {
+        let json = serde_json::json!({
+            "runtime_model_load": true,
+            "data": [
+                {
+                    "id": "ternary-bonsai2-27b-2bit",
+                    "stable_id": "NexVeridian/ternary-bonsai2-27b-2bit",
+                    "path": "/models/ternary",
+                    "model_type": "qwen3",
+                    "adapter": "qwen3",
+                    "loaded": true
+                },
+                {
+                    "id": "wrong-duplicate-name",
+                    "stable_id": "wrong/duplicate",
+                    "path": "/models/ternary",
+                    "model_type": "qwen3",
+                    "adapter": "qwen3",
+                    "loaded": false
+                },
+                {
+                    "id": "Nanbeige4.1-3B",
+                    "stable_id": "Nanbeige/Nanbeige4.1-3B",
+                    "path": "/custom-hf/models--Nanbeige--Nanbeige4.1-3B/snapshots/abc",
+                    "model_type": "nanbeige",
+                    "adapter": "nanbeige",
+                    "loaded": false
+                },
+                {
+                    "id": "LiquidAI/LFM2.5-2.6B-MLX/8bit",
+                    "stable_id": "LiquidAI/LFM2.5-2.6B-MLX/8bit",
+                    "path": "/lm-studio/LiquidAI/LFM2.5-2.6B-MLX/8bit",
+                    "model_type": "lfm2",
+                    "adapter": "lfm2",
+                    "loaded": false
+                }
+            ]
+        });
+
+        let catalog = available_model_catalog_from_json(&json).unwrap();
+
+        assert!(catalog.runtime_model_load);
+        assert_eq!(catalog.models.len(), 3);
+        assert_eq!(catalog.models[0].id, "ternary-bonsai2-27b-2bit");
+        assert_eq!(catalog.models[1].id, "Nanbeige4.1-3B");
+        assert_eq!(catalog.models[1].stable_id, "Nanbeige/Nanbeige4.1-3B");
+        assert_eq!(catalog.models[2].id, "LiquidAI/LFM2.5-2.6B-MLX/8bit");
+        assert!(catalog.models[0].loaded);
+    }
+
+    #[test]
+    fn available_catalog_rejects_unsupported_schema() {
+        assert!(available_model_catalog_from_json(&serde_json::json!({
+            "runtime_model_load": true,
+            "data": [{"id": "missing-contract-fields"}]
+        }))
+        .is_none());
     }
 
     #[test]

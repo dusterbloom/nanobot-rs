@@ -23,7 +23,6 @@
     clippy::format_push_string,
     clippy::string_add
 )]
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -258,6 +257,7 @@ fn higgs_model_bases(
     bases
 }
 
+#[allow(dead_code)]
 fn push_remote_model_entry(
     entries: &mut Vec<ModelEntry>,
     endpoint: &str,
@@ -282,6 +282,51 @@ fn push_remote_model_entry(
         is_active,
         is_loaded,
     });
+}
+
+fn higgs_model_entries(
+    endpoint: &str,
+    active_hint: &str,
+    catalog: Option<crate::higgs::AvailableModelCatalog>,
+    resident: Vec<String>,
+) -> Vec<ModelEntry> {
+    let Some(catalog) = catalog.filter(|catalog| catalog.runtime_model_load) else {
+        return resident
+            .into_iter()
+            .filter(|id| !id.is_empty() && !id.to_lowercase().contains("embedding"))
+            .map(|id| ModelEntry {
+                is_active: crate::lms::is_model_available(std::slice::from_ref(&id), active_hint),
+                source: ModelSource::Higgs {
+                    endpoint: endpoint.to_string(),
+                    path: None,
+                    name: id.clone(),
+                },
+                id,
+                is_loaded: true,
+            })
+            .collect();
+    };
+
+    catalog
+        .models
+        .into_iter()
+        .map(|model| {
+            let is_active = crate::lms::is_model_available(
+                &[model.id.clone(), model.stable_id.clone()],
+                active_hint,
+            );
+            ModelEntry {
+                id: model.id.clone(),
+                source: ModelSource::Higgs {
+                    endpoint: endpoint.to_string(),
+                    path: Some(model.path),
+                    name: model.id,
+                },
+                is_active,
+                is_loaded: model.loaded,
+            }
+        })
+        .collect()
 }
 
 fn model_direct_match_rank(entry: &ModelEntry, query: &str) -> Option<usize> {
@@ -751,63 +796,10 @@ impl ReplContext {
                     if base.is_empty() || already_covered {
                         continue;
                     }
-                    let loaded = crate::higgs::list_available_served_models_at(base, api_key).await;
-                    let switch_supported =
-                        crate::higgs::supports_runtime_model_switch_at(base, api_key).await;
-
-                    if !switch_supported {
-                        for id in loaded {
-                            push_remote_model_entry(&mut entries, base, id, active_hint, true);
-                        }
-                        continue;
-                    }
-
-                    let mut covered_loaded = HashSet::new();
-                    for candidate in crate::higgs::discover_runtime_model_candidates(&self.config) {
-                        let is_loaded = loaded.iter().any(|id| {
-                            crate::lms::model_matches(id, &candidate.id)
-                                || crate::lms::model_matches(id, &candidate.name)
-                        });
-                        if is_loaded {
-                            covered_loaded.insert(candidate.id.clone());
-                            covered_loaded.insert(candidate.name.clone());
-                        }
-                        let is_active = crate::lms::is_model_available(
-                            &[candidate.id.clone(), candidate.name.clone()],
-                            active_hint,
-                        );
-                        entries.push(ModelEntry {
-                            id: candidate.id,
-                            source: ModelSource::Higgs {
-                                endpoint: base.clone(),
-                                path: Some(candidate.path),
-                                name: candidate.name,
-                            },
-                            is_active,
-                            is_loaded,
-                        });
-                    }
-
-                    for id in loaded {
-                        if id.to_lowercase().contains("embedding")
-                            || covered_loaded
-                                .iter()
-                                .any(|known| crate::lms::model_matches(known, &id))
-                        {
-                            continue;
-                        }
-                        let is_active = crate::lms::is_model_available(&[id.clone()], active_hint);
-                        entries.push(ModelEntry {
-                            id: id.clone(),
-                            source: ModelSource::Higgs {
-                                endpoint: base.clone(),
-                                path: None,
-                                name: id,
-                            },
-                            is_active,
-                            is_loaded: true,
-                        });
-                    }
+                    let catalog = crate::higgs::available_model_catalog_at(base, api_key).await;
+                    let resident =
+                        crate::higgs::list_available_served_models_at(base, api_key).await;
+                    entries.extend(higgs_model_entries(base, active_hint, catalog, resident));
                 }
             } else if !base.is_empty() && !already_covered && !covered_by_cluster {
                 let api_key = &self.config.agents.defaults.local_api_key;
@@ -1239,6 +1231,94 @@ mod tests {
         );
 
         assert_eq!(bases, vec!["http://127.0.0.1:8000/v1".to_string()]);
+    }
+
+    #[test]
+    fn higgs_catalog_entries_use_server_names_paths_and_loaded_state() {
+        let catalog = crate::higgs::AvailableModelCatalog {
+            runtime_model_load: true,
+            models: vec![
+                crate::higgs::AvailableRuntimeModel {
+                    id: "ternary-bonsai2-27b-2bit".to_string(),
+                    stable_id: "NexVeridian/ternary-bonsai2-27b-2bit".to_string(),
+                    path: "/models/ternary".to_string(),
+                    model_type: "qwen3".to_string(),
+                    adapter: "qwen3".to_string(),
+                    loaded: true,
+                },
+                crate::higgs::AvailableRuntimeModel {
+                    id: "Nanbeige4.1-3B".to_string(),
+                    stable_id: "Nanbeige/Nanbeige4.1-3B".to_string(),
+                    path: "/custom-hf/nanbeige".to_string(),
+                    model_type: "nanbeige".to_string(),
+                    adapter: "nanbeige".to_string(),
+                    loaded: false,
+                },
+            ],
+        };
+
+        let entries = higgs_model_entries(
+            "http://127.0.0.1:9000/v1",
+            "ternary-bonsai2-27b-2bit",
+            Some(catalog),
+            vec!["must-not-be-added-twice".to_string()],
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].display_name(), "ternary-bonsai2-27b-2bit");
+        assert!(entries[0].is_loaded);
+        assert!(entries[0].is_active);
+        assert_eq!(entries[1].display_name(), "Nanbeige4.1-3B");
+        match &entries[1].source {
+            ModelSource::Higgs { path, name, .. } => {
+                assert_eq!(path.as_deref(), Some("/custom-hf/nanbeige"));
+                assert_eq!(name, "Nanbeige4.1-3B");
+            }
+            source => panic!("unexpected source: {source:?}"),
+        }
+    }
+
+    #[test]
+    fn old_higgs_falls_back_to_resident_models_only() {
+        let entries = higgs_model_entries(
+            "http://127.0.0.1:9000/v1",
+            "resident",
+            None,
+            vec!["resident".to_string()],
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "resident");
+        assert!(entries[0].is_loaded);
+        match &entries[0].source {
+            ModelSource::Higgs { path, .. } => assert!(path.is_none()),
+            source => panic!("unexpected source: {source:?}"),
+        }
+    }
+
+    #[test]
+    fn disabled_runtime_loading_ignores_unloaded_catalog_entries() {
+        let catalog = crate::higgs::AvailableModelCatalog {
+            runtime_model_load: false,
+            models: vec![crate::higgs::AvailableRuntimeModel {
+                id: "Nanbeige4.1-3B".to_string(),
+                stable_id: "Nanbeige/Nanbeige4.1-3B".to_string(),
+                path: "/custom-hf/nanbeige".to_string(),
+                model_type: "nanbeige".to_string(),
+                adapter: "nanbeige".to_string(),
+                loaded: false,
+            }],
+        };
+
+        let entries = higgs_model_entries(
+            "http://127.0.0.1:9000/v1",
+            "resident",
+            Some(catalog),
+            vec!["resident".to_string()],
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "resident");
     }
 
     #[test]
