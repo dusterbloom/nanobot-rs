@@ -4769,6 +4769,11 @@ impl AgentLoopShared {
         let mut higgs_control = None;
         let mut higgs_request_reservation = None;
         if ctx.core.provider.supports_higgs_session_cache() {
+            if messages_for_llm.iter().any(|message| {
+                message.get("role").and_then(|role| role.as_str()) == Some("assistant")
+            }) {
+                counters.restore_higgs_publication_hint(&ctx.session_key, &ctx.session_id);
+            }
             let frozen_tool_hash =
                 crate::agent::prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
             let max_prompt_tokens = ctx

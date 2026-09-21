@@ -868,6 +868,35 @@ impl RuntimeCounters {
         active_id
     }
 
+    /// Restore the conservative server-publication hint after a process restart.
+    ///
+    /// A resumed durable transcript has already completed at least one assistant
+    /// turn. Trying the deterministic retained ID as an exact continuation is
+    /// safe: if Higgs restarted or evicted it, the typed unavailable path rotates
+    /// and seeds once. Never overwrite live in-process state, especially after a
+    /// deliberate compaction rotation.
+    pub(crate) fn restore_higgs_publication_hint(
+        &self,
+        session_key: &str,
+        durable_session_id: &str,
+    ) -> bool {
+        let _transition = self.prompt_cache_transition.lock();
+        let mut sessions = self.higgs_sessions.lock();
+        if sessions.contains_key(session_key) {
+            return false;
+        }
+        let active_id = stable_higgs_session_id(durable_session_id, 0);
+        sessions.insert(
+            session_key.to_string(),
+            HiggsSessionState {
+                active_id: Some(active_id),
+                published_active_id: Some(active_id),
+                ..HiggsSessionState::default()
+            },
+        );
+        true
+    }
+
     pub(crate) fn reserve_higgs_session_request(
         self: &Arc<Self>,
         session_key: &str,
@@ -2658,6 +2687,43 @@ mod tests {
         assert_eq!(
             second.control().reuse_policy,
             HiggsSessionReusePolicy::RequireContinuation
+        );
+    }
+
+    #[test]
+    fn resumed_process_restores_required_continuation_hint_once() {
+        let counters = Arc::new(RuntimeCounters::new_with_config(
+            32_768,
+            &CircuitBreakerConfig::default(),
+        ));
+        assert!(counters.restore_higgs_publication_hint("cli:resume", "sqlite:resume",));
+
+        let resumed = counters.reserve_higgs_session_request(
+            "cli:resume",
+            "sqlite:resume",
+            "bonsai",
+            7,
+            24_576,
+            0,
+        );
+        assert_eq!(
+            resumed.control().reuse_policy,
+            HiggsSessionReusePolicy::RequireContinuation
+        );
+
+        counters.invalidate_prompt_cache("cli:resume", true);
+        assert!(!counters.restore_higgs_publication_hint("cli:resume", "sqlite:resume",));
+        let rotated = counters.reserve_higgs_session_request(
+            "cli:resume",
+            "sqlite:resume",
+            "bonsai",
+            7,
+            24_576,
+            1,
+        );
+        assert_eq!(
+            rotated.control().reuse_policy,
+            HiggsSessionReusePolicy::Seed
         );
     }
 
