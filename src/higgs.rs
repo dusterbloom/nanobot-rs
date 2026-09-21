@@ -1043,11 +1043,17 @@ pub(crate) async fn switch_runtime_model(
     //    collected (not silently discarded) so the 409 the user would otherwise
     //    get is replaced with a clear "couldn't unload X: reason" message.
     let loaded = list_available_served_models_at(api_base, api_key).await;
-    let preloaded_name = loaded_model_name(&loaded, name);
+    let catalog = available_model_catalog_at(api_base, api_key).await;
+    let preloaded_name = catalog
+        .as_ref()
+        .and_then(|catalog| loaded_catalog_model_name(catalog, path));
     let unload_url = models_url_from_base(api_base);
     let mut unload_errors: Vec<String> = Vec::new();
     for id in &loaded {
-        if name.eq_ignore_ascii_case(id) {
+        if preloaded_name
+            .as_ref()
+            .is_some_and(|target| target.eq_ignore_ascii_case(id))
+        {
             continue;
         }
         let resp = auth(client.delete(format!("{unload_url}/{}", url_encode_model_id(id))))
@@ -1077,7 +1083,11 @@ pub(crate) async fn switch_runtime_model(
         // Unload failed — poll anyway in case higgs is still processing.
         for _ in 0..15 {
             let still_loaded = list_available_served_models_at(api_base, api_key).await;
-            if still_loaded.iter().all(|id| name.eq_ignore_ascii_case(id)) {
+            if still_loaded.iter().all(|id| {
+                preloaded_name
+                    .as_ref()
+                    .is_some_and(|target| target.eq_ignore_ascii_case(id))
+            }) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -1087,7 +1097,11 @@ pub(crate) async fn switch_runtime_model(
         let still_loaded = list_available_served_models_at(api_base, api_key).await;
         let blocking: Vec<&str> = still_loaded
             .iter()
-            .filter(|id| !name.eq_ignore_ascii_case(id))
+            .filter(|id| {
+                !preloaded_name
+                    .as_ref()
+                    .is_some_and(|target| target.eq_ignore_ascii_case(id))
+            })
             .map(|s| s.as_str())
             .collect();
         if !blocking.is_empty() {
@@ -1120,8 +1134,11 @@ pub(crate) async fn switch_runtime_model(
         // Another switch may have won the race between our initial listing
         // and this load. Accept the conflict only after confirming the target
         // is resident, and return Higgs's canonical runtime id.
-        let confirmed = list_available_served_models_at(api_base, api_key).await;
-        if let Some(loaded_name) = loaded_model_name(&confirmed, name) {
+        if let Some(loaded_name) = available_model_catalog_at(api_base, api_key)
+            .await
+            .as_ref()
+            .and_then(|catalog| loaded_catalog_model_name(catalog, path))
+        {
             return Ok(loaded_name);
         }
     }
@@ -1139,11 +1156,15 @@ pub(crate) async fn switch_runtime_model(
     Ok(loaded_name)
 }
 
-fn loaded_model_name(loaded: &[String], requested: &str) -> Option<String> {
-    loaded
+fn loaded_catalog_model_name(
+    catalog: &AvailableModelCatalog,
+    requested_path: &str,
+) -> Option<String> {
+    catalog
+        .models
         .iter()
-        .find(|id| !requested.is_empty() && requested.eq_ignore_ascii_case(id))
-        .cloned()
+        .find(|model| model.loaded && model.path == requested_path)
+        .map(|model| model.id.clone())
 }
 
 /// Percent-encode a model id for use in a DELETE path segment. higgs ids are
@@ -1396,6 +1417,111 @@ mod tests {
         snapshot_barrier: Option<Arc<Barrier>>,
     }
 
+    struct SameIdArtifactState {
+        loaded_path: Option<String>,
+        unload_requests: usize,
+        load_requests: usize,
+        conflict_load: bool,
+    }
+
+    async fn spawn_same_id_artifact_server(
+        conflict_load: bool,
+    ) -> (
+        String,
+        Arc<Mutex<SameIdArtifactState>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = Arc::new(Mutex::new(SameIdArtifactState {
+            loaded_path: Some("/models/artifact-a".to_string()),
+            unload_requests: 0,
+            load_requests: 0,
+            conflict_load,
+        }));
+        let server_state = Arc::clone(&state);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let Some((method, path, body)) = read_switch_test_request(&mut stream).await else {
+                    continue;
+                };
+                let (status, response_body) = {
+                    let mut state = server_state.lock().await;
+                    match (method.as_str(), path.as_str()) {
+                        ("GET", "/v1/models") => {
+                            let data = state
+                                .loaded_path
+                                .as_ref()
+                                .map(|_| vec![serde_json::json!({ "id": "shared-name" })])
+                                .unwrap_or_default();
+                            (200, serde_json::json!({ "data": data }).to_string())
+                        }
+                        ("GET", "/health") => (200, r#"{"models":[]}"#.to_string()),
+                        ("GET", "/v1/models/available") => {
+                            let loaded_path = state.loaded_path.as_deref();
+                            (
+                                200,
+                                serde_json::json!({
+                                    "runtime_model_load": true,
+                                    "data": [
+                                        {
+                                            "id": "shared-name",
+                                            "stable_id": "publisher/shared",
+                                            "path": "/models/artifact-a",
+                                            "model_type": "qwen3",
+                                            "adapter": "qwen3",
+                                            "loaded": loaded_path == Some("/models/artifact-a")
+                                        },
+                                        {
+                                            "id": "shared-name",
+                                            "stable_id": "publisher/shared",
+                                            "path": "/models/artifact-b",
+                                            "model_type": "qwen3",
+                                            "adapter": "qwen3",
+                                            "loaded": loaded_path == Some("/models/artifact-b")
+                                        }
+                                    ]
+                                })
+                                .to_string(),
+                            )
+                        }
+                        ("DELETE", "/v1/models/shared-name") => {
+                            state.unload_requests += 1;
+                            state.loaded_path = None;
+                            (200, r#"{"ok":true}"#.to_string())
+                        }
+                        ("POST", "/v1/models") => {
+                            state.load_requests += 1;
+                            if state.conflict_load {
+                                state.loaded_path = Some("/models/artifact-a".to_string());
+                                (409, r#"{"error":"name collision"}"#.to_string())
+                            } else {
+                                state.loaded_path =
+                                    serde_json::from_str::<serde_json::Value>(&body)
+                                        .ok()
+                                        .and_then(|json| {
+                                            json.get("path")?.as_str().map(String::from)
+                                        });
+                                (200, r#"{"id":"shared-name"}"#.to_string())
+                            }
+                        }
+                        _ => (404, r#"{"error":"not found"}"#.to_string()),
+                    }
+                };
+                let reason = if status == 200 { "OK" } else { "Not Found" };
+                let response = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                    response_body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}/v1"), state, task)
+    }
+
     async fn spawn_switch_test_server(
         loaded: &[&str],
         conflict_next_load: bool,
@@ -1458,6 +1584,35 @@ mod tests {
         let (status, response_body) = {
             let mut state = state.lock().await;
             match (method.as_str(), path.as_str()) {
+                ("GET", "/v1/models/available") => {
+                    let data: Vec<_> = state
+                        .loaded
+                        .iter()
+                        .map(|id| {
+                            let model_path = if id == SWITCH_TEST_CANONICAL_TARGET {
+                                "/models/target-model".to_string()
+                            } else {
+                                format!("/models/{id}")
+                            };
+                            serde_json::json!({
+                                "id": id,
+                                "stable_id": id,
+                                "path": model_path,
+                                "model_type": "test",
+                                "adapter": "test",
+                                "loaded": true
+                            })
+                        })
+                        .collect();
+                    (
+                        200,
+                        serde_json::json!({
+                            "runtime_model_load": true,
+                            "data": data
+                        })
+                        .to_string(),
+                    )
+                }
                 ("GET", "/v1/models") => {
                     let data: Vec<_> = state
                         .loaded
@@ -1592,6 +1747,35 @@ mod tests {
     async fn test_wait_for_ready_unreachable_returns_false() {
         let result = wait_for_ready(19998, 1).await;
         assert!(!result, "unreachable port should return false");
+    }
+
+    #[tokio::test]
+    async fn switch_runtime_model_does_not_adopt_same_id_from_wrong_artifact() {
+        let (base, state, server) = spawn_same_id_artifact_server(false).await;
+
+        let result = switch_runtime_model(&base, "", "/models/artifact-b", "shared-name", 1).await;
+
+        server.abort();
+        assert_eq!(result.unwrap(), "shared-name");
+        let state = state.lock().await;
+        assert_eq!(state.loaded_path.as_deref(), Some("/models/artifact-b"));
+        assert_eq!(state.unload_requests, 1);
+        assert_eq!(state.load_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn switch_runtime_model_rejects_conflict_from_same_id_wrong_artifact() {
+        let (base, state, server) = spawn_same_id_artifact_server(true).await;
+
+        let result = switch_runtime_model(&base, "", "/models/artifact-b", "shared-name", 1).await;
+
+        server.abort();
+        let error = result.unwrap_err();
+        assert!(error.contains("HTTP 409"), "unexpected error: {error}");
+        let state = state.lock().await;
+        assert_eq!(state.loaded_path.as_deref(), Some("/models/artifact-a"));
+        assert_eq!(state.unload_requests, 1);
+        assert_eq!(state.load_requests, 1);
     }
 
     #[tokio::test]
