@@ -23,13 +23,11 @@ pub fn route(user_text: &str, available_tools: &[String], policy: &SessionPolicy
         target: "clarify".to_string(),
         args: json!({"question": "Please clarify the exact task and target source."}),
         confidence: 0.2,
-        idempotency_key: "fallback:ask_user".to_string(),
     }
 }
 
 #[derive(Clone, Copy)]
 struct FallbackRule(
-    &'static str,
     Select,
     KeywordMatcher,
     ExtraPredicate,
@@ -40,26 +38,26 @@ struct FallbackRule(
 #[rustfmt::skip]
 const FALLBACK_RULES: &[FallbackRule] = &[
     // Must precede plain URL to avoid web_fetch stealing research requests.
-    FallbackRule("spawn_researcher", Select::Subagent("researcher", ArgsKind::Task), KeywordMatcher::ContainsAny(&["research", "report", "summarize", "summarise", "analyze", "analyse"]), ExtraPredicate::ContainsUrl, "spawn", 0.5),
-    FallbackRule("web_fetch", Select::Tool("web_fetch", ArgsKind::Url), KeywordMatcher::None, ExtraPredicate::UrlOrHackerNews, "web_fetch", 0.4),
-    FallbackRule("spawn_local_news", Select::Subagent("researcher", ArgsKind::LocalNewsTask), KeywordMatcher::ContainsAny(&["latest news"]), ExtraPredicate::LocalNews, "spawn", 0.4),
-    FallbackRule("read_file", Select::Tool("read_file", ArgsKind::Instruction), KeywordMatcher::ContainsAny(&["read ", "show ", "cat ", "display ", "open "]), ExtraPredicate::ContainsPath, "read_file", 0.5),
-    FallbackRule("write_file", Select::Tool("write_file", ArgsKind::Instruction), KeywordMatcher::Mixed(&["write a new", "create a file", "save to "], &["write "]), ExtraPredicate::ContainsPath, "write_file", 0.4),
-    FallbackRule("edit_file", Select::Tool("edit_file", ArgsKind::Instruction), KeywordMatcher::ContainsAny(&["edit ", "modify ", "change ", "fix "]), ExtraPredicate::ContainsPath, "edit_file", 0.4),
-    FallbackRule("list_dir", Select::Tool("list_dir", ArgsKind::Path), KeywordMatcher::Mixed(&["list ", "ls "], &["what files"]), ExtraPredicate::None, "list_dir", 0.4),
-    FallbackRule("exec", Select::Tool("exec", ArgsKind::Command), KeywordMatcher::Mixed(&["run the ", "execute the ", "build the ", "compile the ", "run my "], &["run ", "execute ", "cargo ", "npm ", "git ", "make ", "python "]), ExtraPredicate::None, "exec", 0.3),
-    FallbackRule("web_search", Select::Tool("web_search", ArgsKind::Query), KeywordMatcher::ContainsAny(&["search for ", "search about ", "look up ", "find out about ", "google "]), ExtraPredicate::None, "web_search", 0.4),
+    FallbackRule(Select::Subagent("researcher", ArgsKind::Task), KeywordMatcher::ContainsAny(&["research", "report", "summarize", "summarise", "analyze", "analyse"]), ExtraPredicate::ContainsUrl, "spawn", 0.5),
+    FallbackRule(Select::Tool("web_fetch", ArgsKind::Url), KeywordMatcher::None, ExtraPredicate::UrlOrHackerNews, "web_fetch", 0.4),
+    FallbackRule(Select::Subagent("researcher", ArgsKind::LocalNewsTask), KeywordMatcher::ContainsAny(&["latest news"]), ExtraPredicate::LocalNews, "spawn", 0.4),
+    FallbackRule(Select::Tool("read_file", ArgsKind::Instruction), KeywordMatcher::ContainsAny(&["read ", "show ", "cat ", "display ", "open "]), ExtraPredicate::ContainsPath, "read_file", 0.5),
+    FallbackRule(Select::Tool("write_file", ArgsKind::Instruction), KeywordMatcher::Mixed(&["write a new", "create a file", "save to "], &["write "]), ExtraPredicate::ContainsPath, "write_file", 0.4),
+    FallbackRule(Select::Tool("edit_file", ArgsKind::Instruction), KeywordMatcher::ContainsAny(&["edit ", "modify ", "change ", "fix "]), ExtraPredicate::ContainsPath, "edit_file", 0.4),
+    FallbackRule(Select::Tool("list_dir", ArgsKind::Path), KeywordMatcher::Mixed(&["list ", "ls "], &["what files"]), ExtraPredicate::None, "list_dir", 0.4),
+    FallbackRule(Select::Tool("exec", ArgsKind::Command), KeywordMatcher::Mixed(&["run the ", "execute the ", "build the ", "compile the ", "run my "], &["run ", "execute ", "cargo ", "npm ", "git ", "make ", "python "]), ExtraPredicate::None, "exec", 0.3),
+    FallbackRule(Select::Tool("web_search", ArgsKind::Query), KeywordMatcher::ContainsAny(&["search for ", "search about ", "look up ", "find out about ", "google "]), ExtraPredicate::None, "web_search", 0.4),
 ];
 
 impl FallbackRule {
     fn matches(&self, lower: &str, available_tools: &[String], policy: &SessionPolicy) -> bool {
-        available_tools.iter().any(|tool| tool == self.4)
-            && self.2.matches(lower)
-            && self.3.matches(lower, policy)
+        available_tools.iter().any(|tool| tool == self.3)
+            && self.1.matches(lower)
+            && self.2.matches(lower, policy)
     }
 
     fn plan(&self, user_text: &str, lower: &str) -> ToolPlan {
-        let (action, target, args) = match self.1 {
+        let (action, target, args) = match self.0 {
             Select::Subagent(target, args) => (ToolPlanAction::Subagent, target, args),
             Select::Tool(target, args) => (ToolPlanAction::Tool, target, args),
         };
@@ -67,8 +65,7 @@ impl FallbackRule {
             action,
             target: target.to_string(),
             args: args.to_json(user_text, lower),
-            confidence: self.5,
-            idempotency_key: format!("fallback:{}", self.0),
+            confidence: self.4,
         }
     }
 }
