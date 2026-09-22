@@ -96,15 +96,6 @@ pub fn next_run_after(schedule: &CronSchedule, now_ms: i64) -> Option<i64> {
     }
 }
 
-/// IDs of jobs that are due at `now_ms`: enabled, with a computed
-/// `next_run_at_ms <= now_ms`. Pure — no clock reads, no I/O.
-pub fn due_job_ids(jobs: &[CronJob], now_ms: i64) -> Vec<String> {
-    jobs.iter()
-        .filter(|j| is_due(j, now_ms))
-        .map(|j| j.id.clone())
-        .collect()
-}
-
 fn is_due(job: &CronJob, now_ms: i64) -> bool {
     job.enabled && job.state.next_run_at_ms.is_some_and(|next| next <= now_ms)
 }
@@ -360,21 +351,6 @@ mod tests {
 
     fn store_of(jobs: Vec<CronJob>) -> CronStore {
         CronStore { version: 1, jobs }
-    }
-
-    // ── Due-job selection (pure) ──────────────────────────────────
-
-    #[test]
-    fn test_due_selection_returns_exactly_due_jobs() {
-        let jobs = vec![
-            job("overdue", every(60_000), Some(NOW - 1), true),
-            job("due-now", every(60_000), Some(NOW), true),
-            job("future", every(60_000), Some(NOW + 1), true),
-            job("disabled-overdue", every(60_000), Some(NOW - 1), false),
-            job("uninitialized", every(60_000), None, true),
-        ];
-        assert_eq!(due_job_ids(&jobs, NOW), vec!["overdue", "due-now"]);
-        assert!(due_job_ids(&jobs, NOW - 10).is_empty());
     }
 
     // ── Next-run computation ──────────────────────────────────────
