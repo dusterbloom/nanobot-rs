@@ -168,32 +168,6 @@ impl HealthRegistry {
         states.values().cloned().collect()
     }
 
-    /// One-line summary of all probes.
-    #[allow(dead_code)]
-    pub fn summary_line(&self) -> String {
-        let states = self.states.read();
-        if states.is_empty() {
-            return "no probes".to_string();
-        }
-        states
-            .values()
-            .map(|s| {
-                let status = match s.status {
-                    ProbeStatus::Healthy => "ok",
-                    ProbeStatus::Degraded => "DOWN",
-                    ProbeStatus::Unknown => "?",
-                };
-                let latency = s
-                    .last_result
-                    .as_ref()
-                    .map(|r| format!(" ({}ms)", r.latency_ms))
-                    .unwrap_or_default();
-                format!("{}:{}{}", s.name, status, latency)
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-
     /// Number of registered probes.
     #[allow(dead_code)]
     pub fn probe_count(&self) -> usize {
@@ -569,12 +543,6 @@ mod tests {
         config.tools.web.search.searxng_url = String::new();
         let reg = build_registry(&config);
         assert_eq!(reg.probe_count(), 0);
-    }
-
-    #[test]
-    fn test_summary_line_no_probes() {
-        let reg = HealthRegistry::new();
-        assert_eq!(reg.summary_line(), "no probes");
     }
 
     // --- TrioEndpointProbe tests ---
