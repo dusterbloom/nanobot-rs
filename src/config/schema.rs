@@ -640,37 +640,6 @@ impl ProvidersConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Gateway config
-// ---------------------------------------------------------------------------
-
-/// Gateway/server configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GatewayConfig {
-    #[serde(default = "default_gateway_host")]
-    pub host: String,
-    #[serde(default = "default_gateway_port")]
-    pub port: u16,
-}
-
-fn default_gateway_host() -> String {
-    "0.0.0.0".to_string()
-}
-
-fn default_gateway_port() -> u16 {
-    18790
-}
-
-impl Default for GatewayConfig {
-    fn default() -> Self {
-        Self {
-            host: default_gateway_host(),
-            port: default_gateway_port(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tools configs
 // ---------------------------------------------------------------------------
 
@@ -1902,51 +1871,6 @@ impl ToolDelegationConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Worker/Swarm config
-// ---------------------------------------------------------------------------
-
-/// Configuration for the Worker/Swarm system.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkerConfig {
-    /// Enable the swarm worker system (delegate tool). Default: true.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Maximum delegation depth (how many levels of delegate). Default: 3.
-    #[serde(default = "default_worker_max_depth")]
-    pub max_depth: u32,
-    /// Enable python_eval tool for workers. Default: true.
-    #[serde(default = "default_true")]
-    pub python: bool,
-    /// Enable delegate tool (recursive workers). Default: true.
-    #[serde(default = "default_true")]
-    pub delegate: bool,
-    /// Budget multiplier for children (0.0-1.0). Default: 0.5.
-    #[serde(default = "default_budget_multiplier")]
-    pub budget_multiplier: f32,
-}
-
-fn default_worker_max_depth() -> u32 {
-    3
-}
-
-fn default_budget_multiplier() -> f32 {
-    0.5
-}
-
-impl Default for WorkerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            max_depth: 3,
-            python: true,
-            delegate: true,
-            budget_multiplier: 0.5,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Proprioception config
 // ---------------------------------------------------------------------------
 
@@ -2468,8 +2392,6 @@ pub struct Config {
     #[serde(default)]
     pub providers: ProvidersConfig,
     #[serde(default)]
-    pub gateway: GatewayConfig,
-    #[serde(default)]
     pub tools: ToolsConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
@@ -2479,8 +2401,6 @@ pub struct Config {
     pub provenance: ProvenanceConfig,
     #[serde(default)]
     pub voice: VoiceConfig,
-    #[serde(default)]
-    pub worker: WorkerConfig,
     #[serde(default)]
     pub proprioception: ProprioceptionConfig,
     #[serde(default)]
@@ -2697,7 +2617,6 @@ mod tests {
         let json = serde_json::to_string_pretty(&cfg).unwrap();
         let cfg2: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg2.agents.defaults.model, "anthropic/claude-opus-4-5");
-        assert_eq!(cfg2.gateway.port, 18790);
     }
 
     #[test]
