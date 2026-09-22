@@ -5927,7 +5927,7 @@ mod tests {
             serde_json::json!({"role": "user", "content": "inspect the workspace"}),
         ];
         let higgs = create_openai_compat(
-            ProviderSpec::local(&api_base, Some("model")).with_higgs_session_cache(true),
+            ProviderSpec::local_with_key(&api_base, Some("model"), "local").with_higgs_session_cache(true),
         );
         assert!(higgs
             .chat(
@@ -5972,7 +5972,7 @@ mod tests {
             Some("ok")
         );
 
-        let non_higgs = create_openai_compat(ProviderSpec::local(&api_base, Some("model")));
+        let non_higgs = create_openai_compat(ProviderSpec::local_with_key(&api_base, Some("model"), "local"));
         non_higgs
             .chat(
                 &retained_messages,

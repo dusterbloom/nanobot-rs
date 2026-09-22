@@ -1289,15 +1289,15 @@ fn build_trio_e2e_harness(
     let jit_gate = std::sync::Arc::new(JitGate::new());
 
     let main_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(base_url, Some(main_model))
+        factory::ProviderSpec::local_with_key(base_url, Some(main_model), "local")
             .with_jit_gate_opt(Some(jit_gate.clone())),
     );
     let router_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(base_url, Some(router_model))
+        factory::ProviderSpec::local_with_key(base_url, Some(router_model), "local")
             .with_jit_gate_opt(Some(jit_gate.clone())),
     );
     let specialist_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(base_url, Some(specialist_model))
+        factory::ProviderSpec::local_with_key(base_url, Some(specialist_model), "local")
             .with_jit_gate_opt(Some(jit_gate.clone())),
     );
 
@@ -1751,7 +1751,7 @@ async fn test_trio_e2e_router_unreachable() {
 
     let jit_gate = std::sync::Arc::new(JitGate::new());
     let main_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(&base, Some(&main_model))
+        factory::ProviderSpec::local_with_key(&base, Some(&main_model), "local")
             .with_jit_gate_opt(Some(jit_gate.clone())),
     );
     // Router points to dead port
@@ -1761,7 +1761,7 @@ async fn test_trio_e2e_router_unreachable() {
         Some("dead-router"),
     ));
     let specialist_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(&base, Some(&specialist_model))
+        factory::ProviderSpec::local_with_key(&base, Some(&specialist_model), "local")
             .with_jit_gate_opt(Some(jit_gate.clone())),
     );
 
@@ -1870,11 +1870,11 @@ async fn test_trio_e2e_specialist_unreachable() {
 
     let jit_gate = std::sync::Arc::new(JitGate::new());
     let main_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(&base, Some(&main_model))
+        factory::ProviderSpec::local_with_key(&base, Some(&main_model), "local")
             .with_jit_gate_opt(Some(jit_gate.clone())),
     );
     let router_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(&base, Some(&router_model))
+        factory::ProviderSpec::local_with_key(&base, Some(&router_model), "local")
             .with_jit_gate_opt(Some(jit_gate.clone())),
     );
     // Specialist points to dead port
