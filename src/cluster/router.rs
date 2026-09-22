@@ -175,44 +175,6 @@ impl ClusterRouter {
             RoutingDecision::Local | RoutingDecision::Cloud => None,
         }
     }
-
-    /// Human-readable summary of the current cluster state for logging/status display.
-    pub async fn summary(&self) -> String {
-        let peers = self.state.get_all_peers().await;
-        if peers.is_empty() {
-            return format!(
-                "Cluster: enabled={}, no peers discovered",
-                self.config.enabled
-            );
-        }
-
-        let healthy: Vec<_> = peers.iter().filter(|p| p.healthy).collect();
-        let total_models: usize = healthy.iter().map(|p| p.models.len()).sum();
-
-        let peer_lines: Vec<String> = peers
-            .iter()
-            .map(|p| {
-                let model_names: Vec<&str> = p.models.iter().map(|m| m.id.as_str()).collect();
-                format!(
-                    "  {} [{}] healthy={} models=[{}]",
-                    p.endpoint,
-                    p.peer_type,
-                    p.healthy,
-                    model_names.join(", ")
-                )
-            })
-            .collect();
-
-        format!(
-            "Cluster: enabled={} prefer_cluster={} peers={} healthy={} models={}\n{}",
-            self.config.enabled,
-            self.config.prefer_cluster,
-            peers.len(),
-            healthy.len(),
-            total_models,
-            peer_lines.join("\n")
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -485,25 +447,5 @@ mod tests {
             .create_cluster_provider(&RoutingDecision::Cloud)
             .await;
         assert!(result.is_none());
-    }
-
-    // --- summary ---
-
-    #[tokio::test]
-    async fn test_summary_no_peers() {
-        let state = ClusterState::new();
-        let router = ClusterRouter::new(state, make_config(false, true));
-        let s = router.summary().await;
-        assert!(s.contains("no peers discovered"));
-    }
-
-    #[tokio::test]
-    async fn test_summary_with_peers() {
-        let peer = make_peer("http://exo:52415/v1", vec!["qwen-72b", "llama-70b"], true);
-        let router = router_with_peer(peer, true, true).await;
-        let s = router.summary().await;
-        assert!(s.contains("http://exo:52415/v1"));
-        assert!(s.contains("qwen-72b"));
-        assert!(s.contains("llama-70b"));
     }
 }
