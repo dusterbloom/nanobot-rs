@@ -162,6 +162,7 @@ fn test_clear_resets_lcm_engine() {
         tau_hard: 0.85,
         deterministic_target: 512,
         keep_prefix_fraction: 0.35,
+        checkpoint: nanobot::agent::lcm::CheckpointWriter::Model,
     };
 
     let mut engine = LcmEngine::new(config.clone());
@@ -191,6 +192,7 @@ async fn test_compaction_creates_summary_node() {
         tau_hard: 0.6,
         deterministic_target: 64,
         keep_prefix_fraction: 0.35,
+        checkpoint: nanobot::agent::lcm::CheckpointWriter::Model,
     });
 
     ingest(&mut engine, 1, "system", "System");
@@ -229,6 +231,7 @@ async fn test_second_compaction_summarizes_after_first_summary() {
         tau_hard: 0.5,
         deterministic_target: 64,
         keep_prefix_fraction: 0.35,
+        checkpoint: nanobot::agent::lcm::CheckpointWriter::Model,
     });
 
     ingest(&mut engine, 1, "system", "System");
@@ -395,6 +398,7 @@ async fn test_lossless_retrieval_after_multiple_compactions() {
         tau_hard: 0.5,
         deterministic_target: 64,
         keep_prefix_fraction: 0.35,
+        checkpoint: nanobot::agent::lcm::CheckpointWriter::Model,
     });
 
     ingest(&mut engine, 1, "system", "System");
@@ -476,6 +480,7 @@ fn test_check_thresholds_below_soft() {
         tau_hard: 0.85,
         deterministic_target: 512,
         keep_prefix_fraction: 0.35,
+        checkpoint: nanobot::agent::lcm::CheckpointWriter::Model,
     });
 
     ingest(&mut engine, 1, "system", "System");
@@ -495,6 +500,7 @@ fn test_check_thresholds_above_soft() {
         tau_hard: 0.8,
         deterministic_target: 512,
         keep_prefix_fraction: 0.35,
+        checkpoint: nanobot::agent::lcm::CheckpointWriter::Model,
     });
 
     ingest(&mut engine, 1, "system", "System");
@@ -580,6 +586,7 @@ async fn test_compaction_keeps_stable_system_prefix_and_current_tail() {
         tau_hard: 0.6,
         deterministic_target: 64,
         keep_prefix_fraction: 0.35,
+        checkpoint: nanobot::agent::lcm::CheckpointWriter::Model,
     });
 
     ingest(&mut engine, 1, "system", "System");

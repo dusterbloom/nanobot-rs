@@ -3493,6 +3493,8 @@ async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
         ],
     ));
     let lcm_config = LcmSchemaConfig {
+        // Exercises the cloud model-summary pipeline on a local harness.
+        checkpoint_writer: Some(crate::agent::lcm::CheckpointWriter::Model),
         tau_soft: 0.05,
         tau_hard: 0.10,
         deterministic_target: 64,
@@ -3634,6 +3636,8 @@ async fn soft_lcm_uses_main_provider_and_preserves_foreground_context() {
         )],
     ));
     let lcm_config = LcmSchemaConfig {
+        // Exercises the cloud model-summary pipeline on a local harness.
+        checkpoint_writer: Some(crate::agent::lcm::CheckpointWriter::Model),
         tau_soft: 0.0001,
         // Deliberately above 1.0 in this focused policy test so even a tiny
         // effective budget cannot turn the soft case into hard pressure.
@@ -3863,6 +3867,8 @@ async fn soft_compaction_waits_for_turn_end_and_next_foreground_preempts_generat
         foreground_calls: std::sync::atomic::AtomicUsize::new(0),
     });
     let lcm_config = LcmSchemaConfig {
+        // Exercises the cloud model-summary pipeline on a local harness.
+        checkpoint_writer: Some(crate::agent::lcm::CheckpointWriter::Model),
         tau_soft: 0.0001,
         tau_hard: 10.0,
         deterministic_target: 64,
@@ -4023,6 +4029,8 @@ async fn published_soft_checkpoint_replays_and_installs_on_next_turn() {
         force_recovery_on_second: false,
     });
     let lcm_config = LcmSchemaConfig {
+        // Exercises the cloud model-summary pipeline on a local harness.
+        checkpoint_writer: Some(crate::agent::lcm::CheckpointWriter::Model),
         tau_soft: 0.0001,
         tau_hard: 10.0,
         deterministic_target: 64,
@@ -4191,6 +4199,8 @@ async fn soft_checkpoint_survives_turn_finish_journal_failure() {
         force_recovery_on_second: false,
     });
     let lcm_config = LcmSchemaConfig {
+        // Exercises the cloud model-summary pipeline on a local harness.
+        checkpoint_writer: Some(crate::agent::lcm::CheckpointWriter::Model),
         tau_soft: 0.0001,
         tau_hard: 10.0,
         deterministic_target: 64,
@@ -4457,6 +4467,8 @@ async fn turn_cancellation_after_soft_start_rolls_back_without_checkpoint() {
         generation_dropped: generation_dropped.clone(),
     });
     let lcm_config = LcmSchemaConfig {
+        // Exercises the cloud model-summary pipeline on a local harness.
+        checkpoint_writer: Some(crate::agent::lcm::CheckpointWriter::Model),
         tau_soft: 0.0001,
         tau_hard: 10.0,
         deterministic_target: 64,
@@ -4604,6 +4616,8 @@ async fn cancelling_hard_compaction_restores_engine_without_publishing_checkpoin
         foreground_calls: std::sync::atomic::AtomicUsize::new(0),
     });
     let lcm_config = LcmSchemaConfig {
+        // Exercises the cloud model-summary pipeline on a local harness.
+        checkpoint_writer: Some(crate::agent::lcm::CheckpointWriter::Model),
         tau_soft: 0.05,
         tau_hard: 0.10,
         deterministic_target: 64,
@@ -4829,6 +4843,7 @@ async fn cancelled_before_engine_lock_keeps_soft_compaction_retryable() {
         tau_hard: 10.0,
         deterministic_target: 64,
         keep_prefix_fraction: 0.35,
+        checkpoint: crate::agent::lcm::CheckpointWriter::Model,
     });
     engine.ingest(message);
     assert_eq!(
@@ -4911,6 +4926,8 @@ async fn blocking_compaction_publication_survives_foreground_abort() {
         release: release_compaction.clone(),
     });
     let lcm_config = LcmSchemaConfig {
+        // Exercises the cloud model-summary pipeline on a local harness.
+        checkpoint_writer: Some(crate::agent::lcm::CheckpointWriter::Model),
         tau_soft: 0.05,
         tau_hard: 0.10,
         deterministic_target: 64,
@@ -13536,6 +13553,7 @@ mod capacity_preflight {
             tau_hard: 10.0,
             deterministic_target: 64,
             keep_prefix_fraction: 0.35,
+            checkpoint: crate::agent::lcm::CheckpointWriter::Model,
         });
         for id in 0..messages {
             let _ = engine.ingest(json!({

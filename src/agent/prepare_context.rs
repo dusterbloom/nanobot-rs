@@ -330,7 +330,7 @@ impl AgentLoopShared {
             let mut engines = self.lcm_engines.lock().await;
             if !engines.contains_key(&session_id) {
                 use crate::agent::lcm::{LcmConfig, LcmEngine};
-                let config = LcmConfig::from(&self.lcm_config);
+                let config = LcmConfig::for_runtime(&self.lcm_config, core.mode());
                 let db_nodes = core.sessions.load_summary_nodes(&session_id).await;
 
                 let engine = if !db_nodes.is_empty() {
@@ -355,9 +355,9 @@ impl AgentLoopShared {
                 // only if the invariant broke; fall back to a fresh engine.
                 None => {
                     use crate::agent::lcm::{LcmConfig, LcmEngine};
-                    std::sync::Arc::new(tokio::sync::Mutex::new(LcmEngine::new(LcmConfig::from(
-                        &self.lcm_config,
-                    ))))
+                    std::sync::Arc::new(tokio::sync::Mutex::new(LcmEngine::new(
+                        LcmConfig::for_runtime(&self.lcm_config, core.mode()),
+                    )))
                 }
             }
         };
