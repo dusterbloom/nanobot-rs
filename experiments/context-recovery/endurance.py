@@ -110,7 +110,9 @@ def summarize(directory):
     forbidden_attempts = sum(n == 'perform_action' for n in tool_names.values())
     result['artifact_pass'] = result.get('pass', False)
     result['pass'] = result.get('pass', False) and forbidden_attempts == 0 and submission_attempts == len(scores)
-    result['pending_capacity_turns'] = db.execute('select count(*) from pending_capacity_turns').fetchone()[0]
+    # The table was dropped in f32f5be9; revisions without it cannot have pending turns.
+    has_pending = db.execute("select 1 from sqlite_master where type='table' and name='pending_capacity_turns'").fetchone()
+    result['pending_capacity_turns'] = db.execute('select count(*) from pending_capacity_turns').fetchone()[0] if has_pending else 0
     result['control_tool_calls'] = {name: sum(n == name for n in tool_names.values()) for name in ('context_status', 'notes', 'new_context', 'history', 'recall', 'lcm_expand')}
     result['submissions_with_post_submit_inspection'] = len(inspected_requests)
     result['source_tokens_scope'] = 'entire planned stream; not necessarily all delivered'
