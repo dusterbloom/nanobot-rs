@@ -3163,6 +3163,172 @@ impl LLMProvider for WireRecordingProvider {
     }
 }
 
+/// Higgs stand-in that publishes a v2 retained-session contract and enforces
+/// it by its own token count: the first `refusals` retained requests are
+/// refused as needing compaction even though the client's estimate fit the
+/// contract. Requests that do not opt into retention are always answered.
+struct RetentionRefusingHiggs {
+    calls: std::sync::Mutex<Vec<Vec<Value>>>,
+    refusals: std::sync::atomic::AtomicUsize,
+}
+
+impl RetentionRefusingHiggs {
+    fn new(refusals: usize) -> Self {
+        Self {
+            calls: std::sync::Mutex::new(Vec::new()),
+            refusals: std::sync::atomic::AtomicUsize::new(refusals),
+        }
+    }
+
+    /// The retention policy each request opted into (`None` = ordinary request).
+    fn policies(&self) -> Vec<Option<String>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|messages| {
+                messages
+                    .first()
+                    .and_then(|first| {
+                        first.get(
+                            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD,
+                        )
+                    })
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl LLMProvider for RetentionRefusingHiggs {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        let retained = messages.first().is_some_and(|first| {
+            first
+                .get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD)
+                .is_some()
+        });
+        let refuse = retained
+            && self
+                .refusals
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |left| left.checked_sub(1),
+                )
+                .is_ok();
+        if refuse {
+            return Err(
+                crate::errors::ProviderError::HiggsRetentionCompactionRequired {
+                    contract_revision: "boot-1:1:sha256:abc".to_owned(),
+                }
+                .into(),
+            );
+        }
+        Ok(WireRecordingProvider::text_response("ok"))
+    }
+
+    fn get_default_model(&self) -> &str {
+        "escha"
+    }
+
+    fn get_api_base(&self) -> Option<&str> {
+        Some("http://127.0.0.1:9000")
+    }
+
+    fn supports_higgs_session_cache(&self) -> bool {
+        true
+    }
+
+    fn fetch_higgs_capacity<'a>(
+        &'a self,
+        _model: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Option<crate::agent::capacity::HiggsCapacityFetch>,
+                        crate::errors::ProviderError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let profile = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 2,
+            "contractRevision": "boot-1:1:sha256:abc",
+            "model": "escha",
+            "maxContextTokens": 65_536,
+            "maxOutputTokens": 4_096,
+            "retainedBudgetBytes": 4_294_967_296_u64,
+            "guaranteedFastPromptTokens": 60_000,
+            "softCompactionPromptTokens": 50_000,
+            "targetAfterCompactionTokens": 40_000,
+            "guaranteedSessions": 1
+        }))
+        .expect("valid v2 contract");
+        Box::pin(async move {
+            Ok(Some(crate::agent::capacity::HiggsCapacityFetch::Profile(
+                profile,
+            )))
+        })
+    }
+}
+
+/// Retention is a prefill optimization. When Higgs refuses to retain a
+/// request whose prompt fits the model, the turn must still be answered, from
+/// the same context, as an ordinary request, and must not leave the session
+/// marked as retained for a continuation Higgs never saw.
+#[tokio::test]
+async fn refused_retained_request_is_answered_unretained() {
+    let higgs = Arc::new(RetentionRefusingHiggs::new(1));
+    let (agent, _workspace) = build_local_inline_harness_with_lcm(
+        higgs.clone(),
+        "escha",
+        32_768,
+        LcmSchemaConfig::default(),
+    );
+
+    let reply = agent
+        .process_direct("hello", "cli:retention", "test", "chat")
+        .await;
+    assert!(
+        reply.contains("ok") && !reply.contains("I encountered an error"),
+        "a retention refusal must not become the answer: {reply:?}"
+    );
+    assert_eq!(
+        higgs.policies(),
+        vec![Some("seed".to_owned()), None],
+        "one refused seed, then one ordinary request"
+    );
+    let calls = higgs.calls.lock().unwrap().clone();
+    assert_eq!(
+        calls[1].len(),
+        calls[0].len(),
+        "the retry keeps the context: nothing is folded or trimmed to fit the cache"
+    );
+
+    agent
+        .process_direct("again", "cli:retention", "test", "chat")
+        .await;
+    assert_eq!(
+        higgs.policies().last().cloned().flatten().as_deref(),
+        Some("seed"),
+        "an unretained answer must not publish the session for continuation"
+    );
+}
+
 /// Blocks the first provider request so a test can prove that a queued
 /// same-session message cannot enter the provider concurrently and cannot
 /// starve another session's concurrency permit.

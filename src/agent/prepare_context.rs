@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use crate::agent::agent_core::SwappableCore;
 use crate::agent::agent_loop::{
-    AgentLoopShared, FlowControl, ProviderCallMode, TurnContext, TurnOutcome,
+    AgentLoopShared, FlowControl, ProviderCallMode, RetentionEligibility, TurnContext, TurnOutcome,
 };
 use crate::agent::audit::AuditLog;
 use crate::agent::context::PromptBlock;
@@ -745,6 +745,7 @@ impl AgentLoopShared {
                 prev_round_keys: Vec::new(),
                 consecutive_repeat_rounds: 0,
                 provider_call_mode: ProviderCallMode::Normal,
+                retention: RetentionEligibility::Contracted,
                 terminal_attempted: false,
                 infra_error: None,
             },

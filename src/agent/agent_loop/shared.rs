@@ -69,12 +69,13 @@ use super::response::RetryState;
 use crate::turn_stream::{BackendActivity, CacheResetReason, CacheStatus, ControlMarker};
 
 use super::budget::{
-    advertised_tool_names, attach_higgs_session_control, clear_prompt_cache_state,
-    divergent_message_digest, history_window_near, invalidate_prompt_cache_for_rewrite,
-    overflow_recovery_fallback_budget, overflow_trim_threshold,
-    proactive_grounding_preserves_prefix_cache, send_cache_reset_marker, send_compaction_marker,
-    send_retract_reply_marker, should_allow_checkpoint, should_inject_heartbeat_grounding,
-    strip_higgs_session_lease_control, MAX_OVERFLOW_RECOVERIES, OVERFLOW_RECOVERY_HEADROOM,
+    advertised_tool_names, attach_higgs_session_control, attach_retained_session_control,
+    clear_prompt_cache_state, divergent_message_digest, history_window_near,
+    invalidate_prompt_cache_for_rewrite, overflow_recovery_fallback_budget,
+    overflow_trim_threshold, proactive_grounding_preserves_prefix_cache, retention_attachment,
+    send_cache_reset_marker, send_compaction_marker, send_retract_reply_marker,
+    should_allow_checkpoint, should_inject_heartbeat_grounding, strip_higgs_session_lease_control,
+    RetentionAttachment, MAX_OVERFLOW_RECOVERIES, OVERFLOW_RECOVERY_HEADROOM,
 };
 use super::compaction::execute_lcm_compaction;
 use super::local_stream::{
@@ -1196,6 +1197,15 @@ pub(crate) enum ProviderCallMode {
     TerminalNoTools,
 }
 
+/// Whether this turn's requests may opt into Higgs's retained-session
+/// contract. Once Higgs refuses to retain a request, the turn continues as
+/// ordinary prompts instead of cutting live context to fit a cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetentionEligibility {
+    Contracted,
+    SuspendedForTurn,
+}
+
 /// Per-turn flow control flags.
 ///
 /// These are orthogonal fields (not a linear state machine):
@@ -1272,6 +1282,8 @@ pub(crate) struct FlowControl {
     /// Provider mode for the next call. Terminal mode is entered only after a
     /// convergence limit and never returns to the normal loop.
     pub(crate) provider_call_mode: ProviderCallMode,
+    /// Whether requests in this turn may opt into retained-session reuse.
+    pub(crate) retention: RetentionEligibility,
     /// Shared at-most-once authority for every convergence trigger.
     pub(crate) terminal_attempted: bool,
     /// Infrastructure error surfaced by the tool engine when the
@@ -2663,6 +2675,25 @@ impl AgentLoopShared {
         }
     }
 
+    /// Higgs refused to retain a request whose prompt fits the model: a seed
+    /// above the contract's post-compaction target (the client estimate
+    /// under-counted), or a continuation past its guarantee. Retention only
+    /// saves prefill, so answer the rest of the turn with ordinary requests
+    /// instead of folding or trimming live context to fit the cache. A refusal
+    /// after suspension is not a retention problem and surfaces.
+    fn suspend_retention_for_turn(ctx: &mut TurnContext, error: &anyhow::Error) -> bool {
+        if ctx.flow.retention == RetentionEligibility::SuspendedForTurn {
+            return false;
+        }
+        ctx.flow.retention = RetentionEligibility::SuspendedForTurn;
+        warn!(
+            session = %ctx.session_key,
+            error = %error,
+            "retained_request_refused_continuing_unretained"
+        );
+        true
+    }
+
     /// Server-oracle overflow recovery: the provider rejected the request with    /// Server-oracle overflow recovery: the provider rejected the request with
     /// `context_length_exceeded`, which proves the client's tokenizer estimate
     /// wrong for this content (cl100k under-counts the server's BPE, up to
@@ -2679,13 +2710,18 @@ impl AgentLoopShared {
         effective_max_tokens: u32,
         tool_def_tokens: usize,
     ) -> bool {
+        if matches!(
+            error.downcast_ref::<crate::errors::ProviderError>(),
+            Some(crate::errors::ProviderError::HiggsRetentionCompactionRequired { .. })
+        ) {
+            return Self::suspend_retention_for_turn(ctx, error);
+        }
         if ctx.flow.retries.overflow_trim_recoveries >= MAX_OVERFLOW_RECOVERIES {
             return false;
         }
         let retained_failure = match error.downcast_ref::<crate::errors::ProviderError>() {
             Some(crate::errors::ProviderError::HiggsStaleRetentionContract { .. }) => Some(true),
-            Some(crate::errors::ProviderError::HiggsRetainedSessionUnavailable { .. })
-            | Some(crate::errors::ProviderError::HiggsRetentionCompactionRequired { .. }) => {
+            Some(crate::errors::ProviderError::HiggsRetainedSessionUnavailable { .. }) => {
                 Some(false)
             }
             _ => None,
@@ -4866,30 +4902,27 @@ impl AgentLoopShared {
         ctx.flow.llm_call_start = Some(std::time::Instant::now());
         ctx.flow.ttft_ms = None;
 
-        if let Some(control) = &higgs_control {
-            if let Some((contract_revision, _, _, _)) = ctx.capacity.retained_contract() {
-                attach_higgs_session_control(&mut messages_for_llm, control);
-                if let Some(first) = messages_for_llm
-                    .first_mut()
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    first.insert(
-                        crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD
-                            .to_owned(),
-                        serde_json::json!(control.reuse_policy.as_wire()),
-                    );
-                    first.insert(
-                        crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_EPOCH_FIELD
-                            .to_owned(),
-                        serde_json::json!(ctx.counters.session_prompt_epoch(&ctx.session_key)),
-                    );
-                    first.insert(
-                        crate::providers::openai_compat::NANOBOT_HIGGS_CONTRACT_REVISION_FIELD
-                            .to_owned(),
-                        serde_json::json!(contract_revision),
-                    );
-                }
+        let retention = higgs_control.as_ref().map(|control| {
+            retention_attachment(
+                ctx.capacity.retained_contract(),
+                control.reuse_policy,
+                TokenBudget::estimate_tokens(&messages_for_llm).saturating_add(tool_def_tokens),
+                ctx.flow.retention,
+            )
+        });
+        match (&higgs_control, &retention) {
+            (Some(control), Some(RetentionAttachment::Retained { contract_revision })) => {
+                attach_retained_session_control(
+                    &mut messages_for_llm,
+                    control,
+                    ctx.counters.session_prompt_epoch(&ctx.session_key),
+                    contract_revision,
+                );
             }
+            // Nothing offered for retention: the queued drops stay pending for
+            // a retained request to carry.
+            (_, Some(RetentionAttachment::Unretained)) => pending_higgs_drop.clear(),
+            _ => {}
         }
 
         // The provider boundary is the exact model-visible contract: protocol
@@ -5414,7 +5447,12 @@ impl AgentLoopShared {
 
         let response_ok = Self::response_status(&response) == "ok";
         if response_ok {
-            if let Some(reservation) = higgs_request_reservation.as_ref() {
+            // Higgs retained nothing for an unretained request, so the next
+            // one must seed rather than demand an exact continuation.
+            if let Some(reservation) = higgs_request_reservation
+                .as_ref()
+                .filter(|_| retention != Some(RetentionAttachment::Unretained))
+            {
                 reservation.publish_exact();
             }
             if let Some(staged) = ctx.staged_auto_expansion.take() {

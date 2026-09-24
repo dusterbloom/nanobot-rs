@@ -13,14 +13,12 @@ use std::collections::HashSet;
 
 use serde_json::{json, Value};
 
-use crate::agent::agent_core::HiggsSessionControl;
-#[cfg(test)]
-use crate::agent::agent_core::HiggsSessionReusePolicy;
+use crate::agent::agent_core::{HiggsSessionControl, HiggsSessionReusePolicy};
 use crate::agent::system_state;
 use crate::agent::token_budget::TokenBudget;
 use crate::turn_stream::{CacheResetReason, CacheStatus, ControlMarker};
 
-use super::shared::TurnContext;
+use super::shared::{RetentionEligibility, TurnContext};
 
 pub(super) fn send_cache_reset_marker(
     tx: &Option<tokio::sync::mpsc::UnboundedSender<String>>,
@@ -126,6 +124,71 @@ pub(super) fn divergent_message_digest(msg: &Value) -> String {
     }
 }
 
+/// What one provider request offers Higgs's retained-session contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum RetentionAttachment {
+    /// Opt in: the contract admits this request.
+    Retained { contract_revision: String },
+    /// A contract exists but will not admit this request. Send an ordinary
+    /// prompt, which publishes no session and carries none of the queued drops.
+    Unretained,
+    /// No retained contract (stateless or legacy server).
+    NoContract,
+}
+
+/// Retention is a prefill optimization, never a reason to fail or shrink a
+/// turn. Higgs admits a seed only up to the contract's post-compaction target
+/// by its own count, which the client estimate under-counts, so a seed must
+/// fit under the overflow margin. Continuations are bounded by the retained
+/// compaction thresholds instead.
+pub(super) fn retention_attachment(
+    contract: Option<(String, usize, usize, usize)>,
+    policy: HiggsSessionReusePolicy,
+    prompt_tokens: usize,
+    eligibility: RetentionEligibility,
+) -> RetentionAttachment {
+    let Some((contract_revision, _, _, seed_target)) = contract else {
+        return RetentionAttachment::NoContract;
+    };
+    let seed_fits = prompt_tokens as f64 <= seed_target as f64 * OVERFLOW_RECOVERY_MARGIN;
+    match (eligibility, policy) {
+        (RetentionEligibility::SuspendedForTurn, _) => RetentionAttachment::Unretained,
+        (RetentionEligibility::Contracted, HiggsSessionReusePolicy::Seed) if !seed_fits => {
+            RetentionAttachment::Unretained
+        }
+        (RetentionEligibility::Contracted, _) => {
+            RetentionAttachment::Retained { contract_revision }
+        }
+    }
+}
+
+/// Opt one request into the retained-session contract: session identity,
+/// queued drops and lease, plus the reuse policy, epoch and contract revision.
+pub(super) fn attach_retained_session_control(
+    messages: &mut [Value],
+    control: &HiggsSessionControl,
+    epoch: u64,
+    contract_revision: &str,
+) {
+    use crate::providers::openai_compat::{
+        NANOBOT_HIGGS_CONTRACT_REVISION_FIELD, NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD,
+        NANOBOT_HIGGS_SESSION_EPOCH_FIELD,
+    };
+    attach_higgs_session_control(messages, control);
+    let Some(first) = messages.first_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    first.insert(
+        NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD.to_owned(),
+        json!(control.reuse_policy.as_wire()),
+    );
+    first.insert(NANOBOT_HIGGS_SESSION_EPOCH_FIELD.to_owned(), json!(epoch));
+    first.insert(
+        NANOBOT_HIGGS_CONTRACT_REVISION_FIELD.to_owned(),
+        json!(contract_revision),
+    );
+}
+
 pub(super) fn attach_higgs_session_control(messages: &mut [Value], control: &HiggsSessionControl) {
     if let Some(first) = messages.first_mut().and_then(Value::as_object_mut) {
         first.insert(
@@ -191,6 +254,67 @@ pub(super) fn attach_higgs_session_marker(
             max_prompt_tokens: 0,
         },
     );
+}
+
+#[cfg(test)]
+mod retention_attachment_tests {
+    use super::*;
+
+    fn contract(seed_target: usize) -> Option<(String, usize, usize, usize)> {
+        Some(("rev".to_owned(), 60_000, 50_000, seed_target))
+    }
+
+    #[test]
+    fn requests_opt_into_retention_only_when_the_contract_admits_them() {
+        use HiggsSessionReusePolicy::{RequireContinuation, Seed};
+        use RetentionEligibility::{Contracted, SuspendedForTurn};
+        let retained = RetentionAttachment::Retained {
+            contract_revision: "rev".to_owned(),
+        };
+        // (contract, policy, estimated prompt, eligibility) -> attachment
+        let cases = [
+            (None, Seed, 100, Contracted, RetentionAttachment::NoContract),
+            (contract(4_096), Seed, 3_000, Contracted, retained.clone()),
+            // Over the seed target once the estimator's under-count is allowed for.
+            (
+                contract(4_096),
+                Seed,
+                3_500,
+                Contracted,
+                RetentionAttachment::Unretained,
+            ),
+            // Continuations are not seed-capped.
+            (
+                contract(4_096),
+                RequireContinuation,
+                20_000,
+                Contracted,
+                retained.clone(),
+            ),
+            // After a refusal the turn stays unretained even when it would fit.
+            (
+                contract(4_096),
+                Seed,
+                100,
+                SuspendedForTurn,
+                RetentionAttachment::Unretained,
+            ),
+            (
+                contract(4_096),
+                RequireContinuation,
+                100,
+                SuspendedForTurn,
+                RetentionAttachment::Unretained,
+            ),
+        ];
+        for (contract, policy, prompt_tokens, eligibility, expected) in cases {
+            assert_eq!(
+                retention_attachment(contract.clone(), policy, prompt_tokens, eligibility),
+                expected,
+                "{contract:?} {policy:?} {prompt_tokens} {eligibility:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
