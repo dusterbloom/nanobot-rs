@@ -23,7 +23,7 @@ use crate::agent::context::PromptBlock;
 use crate::agent::context_gate::ContentGate;
 use crate::agent::memory_ladder::{MemoryLadder, MemoryLayer, MemoryQuery};
 use crate::agent::policy;
-use crate::agent::prompt_contract::{PromptSection, SectionEntry, SectionSource};
+use crate::agent::prompt_contract::{PromptSection, SectionEntry};
 use crate::agent::protocol::{CloudProtocol, ConversationProtocol, LocalProtocol};
 use crate::agent::runtime_mode::RuntimeMode;
 use crate::agent::taint::TaintState;
@@ -132,7 +132,6 @@ impl AgentLoopShared {
             block: PromptBlock::new("Context Management", LCM_EXPAND_GUIDE),
             allocated_tokens: 0,
             actual_tokens: 0,
-            source: SectionSource::Runtime("lcm-context".to_string()),
             included: true,
             shrinkable: false,
         });
@@ -164,7 +163,6 @@ impl AgentLoopShared {
                         block: PromptBlock::new(title, &result.content),
                         allocated_tokens: 0,
                         actual_tokens: 0,
-                        source: SectionSource::Runtime(format!("memory-ladder:{:?}", result.layer)),
                         included: true,
                         shrinkable: section.shrinkable(),
                     });
@@ -188,7 +186,6 @@ impl AgentLoopShared {
                     block: PromptBlock::new("Background Tasks", &status),
                     allocated_tokens: 0,
                     actual_tokens: 0,
-                    source: SectionSource::Runtime("subagent status".to_string()),
                     included: true,
                     shrinkable: PromptSection::BackgroundTasks.shrinkable(),
                 });
@@ -692,7 +689,6 @@ impl AgentLoopShared {
             user_content,
             channel: msg.channel.clone(),
             chat_id: msg.chat_id.clone(),
-            sender_id: msg.sender_id.clone(),
             is_voice_message,
             detected_language,
             text_delta_tx,
@@ -710,7 +706,6 @@ impl AgentLoopShared {
             turn_tool_entries: Vec::new(),
             router_synthetic_call_sequence: Default::default(),
             iterations_used: 0,
-            turn_start: std::time::Instant::now(),
             compaction,
             soft_compaction_requested: false,
             staged_auto_expansion: None,
@@ -728,7 +723,6 @@ impl AgentLoopShared {
                 consecutive_all_blocked: 0,
                 consecutive_no_progress_rounds: 0,
                 round_executed_no_tools: false,
-                emergency_write_used: false,
                 lease: crate::agent::lease::Lease::new(
                     crate::agent::lease::DEFAULT_TOOLS_PER_LEASE,
                     crate::agent::lease::DEFAULT_MAX_LEASES_PER_TURN,
@@ -749,7 +743,6 @@ impl AgentLoopShared {
                 terminal_attempted: false,
                 infra_error: None,
             },
-            health_registry: self.health_registry.clone(),
             taint_state: TaintState::new(),
             reasoning: reasoning_engine,
         }

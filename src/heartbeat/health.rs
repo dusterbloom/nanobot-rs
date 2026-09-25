@@ -169,7 +169,6 @@ impl HealthRegistry {
     }
 
     /// One-line summary of all probes.
-    #[allow(dead_code)]
     pub fn summary_line(&self) -> String {
         let states = self.states.read();
         if states.is_empty() {
@@ -195,7 +194,6 @@ impl HealthRegistry {
     }
 
     /// Number of registered probes.
-    #[allow(dead_code)]
     pub fn probe_count(&self) -> usize {
         self.probes.len()
     }

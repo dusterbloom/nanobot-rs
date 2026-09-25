@@ -15,7 +15,6 @@ use serde_json::{json, Value};
 
 use crate::agent::agent_core::{HiggsSessionControl, HiggsSessionReusePolicy};
 use crate::agent::system_state;
-use crate::agent::token_budget::TokenBudget;
 use crate::turn_stream::{CacheResetReason, CacheStatus, ControlMarker};
 
 use super::shared::{RetentionEligibility, TurnContext};
@@ -250,7 +249,7 @@ pub(super) fn attach_higgs_session_marker(
             active_id: session_id,
             drop_ids: drop_session_ids.to_vec(),
             session_lease: None,
-            reuse_policy: HiggsSessionReusePolicy::BestEffort,
+            reuse_policy: HiggsSessionReusePolicy::Seed,
             max_prompt_tokens: 0,
         },
     );
@@ -397,15 +396,6 @@ pub(super) fn should_inject_heartbeat_grounding(
 ) -> bool {
     system_state::should_ground(iteration, interval, pressure)
         && proactive_grounding_preserves_prefix_cache(is_local)
-}
-
-pub(super) fn conversation_token_count(messages: &[Value]) -> usize {
-    let conversation: Vec<Value> = messages
-        .iter()
-        .filter(|message| message.get("role").and_then(Value::as_str) != Some("system"))
-        .cloned()
-        .collect();
-    TokenBudget::estimate_tokens(&conversation)
 }
 
 pub(super) fn advertised_tool_names(tool_defs: &[Value]) -> HashSet<String> {

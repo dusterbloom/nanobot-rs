@@ -2107,65 +2107,6 @@ fn test_should_strip_tools_both_degraded() {
     assert!(!should_strip_tools_for_trio(true, true, false, false));
 }
 
-#[test]
-fn test_adaptive_max_tokens_adds_thinking_headroom_for_local() {
-    // Thinking budget is added on top of base so the model has room for
-    // both reasoning tokens AND completion output.
-    let out = adaptive_max_tokens(
-        4096,
-        false,
-        "What time is it?",
-        0,
-        true,
-        Some(512),
-        &AdaptiveTokenConfig::default(),
-    );
-    assert_eq!(out, 4608); // 4096 + 512
-}
-
-#[test]
-fn test_adaptive_max_tokens_no_reserve_without_thinking() {
-    let out = adaptive_max_tokens(
-        4096,
-        false,
-        "What time is it?",
-        0,
-        true,
-        None,
-        &AdaptiveTokenConfig::default(),
-    );
-    assert_eq!(out, 4096);
-}
-
-#[test]
-fn test_adaptive_max_tokens_no_reserve_for_cloud() {
-    let out = adaptive_max_tokens(
-        4096,
-        false,
-        "What time is it?",
-        0,
-        false,
-        Some(512),
-        &AdaptiveTokenConfig::default(),
-    );
-    assert_eq!(out, 4096);
-}
-
-#[test]
-fn test_adaptive_max_tokens_adds_thinking_even_on_small_base() {
-    // Even with a small base, thinking budget is added on top.
-    let out = adaptive_max_tokens(
-        512,
-        false,
-        "short",
-        0,
-        true,
-        Some(128),
-        &AdaptiveTokenConfig::default(),
-    );
-    assert_eq!(out, 640); // 512 + 128
-}
-
 // -----------------------------------------------------------------------
 // Offline trio E2E tests (no network required — all providers are mocks)
 // -----------------------------------------------------------------------
@@ -4111,10 +4052,6 @@ struct ReplayStableSoftProvider {
 impl ReplayStableSoftProvider {
     fn foreground_calls(&self) -> Vec<Vec<Value>> {
         self.foreground_calls.lock().unwrap().clone()
-    }
-
-    fn foreground_max_tokens(&self) -> Vec<u32> {
-        self.foreground_max_tokens.lock().unwrap().clone()
     }
 }
 
@@ -8924,29 +8861,6 @@ async fn final_assistant_persistence_failure_records_error_outcome() {
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
-struct EnvVarGuard {
-    key: &'static str,
-    saved: Option<std::ffi::OsString>,
-}
-
-impl EnvVarGuard {
-    fn remove(key: &'static str) -> Self {
-        let saved = std::env::var_os(key);
-        std::env::remove_var(key);
-        Self { key, saved }
-    }
-}
-
-impl Drop for EnvVarGuard {
-    fn drop(&mut self) {
-        if let Some(value) = self.saved.take() {
-            std::env::set_var(self.key, value);
-        } else {
-            std::env::remove_var(self.key);
-        }
-    }
-}
-
 #[tokio::test]
 async fn test_tool_call_carrier_persists_before_tool_result() {
     let mut args = std::collections::HashMap::new();
@@ -11081,58 +10995,6 @@ mod nudge_tests {
             "The turn ended before I could produce a final answer. The actions above may be incomplete.",
             "should use static fallback when no assistant message found"
         );
-    }
-
-    // ---------------------------------------------------------------------------
-    // Cost tracking tests
-    // ---------------------------------------------------------------------------
-
-    /// Test that cost calculation works with token counts and model prices.
-    /// This is a RED test - it will fail until we wire up cost tracking.
-    #[test]
-    fn test_cost_tracking_calculates_from_tokens() {
-        use crate::agent::model_prices::ModelPrices;
-
-        let mut prices = ModelPrices::empty();
-        // Add a test model: $0.01 per 1M prompt tokens, $0.03 per 1M completion tokens
-        prices.prices.insert(
-            "test-model".to_string(),
-            (0.01 / 1_000_000.0, 0.03 / 1_000_000.0),
-        );
-
-        // 10,000 prompt tokens * $0.01/1M = $0.0001
-        // 5,000 completion tokens * $0.03/1M = $0.00015
-        // Total: $0.00025
-        let cost = prices.cost_of("test-model", 10_000, 5_000);
-
-        let expected = 0.0001 + 0.00015;
-        assert!(
-            (cost - expected).abs() < 0.0000001,
-            "cost should be ${:.6}, got ${:.6}",
-            expected,
-            cost
-        );
-    }
-
-    /// Test that finalize_response records actual costs (not hardcoded 0.0).
-    /// This is the integration test for the cost tracking feature.
-    #[test]
-    fn test_finalize_response_records_nonzero_cost() {
-        // This test will fail until we wire cost tracking in finalize_response.rs:231
-        // The TODO currently hardcodes cost_usd: 0.0
-        // After wiring, this should record actual costs based on token usage
-
-        // For now, just verify the infrastructure exists
-        use crate::agent::model_prices::ModelPrices;
-        let prices = ModelPrices::empty();
-
-        // Verify cost_of returns 0.0 for unknown models
-        let unknown_cost = prices.cost_of("unknown-model", 1000, 500);
-        assert_eq!(unknown_cost, 0.0, "unknown models should return 0.0 cost");
-
-        // This assertion documents the TODO - it will pass once we wire cost tracking
-        // Currently finalize_response hardcodes cost_usd: 0.0
-        // TODO: Update this test to verify actual cost recording after wiring
     }
 }
 
@@ -13299,7 +13161,6 @@ mod capacity_runtime {
     struct CapacityMockLLM {
         fetches: AtomicU64,
         next: Mutex<Vec<HiggsCapacityFetch>>,
-        legacy: bool,
     }
 
     impl CapacityMockLLM {
@@ -13307,7 +13168,6 @@ mod capacity_runtime {
             Arc::new(Self {
                 fetches: AtomicU64::new(0),
                 next: Mutex::new(profiles),
-                legacy: false,
             })
         }
 
@@ -14187,13 +14047,10 @@ mod capacity_exceeded {
 
     struct TurnRecord {
         provider_calls: u64,
-        compaction_requests_after_rejection: u64,
         prompt_limits: Vec<u64>,
         output_limits: Vec<u32>,
         request_tokens: Vec<usize>,
-        event_kinds: Vec<&'static str>,
         outcome: String,
-        reply: String,
         suspended_events: usize,
     }
 
@@ -14317,7 +14174,7 @@ mod capacity_exceeded {
             LcmSchemaConfig::default(),
             None,
         );
-        let reply = agent_loop
+        agent_loop
             .process_direct(prompt, session_key, "test", "capacity-413")
             .await;
 
@@ -14333,10 +14190,6 @@ mod capacity_exceeded {
             .rposition(|event| event.payload.kind() == "turn_started")
             .expect("turn_started");
         let turn_events = &events[last_start..];
-        let event_kinds = turn_events
-            .iter()
-            .map(|event| event.payload.kind())
-            .collect();
         let outcome = turn_events
             .iter()
             .rev()
@@ -14356,15 +14209,10 @@ mod capacity_exceeded {
         let request_tokens = provider.request_tokens.lock().unwrap().clone();
         TurnRecord {
             provider_calls: provider.requests.load(Ordering::SeqCst),
-            compaction_requests_after_rejection: provider
-                .compaction_requests_after_rejection
-                .load(Ordering::SeqCst),
             prompt_limits,
             output_limits,
             request_tokens,
-            event_kinds,
             outcome,
-            reply,
             suspended_events,
         }
     }

@@ -193,6 +193,7 @@ enum CompactionReapMode {
 }
 
 impl CompactionHandle {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::for_session("unknown")
     }
@@ -258,6 +259,7 @@ impl CompactionHandle {
         Arc::ptr_eq(&self.lifecycle, &other.lifecycle)
     }
 
+    #[cfg(test)]
     pub(super) async fn try_start<F, Fut>(&self, run: F) -> bool
     where
         F: FnOnce(tokio_util::sync::CancellationToken, Arc<CompactionPublication>) -> Fut

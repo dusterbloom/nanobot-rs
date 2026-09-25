@@ -6,9 +6,8 @@
 //! cleanup), `LcmEngine` (semantic summarization — a separate job, untouched
 //! here), and `token_budget::trim_to_fit_with_age_preserving_prefix` (hard
 //! token-budget eviction). This module centralizes the config lookup and call
-//! surface for the hygiene/anti-drift/budget trio so callers stop reading
-//! `hygiene_keep_last_messages` / `anti_drift` / `max_message_age_turns`
-//! directly off `SwappableCore` — without changing any pipeline's internal
+//! surface for the hygiene/anti-drift pair so callers stop reading
+//! `hygiene_keep_last_messages` / `anti_drift` directly off `SwappableCore` — without changing any pipeline's internal
 //! logic, order, or call site. `LcmEngine` and `filter_history` are out of
 //! scope: they run at different points in the turn lifecycle for unrelated
 //! reasons (session load, summarization) and are not "retention limits".
@@ -23,7 +22,6 @@ use serde_json::Value;
 
 use crate::agent::anti_drift;
 use crate::agent::context_hygiene;
-use crate::agent::token_budget::{PrefixTrimDisposition, TokenBudget};
 use crate::config::schema::{AntiDriftConfig, MemoryConfig};
 
 /// Single source of retention knobs, built once from config.
@@ -32,18 +30,8 @@ pub struct RetentionPolicy {
     /// Recent messages kept untruncated by context hygiene
     /// (`memory.hygiene.keepLastMessages`).
     pub keep_last_messages: usize,
-    /// Turn-age ceiling past which token-budget trim prefers eviction
-    /// (`memory.maxMessageAgeTurns`).
-    pub max_message_age_turns: usize,
     /// Quality-based cleanup config for local models (`trio.antiDrift`).
     pub anti_drift: AntiDriftConfig,
-}
-
-/// Budget-trim context passed by `step_pre_call`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BudgetMode {
-    /// Standard pre-call trim: age-aware eviction using this turn's number.
-    Normal { turn_count: u64 },
 }
 
 impl RetentionPolicy {
@@ -54,7 +42,6 @@ impl RetentionPolicy {
     pub fn from_config(memory_config: &MemoryConfig, anti_drift: &AntiDriftConfig) -> Self {
         Self {
             keep_last_messages: memory_config.hygiene.keep_last_messages,
-            max_message_age_turns: memory_config.max_message_age_turns,
             anti_drift: anti_drift.clone(),
         }
     }
@@ -82,27 +69,6 @@ impl RetentionPolicy {
             );
         }
     }
-
-    /// Token-budget trim, preserving the frozen KV-cache prefix.
-    pub fn apply_budget(
-        &self,
-        token_budget: &TokenBudget,
-        messages: &[Value],
-        tool_def_tokens: usize,
-        mode: BudgetMode,
-        frozen_prefix: usize,
-    ) -> (Vec<Value>, PrefixTrimDisposition) {
-        match mode {
-            BudgetMode::Normal { turn_count } => token_budget
-                .trim_to_fit_with_age_preserving_prefix(
-                    messages,
-                    tool_def_tokens,
-                    turn_count,
-                    self.max_message_age_turns,
-                    frozen_prefix,
-                ),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -113,7 +79,6 @@ mod tests {
     fn policy() -> RetentionPolicy {
         RetentionPolicy {
             keep_last_messages: 2,
-            max_message_age_turns: 5,
             anti_drift: AntiDriftConfig {
                 enabled: true,
                 anchor_interval: 0,
@@ -125,11 +90,8 @@ mod tests {
     }
 
     #[test]
-    fn test_from_config_reads_the_three_knobs() {
-        let mut memory_config = MemoryConfig {
-            max_message_age_turns: 42,
-            ..Default::default()
-        };
+    fn test_from_config_reads_the_knobs() {
+        let mut memory_config = MemoryConfig::default();
         memory_config.hygiene.keep_last_messages = 9;
         let anti_drift = AntiDriftConfig {
             anchor_interval: 7,
@@ -137,7 +99,6 @@ mod tests {
         };
 
         let p = RetentionPolicy::from_config(&memory_config, &anti_drift);
-        assert_eq!(p.max_message_age_turns, 42);
         assert_eq!(p.keep_last_messages, 9);
         assert_eq!(p.anti_drift.anchor_interval, 7);
     }
@@ -194,30 +155,5 @@ mod tests {
         // Hygiene alone is a no-op on this already-clean conversation, and
         // anti-drift never ran, so nothing should have changed.
         assert_eq!(messages, before);
-    }
-
-    #[test]
-    fn test_apply_budget_normal_uses_policy_age_ceiling() {
-        let p = policy();
-        let token_budget = TokenBudget::new(2_000, 500);
-        let fat = "word ".repeat(1200);
-        let mut messages = vec![json!({"role": "system", "content": "sys"})];
-        for i in 0..5 {
-            messages.push(json!({"role": "user", "content": format!("q{i}")}));
-            messages.push(json!({"role": "assistant", "content": fat.clone()}));
-        }
-        assert!(
-            TokenBudget::estimate_tokens(&messages) > 1500,
-            "test setup must be over budget"
-        );
-
-        let (trimmed, _) = p.apply_budget(
-            &token_budget,
-            &messages,
-            0,
-            BudgetMode::Normal { turn_count: 5 },
-            0,
-        );
-        assert!(TokenBudget::estimate_tokens(&trimmed) <= 1500);
     }
 }

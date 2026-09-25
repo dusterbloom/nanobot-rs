@@ -120,7 +120,6 @@ enum ModelSource {
         #[cfg(feature = "cluster")]
         peer_type: crate::cluster::state::PeerType,
         #[cfg(not(feature = "cluster"))]
-        #[allow(dead_code)]
         peer_type: (),
     },
     /// Filesystem GGUF file.
@@ -256,33 +255,6 @@ fn higgs_model_bases(
     }
 
     bases
-}
-
-#[allow(dead_code)]
-fn push_remote_model_entry(
-    entries: &mut Vec<ModelEntry>,
-    endpoint: &str,
-    id: String,
-    active_hint: &str,
-    is_loaded: bool,
-) {
-    if id.is_empty() || id.to_lowercase().contains("embedding") {
-        return;
-    }
-    let is_active = crate::lms::is_model_available(std::slice::from_ref(&id), active_hint);
-    let source = ModelSource::Remote {
-        endpoint: endpoint.to_string(),
-        #[cfg(feature = "cluster")]
-        peer_type: crate::cluster::state::PeerType::Unknown,
-        #[cfg(not(feature = "cluster"))]
-        peer_type: (),
-    };
-    entries.push(ModelEntry {
-        id,
-        source,
-        is_active,
-        is_loaded,
-    });
 }
 
 fn higgs_model_entries(

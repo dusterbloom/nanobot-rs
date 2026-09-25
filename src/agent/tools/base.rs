@@ -119,25 +119,9 @@ impl ToolExecutionResult {
 
     /// Whether this result represents a retryable (transient) error.
     #[must_use]
+    #[cfg(test)]
     pub fn is_retryable(&self) -> bool {
         self.error_kind.as_ref().map_or(false, |k| k.is_retryable())
-    }
-
-    /// Build a failure from a message plus a structural classification.
-    ///
-    /// The `data` is the full model-visible string (already `Error:`-prefixed);
-    /// `error_kind` is produced at the source instead of by substring
-    /// classification. Transitional: used by the legacy registry
-    /// example-append path until Phase 3 deletes the legacy channel.
-    #[must_use]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn failure_with_kind(data: String, error_kind: crate::errors::ToolErrorKind) -> Self {
-        Self {
-            ok: false,
-            data,
-            error: None,
-            error_kind: Some(error_kind),
-        }
     }
 
     #[must_use]

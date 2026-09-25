@@ -4,7 +4,6 @@
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
 #![allow(clippy::as_conversions, clippy::indexing_slicing)]
-#![allow(dead_code)]
 //! Typed prompt contract: section enum, budget tracking, and assemblers.
 //!
 //! Defines the canonical ordering and budget allocation for prompt sections,
@@ -37,6 +36,7 @@ pub enum PromptSection {
     MemoryBriefing = 10,
 }
 
+#[cfg(test)]
 static ALL_SECTIONS: [PromptSection; 11] = [
     PromptSection::Identity,
     PromptSection::Verification,
@@ -53,6 +53,7 @@ static ALL_SECTIONS: [PromptSection; 11] = [
 
 impl PromptSection {
     /// Returns every variant in discriminant order.
+    #[cfg(test)]
     pub fn all() -> &'static [PromptSection] {
         &ALL_SECTIONS
     }
@@ -109,19 +110,6 @@ impl PromptSection {
     }
 }
 
-/// Describes where a section's content originated.
-#[derive(Debug, Clone)]
-pub enum SectionSource {
-    /// Hard-coded content baked into the binary.
-    Static(&'static str),
-    /// Loaded from a file at the given path.
-    File(String),
-    /// Generated at runtime (e.g., session metadata).
-    Runtime(String),
-    /// Computed from multiple sources.
-    Computed(String),
-}
-
 /// A single section entry with budget tracking metadata.
 #[derive(Debug, Clone)]
 pub struct SectionEntry {
@@ -133,8 +121,6 @@ pub struct SectionEntry {
     pub allocated_tokens: usize,
     /// Actual measured token count of the content.
     pub actual_tokens: usize,
-    /// Where the content came from.
-    pub source: SectionSource,
     /// Whether this section is included in the final prompt.
     pub included: bool,
     /// Whether this section can be truncated during overflow.
@@ -162,8 +148,6 @@ pub struct AssemblyResult {
     pub system_content: String,
     /// Developer-level content (non-Identity sections for cloud, empty for local).
     pub developer_content: String,
-    /// Fully ordered sections that contributed to the assembled output.
-    pub sections: Vec<SectionEntry>,
     /// Backward-compatible assembly report.
     pub report: PromptAssemblyReport,
 }
@@ -291,18 +275,10 @@ fn build_report(
             },
             tokens: s.actual_tokens,
             included: s.included,
-            allocated_tokens: s.allocated_tokens,
-            source: match &s.source {
-                SectionSource::Static(label) => label.to_string(),
-                SectionSource::File(path) => path.clone(),
-                SectionSource::Runtime(desc) => desc.clone(),
-                SectionSource::Computed(desc) => desc.clone(),
-            },
         })
         .collect();
 
     PromptAssemblyReport {
-        prompt: prompt.to_string(),
         total_tokens: TokenBudget::estimate_str_tokens(prompt),
         cap_tokens: cap,
         blocks,
@@ -324,10 +300,9 @@ fn prepare_sections(sections: &mut Vec<SectionEntry>, cap: usize) {
             ((entry.section.default_budget_pct() / 100.0) * cap as f64).round() as usize;
 
         tracing::debug!(
-            "Section {:?}: {} tokens, source={:?}, included={}",
+            "Section {:?}: {} tokens, included={}",
             entry.section,
             entry.actual_tokens,
-            entry.source,
             entry.included,
         );
     }
@@ -372,7 +347,6 @@ impl PromptAssembler for CloudAssembler {
         AssemblyResult {
             system_content,
             developer_content,
-            sections,
             report,
         }
     }
@@ -404,7 +378,6 @@ impl PromptAssembler for LocalAssembler {
         AssemblyResult {
             system_content,
             developer_content: String::new(),
-            sections,
             report,
         }
     }
@@ -523,7 +496,6 @@ mod tests {
             block: PromptBlock::new(title, content),
             allocated_tokens: 0,
             actual_tokens: 0,
-            source: SectionSource::Runtime("test".to_string()),
             included: true,
             shrinkable: section.shrinkable(),
         }
@@ -642,41 +614,6 @@ mod tests {
             wm_block.tokens < 2000,
             "should have been shrunk, got {} tokens",
             wm_block.tokens
-        );
-    }
-
-    #[test]
-    fn test_proportional_budgets_scale_with_context_window() {
-        let sections_small = vec![
-            make_entry(PromptSection::Identity, "Identity", "I am nanobot"),
-            make_entry(PromptSection::WorkingMemory, "WM", "some memory"),
-        ];
-        let sections_large = sections_small.clone();
-
-        let ctx_small = make_ctx(4_000, 0.3, sections_small); // 1200 token cap
-        let ctx_large = make_ctx(128_000, 0.4, sections_large); // 51200 token cap
-
-        let result_small = LocalAssembler.assemble(&ctx_small);
-        let result_large = LocalAssembler.assemble(&ctx_large);
-
-        // Both should report allocated_tokens, and large should have bigger allocations
-        let wm_small = result_small
-            .report
-            .blocks
-            .iter()
-            .find(|b| b.title == "WM")
-            .unwrap();
-        let wm_large = result_large
-            .report
-            .blocks
-            .iter()
-            .find(|b| b.title == "WM")
-            .unwrap();
-        assert!(
-            wm_large.allocated_tokens > wm_small.allocated_tokens,
-            "larger context window should produce larger allocated budget: small={} large={}",
-            wm_small.allocated_tokens,
-            wm_large.allocated_tokens,
         );
     }
 

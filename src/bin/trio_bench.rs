@@ -200,7 +200,6 @@ struct ScenarioResult {
     router_latency_ms: Option<u64>,
     total_latency_ms: u64,
     response_preview: String,
-    #[allow(dead_code)]
     context_summary_found: bool,
 }
 

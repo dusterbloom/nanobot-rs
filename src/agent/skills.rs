@@ -4,7 +4,6 @@
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
 #![allow(clippy::format_push_string)]
-#![allow(dead_code)]
 //! Skills loader for agent capabilities.
 //!
 //! Skills are markdown files (`SKILL.md`) that teach the agent how to use
@@ -67,7 +66,6 @@ impl SkillRecord {
 #[derive(Debug, Clone)]
 pub struct SkillValidationResult {
     pub name: String,
-    pub path: String,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
 }
@@ -81,7 +79,6 @@ impl SkillValidationResult {
 
 /// Loads and manages agent skills from workspace and built-in directories.
 pub struct SkillsLoader {
-    workspace: PathBuf,
     workspace_skills: PathBuf,
     builtin_skills: PathBuf,
 }
@@ -97,7 +94,6 @@ impl SkillsLoader {
             None => workspace.join("builtin_skills"),
         };
         Self {
-            workspace: workspace.to_path_buf(),
             workspace_skills: workspace.join("skills"),
             builtin_skills: builtin,
         }
@@ -550,7 +546,6 @@ impl SkillsLoader {
 
         SkillValidationResult {
             name: skill.name.clone(),
-            path: skill.path.clone(),
             errors,
             warnings,
         }

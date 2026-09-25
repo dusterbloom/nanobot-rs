@@ -316,28 +316,6 @@ fn adaptive_fallback_max_tokens(
     }
 }
 
-pub(super) fn adaptive_max_tokens(
-    base: u32,
-    had_long: bool,
-    user_text: &str,
-    recent_tool_calls: usize,
-    is_local: bool,
-    thinking_budget: Option<u32>,
-    cfg: &AdaptiveTokenConfig,
-) -> u32 {
-    let artifact_action = is_local.then(|| local_artifact_action(user_text)).flatten();
-    adaptive_max_tokens_for_artifact_action(
-        base,
-        had_long,
-        user_text,
-        recent_tool_calls,
-        is_local,
-        artifact_action,
-        thinking_budget,
-        cfg,
-    )
-}
-
 pub(super) fn adaptive_max_tokens_for_artifact_action(
     base: u32,
     had_long: bool,
@@ -387,40 +365,6 @@ pub(super) fn adaptive_max_tokens_for_artifact_action(
     }
 
     effective
-}
-
-/// Proactive recall: search the knowledge store for context relevant to the user's message.
-/// Returns a formatted string of relevant snippets, or None if nothing useful was found.
-/// Silently returns None on any error (knowledge store missing, etc.).
-#[allow(dead_code)]
-pub(super) fn proactive_recall(user_message: &str) -> Option<String> {
-    // Skip very short messages (greetings, single words).
-    if user_message.len() < 15 {
-        return None;
-    }
-
-    let store = crate::agent::knowledge_store::KnowledgeStore::open_default().ok()?;
-    let hits = store.search(user_message, 3).ok()?;
-
-    if hits.is_empty() {
-        return None;
-    }
-
-    let mut output = String::new();
-    for hit in &hits {
-        // Truncate long snippets.
-        let snippet: String = if hit.snippet.len() > 300 {
-            hit.snippet.chars().take(300).collect::<String>() + "..."
-        } else {
-            hit.snippet.clone()
-        };
-        output.push_str(&format!(
-            "**{}** (chunk {}): {}\n",
-            hit.source_name, hit.chunk_idx, snippet
-        ));
-    }
-
-    Some(output.trim_end().to_string())
 }
 
 // ============================================================================
@@ -490,7 +434,7 @@ pub(crate) fn appears_incomplete(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        adaptive_max_tokens, adaptive_max_tokens_for_artifact_action, evaluate_repeated_tool_round,
+        adaptive_max_tokens_for_artifact_action, evaluate_repeated_tool_round,
         local_artifact_action_with_sticky, should_strip_tools_for_trio, LocalArtifactAction,
         RepeatBreakerAction,
     };
@@ -555,172 +499,6 @@ mod tests {
                 mask, is_local, strict, healthy, cb, expected
             );
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // adaptive_max_tokens — pins agent_heuristics.rs:92, :119-127
-    // (thinking budget is ADDED on top of max_tokens for local models;
-    //  excluded for cloud). Also covers agent_shared.rs:1351.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_adaptive_max_tokens_is_local_budget() {
-        // pins agent_heuristics.rs:119-127 — thinking-budget addition is
-        // local-only. Base tokens: 2000. Thinking budget: 1000.
-        let cfg = AdaptiveTokenConfig::default();
-        let base = 2000u32;
-        let thinking = Some(1000u32);
-
-        // Local with thinking budget → base + budget (capped at 32_768).
-        let local_total = adaptive_max_tokens(base, false, "short msg", 0, true, thinking, &cfg);
-        assert_eq!(
-            local_total, 3000,
-            "local + thinking=1000 on top of base=2000 → 3000"
-        );
-
-        // Cloud with the same inputs → no addition (thinking is included
-        // inside max_tokens on cloud).
-        let cloud_total = adaptive_max_tokens(base, false, "short msg", 0, false, thinking, &cfg);
-        assert_eq!(
-            cloud_total, base,
-            "cloud does not add thinking budget on top of max_tokens"
-        );
-
-        // Local with thinking = None → no addition.
-        let local_no_think = adaptive_max_tokens(base, false, "short msg", 0, true, None, &cfg);
-        assert_eq!(
-            local_no_think, base,
-            "local + no thinking budget → base unchanged"
-        );
-    }
-
-    #[test]
-    fn test_adaptive_max_tokens_local_thinking_clamps_to_32k() {
-        // pins agent_heuristics.rs:125 — .min(32_768) cap on the local path
-        // keeps us within typical local-model context limits even when base +
-        // thinking would otherwise exceed it.
-        let cfg = AdaptiveTokenConfig::default();
-        let got = adaptive_max_tokens(40_000, false, "x", 0, true, Some(10_000), &cfg);
-        assert_eq!(got, 32_768, "local thinking total must clamp to 32_768");
-
-        // Cloud path ignores thinking addition entirely, so no clamp needed;
-        // pin that the cloud branch does not re-clamp to 32K.
-        let cloud_got = adaptive_max_tokens(40_000, false, "x", 0, false, Some(10_000), &cfg);
-        assert_eq!(
-            cloud_got, 40_000,
-            "cloud path leaves base untouched — no 32K clamp"
-        );
-    }
-
-    #[test]
-    fn test_adaptive_max_tokens_is_local_orthogonal_to_longform() {
-        // pins agent_heuristics.rs:92 — `is_local` is an independent axis
-        // from the long-form / tool-heavy / long-mode branches above. A
-        // long-form bump followed by local-thinking addition must compose
-        // correctly (bump first, then +thinking on local).
-        let cfg = AdaptiveTokenConfig::default();
-        let long_form_trigger = "explain in detail how this works";
-        let base = 1000u32;
-        let thinking = Some(500u32);
-
-        // Cloud long-form: bumped to adaptive_long_form_min_tokens (4096 default).
-        let cloud_long =
-            adaptive_max_tokens(base, false, long_form_trigger, 0, false, thinking, &cfg);
-        assert_eq!(
-            cloud_long, cfg.adaptive_long_form_min_tokens,
-            "cloud long-form bump → adaptive_long_form_min_tokens; no thinking add"
-        );
-
-        // Local long-form: bump first, then add thinking budget on top.
-        let local_long =
-            adaptive_max_tokens(base, false, long_form_trigger, 0, true, thinking, &cfg);
-        assert_eq!(
-            local_long,
-            cfg.adaptive_long_form_min_tokens + 500,
-            "local long-form: bump then +thinking"
-        );
-    }
-
-    #[test]
-    fn test_adaptive_max_tokens_local_post_tool_stays_tool_heavy() {
-        let cfg = AdaptiveTokenConfig::default();
-        let base = 1024u32;
-        let long_form_trigger = "implement a complete multi-step edit after reading the file";
-
-        let local_post_tool =
-            adaptive_max_tokens(base, false, long_form_trigger, 1, true, None, &cfg);
-        assert_eq!(
-            local_post_tool, cfg.adaptive_long_form_min_tokens,
-            "the artifact request keeps elevated headroom after a tool call"
-        );
-
-        let local_long_mode =
-            adaptive_max_tokens(base, true, long_form_trigger, 1, true, None, &cfg);
-        assert_eq!(
-            local_long_mode, cfg.adaptive_long_mode_min_tokens,
-            "/long still overrides the local post-tool cap"
-        );
-    }
-
-    #[test]
-    fn test_adaptive_max_tokens_escalates_local_file_and_tool_action_turns() {
-        let cfg = AdaptiveTokenConfig::default();
-        let base = 1024u32;
-
-        let file_generation = adaptive_max_tokens(
-            base,
-            false,
-            "Create a file named report.md",
-            0,
-            true,
-            None,
-            &cfg,
-        );
-        assert_eq!(
-            file_generation, cfg.adaptive_long_form_min_tokens,
-            "local file generation needs enough room to emit a complete tool call"
-        );
-
-        let post_tool =
-            adaptive_max_tokens(base, false, "Summarize the result", 1, true, None, &cfg);
-        assert_eq!(
-            post_tool, base,
-            "ordinary local post-tool reporting remains latency-focused"
-        );
-
-        let ordinary_local = adaptive_max_tokens(base, false, "What is Rust?", 0, true, None, &cfg);
-        assert_eq!(ordinary_local, base);
-
-        let cloud_file = adaptive_max_tokens(
-            base,
-            false,
-            "Create a file named report.md",
-            0,
-            false,
-            None,
-            &cfg,
-        );
-        assert_eq!(cloud_file, base, "cloud long-form sizing remains unchanged");
-    }
-
-    #[test]
-    fn test_adaptive_max_tokens_local_html_game_request_uses_long_mode_headroom() {
-        let cfg = AdaptiveTokenConfig::default();
-        let base = 2048u32;
-
-        let tetris_request = adaptive_max_tokens(
-            base,
-            false,
-            "I want you to create a colorfun and fun tetris game in a single HTML file at `~/Dev/tetris`",
-            2,
-            true,
-            None,
-            &cfg,
-        );
-        assert_eq!(
-            tetris_request, cfg.adaptive_long_mode_min_tokens,
-            "local HTML/game artifact creation needs enough room to complete a write_file call"
-        );
     }
 
     #[test]

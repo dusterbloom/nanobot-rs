@@ -4,7 +4,6 @@
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
 #![allow(clippy::shadow_reuse)]
-#![allow(dead_code)]
 //! Main agent loop that consumes inbound messages and produces responses.
 //!
 //! Ported from Python `agent/loop.py`.
@@ -59,8 +58,6 @@ pub(crate) use response::RetryState;
 pub(crate) use shared::*;
 // Re-export remaining heuristic functions at module-private level for use
 // within this module and its submodules (shared uses them via super::).
-#[cfg(test)]
-use heuristics::adaptive_max_tokens;
 use heuristics::{last_user_message, render_via_protocol, should_strip_tools_for_trio};
 
 // ---------------------------------------------------------------------------
@@ -193,7 +190,6 @@ impl AgentLoop {
             proprioception_config,
             idle: crate::agent::idle::IdleRuntime::default(),
             aha_rx: Arc::new(Mutex::new(aha_rx)),
-            aha_tx,
             session_policies: Arc::new(Mutex::new(HashMap::new())),
             continuity_notes: Arc::new(Mutex::new(HashMap::new())),
             lcm_engines: Arc::new(Mutex::new(HashMap::new())),
@@ -654,6 +650,7 @@ impl AgentLoop {
 
     /// Process a message directly (for CLI / cron usage) without going through
     /// the bus.
+    #[cfg(test)]
     pub async fn process_direct(
         &self,
         content: &str,
@@ -672,6 +669,7 @@ impl AgentLoop {
 
     /// Like `process_direct` but allows passing a detected language code
     /// (e.g. "it", "es") so the LLM responds in that language.
+    #[cfg(test)]
     pub async fn process_direct_with_lang(
         &self,
         content: &str,

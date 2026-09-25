@@ -1764,12 +1764,8 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
     #[test]
     fn test_web_fetch_passthrough_vs_summarized() {
         use crate::agent::context_gate::ContentGate;
-        use crate::agent::context_store::ContextStore;
         let raw = bbc_web_fetch_fixture();
         let passthrough = raw.clone();
-
-        let mut store = ContextStore::new();
-        let (var_name, context_store_view) = store.store(raw.clone());
 
         // 50 token budget → raw (≈575 tokens) will not fit → briefing path.
         let mut gate = ContentGate::new(50, 0.2);
@@ -1778,9 +1774,6 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
 
         assert!(passthrough.contains("UK economy grew by 0.4%"));
         assert!(passthrough.contains("Bank of England"));
-        assert!(!context_store_view.contains("Bank of England"));
-        assert!(context_store_view.contains("chars"));
-        assert!(context_store_view.contains(&var_name));
         assert!(!gate_view.contains("Bank of England"));
         assert!(gate_view.contains("JSON Summary") || gate_view.contains("Content Summary"));
     }

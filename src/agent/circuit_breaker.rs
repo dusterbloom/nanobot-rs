@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Circuit breaker for LLM provider health tracking.
 //!
 //! Tracks consecutive failures per provider:model key and marks providers
@@ -34,6 +33,7 @@ impl CircuitBreaker {
     }
 
     /// Create with custom threshold and cooldown.
+    #[cfg(test)]
     pub fn with_settings(threshold: u32, cooldown: Duration) -> Self {
         Self {
             states: HashMap::new(),

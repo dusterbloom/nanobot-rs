@@ -4,7 +4,6 @@
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
 #![allow(clippy::as_conversions, clippy::indexing_slicing)]
-#![allow(dead_code)]
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};

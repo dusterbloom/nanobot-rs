@@ -1181,11 +1181,6 @@ pub struct MemoryConfig {
     #[serde(default = "default_session_complete_after_secs")]
     pub session_complete_after_secs: u64,
 
-    /// Maximum age (in turns) before messages are preferred for eviction (default: 50).
-    /// Messages older than this are dropped first during trim_to_fit.
-    #[serde(default = "default_max_message_age_turns")]
-    pub max_message_age_turns: usize,
-
     /// Maximum number of user turns to load from session history (default: 10).
     /// Working memory carries context from older turns, so loading fewer turns
     /// saves context budget for the current conversation.
@@ -1226,19 +1221,10 @@ fn default_session_complete_after_secs() -> u64 {
     3600
 }
 
-/// Shared default for both `max_message_age_turns` and `max_history_turns`.
-///
-/// Single source of truth (rather than two constants a comment promises to
-/// keep in sync): age-based eviction must not rewrite turns older than the
-/// history load already drops them at, or trim busts the prefix cache for
-/// turns the model never even sees. Keeps many turns append-only so the
+/// Default for `max_history_turns`. Keeps many turns append-only so the
 /// inference server's prefix cache stays warm across a long session.
 /// Capable long-context models (e.g. Qwen3.6, 256K) comfortably hold this.
 const DEFAULT_RETENTION_TURNS: usize = 60;
-
-fn default_max_message_age_turns() -> usize {
-    DEFAULT_RETENTION_TURNS
-}
 
 fn default_max_history_turns() -> usize {
     DEFAULT_RETENTION_TURNS
@@ -1267,7 +1253,6 @@ impl Default for MemoryConfig {
             reflection_threshold: default_reflection_threshold(),
             memory_file_max_words: default_memory_file_max_words(),
             session_complete_after_secs: default_session_complete_after_secs(),
-            max_message_age_turns: default_max_message_age_turns(),
             max_history_turns: default_max_history_turns(),
             lazy_skills: true,
             skill_disclosure: default_skill_disclosure(),

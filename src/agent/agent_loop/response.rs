@@ -133,7 +133,7 @@ async fn recorded_auxiliary_chat(
 #[derive(Debug)]
 pub(crate) enum ResponseKind {
     /// Response has native or text-parsed tool calls to execute.
-    ToolCalls { tool_calls: Vec<ToolCallRequest> },
+    ToolCalls,
     /// Response contains visible text, no tool calls — final answer.
     Text(String),
     /// Validation failed (hallucinated tool call or claimed-but-not-executed).
@@ -180,14 +180,6 @@ pub(crate) struct RetryState {
     /// context, but a hard cap bounds the prefill cost of pathological
     /// shrink-overflow-shrink cycles.
     pub(crate) overflow_trim_recoveries: u32,
-    /// Consecutive lease-renewal rejections (the model emitted a PARTIAL
-    /// checkpoint — some labels, missing a field — and was nudged what to
-    /// add). Without a cap a small model that keeps emitting partial
-    /// checkpoints loops forever: each rejection returns to PreCall, which
-    /// advances neither `max_iterations` nor the no-progress counter. After
-    /// `MAX_LEASE_RENEWAL_REJECTIONS` the turn finishes with whatever text
-    /// the model produced — renewal is a privilege, not a right.
-    pub(crate) lease_renewal_rejections: u32,
 }
 
 impl RetryState {
@@ -199,7 +191,6 @@ impl RetryState {
             rescue_attempted: false,
             api_retried: false,
             overflow_trim_recoveries: 0,
-            lease_renewal_rejections: 0,
         }
     }
 }
@@ -274,9 +265,7 @@ pub(crate) fn classify_response(
                 }
             }
         }
-        return ResponseKind::ToolCalls {
-            tool_calls: response.tool_calls.clone(),
-        };
+        return ResponseKind::ToolCalls;
     }
 
     // No tool calls — check for validation errors on pure-text responses.
@@ -525,7 +514,7 @@ impl AgentLoopShared {
         );
 
         // --- Token telemetry (always, regardless of kind) ---
-        let defers_metrics = matches!(&kind, ResponseKind::ToolCalls { .. });
+        let defers_metrics = matches!(&kind, ResponseKind::ToolCalls);
         self.emit_token_telemetry(ctx, &response, defers_metrics);
         // Forward the completion-token count to the REPL footer. Sent per LLM
         // call so the renderer can accumulate the turn total and report tok/s.
@@ -548,7 +537,7 @@ impl AgentLoopShared {
 
         // --- Dispatch ---
         match kind {
-            ResponseKind::ToolCalls { tool_calls: _ } => {
+            ResponseKind::ToolCalls => {
                 // Validation may have flagged StripHallucination — clean up.
                 if let Some(ref mut content) = response.content {
                     let stripped = validation::strip_hallucinated_text(content);
@@ -1323,7 +1312,7 @@ mod tests {
         let kind = classify_response(&resp, true, false, false, &default_retries(), false);
 
         assert!(
-            matches!(kind, ResponseKind::ToolCalls { .. }),
+            matches!(kind, ResponseKind::ToolCalls),
             "truncated textual tool call must be recovered as ToolCalls, not discarded; got {kind:?}"
         );
     }
@@ -1408,7 +1397,7 @@ mod tests {
     fn test_classify_tool_calls() {
         let resp = make_response_with_tools(Some("Let me check."), &["read_file"], "stop");
         let kind = classify_response(&resp, false, false, false, &default_retries(), false);
-        assert!(matches!(kind, ResponseKind::ToolCalls { .. }));
+        assert!(matches!(kind, ResponseKind::ToolCalls));
     }
 
     #[test]
@@ -1444,7 +1433,7 @@ mod tests {
             "stop",
         );
         let kind = classify_response(&resp, false, false, false, &default_retries(), false);
-        assert!(matches!(kind, ResponseKind::ToolCalls { .. }));
+        assert!(matches!(kind, ResponseKind::ToolCalls));
     }
 
     #[test]
@@ -1541,7 +1530,7 @@ mod tests {
         );
         let kind = classify_response(&resp, false, false, false, &default_retries(), false);
         assert!(
-            matches!(kind, ResponseKind::ToolCalls { .. }),
+            matches!(kind, ResponseKind::ToolCalls),
             "Expected ToolCalls for [Calling tool: ...], got {:?}",
             kind
         );
@@ -1558,7 +1547,7 @@ mod tests {
         // the content pre-stripping, so it falls through to text or empty.
         // The key assertion: it must NOT be ResponseKind::ToolCalls.
         assert!(
-            !matches!(kind, ResponseKind::ToolCalls { .. }),
+            !matches!(kind, ResponseKind::ToolCalls),
             "Empty <tool_call></tool_call> must NOT be classified as tool calls"
         );
     }

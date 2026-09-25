@@ -4,7 +4,6 @@
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
 #![allow(clippy::shadow_reuse)]
-#![allow(dead_code)]
 //! Response validation to detect hallucinated tool calls and context drift.
 //!
 //! When local SLMs get confused or context becomes polluted, they may:
@@ -378,7 +377,7 @@ mod tests {
         for content in [
             "Use `#[cfg(test)]` above the module.",
             "The attribute #[derive(Debug, Clone)] is common.",
-            "#[allow(dead_code)]",
+            "",
             "#[serde(rename_all = camelCase)]",
             "#[cfg(feature = python-kernel)]",
             "You can write let v = vec![foo()]; in Rust.",

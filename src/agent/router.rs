@@ -1920,7 +1920,6 @@ mod tests {
             user_content: "run it".to_string(),
             channel: "test".to_string(),
             chat_id: "test".to_string(),
-            sender_id: "user".to_string(),
             is_voice_message: false,
             detected_language: None,
             text_delta_tx: None,
@@ -1938,7 +1937,6 @@ mod tests {
             turn_tool_entries: Vec::new(),
             router_synthetic_call_sequence: RouterSyntheticCallSequence::default(),
             iterations_used: 0,
-            turn_start: std::time::Instant::now(),
             compaction: CompactionHandle::new(),
             soft_compaction_requested: false,
             staged_auto_expansion: None,
@@ -1956,7 +1954,6 @@ mod tests {
                 consecutive_all_blocked: 0,
                 consecutive_no_progress_rounds: 0,
                 round_executed_no_tools: false,
-                emergency_write_used: false,
                 lease: crate::agent::lease::Lease::new(
                     crate::agent::lease::DEFAULT_TOOLS_PER_LEASE,
                     crate::agent::lease::DEFAULT_MAX_LEASES_PER_TURN,
@@ -1977,7 +1974,6 @@ mod tests {
                 terminal_attempted: false,
                 infra_error: None,
             },
-            health_registry: None,
             taint_state: crate::agent::taint::TaintState::new(),
             reasoning,
         }

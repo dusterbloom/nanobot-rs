@@ -10,7 +10,6 @@
     clippy::shadow_reuse
 )]
 #![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
-#![allow(dead_code)]
 //! Subagent manager for background task execution.
 //!
 //! Spawns independent agent loops that can read/write files, execute commands,
@@ -317,25 +316,9 @@ impl SubagentManager {
         self
     }
 
-    /// Set the cluster router for distributed inference routing.
-    #[cfg(feature = "cluster")]
-    pub fn with_cluster_router(
-        mut self,
-        router: std::sync::Arc<crate::cluster::router::ClusterRouter>,
-    ) -> Self {
-        self.cluster_router = Some(router);
-        self
-    }
-
     /// Set the parent's context token limit as fallback for subagents.
     pub fn with_local_context_limit(mut self, limit: usize) -> Self {
         self.local_context_limit = Some(limit);
-        self
-    }
-
-    /// Set the spawn depth (for nested subagents).
-    pub fn with_depth(mut self, depth: u32) -> Self {
-        self.depth = depth;
         self
     }
 
@@ -358,11 +341,6 @@ impl SubagentManager {
             self.default_subagent_model = Some(model);
         }
         self
-    }
-
-    /// Get a reference to loaded profiles (for system prompt injection).
-    pub fn profiles(&self) -> &HashMap<String, AgentProfile> {
-        &self.profiles
     }
 
     /// Resolve a profile name to a profile, or an error message listing
@@ -545,15 +523,9 @@ impl SubagentManager {
             if let Some(ref tx) = aha_tx {
                 use crate::agent::system_state::{classify_signal, AhaSignal};
                 if let Some(priority) = classify_signal(&result_text) {
-                    let category = if status == "failed" {
-                        "error".to_string()
-                    } else {
-                        "complete".to_string()
-                    };
                     let _ = tx.send(AhaSignal {
                         priority,
                         agent_id: tid.clone(),
-                        category,
                         message: truncate_lines_chars(&result_text, 5, 500),
                     });
                 }

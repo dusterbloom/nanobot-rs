@@ -4,7 +4,6 @@
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
 #![allow(clippy::indexing_slicing, clippy::shadow_reuse)]
-#![allow(dead_code)]
 //! Tool registry for dynamic tool management.
 
 use std::collections::{HashMap, HashSet};
@@ -285,24 +284,6 @@ impl ToolRegistry {
         }
     }
 
-    /// Create a registry with a permission ceiling.
-    ///
-    /// Tools whose [`PermissionLevel`] exceeds `max` will be denied at
-    /// execution time.
-    pub fn with_max_permission(max: PermissionLevel) -> Self {
-        Self {
-            tools: HashMap::new(),
-            max_permission: max,
-            hooks: None,
-            host: None,
-        }
-    }
-
-    /// Set the maximum permission level for this registry.
-    pub fn set_max_permission(&mut self, max: PermissionLevel) {
-        self.max_permission = max;
-    }
-
     /// Inject the typed host bridge (spawn/pipeline/loop/message). Builder
     /// style so the registry stays immutable after construction; the single
     /// production injection point is `tool_wiring::build_tools`.
@@ -312,11 +293,6 @@ impl ToolRegistry {
     ) -> Self {
         self.host = host;
         self
-    }
-
-    /// Configure hook scripts that run before/after tool calls.
-    pub fn set_hooks(&mut self, hooks: crate::config::schema::HooksConfig) {
-        self.hooks = Some(hooks);
     }
 
     /// Create a registry pre-populated with standard stateless tools.
@@ -398,7 +374,6 @@ impl ToolRegistry {
                 None,
                 None,
                 config.restrict_to_workspace,
-                config.max_tool_result_chars,
             )));
         }
         if should_include("web_search") {
@@ -498,6 +473,7 @@ impl ToolRegistry {
     }
 
     /// Check if a tool is registered.
+    #[cfg(test)]
     pub fn has(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
@@ -778,6 +754,7 @@ impl ToolRegistry {
     }
 
     /// Core tools that are always included in tool definitions.
+    #[cfg(test)]
     const CORE_TOOLS: &'static [&'static str] = &[
         "read_file",
         "write_file",
@@ -791,6 +768,7 @@ impl ToolRegistry {
     /// Extra tools included (when registered) in the Lean production surface,
     /// on top of `CORE_TOOLS`. Everything else is reachable via the proxy
     /// meta-tool appended by `get_lean_definitions`.
+    #[cfg(test)]
     const LEAN_EXTRA_TOOLS: &'static [&'static str] = &[
         "get_skills",
         "web_search",
@@ -844,57 +822,6 @@ impl ToolRegistry {
         "browser",
     ];
 
-    /// Internal Lean-catalog builder: condense every available schema before
-    /// selecting the fixed production subset. `pub(crate)` so the delegation
-    /// (sub-agent) path can also send condensed descriptions without losing
-    /// any tool (unlike `get_lean_definitions`, which is a fixed subset).
-    pub(crate) fn get_local_definitions(&self) -> Vec<serde_json::Value> {
-        let mut defs: Vec<serde_json::Value> = self
-            .tools
-            .values()
-            .filter(|tool| tool.is_available())
-            .map(|tool| tool.to_schema())
-            .collect();
-        Self::condense_definitions(&mut defs);
-        Self::sort_definitions(&mut defs);
-        defs
-    }
-
-    /// Returns individual tool schemas with condensed descriptions AND stripped
-    /// parameter descriptions. Keeps property names, types, and required list
-    /// but removes per-parameter `"description"` fields that consume most tokens.
-    fn get_slim_definitions(&self) -> Vec<serde_json::Value> {
-        // Tools whose parameter semantics are load-bearing and must survive
-        // slimming. read_file's `lines` paging syntax is the prime case: strip
-        // it and the local model can't page large files and re-prefills the
-        // whole file each turn.
-        // lcm_expand's param teaches the copyable range-string form ("120-158")
-        // — strip it and small models invent shapes.
-        const KEEP_PARAM_DESCRIPTIONS: &[&str] =
-            &["read_file", "write_file", "edit_file", "lcm_expand"];
-        let mut defs = self.get_local_definitions();
-        for def in &mut defs {
-            Self::remove_local_hot_model_hazards(def);
-            let name = def
-                .pointer("/function/name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if KEEP_PARAM_DESCRIPTIONS.contains(&name) {
-                continue;
-            }
-            if let Some(params) = def.pointer_mut("/function/parameters/properties") {
-                if let Some(props) = params.as_object_mut() {
-                    for (_key, prop) in props.iter_mut() {
-                        if let Some(obj) = prop.as_object_mut() {
-                            obj.remove("description");
-                        }
-                    }
-                }
-            }
-        }
-        defs
-    }
-
     /// Lean production surface: a SINGLE meta-tool (`tool`) advertised at turn 1.
     ///
     /// Lazy-load contract — the proxy unlocks every registered tool on demand:
@@ -914,15 +841,6 @@ impl ToolRegistry {
     /// proxy keeps the long tail executable on demand (no tool lost).
     pub fn get_core_plus_proxy_definitions(&self) -> Vec<serde_json::Value> {
         self.get_core_plus_proxy_definitions_for(Self::CORE_NATIVE_TOOLS, Self::CORE_NATIVE_TOOLS)
-    }
-
-    /// Artifact surface for local models.
-    ///
-    /// Keep this byte-identical to the normal core-plus-proxy surface. The chat
-    /// template renders tool schemas at the prompt head, so switching tool
-    /// catalogs mid-session busts the retained local KV cache.
-    pub fn get_artifact_core_plus_proxy_definitions(&self) -> Vec<serde_json::Value> {
-        self.get_core_plus_proxy_definitions()
     }
 
     fn get_core_plus_proxy_definitions_for(
@@ -1016,13 +934,6 @@ impl ToolRegistry {
             .collect();
         names.sort();
         names
-    }
-
-    /// Extract the first required parameter name from a tool's JSON Schema.
-    fn primary_arg_hint(tool: &dyn Tool) -> Option<String> {
-        let params = tool.parameters();
-        let required = params.get("required")?.as_array()?;
-        required.first()?.as_str().map(String::from)
     }
 
     /// Build arg hints for all required params: `"name(path,content)"`.
@@ -1398,11 +1309,13 @@ impl ToolRegistry {
     }
 
     /// Get the number of registered tools.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.tools.len()
     }
 
     /// Check if the registry is empty.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }
@@ -1446,17 +1359,12 @@ mod tests {
         config.db_path = Some(ws.path().join("sessions.db"));
         let mut reg = ToolRegistry::with_standard_tools(&config);
         register_test_result_inspector(&mut reg, ws.path().join("sessions.db"));
-        let count = reg.get_local_definitions().len();
         let full = TokenBudget::estimate_tool_def_tokens(&reg.get_definitions());
-        let local = TokenBudget::estimate_tool_def_tokens(&reg.get_local_definitions());
-        let slim = TokenBudget::estimate_tool_def_tokens(&reg.get_slim_definitions());
         let lean = TokenBudget::estimate_tool_def_tokens(&reg.get_lean_definitions());
         let proxy = TokenBudget::estimate_tool_def_tokens(&reg.get_proxy_definition());
         let core_proxy =
             TokenBudget::estimate_tool_def_tokens(&reg.get_core_plus_proxy_definitions());
-        println!(
-            "tool surface: count={count} full={full} local={local} slim={slim} lean={lean} proxy={proxy} core_proxy={core_proxy}"
-        );
+        println!("tool surface: full={full} lean={lean} proxy={proxy} core_proxy={core_proxy}");
         // Lean surface is now a SINGLE proxy definition (~150 tokens), paid on
         // every cold prefill. This is the lazy-load contract: one tool at turn 1.
         assert_eq!(
@@ -1467,10 +1375,6 @@ mod tests {
             lean <= 400,
             "lean tool defs (the local default) ballooned to {lean} tokens (budget 400) — \
              every token here is cold-prefill cost on the local path"
-        );
-        assert!(
-            slim <= 2500,
-            "slim tool defs ballooned to {slim} tokens (budget 2500) across {count} tools"
         );
         assert!(
             core_proxy <= 1900,
@@ -1540,35 +1444,6 @@ mod tests {
         assert!(proxy_desc.contains("read_file"), "{proxy_desc}");
         assert!(proxy_desc.contains("todo"), "{proxy_desc}");
         assert!(proxy_desc.contains("validate"), "{proxy_desc}");
-    }
-
-    #[test]
-    fn test_artifact_core_plus_proxy_surface_matches_core_for_prefix_stability() {
-        let ws = tempfile::tempdir().unwrap();
-        let mut reg = ToolRegistry::with_standard_tools(&ToolConfig::new(ws.path()));
-        register_test_result_inspector(&mut reg, ws.path().join("sessions.db"));
-        let core_defs = reg.get_core_plus_proxy_definitions();
-        let defs = reg.get_artifact_core_plus_proxy_definitions();
-        // Both surfaces are pure-proxy; they must be byte-identical so the chat
-        // template's prompt-head tool block stays hash-stable for prefix cache.
-        assert_eq!(
-            serde_json::to_string(&defs).unwrap(),
-            serde_json::to_string(&core_defs).unwrap(),
-            "artifact turns must not switch tool catalogs; the chat template renders tools at the prompt head"
-        );
-        let proxy_desc = defs
-            .iter()
-            .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some("get_tools"))
-            .and_then(|d| d.pointer("/function/description").and_then(|v| v.as_str()))
-            .unwrap_or("");
-        assert!(
-            !proxy_desc.contains("write_file_chunk"),
-            "proxy must expose one file-writing path: {proxy_desc}"
-        );
-        assert!(
-            proxy_desc.contains("write_file"),
-            "proxy must keep transactional write_file reachable: {proxy_desc}"
-        );
     }
 
     /// Lean surface contract: EXACTLY one tool (the `tool` proxy) advertised at
@@ -1753,55 +1628,6 @@ mod tests {
         assert_eq!(registry.len(), 0);
     }
 
-    /// Tool definitions must be byte-identical across registry instances
-    /// regardless of registration order or HashMap seed. The registry is
-    /// rebuilt per message, so an unstable order changes the prompt's tool
-    /// block every turn and busts the inference server's prefix cache
-    /// (measured: a warm turn re-prefilling ~10s instead of ~1s). Build two
-    /// registries with the SAME tools registered in DIFFERENT orders and
-    /// require identical output from every definition accessor.
-    #[test]
-    fn test_slim_keeps_read_file_param_descriptions() {
-        // The local model gets slim definitions by default. read_file's `lines`
-        // paging syntax is load-bearing — it must survive slimming, while a
-        // normal tool's param descriptions are still stripped to save tokens.
-        let mut reg = ToolRegistry::new();
-        reg.register(Box::new(ReadFileTool::default()));
-        reg.register(Box::new(ListDirTool));
-
-        let slim = reg.get_slim_definitions();
-        let find = |name: &str| {
-            slim.iter()
-                .find(|d| d.pointer("/function/name").and_then(|v| v.as_str()) == Some(name))
-                .unwrap()
-                .clone()
-        };
-
-        // read_file keeps its `lines` description (paging guidance preserved).
-        let rf = find("read_file");
-        let lines_desc = rf.pointer("/function/parameters/properties/lines/description");
-        assert!(
-            lines_desc
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| s.contains("1:")),
-            "read_file lines description must survive slim: {rf:?}"
-        );
-
-        // A non-allowlisted tool still has every param description stripped.
-        let other = find("list_dir");
-        if let Some(props) = other
-            .pointer("/function/parameters/properties")
-            .and_then(|v| v.as_object())
-        {
-            for (k, prop) in props {
-                assert!(
-                    prop.get("description").is_none(),
-                    "list_dir param '{k}' description should be stripped in slim"
-                );
-            }
-        }
-    }
-
     #[test]
     fn test_definitions_order_is_deterministic() {
         let names = ["zeta", "alpha", "mike", "bravo", "yankee"];
@@ -1829,11 +1655,6 @@ mod tests {
         // Same order from both registries (seed/registration-order independent).
         assert_eq!(extract(&reg_a.get_definitions()), want);
         assert_eq!(extract(&reg_b.get_definitions()), want);
-        // And from the local + slim accessors that the prefix-cache path uses.
-        assert_eq!(extract(&reg_a.get_local_definitions()), want);
-        assert_eq!(extract(&reg_b.get_local_definitions()), want);
-        assert_eq!(extract(&reg_a.get_slim_definitions()), want);
-        assert_eq!(extract(&reg_b.get_slim_definitions()), want);
         // definitions_for preserves the deterministic order for a subset.
         let subset = ["zeta".to_owned(), "alpha".to_owned(), "mike".to_owned()];
         assert_eq!(
@@ -2343,52 +2164,6 @@ mod tests {
         );
     }
 
-    /// The internal condensed builder starts from every registered tool before
-    /// the Lean production subset is selected.
-    #[test]
-    fn test_local_defs_all_registered_visible() {
-        let mut registry = ToolRegistry::new();
-        for name in &[
-            "read_file",
-            "write_file",
-            "edit_file",
-            "list_dir",
-            "exec",
-            "spawn",
-            "web_search",
-            "browser",
-            "message",
-        ] {
-            registry.register(Box::new(MockTool::new(name)));
-        }
-
-        let defs = registry.get_local_definitions();
-        let names: HashSet<String> = defs
-            .iter()
-            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
-            .collect();
-
-        assert_eq!(
-            names.len(),
-            9,
-            "All 9 registered tools must be visible: {:?}",
-            names
-        );
-        for tool in &[
-            "read_file",
-            "write_file",
-            "edit_file",
-            "list_dir",
-            "exec",
-            "spawn",
-            "web_search",
-            "browser",
-            "message",
-        ] {
-            assert!(names.contains(*tool), "Missing '{}' in {:?}", tool, names);
-        }
-    }
-
     // -----------------------------------------------------------------------
     // is_available() gating tests
     // -----------------------------------------------------------------------
@@ -2500,24 +2275,6 @@ mod tests {
         let result = registry.execute("available_tool", params).await;
         assert!(result.ok());
         assert_eq!(result.data(), "available_tool:still-runs");
-    }
-
-    #[test]
-    fn test_unavailable_tool_excluded_from_local_definitions() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(MockTool::new("read_file")));
-        registry.register(Box::new(MockTool::new("list_dir")));
-        registry.register(Box::new(MockTool::new("exec")));
-        registry.register(Box::new(UnavailableTool));
-
-        let defs = registry.get_local_definitions();
-
-        let names: Vec<String> = defs
-            .iter()
-            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
-            .collect();
-
-        assert!(!names.contains(&"unavailable_test".to_string()));
     }
 
     // -----------------------------------------------------------------------
@@ -2671,77 +2428,15 @@ mod tests {
     // Local tool selection: all registered tools visible
     // -----------------------------------------------------------------------
 
-    /// Local models must see ALL registered+available tools — not a hardcoded
-    /// subset. Registration is the source of truth; `is_available()` gates
-    /// visibility; keyword triggers are irrelevant for local (everything shows).
-    #[test]
-    fn test_local_defs_include_all_registered_tools() {
-        let mut registry = ToolRegistry::new();
-        let all_tools = [
-            "read_file",
-            "write_file",
-            "edit_file",
-            "list_dir",
-            "exec",
-            "web_search",
-            "web_fetch",
-            "recall",
-            "remember",
-            "get_skills",
-            "browser",
-            "spawn",
-        ];
-        for name in &all_tools {
-            registry.register(Box::new(MockTool::new(name)));
-        }
-
-        let defs = registry.get_local_definitions();
-        let names: HashSet<String> = defs
-            .iter()
-            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
-            .collect();
-
-        // Every registered tool must be present — no keyword gating.
-        for tool in &all_tools {
-            assert!(
-                names.contains(*tool),
-                "Local model must see '{}' — got: {:?}",
-                tool,
-                names,
-            );
-        }
-    }
-
-    /// Unavailable tools must still be excluded from local definitions.
-    #[test]
-    fn test_local_defs_exclude_unavailable() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(MockTool::new("read_file")));
-        registry.register(Box::new(MockTool::new("web_search")));
-        registry.register(Box::new(UnavailableTool)); // unavailable_test
-
-        let defs = registry.get_local_definitions();
-        let names: HashSet<String> = defs
-            .iter()
-            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
-            .collect();
-
-        assert!(names.contains("read_file"));
-        assert!(names.contains("web_search"));
-        assert!(
-            !names.contains("unavailable_test"),
-            "Unavailable tools must be excluded from local definitions"
-        );
-    }
-
     /// Local definitions must have condensed (two-sentence) descriptions
     /// to save tokens without hiding tools.
     #[test]
-    fn test_local_defs_are_condensed() {
+    fn test_condense_keeps_short_description() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockTool::new("read_file")));
 
-        let defs = registry.get_local_definitions();
+        let mut defs = registry.get_definitions();
+        ToolRegistry::condense_definitions(&mut defs);
         assert_eq!(defs.len(), 1);
 
         let desc = defs[0]["function"]["description"].as_str().unwrap();
@@ -2753,9 +2448,9 @@ mod tests {
     }
 
     #[test]
-    fn test_local_defs_preserve_operational_tool_contracts() {
+    fn test_core_defs_preserve_operational_tool_contracts() {
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ExecTool::new(30, None, None, None, false, 30_000)));
+        registry.register(Box::new(ExecTool::new(30, None, None, None, false)));
         registry.register(Box::new(ReadSkillTool::new(std::path::Path::new("."))));
         registry.register(Box::new(
             crate::agent::tools::stash_search::SearchToolResultTool::with_db(
@@ -2764,7 +2459,7 @@ mod tests {
             ),
         ));
 
-        let defs = registry.get_local_definitions();
+        let defs = registry.get_core_plus_proxy_definitions();
         let description = |name: &str| {
             defs.iter()
                 .find(|def| def["function"]["name"] == name)
@@ -2795,7 +2490,7 @@ mod tests {
 
     /// Verify condensation truncates to two sentences (not one, not all).
     #[test]
-    fn test_local_defs_condense_truncates_multi_sentence() {
+    fn test_condense_truncates_multi_sentence() {
         // Inline mock with a 3-sentence description so this test doesn't
         // depend on any real tool's prose.
         struct ThreeSentenceTool;
@@ -2834,7 +2529,8 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(tool));
 
-        let defs = registry.get_local_definitions();
+        let mut defs = registry.get_definitions();
+        ToolRegistry::condense_definitions(&mut defs);
         let condensed_desc = defs[0]["function"]["description"].as_str().unwrap();
 
         // Should keep two sentences but drop the third.
@@ -3607,138 +3303,9 @@ mod tests {
         );
     }
 
-    /// A mock tool with param descriptions for testing slim stripping.
-    struct DescribedTool;
-    #[async_trait]
-    impl Tool for DescribedTool {
-        fn name(&self) -> &str {
-            "described_tool"
-        }
-        fn description(&self) -> &str {
-            "A tool with described params."
-        }
-        fn parameters(&self) -> serde_json::Value {
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "The file path" },
-                    "content": { "type": "string", "description": "The content to write" }
-                },
-                "required": ["path", "content"]
-            })
-        }
-        async fn execute(
-            &self,
-            _params: HashMap<String, serde_json::Value>,
-            _ctx: &ToolContext,
-        ) -> ToolResult {
-            Ok("ok".into())
-        }
-    }
-
-    #[test]
-    fn test_slim_definitions_strip_param_descriptions() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(DescribedTool));
-
-        let slim = registry.get_slim_definitions();
-        let full = registry.get_local_definitions();
-
-        assert_eq!(slim.len(), 1);
-        assert_eq!(full.len(), 1);
-
-        // Slim defs should have no "description" keys in parameter properties
-        let slim_props = slim[0].pointer("/function/parameters/properties").unwrap();
-        for (key, prop) in slim_props.as_object().unwrap() {
-            assert!(
-                prop.get("description").is_none(),
-                "Slim def should strip description from param '{}': {:?}",
-                key,
-                prop
-            );
-            // But type should still be present
-            assert!(
-                prop.get("type").is_some(),
-                "Slim def should keep type for param '{}'",
-                key
-            );
-        }
-
-        // Full defs should retain descriptions
-        let full_props = full[0].pointer("/function/parameters/properties").unwrap();
-        let has_desc = full_props
-            .as_object()
-            .unwrap()
-            .values()
-            .any(|v| v.get("description").is_some());
-        assert!(has_desc, "Full defs should retain param descriptions");
-    }
-
     // -----------------------------------------------------------------------
     // Permission enforcement tests
     // -----------------------------------------------------------------------
-
-    struct ExecuteTool;
-
-    #[async_trait]
-    impl Tool for ExecuteTool {
-        fn name(&self) -> &str {
-            "exec_mock"
-        }
-        fn description(&self) -> &str {
-            "mock execute-level tool"
-        }
-        fn parameters(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object", "properties": {}})
-        }
-        fn permission(&self) -> PermissionLevel {
-            PermissionLevel::Execute
-        }
-        async fn execute(
-            &self,
-            _params: HashMap<String, serde_json::Value>,
-            _ctx: &ToolContext,
-        ) -> ToolResult {
-            Ok("executed".into())
-        }
-    }
-
-    #[tokio::test]
-    async fn test_permission_denied_when_above_ceiling() {
-        let mut registry = ToolRegistry::with_max_permission(PermissionLevel::ReadOnly);
-        registry.register(Box::new(ExecuteTool));
-
-        let result = registry.execute("exec_mock", HashMap::new()).await;
-        assert!(!result.ok());
-        assert!(result.data().contains("Permission denied"));
-    }
-
-    #[tokio::test]
-    async fn test_permission_allowed_at_ceiling() {
-        let mut registry = ToolRegistry::with_max_permission(PermissionLevel::Execute);
-        registry.register(Box::new(ExecuteTool));
-
-        let result = registry.execute("exec_mock", HashMap::new()).await;
-        assert!(result.ok());
-        assert_eq!(result.data(), "executed");
-    }
-
-    #[tokio::test]
-    async fn test_permission_allowed_above_ceiling() {
-        let mut registry = ToolRegistry::with_max_permission(PermissionLevel::System);
-        registry.register(Box::new(ExecuteTool));
-
-        let result = registry.execute("exec_mock", HashMap::new()).await;
-        assert!(result.ok());
-    }
-
-    #[test]
-    fn test_set_max_permission() {
-        let mut registry = ToolRegistry::new();
-        assert_eq!(registry.max_permission, PermissionLevel::System);
-        registry.set_max_permission(PermissionLevel::Write);
-        assert_eq!(registry.max_permission, PermissionLevel::Write);
-    }
 
     // -----------------------------------------------------------------------
     // cua registration gating (register behind config.cua.enabled)

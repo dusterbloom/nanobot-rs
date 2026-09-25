@@ -131,8 +131,6 @@ pub(crate) struct AgentLoopShared {
     pub(crate) idle: crate::agent::idle::IdleRuntime,
     /// Receiver for priority signals from subagents (aha channel).
     pub(crate) aha_rx: Arc<Mutex<tokio::sync::mpsc::UnboundedReceiver<AhaSignal>>>,
-    /// Sender for priority signals (given to subagent manager).
-    pub(crate) aha_tx: tokio::sync::mpsc::UnboundedSender<AhaSignal>,
     /// Sticky per-session policy flags (e.g. local_only).
     pub(crate) session_policies: Arc<Mutex<HashMap<String, policy::SessionPolicy>>>,
     /// Per-session previous-session continuity note. Computed once on the
@@ -350,7 +348,6 @@ pub(crate) struct TurnContext {
     pub(crate) user_content: String,
     pub(crate) channel: String,
     pub(crate) chat_id: String,
-    pub(crate) sender_id: String,
     pub(crate) is_voice_message: bool,
     pub(crate) detected_language: Option<String>,
 
@@ -395,8 +392,6 @@ pub(crate) struct TurnContext {
     pub(crate) router_synthetic_call_sequence: RouterSyntheticCallSequence,
     /// Number of LLM iterations consumed in this agent turn (for calibration).
     pub(crate) iterations_used: u32,
-    /// Wall-clock start of this agent turn (for duration measurement).
-    pub(crate) turn_start: std::time::Instant,
 
     // --- Budget/compaction ---
     pub(crate) compaction: CompactionHandle,
@@ -429,7 +424,6 @@ pub(crate) struct TurnContext {
     pub(crate) flow: FlowControl,
 
     // --- Health ---
-    pub(crate) health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
 
     // --- Security ---
     /// Tracks taint introduced by web tools; used to warn before sensitive tool calls.
@@ -503,6 +497,7 @@ pub(crate) struct PromptCacheSnapshot {
 }
 
 impl PromptCacheSnapshot {
+    #[cfg(test)]
     fn capture(counters: &RuntimeCounters, session_key: &str) -> Self {
         let _transition = counters.lock_prompt_cache_transition();
         let route_identity = counters.prompt_cache_route_identity(session_key);
@@ -1187,7 +1182,6 @@ async fn await_compaction_with_cancellation(
 // stop converges repeated blocked calls without mutating the frozen tool schema
 // that participates in the server-side prompt prefix.
 pub(crate) const NO_PROGRESS_HARD_STOP: u32 = 4;
-pub(crate) const MAX_LEASE_RENEWAL_REJECTIONS: u32 = 2;
 const LIMIT_EXHAUSTED_REPLY: &str =
     "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.";
 
@@ -1238,11 +1232,6 @@ pub(crate) struct FlowControl {
     /// of each iteration. Cached duplicate receipts and lease rejections feed
     /// the single bounded terminal call.
     pub(crate) round_executed_no_tools: bool,
-    /// One guaranteed post-exhaustion write per turn: when the lease is gone,
-    /// a write tool is still granted exactly once so a research-heavy turn
-    /// cannot end with its artifact rejected. Fresh per turn (FlowControl is
-    /// rebuilt by prepare_context).
-    pub(crate) emergency_write_used: bool,
     /// Per-turn tool lease. Caps the total tool calls per turn at
     /// `lease_size * (1 + max_renewals)`; after exhaustion, paired rejection
     /// receipts preserve provider protocol and the no-progress breaker bounds
@@ -2465,11 +2454,7 @@ impl AgentLoopShared {
                 counters.last_context_used.load(Ordering::Relaxed),
                 counters.last_context_max.load(Ordering::Relaxed),
                 ctx.turn_count,
-                ctx.messages.len() as u64,
-                ctx.flow.iterations_since_compaction,
                 counters.delegation_healthy.load(Ordering::Relaxed),
-                0,    // recent_tool_failures — not tracked yet
-                true, // last_tool_ok
                 active_subs,
                 0, // pending_aha_signals filled below
             );
@@ -6150,7 +6135,6 @@ impl AgentLoopShared {
 //   :942-951 — `should_strip_tools_for_trio` free fn                      → pinned in `agent_heuristics::tests`
 //   :983   — ToolGate cloud gate (`!is_local`)                            → `tool_gate_enabled_for_turn`
 //   :1029-1036 (same decision as :983; RESEARCH row)                       → `tool_gate_enabled_for_turn`
-//   :1351  — `adaptive_max_tokens(is_local, ...)`                         → pinned in `agent_heuristics::tests`
 //   :1411  — thinking-cap small-model guard                               → `thinking_cap_applied`
 //   :1457-1460 (same decision as :1411; RESEARCH row)                      → `thinking_cap_applied`
 //
@@ -7504,8 +7488,6 @@ mod tests {
     // the helpers above, which ARE exercised:
     //   :942-951 → `should_strip_tools_for_trio` free fn (pinned in
     //              agent_heuristics::tests::test_should_strip_tools_for_trio_is_local_gate)
-    //   :1351   → `adaptive_max_tokens(is_local, …)` free fn (pinned in
-    //              agent_heuristics::tests::test_adaptive_max_tokens_is_local_budget)
     // Wave 1 will replace every `ctx.core.is_local` site with a
     // `ctx.core.mode()` method call; the invariant suite in Wave 0's
     // runtime_mode.rs will then act as the deep-path regression net.

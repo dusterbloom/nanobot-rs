@@ -4,7 +4,6 @@
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
 #![allow(clippy::indexing_slicing)]
-#![allow(dead_code)]
 //! Context hygiene pipeline for cleaning up conversation history.
 //!
 //! Vendored and adapted from stakpak-agent-core:
@@ -434,14 +433,6 @@ fn get_tool_call_ids(message: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn get_tool_result_ids_set(message: &Value) -> HashSet<String> {
-    if get_role(message) == "tool" {
-        get_tool_result_id(message).into_iter().collect()
-    } else {
-        HashSet::new()
-    }
 }
 
 #[cfg(test)]

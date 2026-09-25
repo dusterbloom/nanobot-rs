@@ -450,44 +450,6 @@ fn digest_tool_result(
     build_tool_result_preview(tool_name, args, data, prompt_cap, tool_call_id)
 }
 
-/// Head+tail preview builder retained as the reference for the truncation
-/// tests; production ingestion uses [`digest_tool_result`] (which adds
-/// lossless retrieval).
-#[allow(dead_code)]
-fn compact_inline_tool_result(
-    tool_name: &str,
-    _args: &std::collections::HashMap<String, Value>,
-    data: &str,
-    max_chars: usize,
-) -> String {
-    let total_chars = data.chars().count();
-    if total_chars <= max_chars {
-        return data.to_string();
-    }
-
-    let estimated_tokens = crate::agent::token_budget::TokenBudget::estimate_str_tokens(data);
-    let header = format!(
-        "[truncated: {tool_name}, ~{estimated_tokens} tokens; \
-         head+tail shown, re-request with a narrower range/query for the middle]\n"
-    );
-
-    let footer = "\n[...]\n";
-    let fixed_chars = header.chars().count() + footer.chars().count();
-    let preview_budget = max_chars.saturating_sub(fixed_chars).max(200);
-    let head_chars = preview_budget * 2 / 3;
-    let tail_chars = preview_budget.saturating_sub(head_chars);
-
-    let head: String = data.chars().take(head_chars).collect();
-    let tail_rev: Vec<char> = data.chars().rev().take(tail_chars).collect();
-    let tail: String = tail_rev.into_iter().rev().collect();
-
-    let mut out = format!("{header}{head}{footer}{tail}");
-    if out.chars().count() > max_chars {
-        out = out.chars().take(max_chars).collect();
-    }
-    out
-}
-
 pub(crate) fn local_model_key(model: &str) -> String {
     model
         .strip_prefix("local:")
@@ -1660,36 +1622,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compact_inline_tool_result_keeps_short_data_raw() {
-        let args = HashMap::new();
-        let data = "short result";
-        assert_eq!(
-            compact_inline_tool_result("read_file", &args, data, 100),
-            data
-        );
-    }
-
-    #[test]
-    fn test_compact_inline_tool_result_caps_large_data() {
-        let mut args = HashMap::new();
-        args.insert("path".to_string(), serde_json::json!("src/lib.rs"));
-        args.insert("lines".to_string(), serde_json::json!("1:1000"));
-        let data = format!(
-            "{}MIDDLE_SHOULD_BE_OMITTED{}",
-            "head line\n".repeat(200),
-            "tail line\n".repeat(200)
-        );
-
-        let compacted = compact_inline_tool_result("read_file", &args, &data, 900);
-
-        assert!(compacted.chars().count() <= 900);
-        assert!(compacted.contains("[truncated: read_file"));
-        assert!(compacted.contains("re-request with a narrower range/query"));
-        assert!(compacted.contains("\n[...]\n"));
-        assert!(!compacted.contains("MIDDLE_SHOULD_BE_OMITTED"));
-    }
-
-    #[test]
     fn digest_tool_result_passes_small_data_raw() {
         let args = HashMap::new();
         let out = digest_tool_result("exec", &args, "short output", 1200, "call_1");
@@ -2198,72 +2130,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(completion_order, vec!["tc-fast", "tc-slow"]);
-    }
-
-    #[tokio::test]
-    async fn delegated_tool_status_reaches_receipt_event_and_session_event() {
-        let source = crate::agent::tools::base::ToolExecutionResult::failure_with_kind(
-            "body without an Error prefix".to_string(),
-            crate::errors::ToolErrorKind::InvalidArgs("synthetic test failure".to_string()),
-        );
-        let outcome = crate::agent::tool_runner::ToolRunOutcome::from_execution(
-            "call_failed",
-            "exec",
-            source,
-            7,
-        );
-
-        let mut receipt = Vec::new();
-        ContextBuilder::add_tool_result_with_status(
-            &mut receipt,
-            &outcome.tool_call_id,
-            &outcome.tool_name,
-            &outcome.data,
-            outcome.ok,
-        );
-        assert_eq!(receipt[0].get("ok").and_then(Value::as_bool), Some(false));
-
-        let event = ToolEvent::CallEnd {
-            tool_name: outcome.tool_name.clone(),
-            tool_call_id: outcome.tool_call_id.clone(),
-            result_data: outcome.data.clone(),
-            ok: outcome.ok,
-            duration_ms: outcome.duration_ms,
-        };
-        assert!(matches!(event, ToolEvent::CallEnd { ok: false, .. }));
-
-        let dir = tempfile::tempdir().unwrap();
-        let sessions = crate::session::SessionDb::new(&dir.path().join("sessions.db"));
-        let session = sessions.create_session("cli:delegated-status").await;
-        sessions
-            .record_tool_pre_execute(
-                &session.id,
-                "request-1",
-                1,
-                &outcome.tool_call_id,
-                &outcome.tool_name,
-                &HashMap::new(),
-                ToolPreExecuteDecision::Ready,
-            )
-            .await
-            .unwrap();
-        sessions
-            .record_tool_execute(
-                &session.id,
-                "request-1",
-                1,
-                &outcome.tool_call_id,
-                &outcome.data,
-                outcome.ok,
-                outcome.duration_ms,
-            )
-            .await
-            .unwrap();
-        let events = sessions.load_session_events(&session.id).await.unwrap();
-        assert!(events.iter().any(|event| matches!(
-            event.payload,
-            crate::session::db::SessionEventPayload::ToolExecute { ok: false, .. }
-        )));
     }
 
     #[tokio::test]

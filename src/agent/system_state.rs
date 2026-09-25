@@ -4,14 +4,12 @@
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
 #![allow(clippy::as_conversions)]
-#![allow(dead_code)]
 //! Shared proprioception: SystemState, TaskPhase, and ensemble coordination types.
 //!
 //! Every model in the ensemble can sense the system's current state through
 //! `SystemState`. This enables phase-aware tool scoping, heartbeat grounding,
 //! and priority interrupt signaling.
 
-use std::time::Instant;
 
 // ---------------------------------------------------------------------------
 // Task Phase
@@ -45,22 +43,7 @@ impl std::fmt::Display for TaskPhase {
     }
 }
 
-impl TaskPhase {
-    /// Parse a phase name from a string (for `set_phase` micro-tool).
-    pub fn from_str_loose(s: &str) -> Option<TaskPhase> {
-        match s.to_lowercase().trim() {
-            "idle" => Some(TaskPhase::Idle),
-            "understanding" => Some(TaskPhase::Understanding),
-            "planning" => Some(TaskPhase::Planning),
-            "file_editing" | "fileediting" | "file editing" => Some(TaskPhase::FileEditing),
-            "code_execution" | "codeexecution" | "code execution" => Some(TaskPhase::CodeExecution),
-            "web_research" | "webresearch" | "web research" => Some(TaskPhase::WebResearch),
-            "communication" => Some(TaskPhase::Communication),
-            "reflection" => Some(TaskPhase::Reflection),
-            _ => None,
-        }
-    }
-}
+impl TaskPhase {}
 
 /// Infer the current task phase from the last N tool calls.
 ///
@@ -128,14 +111,9 @@ pub struct SystemState {
     /// Context pressure: 0.0 = empty, 1.0 = full.
     pub context_pressure: f32,
     pub turn_number: u64,
-    pub message_count: u64,
-    pub turns_since_compaction: u32,
     pub delegation_healthy: bool,
-    pub recent_tool_failures: u32,
-    pub last_tool_ok: bool,
     pub active_subagents: u8,
     pub pending_aha_signals: u8,
-    pub updated_at: Instant,
 }
 
 impl SystemState {
@@ -145,11 +123,7 @@ impl SystemState {
         context_used: u64,
         context_max: u64,
         turn_number: u64,
-        message_count: u64,
-        turns_since_compaction: u32,
         delegation_healthy: bool,
-        recent_tool_failures: u32,
-        last_tool_ok: bool,
         active_subagents: u8,
         pending_aha_signals: u8,
     ) -> Self {
@@ -162,14 +136,9 @@ impl SystemState {
             task_phase,
             context_pressure: pressure,
             turn_number,
-            message_count,
-            turns_since_compaction,
             delegation_healthy,
-            recent_tool_failures,
-            last_tool_ok,
             active_subagents,
             pending_aha_signals,
-            updated_at: Instant::now(),
         }
     }
 }
@@ -180,14 +149,9 @@ impl Default for SystemState {
             task_phase: TaskPhase::Idle,
             context_pressure: 0.0,
             turn_number: 0,
-            message_count: 0,
-            turns_since_compaction: 0,
             delegation_healthy: true,
-            recent_tool_failures: 0,
-            last_tool_ok: true,
             active_subagents: 0,
             pending_aha_signals: 0,
-            updated_at: Instant::now(),
         }
     }
 }
@@ -254,7 +218,6 @@ pub enum AhaPriority {
 pub struct AhaSignal {
     pub priority: AhaPriority,
     pub agent_id: String,
-    pub category: String,
     pub message: String,
 }
 
@@ -359,10 +322,6 @@ mod tests {
             50_000,
             100_000,
             5,
-            10,
-            3,
-            true,
-            0,
             true,
             0,
             0,
@@ -372,7 +331,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_zero_max_context() {
-        let state = SystemState::snapshot(TaskPhase::Idle, 50_000, 0, 1, 2, 0, true, 0, true, 0, 0);
+        let state = SystemState::snapshot(TaskPhase::Idle, 50_000, 0, 1, true, 0, 0);
         assert_eq!(state.context_pressure, 0.0);
     }
 
@@ -383,10 +342,6 @@ mod tests {
             200_000,
             100_000,
             1,
-            2,
-            0,
-            true,
-            0,
             true,
             0,
             0,
@@ -437,10 +392,6 @@ mod tests {
             67_000,
             100_000,
             12,
-            25,
-            5,
-            true,
-            0,
             true,
             1,
             0,
@@ -455,7 +406,7 @@ mod tests {
     #[test]
     fn test_format_grounding_with_signals() {
         let state =
-            SystemState::snapshot(TaskPhase::Idle, 0, 100_000, 1, 1, 0, true, 0, true, 0, 3);
+            SystemState::snapshot(TaskPhase::Idle, 0, 100_000, 1, true, 0, 3);
         let text = format_grounding(&state);
         assert!(text.contains("3 pending signals"));
     }
@@ -502,19 +453,5 @@ mod tests {
     fn test_task_phase_display() {
         assert_eq!(format!("{}", TaskPhase::FileEditing), "file editing");
         assert_eq!(format!("{}", TaskPhase::Idle), "idle");
-    }
-
-    #[test]
-    fn test_task_phase_from_str_loose() {
-        assert_eq!(
-            TaskPhase::from_str_loose("file_editing"),
-            Some(TaskPhase::FileEditing)
-        );
-        assert_eq!(
-            TaskPhase::from_str_loose("FileEditing"),
-            Some(TaskPhase::FileEditing)
-        );
-        assert_eq!(TaskPhase::from_str_loose("idle"), Some(TaskPhase::Idle));
-        assert_eq!(TaskPhase::from_str_loose("nonsense"), None);
     }
 }

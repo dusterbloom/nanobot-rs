@@ -4,7 +4,6 @@
 // the regime.
 // Tracking: docs/error-protocol-backlog.md
 #![allow(clippy::as_conversions, clippy::indexing_slicing)]
-#![allow(dead_code)]
 //! Token budget management for context window overflow prevention.
 //!
 //! Uses tiktoken-rs (cl100k_base BPE) for accurate token counting,

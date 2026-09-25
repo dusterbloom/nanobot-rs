@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Knowledge graph: entity/relation store backed by petgraph.
 //!
 //! Stores entities (people, tools, concepts) and their relationships.

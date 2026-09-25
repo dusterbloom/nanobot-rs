@@ -8,7 +8,6 @@
     clippy::format_push_string,
     clippy::indexing_slicing
 )]
-#![allow(dead_code)]
 //! Pipeline runner: Rust-level orchestration for multi-step pipelines.
 //!
 //! The key insight: the pipeline loop is Rust, not LLM. A 3B model doing
@@ -30,9 +29,6 @@ use crate::providers::base::LLMProvider;
 
 /// Default max iterations per tool-equipped step.
 const DEFAULT_STEP_MAX_ITERATIONS: u32 = 5;
-
-/// Default max chars for tool results in pipeline steps.
-const DEFAULT_MAX_TOOL_RESULT_CHARS: usize = 30_000;
 
 /// A single step in a pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]

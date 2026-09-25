@@ -106,9 +106,9 @@ pub struct SwappableCore {
     pub session_complete_after_secs: u64,
     pub max_history_turns: usize,
     pub model_capabilities: crate::agent::model_capabilities::ModelCapabilities,
-    /// Single owner of hygiene/anti-drift/budget-trim retention knobs. See
-    /// `agent::retention` — replaces the formerly separate `anti_drift`,
-    /// `max_message_age_turns`, and `hygiene_keep_last_messages` fields.
+    /// Single owner of hygiene/anti-drift retention knobs. See
+    /// `agent::retention` — replaces the formerly separate `anti_drift` and
+    /// `hygiene_keep_last_messages` fields.
     pub retention: crate::agent::retention::RetentionPolicy,
     /// When true, specialist is instructed to return strict JSON and the response
     /// is parsed as `SpecialistResponse`. Sourced from `TrioConfig::specialist_output_schema`.
@@ -118,7 +118,6 @@ pub struct SwappableCore {
     /// Code execution tool config.
     pub code_execution: crate::config::schema::CodeExecutionConfig,
     /// Python kernel tool config (feature: python-kernel).
-    #[allow(dead_code)]
     pub python_kernel: crate::config::schema::PythonKernelConfig,
     /// Cua driver (local desktop computer-use) tool settings.
     pub cua: crate::config::schema::CuaToolConfig,
@@ -225,7 +224,6 @@ pub(crate) enum SessionRetirement {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HiggsSessionReusePolicy {
-    BestEffort,
     Seed,
     RequireContinuation,
 }
@@ -233,7 +231,6 @@ pub(crate) enum HiggsSessionReusePolicy {
 impl HiggsSessionReusePolicy {
     pub(crate) fn as_wire(self) -> &'static str {
         match self {
-            Self::BestEffort => "best_effort",
             Self::Seed => "seed",
             Self::RequireContinuation => "require_continuation",
         }

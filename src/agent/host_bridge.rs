@@ -300,12 +300,13 @@ impl HostDispatcher {
     // deserializes `HostRequest` and calls `dispatch` — the envelope-level
     // entry point. Today the in-process production path goes through
     // `Arc<dyn HostBridge>::call` (the trait default, which shares this
-    // envelope construction), so the only current callers are the test suite
-    // and the Step-4 server; kept live as the documented OCP choke point.
-    #[allow(dead_code)]
+    // envelope construction), so until that server exists `dispatch` is
+    // compiled for tests only.
+
     /// Transport entry point: request in, reply out. The single OCP `match`
     /// over the request enum — a new capability adds a variant + one arm here
     /// (or none, if routed through an existing host) and nothing else.
+    #[cfg(test)]
     pub async fn dispatch(&self, req: HostRequest) -> HostReply {
         match req {
             HostRequest::Spawn(r) => self.spawn.spawn(r).await.into(),

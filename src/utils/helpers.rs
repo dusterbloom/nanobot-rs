@@ -5,7 +5,6 @@
 // Tracking: docs/error-protocol-backlog.md
 #![allow(clippy::indexing_slicing, clippy::print_stderr, clippy::shadow_reuse)]
 #![allow(clippy::disallowed_types)] // anyhow is the app convention — the ban targets tool boundaries (error protocol §2.5)
-#![allow(dead_code)]
 //! Utility functions for nanobot.
 
 use std::fs;

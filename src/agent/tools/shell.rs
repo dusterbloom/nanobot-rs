@@ -111,12 +111,6 @@ pub struct ExecTool {
     deny_patterns: Vec<String>,
     allow_patterns: Vec<String>,
     restrict_to_workspace: bool,
-    /// Retained for API stability and future per-tool capping. Truncation now
-    /// happens in the tool-result ingestion layer (`tool_engine.rs`) so the
-    /// full body reaches the SQLite stash for search/slice/recall. See the
-    /// comment in `execute`.
-    #[allow(dead_code)]
-    max_output_chars: usize,
 }
 
 impl ExecTool {
@@ -127,7 +121,6 @@ impl ExecTool {
         deny_patterns: Option<Vec<String>>,
         allow_patterns: Option<Vec<String>>,
         restrict_to_workspace: bool,
-        max_output_chars: usize,
     ) -> Self {
         Self {
             timeout,
@@ -135,7 +128,6 @@ impl ExecTool {
             deny_patterns: deny_patterns.unwrap_or_else(default_deny_patterns),
             allow_patterns: allow_patterns.unwrap_or_default(),
             restrict_to_workspace,
-            max_output_chars,
         }
     }
 
@@ -644,7 +636,7 @@ mod tests {
     /// Create an ExecTool with default deny patterns, no allow patterns,
     /// and workspace restriction enabled.
     fn make_exec_tool(restrict: bool) -> ExecTool {
-        ExecTool::new(10, None, None, None, restrict, 30000)
+        ExecTool::new(10, None, None, None, restrict)
     }
 
     /// Helper: call guard_command with the given command on a restricted tool.
@@ -1062,14 +1054,7 @@ mod tests {
 
     #[test]
     fn test_allow_patterns_block_unmatched() {
-        let tool = ExecTool::new(
-            10,
-            None,
-            None,
-            Some(vec![r"^echo\b".to_string()]),
-            false,
-            30000,
-        );
+        let tool = ExecTool::new(10, None, None, Some(vec![r"^echo\b".to_string()]), false);
         let cwd = ".".to_string();
 
         // "echo" matches, so it should be allowed.
@@ -1649,7 +1634,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_timeout_has_hint() {
         // Use a very short timeout (1s) with a command that sleeps longer.
-        let tool = ExecTool::new(1, None, None, None, false, 30000);
+        let tool = ExecTool::new(1, None, None, None, false);
         let mut params = HashMap::new();
         params.insert(
             "command".to_string(),
@@ -1681,7 +1666,7 @@ mod tests {
     // ---------------------------------------------------------------
 
     fn tool_blocks(cmd: &str) -> bool {
-        let tool = ExecTool::new(10, None, None, None, false, 10000);
+        let tool = ExecTool::new(10, None, None, None, false);
         tool.guard_command(cmd, "/tmp").is_some()
     }
 
@@ -1811,7 +1796,7 @@ mod tests {
     }
 
     fn resolve_cwd_param(cwd: Option<&str>) -> String {
-        let tool = ExecTool::new(10, None, None, None, false, 30000);
+        let tool = ExecTool::new(10, None, None, None, false);
         let mut params: HashMap<String, serde_json::Value> = HashMap::new();
         if let Some(c) = cwd {
             params.insert("working_dir".to_string(), serde_json::json!(c));
@@ -1842,7 +1827,7 @@ mod tests {
     #[test]
     fn test_spawn_error_hint_bad_cwd() {
         // A `NotFound` error should hint at a bad working directory, not PATH.
-        let tool = ExecTool::new(10, None, None, None, false, 30000);
+        let tool = ExecTool::new(10, None, None, None, false);
         let err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
         let msg = tool.spawn_error_hint(&err, "/nonexistent/path");
         assert!(
@@ -1855,7 +1840,7 @@ mod tests {
     #[test]
     fn test_spawn_error_hint_other_error() {
         // Non-NotFound errors should keep the generic PATH hint.
-        let tool = ExecTool::new(10, None, None, None, false, 30000);
+        let tool = ExecTool::new(10, None, None, None, false);
         let err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied");
         let msg = tool.spawn_error_hint(&err, "/tmp");
         assert!(msg.contains("PATH"), "expected PATH hint, got: {msg}");
