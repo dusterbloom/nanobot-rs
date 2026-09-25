@@ -165,7 +165,13 @@ if __name__ == '__main__':
     parser.add_argument('--minutes', type=int, default=45)
     parser.add_argument('--arms', default='A,B')
     parser.add_argument('--policy', choices=['optional', 'decision', 'scheduled'], default='optional')
+    parser.add_argument('--test-binary', type=Path, default=Path('target/release/deps/nanobot-67848bc0f9b02956'),
+                        help='prebuilt lib test executable containing endurance_eval_live')
+    parser.add_argument('--source-dir', type=Path, default=Path('.'),
+                        help='checkout the test binary was built from; used for provenance and as its cwd')
     args = parser.parse_args()
+    source_dir = args.source_dir.resolve()
+    test_binary = args.test_binary.resolve()
     requested_long_form_min_tokens = os.environ.get('ENDURANCE_LONG_FORM_MIN_TOKENS')
     if requested_long_form_min_tokens is not None:
         try:
@@ -203,12 +209,13 @@ if __name__ == '__main__':
                   'endurance_reset_handoff_requested': requested_reset_handoff,
                   'endurance_reset_handoff_enabled': reset_handoff_enabled,
                   'arm_servers': arm_servers,
-                  'nanobot_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()}
+                  'test_binary': str(test_binary), 'source_dir': str(source_dir),
+                  'nanobot_head': subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source_dir, text=True).strip()}
     provenance['sha256'] = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in [
-        Path('target/release/deps/nanobot-67848bc0f9b02956'), Path('/private/tmp/higgs-recovery/higgs-hardened'),
-        Path('src/agent/agent_loop/recovery_eval.rs'), Path('src/agent/agent_loop/endurance_eval.rs'),
-        Path('src/agent/token_budget.rs'), Path('/Users/peppi/.local/bin/nanobot'),
-        Path(__file__), Path(__file__).with_name('memory_probe.py')]}
+        test_binary, Path('/private/tmp/higgs-recovery/higgs-hardened'),
+        source_dir / 'src/agent/agent_loop/recovery_eval.rs', source_dir / 'src/agent/agent_loop/endurance_eval.rs',
+        source_dir / 'src/agent/token_budget.rs', source_dir / 'src/agent/lcm.rs',
+        Path(__file__), Path(__file__).with_name('memory_probe.py')] if p.exists()}
     (root / 'provenance.json').write_text(json.dumps(provenance, indent=2))
     summaries = []
     for arm in arms:
@@ -221,7 +228,7 @@ if __name__ == '__main__':
         server_pid = int(subprocess.check_output(['lsof', '-tiTCP:9000', '-sTCP:LISTEN'], text=True).strip())
         started = time.monotonic()
         with (root / f'{arm}.log').open('w') as log, (root / f'{arm}-telemetry.jsonl').open('w') as telemetry:
-            process = subprocess.Popen(['target/release/deps/nanobot-67848bc0f9b02956', 'endurance_eval_live', '--ignored', '--nocapture', '--test-threads=1'], env=env, stdout=log, stderr=subprocess.STDOUT)
+            process = subprocess.Popen([str(test_binary), 'endurance_eval_live', '--ignored', '--nocapture', '--test-threads=1'], cwd=source_dir, env=env, stdout=log, stderr=subprocess.STDOUT)
             watchdog = False
             unexpected_restart = False
             while process.poll() is None:
