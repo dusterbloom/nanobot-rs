@@ -1428,6 +1428,7 @@ mod lcm_checkpoint_tests {
             tau_hard: 0.8,
             deterministic_target: 64,
             keep_prefix_fraction: 0.35,
+            checkpoint: crate::agent::lcm::CheckpointWriter::Model,
         });
         for id in 1..=12 {
             let role = if id % 2 == 0 { "assistant" } else { "user" };
@@ -3497,7 +3498,7 @@ impl AgentLoopShared {
                 engines
                     .entry(ctx.session_id.clone())
                     .or_insert_with(|| {
-                        let config = LcmConfig::from(&self.lcm_config);
+                        let config = LcmConfig::for_runtime(&self.lcm_config, ctx.core.mode());
                         Arc::new(tokio::sync::Mutex::new(LcmEngine::new(config)))
                     })
                     .clone()

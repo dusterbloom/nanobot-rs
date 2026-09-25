@@ -50,14 +50,9 @@ cargo test                   # Run all tests (unit tests are inline in each modu
 cargo test -- test_name      # Run a single test by name
 cargo test module::tests     # Run tests for a specific module
 RUST_LOG=debug cargo run -- agent -m "Hello"  # Run with debug logging
-
-# ANE tests (require Apple Silicon, use serial execution to avoid hardware contention)
-cargo build --features ane
-cargo test --features ane --lib -- "ane_" --test-threads=1
-cargo test --features ane --release --lib -- "bench_" --nocapture --test-threads=1  # Benchmarks
 ```
 
-No CI, no linter config, no integration tests. All tests are `#[cfg(test)] mod tests` inside their source files.
+No CI. Lints are configured in `Cargo.toml` (`[lints]`, deny regime) and `clippy.toml`. Most tests are inline `#[cfg(test)] mod tests`; a few integration tests live in `tests/`.
 
 ## Architecture
 
@@ -104,6 +99,8 @@ Tools implement the `Tool` trait (`agent/tools/base.rs`): `name()`, `description
 ### Context & Memory
 
 `ContextBuilder` assembles the system prompt from: identity text, the loaded bootstrap files (`AGENTS.md`, `SOUL.md`, `USER.md` in workspace), compact local directory/memory contracts, and skills. The workspace defaults to `~/.nanobot/workspace/`. Raw sessions, LCM nodes, tool results, and session working state live in `~/.nanobot/sessions.db`; `workspace/memory/MEMORY.md` contains curated cross-session facts rather than transcript history. `TOOLS.md` and `IDENTITY.md` may exist in old workspaces but are not loaded into the prompt.
+
+**LCM checkpoints** follow `RuntimeMode`: local runtimes fold the retired span mechanically (CliffCompaction-style, no model call: user/assistant text kept, tool calls as signatures, tool results ≤500 chars kept, larger ones dropped behind `lcm_expand`); cloud runtimes ask the model for a handoff summary and fall back to the same mechanical checkpoint. See `LcmConfig::for_runtime` in `src/agent/lcm.rs`.
 
 ### Skills
 

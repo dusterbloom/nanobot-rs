@@ -2167,6 +2167,11 @@ pub struct LcmSchemaConfig {
     /// immutable system/developer prefix; this value is ignored. Default: 0.35.
     #[serde(default = "default_lcm_keep_prefix_fraction")]
     pub keep_prefix_fraction: f64,
+    /// Test seam: pin the checkpoint writer regardless of `RuntimeMode`, so
+    /// local harnesses can still exercise the cloud model-summary pipeline.
+    #[cfg(test)]
+    #[serde(skip)]
+    pub checkpoint_writer: Option<crate::agent::lcm::CheckpointWriter>,
 }
 
 impl Default for LcmSchemaConfig {
@@ -2176,6 +2181,8 @@ impl Default for LcmSchemaConfig {
             tau_hard: default_lcm_tau_hard(),
             deterministic_target: default_lcm_deterministic_target(),
             keep_prefix_fraction: default_lcm_keep_prefix_fraction(),
+            #[cfg(test)]
+            checkpoint_writer: None,
         }
     }
 }
