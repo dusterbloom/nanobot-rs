@@ -51,11 +51,6 @@ pub struct ProviderSpec {
 }
 
 impl ProviderSpec {
-    /// Create a spec for a local server.
-    pub fn local(base_url: &str, model: Option<&str>) -> Self {
-        Self::local_with_key(base_url, model, "local")
-    }
-
     /// Create a spec for a local server with a custom API key.
     pub fn local_with_key(base_url: &str, model: Option<&str>, api_key: &str) -> Self {
         ProviderSpec {
@@ -300,7 +295,7 @@ mod tests {
 
     #[test]
     fn test_provider_spec_local() {
-        let spec = ProviderSpec::local("http://localhost:1234/v1", Some("my-model"));
+        let spec = ProviderSpec::local_with_key("http://localhost:1234/v1", Some("my-model"), "local");
         assert_eq!(spec.api_key, "local");
         assert_eq!(spec.api_base.as_deref(), Some("http://localhost:1234/v1"));
         assert_eq!(spec.model.as_deref(), Some("my-model"));
@@ -332,7 +327,7 @@ mod tests {
 
     #[test]
     fn test_with_jit_gate_opt_none() {
-        let spec = ProviderSpec::local("http://localhost:1234/v1", None).with_jit_gate_opt(None);
+        let spec = ProviderSpec::local_with_key("http://localhost:1234/v1", None, "local").with_jit_gate_opt(None);
         assert!(spec.jit_gate.is_none());
     }
 
@@ -340,7 +335,7 @@ mod tests {
     fn test_with_jit_gate_opt_some() {
         let gate = Arc::new(JitGate::new());
         let spec =
-            ProviderSpec::local("http://localhost:1234/v1", None).with_jit_gate_opt(Some(gate));
+            ProviderSpec::local_with_key("http://localhost:1234/v1", None, "local").with_jit_gate_opt(Some(gate));
         assert!(spec.jit_gate.is_some());
     }
 
