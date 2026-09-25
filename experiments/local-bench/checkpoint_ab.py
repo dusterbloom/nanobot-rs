@@ -123,19 +123,18 @@ def fmt(values):
     return f'{statistics.median(values):.1f} [{min(values):.1f}-{max(values):.1f}]'
 
 
-def compare(root, results, provenance):
+def compare(root, results, provenance, stream, metrics=METRICS):
     lines = [f'# Checkpoint writer A/B ({root.name})', '',
              f'- base (model handoff): `{provenance["base"]["sha"]}`',
              f'- head (mechanical fold): `{provenance["head"]["sha"]}`',
-             f'- stream: endurance arm A, {provenance["updates"]} updates, '
-             f'ceiling {provenance["ceiling"]}, {provenance["minutes"]} min/run', '']
+             f'- stream: {stream}', '']
     valid = {label: [r for r in runs if r.get('valid_measurement')] for label, runs in results.items()}
     for label, runs in results.items():
         lines.append(f'- {label}: {len(valid[label])}/{len(runs)} valid runs, '
                      f'{sum(bool(r.get("pass")) for r in valid[label])} full passes')
     lines += ['', 'Median [min-max] over valid runs.', '',
               '| metric | base | head | better |', '|---|---|---|---|']
-    for key, label, lower in METRICS:
+    for key, label, lower in metrics:
         base = [float(r[key]) for r in valid['base'] if r.get(key) is not None]
         head = [float(r[key]) for r in valid['head'] if r.get(key) is not None]
         verdict = ''
@@ -186,7 +185,8 @@ def main():
         summary = run_one(root, label, index, build['binary'], build['source'], args)
         if summary is not None:
             results[label].append(derive(summary))
-    compare(root, results, provenance)
+    compare(root, results, provenance, f'endurance arm A, {args.updates} updates, '
+            f'ceiling {args.ceiling}, {args.minutes} min/run')
 
 
 if __name__ == '__main__':
