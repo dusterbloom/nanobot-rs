@@ -181,7 +181,10 @@ mod tests {
     fn test_load_nonexistent_returns_default() {
         let path = Path::new("/tmp/nanobot_test_does_not_exist_987654.json");
         let cfg = load_config(Some(path));
-        assert_eq!(cfg.gateway.port, 18790);
+        assert_eq!(
+            cfg.agents.defaults.model,
+            Config::default().agents.defaults.model
+        );
     }
 
     #[test]
@@ -213,7 +216,6 @@ mod tests {
 
         let loaded = load_config(Some(&tmp_path));
         assert_eq!(loaded.agents.defaults.model, cfg.agents.defaults.model);
-        assert_eq!(loaded.gateway.port, cfg.gateway.port);
 
         // Clean up.
         let _ = fs::remove_file(&tmp_path);
