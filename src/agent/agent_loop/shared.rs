@@ -49,16 +49,13 @@ use crate::agent::validation;
 use crate::bus::events::OutboundMessage;
 use crate::config::schema::{EmailConfig, LcmSchemaConfig, ProprioceptionConfig};
 use crate::cron::service::CronService;
-use crate::errors::{
-    classify_retained_session_error, is_retryable_provider_error, RetainedSessionErrorKind,
-};
+use crate::errors::is_retryable_provider_error;
 use crate::providers::base::{LLMResponse, StreamChunk, ToolChoice};
 use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProviderResponse};
 
 use crate::agent::agent_core::{
-    apply_compaction_result, prompt_prefix_len, ExpansionCheckpoint, PendingCompaction,
-    RuntimeCounters, SessionRetirement, SharedCoreHandle, StablePromptAnchor, SwappableCore,
-    ToolPresentationMode,
+    apply_compaction_result, prompt_prefix_len, PendingCompaction, RuntimeCounters,
+    SharedCoreHandle, StablePromptAnchor, SwappableCore, ToolPresentationMode,
 };
 
 use super::{last_user_message, render_via_protocol};
@@ -69,13 +66,13 @@ use super::response::RetryState;
 use crate::turn_stream::{BackendActivity, CacheResetReason, CacheStatus, ControlMarker};
 
 use super::budget::{
-    advertised_tool_names, attach_higgs_session_control, attach_retained_session_control,
-    clear_prompt_cache_state, divergent_message_digest, history_window_near,
-    invalidate_prompt_cache_for_rewrite, overflow_recovery_fallback_budget,
-    overflow_trim_threshold, proactive_grounding_preserves_prefix_cache, retention_attachment,
-    send_cache_reset_marker, send_compaction_marker, send_retract_reply_marker,
-    should_allow_checkpoint, should_inject_heartbeat_grounding, strip_higgs_session_lease_control,
-    RetentionAttachment, MAX_OVERFLOW_RECOVERIES, OVERFLOW_RECOVERY_HEADROOM,
+    advertised_tool_names, attach_retained_session_control, clear_prompt_cache_state,
+    divergent_message_digest, history_window_near, invalidate_prompt_cache_for_rewrite,
+    overflow_recovery_fallback_budget, overflow_trim_threshold,
+    proactive_grounding_preserves_prefix_cache, retention_attachment, send_cache_reset_marker,
+    send_compaction_marker, send_retract_reply_marker, should_allow_checkpoint,
+    should_inject_heartbeat_grounding, RetentionAttachment, MAX_OVERFLOW_RECOVERIES,
+    OVERFLOW_RECOVERY_HEADROOM,
 };
 use super::compaction::execute_lcm_compaction;
 use super::local_stream::{
@@ -93,12 +90,6 @@ pub(crate) use super::compaction::CompactionHandle;
 // Per-instance state (different per agent)
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProviderRequestRetryPolicy {
-    Standard,
-    OneShotLease,
-}
-
 enum ForcedToolRecoveryOutcome {
     Response(LLMResponse),
     Step(StepResult),
@@ -107,12 +98,6 @@ enum ForcedToolRecoveryOutcome {
         error: anyhow::Error,
     },
     PersistenceError(anyhow::Error),
-}
-
-impl ProviderRequestRetryPolicy {
-    fn allows_retry(self) -> bool {
-        matches!(self, Self::Standard)
-    }
 }
 
 pub(crate) struct AgentLoopShared {
@@ -378,13 +363,6 @@ pub(crate) struct TurnContext {
     /// Planned LCM nodes carried by the current provider request. They remain
     /// eligible until that request completes successfully.
     pub(crate) staged_auto_expansion: Option<AppliedAutoExpansion>,
-    /// Higgs cache route selected once for this turn and retained across every
-    /// tool iteration until terminal cleanup.
-    pub(crate) higgs_session_route: HiggsSessionRoute,
-    /// Synchronous fail-safe for cancellation or task abort after retained
-    /// preflight. Normal terminal/fallback paths disarm it after explicit
-    /// checkpoint retirement.
-    pub(crate) retained_route_cleanup: RetainedRouteCleanupGuard,
     pub(crate) content_gate: crate::agent::context_gate::ContentGate,
 
     // --- Observability ---
@@ -418,328 +396,14 @@ enum ProtocolGroupPersistence {
     MessagesWithRejectedResults,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AutoExpansionMaterializationKind {
-    ExactCheckpoint,
-    FlattenedFallback,
-}
-
-struct AutoExpansionMaterialization {
-    messages: Vec<Value>,
-    kind: AutoExpansionMaterializationKind,
-}
-
 pub(crate) struct AppliedAutoExpansion {
     logical_messages: Vec<Value>,
     rendered_messages: Vec<Value>,
     node_ids: Vec<usize>,
-    exact_count: usize,
     estimated_added_tokens: usize,
-    retained_plan: Option<RetainedExpansionPlan>,
-}
-
-#[derive(Clone)]
-struct RetainedExpansionPlan {
-    checkpoint: ExpansionCheckpoint,
-    compacted_prefix: Vec<Value>,
-    fallback_prefix: Option<Vec<Value>>,
-    exact_prefix_len: usize,
-}
-
-impl AppliedAutoExpansion {
-    fn retained_plan(&self) -> Option<RetainedExpansionPlan> {
-        self.retained_plan.clone()
-    }
-
-    fn use_flattened_fallback(&mut self, protocol: &dyn ConversationProtocol) -> bool {
-        let Some(plan) = self.retained_plan.take() else {
-            return false;
-        };
-        let Some(fallback_prefix) = plan.fallback_prefix else {
-            return false;
-        };
-        self.logical_messages = fallback_prefix;
-        self.rendered_messages = render_via_protocol(protocol, &self.logical_messages);
-        self.exact_count = 0;
-        true
-    }
 }
 
 struct CommittedAutoExpansion(AppliedAutoExpansion);
-
-#[derive(Clone, Default)]
-pub(crate) struct PromptCacheSnapshot {
-    fingerprint: Option<crate::agent::prompt_fingerprint::PromptFingerprint>,
-    watermark: Option<usize>,
-    route_identity: (Option<u64>, u64, Option<u64>),
-}
-
-impl PromptCacheSnapshot {
-    #[cfg(test)]
-    fn capture(counters: &RuntimeCounters, session_key: &str) -> Self {
-        let _transition = counters.lock_prompt_cache_transition();
-        let route_identity = counters.prompt_cache_route_identity(session_key);
-        let fingerprints = counters.prompt_fingerprints.lock();
-        let watermarks = counters.prompt_cache_watermark.lock();
-        Self {
-            fingerprint: fingerprints.get(session_key).cloned(),
-            watermark: watermarks.get(session_key).copied(),
-            route_identity,
-        }
-    }
-
-    fn capture_and_clear(counters: &RuntimeCounters, session_key: &str) -> Self {
-        let _transition = counters.lock_prompt_cache_transition();
-        let route_identity = counters.prompt_cache_route_identity(session_key);
-        let mut fingerprints = counters.prompt_fingerprints.lock();
-        let mut watermarks = counters.prompt_cache_watermark.lock();
-        Self {
-            fingerprint: fingerprints.remove(session_key),
-            watermark: watermarks.remove(session_key),
-            route_identity,
-        }
-    }
-
-    fn restore(self, counters: &RuntimeCounters, session_key: &str) {
-        self.restore_inner(counters, session_key, || {});
-    }
-
-    fn restore_inner<F>(self, counters: &RuntimeCounters, session_key: &str, observe_identity: F)
-    where
-        F: FnOnce(),
-    {
-        let _transition = counters.lock_prompt_cache_transition();
-        if counters.prompt_cache_route_identity(session_key) != self.route_identity {
-            return;
-        }
-        observe_identity();
-        let mut fingerprints = counters.prompt_fingerprints.lock();
-        let mut watermarks = counters.prompt_cache_watermark.lock();
-        match self.fingerprint {
-            Some(fingerprint) => {
-                fingerprints.insert(session_key.to_string(), fingerprint);
-            }
-            None => {
-                fingerprints.remove(session_key);
-            }
-        }
-        match self.watermark {
-            Some(watermark) => {
-                watermarks.insert(session_key.to_string(), watermark);
-            }
-            None => {
-                watermarks.remove(session_key);
-            }
-        }
-    }
-
-    #[cfg(test)]
-    fn restore_observed<F>(self, counters: &RuntimeCounters, session_key: &str, observe_identity: F)
-    where
-        F: FnOnce(),
-    {
-        self.restore_inner(counters, session_key, observe_identity);
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct RetainedRouteCleanupGuard {
-    armed: Option<(
-        Arc<RuntimeCounters>,
-        String,
-        ExpansionCheckpoint,
-        PromptCacheSnapshot,
-    )>,
-}
-
-impl RetainedRouteCleanupGuard {
-    fn arm(
-        &mut self,
-        counters: Arc<RuntimeCounters>,
-        session_key: String,
-        checkpoint: ExpansionCheckpoint,
-        active_prompt_cache: PromptCacheSnapshot,
-    ) {
-        self.armed = Some((counters, session_key, checkpoint, active_prompt_cache));
-    }
-
-    fn disarm(&mut self) {
-        self.armed = None;
-    }
-}
-
-impl Drop for RetainedRouteCleanupGuard {
-    fn drop(&mut self) {
-        let Some((counters, session_key, checkpoint, active_prompt_cache)) = self.armed.take()
-        else {
-            return;
-        };
-        active_prompt_cache.restore(&counters, &session_key);
-        counters.discard_expansion_checkpoint(
-            &session_key,
-            checkpoint.old_higgs_session_id,
-            checkpoint.summary_node_id,
-        );
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ActiveCompactedRoute {
-    Active,
-    Fallback,
-    OverflowSummary,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RetainedExpansionFailure {
-    Unavailable,
-    ContextOverflow,
-}
-
-/// One cache route for the whole foreground turn. The retained variant keeps
-/// both active fallbacks so a later tool-iteration failure can replace the
-/// exact prefix without disturbing assistant/tool messages appended after it.
-pub(crate) enum HiggsSessionRoute {
-    ActiveCompacted {
-        route: ActiveCompactedRoute,
-    },
-    RetainedExpansion {
-        checkpoint: ExpansionCheckpoint,
-        compacted_prefix: Vec<Value>,
-        fallback_prefix: Option<Vec<Value>>,
-        exact_prefix_len: usize,
-        expansion_published: bool,
-        active_prompt_cache: PromptCacheSnapshot,
-    },
-}
-
-impl Default for HiggsSessionRoute {
-    fn default() -> Self {
-        Self::ActiveCompacted {
-            route: ActiveCompactedRoute::Active,
-        }
-    }
-}
-
-impl HiggsSessionRoute {
-    fn retained_expansion(
-        checkpoint: ExpansionCheckpoint,
-        compacted_prefix: Vec<Value>,
-        fallback_prefix: Option<Vec<Value>>,
-        exact_prefix_len: usize,
-        active_prompt_cache: PromptCacheSnapshot,
-    ) -> Self {
-        Self::RetainedExpansion {
-            checkpoint,
-            compacted_prefix,
-            fallback_prefix,
-            exact_prefix_len,
-            expansion_published: false,
-            active_prompt_cache,
-        }
-    }
-
-    pub(super) fn cache_route(&self) -> &'static str {
-        match self {
-            Self::ActiveCompacted {
-                route: ActiveCompactedRoute::Active,
-            } => "active",
-            Self::ActiveCompacted {
-                route: ActiveCompactedRoute::Fallback | ActiveCompactedRoute::OverflowSummary,
-            } => "fallback",
-            Self::RetainedExpansion { .. } => "retained_expansion",
-        }
-    }
-
-    fn mark_expansion_published(&mut self) {
-        if let Self::RetainedExpansion {
-            expansion_published,
-            ..
-        } = self
-        {
-            *expansion_published = true;
-        }
-    }
-
-    fn permits_auto_expansion(&self) -> bool {
-        matches!(
-            self,
-            Self::ActiveCompacted {
-                route: ActiveCompactedRoute::Active | ActiveCompactedRoute::Fallback
-            }
-        )
-    }
-
-    fn retained_checkpoint(&self) -> Option<&ExpansionCheckpoint> {
-        match self {
-            Self::RetainedExpansion { checkpoint, .. } => Some(checkpoint),
-            Self::ActiveCompacted { .. } => None,
-        }
-    }
-
-    fn take_retained_checkpoint(&mut self) -> Option<(ExpansionCheckpoint, PromptCacheSnapshot)> {
-        let retained = std::mem::take(self);
-        match retained {
-            Self::RetainedExpansion {
-                checkpoint,
-                active_prompt_cache,
-                ..
-            } => Some((checkpoint, active_prompt_cache)),
-            active => {
-                *self = active;
-                None
-            }
-        }
-    }
-
-    fn fallback_from_retained(
-        &mut self,
-        failure: RetainedExpansionFailure,
-        logical_messages: &mut MessageLog,
-        rendered_messages: &mut Vec<Value>,
-        protocol: &dyn ConversationProtocol,
-    ) -> Option<(ExpansionCheckpoint, PromptCacheSnapshot)> {
-        let retained = std::mem::take(self);
-        let Self::RetainedExpansion {
-            checkpoint,
-            compacted_prefix,
-            fallback_prefix,
-            exact_prefix_len,
-            expansion_published,
-            active_prompt_cache,
-        } = retained
-        else {
-            return None;
-        };
-        let use_flattened =
-            matches!(failure, RetainedExpansionFailure::Unavailable) && fallback_prefix.is_some();
-        *self = Self::ActiveCompacted {
-            route: if use_flattened {
-                ActiveCompactedRoute::Fallback
-            } else {
-                ActiveCompactedRoute::OverflowSummary
-            },
-        };
-        if expansion_published {
-            let tail = logical_messages
-                .get(exact_prefix_len..)
-                .unwrap_or_default()
-                .to_vec();
-            // Whole-log install, not `rewrite_committed`: the caller restores
-            // the retained session's own `PromptCacheSnapshot` afterwards —
-            // this path manages its cache identity explicitly.
-            let mut restored = if use_flattened {
-                fallback_prefix.unwrap_or(compacted_prefix)
-            } else {
-                compacted_prefix
-            };
-            restored.extend(tail);
-            logical_messages.install(restored);
-            *rendered_messages = render_via_protocol(protocol, logical_messages);
-        }
-        Some((checkpoint, active_prompt_cache))
-    }
-}
 
 impl CommittedAutoExpansion {
     /// Publish the prompt and its cache identity as one synchronous operation.
@@ -786,67 +450,15 @@ async fn commit_staged_auto_expansion(
         .then_some(CommittedAutoExpansion(staged))
 }
 
-/// Materialize a planned candidate without touching LCM eligibility state.
-/// Exact reuse requires one matching summary and complete, ordered durable IDs;
-/// every uncertain shape preserves the compacted prompt and appends the current
-/// bounded flattened representation instead.
-fn materialize_auto_expansion(
-    messages: &[Value],
-    candidate: &AutoExpansionCandidate,
-    checkpoint: Option<&ExpansionCheckpoint>,
-) -> AutoExpansionMaterialization {
-    let exact_span = checkpoint.and_then(|checkpoint| {
-        if !checkpoint.lease_confirmed || checkpoint.summary_node_id != candidate.node_id {
-            return None;
-        }
-        let replaced_source_ids = checkpoint
-            .replaced_span
-            .iter()
-            .map(|message| {
-                message
-                    .get("_db_id")
-                    .and_then(Value::as_u64)
-                    .and_then(|id| usize::try_from(id).ok())
-            })
-            .collect::<Option<Vec<_>>>()?;
-        (replaced_source_ids == candidate.source_ids).then_some(&checkpoint.replaced_span)
-    });
-    if let Some(replaced_span) = exact_span {
-        let mut positions = messages.iter().enumerate().filter_map(|(index, message)| {
-            (message == &candidate.summary_message).then_some(index)
-        });
-        if let Some(summary_index) = positions.next() {
-            if positions.next().is_none() {
-                let mut exact =
-                    Vec::with_capacity(messages.len().saturating_sub(1) + replaced_span.len());
-                exact.extend_from_slice(&messages[..summary_index]);
-                exact.extend(replaced_span.iter().cloned());
-                exact.extend_from_slice(&messages[summary_index + 1..]);
-                return AutoExpansionMaterialization {
-                    messages: exact,
-                    kind: AutoExpansionMaterializationKind::ExactCheckpoint,
-                };
-            }
-        }
-    }
-
-    let mut flattened = messages.to_vec();
-    flattened.push(candidate.flattened_fallback.clone());
-    AutoExpansionMaterialization {
-        messages: flattened,
-        kind: AutoExpansionMaterializationKind::FlattenedFallback,
-    }
-}
-
 /// Build and protocol-render the complete candidate prompt before publishing
-/// any mutation to the turn. Returning `None` leaves the compacted logical
-/// prompt untouched, which prevents an oversized expansion from triggering the
-/// ordinary emergency-trim/session-rotation path.
+/// any mutation to the turn. Each candidate appends its bounded flattened
+/// representation after the compacted history. Returning `None` leaves the
+/// compacted logical prompt untouched, which prevents an oversized expansion
+/// from triggering the ordinary emergency-trim/session-rotation path.
 fn apply_auto_expansion_candidates(
     protocol: &dyn ConversationProtocol,
     messages: &[Value],
     candidates: &[AutoExpansionCandidate],
-    checkpoint: Option<&ExpansionCheckpoint>,
     tool_def_tokens: usize,
     prompt_token_limit: usize,
 ) -> Option<AppliedAutoExpansion> {
@@ -854,37 +466,17 @@ fn apply_auto_expansion_candidates(
         return None;
     }
     let mut logical_messages = messages.to_vec();
-    let mut exact_count = 0;
-    for candidate in candidates {
-        let materialized = materialize_auto_expansion(&logical_messages, candidate, checkpoint);
-        if materialized.kind == AutoExpansionMaterializationKind::ExactCheckpoint {
-            exact_count += 1;
-        }
-        logical_messages = materialized.messages;
-    }
+    logical_messages.extend(
+        candidates
+            .iter()
+            .map(|candidate| candidate.flattened_fallback.clone()),
+    );
     let rendered_messages = render_via_protocol(protocol, &logical_messages);
     let estimated_tokens =
         TokenBudget::estimate_tokens(&rendered_messages).saturating_add(tool_def_tokens);
     if estimated_tokens > prompt_token_limit {
         return None;
     }
-    let retained_plan = if candidates.len() == 1 && exact_count == 1 {
-        checkpoint.cloned().map(|checkpoint| {
-            let fallback_prefix =
-                materialize_auto_expansion(messages, &candidates[0], None).messages;
-            let fallback_rendered = render_via_protocol(protocol, &fallback_prefix);
-            let fallback_tokens =
-                TokenBudget::estimate_tokens(&fallback_rendered).saturating_add(tool_def_tokens);
-            RetainedExpansionPlan {
-                checkpoint,
-                compacted_prefix: messages.to_vec(),
-                fallback_prefix: (fallback_tokens <= prompt_token_limit).then_some(fallback_prefix),
-                exact_prefix_len: logical_messages.len(),
-            }
-        })
-    } else {
-        None
-    };
     Some(AppliedAutoExpansion {
         logical_messages,
         rendered_messages,
@@ -892,12 +484,10 @@ fn apply_auto_expansion_candidates(
             .iter()
             .map(|candidate| candidate.node_id)
             .collect(),
-        exact_count,
         estimated_added_tokens: candidates
             .iter()
             .map(|candidate| candidate.estimated_tokens)
             .fold(0usize, usize::saturating_add),
-        retained_plan,
     })
 }
 
@@ -1621,7 +1211,6 @@ fn stateless_forced_recovery_messages(messages: &[Value]) -> Vec<Value> {
         NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD, NANOBOT_HIGGS_SESSION_ID_FIELD,
     };
     let mut retry = messages.to_vec();
-    strip_higgs_session_lease_control(&mut retry);
     // Constrained decoding cannot resume Higgs's retained route. Change only
     // the wire copy: durable conversation/session identity remains intact.
     for message in &mut retry {
@@ -1662,10 +1251,7 @@ fn install_higgs_capacity_fetch(
             let availability = profile.availability();
             if capacity.install_profile(endpoint, model, profile) == CapacityRefresh::BootChanged {
                 counters.reset_session_prompt_state(session_key);
-                counters.retire_higgs_session(
-                    session_key,
-                    crate::agent::agent_core::SessionRetirement::Drop,
-                );
+                counters.retire_higgs_session(session_key);
                 warn!(session = %session_key, "higgs_boot_changed_rotated_retained_session");
             }
             availability
@@ -2295,18 +1881,6 @@ impl AgentLoopShared {
             } else {
                 ctx.final_content = LIMIT_EXHAUSTED_REPLY.to_string();
             }
-        }
-
-        if let Some((checkpoint, active_prompt_cache)) =
-            ctx.higgs_session_route.take_retained_checkpoint()
-        {
-            active_prompt_cache.restore(&ctx.counters, &ctx.session_key);
-            ctx.counters.discard_expansion_checkpoint(
-                &ctx.session_key,
-                checkpoint.old_higgs_session_id,
-                checkpoint.summary_node_id,
-            );
-            ctx.retained_route_cleanup.disarm();
         }
 
         // If the loop exited via a non-streaming path (e.g. router preflight
@@ -3178,11 +2752,8 @@ impl AgentLoopShared {
                 "lcm_checkpoint_prefix_changed — sanctioned cache reset"
             );
         } else if higgs_capable {
-            ctx.counters.retire_higgs_session_preserving_prefix(
-                &ctx.session_key,
-                SessionRetirement::Drop,
-                anchor,
-            );
+            ctx.counters
+                .retire_higgs_session_preserving_prefix(&ctx.session_key, anchor);
             info!(
                 session = %ctx.session_key,
                 frozen_prefix,
@@ -3577,9 +3148,6 @@ impl AgentLoopShared {
         tool_defs: &[Value],
         max_tokens: u32,
     ) {
-        if !ctx.higgs_session_route.permits_auto_expansion() {
-            return;
-        }
         ctx.staged_auto_expansion = None;
         let Some(lcm_engine) = self.lcm_engines.lock().await.get(&ctx.session_id).cloned() else {
             return;
@@ -3624,21 +3192,10 @@ impl AgentLoopShared {
             return;
         }
 
-        let frozen_tool_hash = crate::agent::prompt_fingerprint::hash_tools(tool_defs);
-        let checkpoint = ctx.core.provider.supports_higgs_session_cache().then(|| {
-            ctx.counters.confirmed_expansion_checkpoint(
-                &ctx.session_key,
-                &ctx.core.model,
-                frozen_tool_hash,
-                RuntimeCounters::now_epoch_ms(),
-            )
-        });
-        let checkpoint = checkpoint.flatten();
         let Some(applied) = apply_auto_expansion_candidates(
             &*ctx.protocol,
             &ctx.messages,
             &candidates,
-            checkpoint.as_ref(),
             tool_def_tokens,
             prompt_token_limit,
         ) else {
@@ -3654,7 +3211,6 @@ impl AgentLoopShared {
         debug!(
             session = %ctx.session_key,
             count = applied.node_ids.len(),
-            exact_count = applied.exact_count,
             estimated_added_tokens = applied.estimated_added_tokens,
             "LCM auto-expand: planned expansion for provider response"
         );
@@ -3759,12 +3315,8 @@ impl AgentLoopShared {
         ctx: &mut TurnContext,
         counters: &RuntimeCounters,
         label: &str,
-        retry_policy: ProviderRequestRetryPolicy,
     ) -> StepResult {
-        if retry_policy.allows_retry()
-            && !ctx.flow.retries.api_retried
-            && is_retryable_provider_error(&e)
-        {
+        if !ctx.flow.retries.api_retried && is_retryable_provider_error(&e) {
             ctx.flow.retries.api_retried = true;
             warn!(model = %ctx.core.model, error = %e, "{label}_retrying");
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -3776,290 +3328,6 @@ impl AgentLoopShared {
             "I encountered an error: {}",
             e
         )))
-    }
-
-    fn discard_selected_expansion_checkpoint(
-        ctx: &mut TurnContext,
-        checkpoint: &ExpansionCheckpoint,
-        failure: RetainedExpansionFailure,
-    ) {
-        let used_flattened = matches!(failure, RetainedExpansionFailure::Unavailable)
-            && ctx
-                .staged_auto_expansion
-                .as_mut()
-                .is_some_and(|staged| staged.use_flattened_fallback(&*ctx.protocol));
-        if !used_flattened {
-            ctx.staged_auto_expansion = None;
-        }
-        ctx.higgs_session_route = HiggsSessionRoute::ActiveCompacted {
-            route: if used_flattened {
-                ActiveCompactedRoute::Fallback
-            } else {
-                ActiveCompactedRoute::OverflowSummary
-            },
-        };
-        ctx.counters.discard_expansion_checkpoint(
-            &ctx.session_key,
-            checkpoint.old_higgs_session_id,
-            checkpoint.summary_node_id,
-        );
-    }
-
-    fn fallback_retained_expansion_route(ctx: &mut TurnContext, failure: RetainedExpansionFailure) {
-        let checkpoint = ctx.higgs_session_route.fallback_from_retained(
-            failure,
-            &mut ctx.messages,
-            &mut ctx.rendered_messages,
-            &*ctx.protocol,
-        );
-        if let Some((checkpoint, active_prompt_cache)) = checkpoint {
-            match failure {
-                RetainedExpansionFailure::Unavailable => {
-                    let used_flattened = ctx
-                        .staged_auto_expansion
-                        .as_mut()
-                        .is_some_and(|staged| staged.use_flattened_fallback(&*ctx.protocol));
-                    if !used_flattened {
-                        ctx.staged_auto_expansion = None;
-                    }
-                }
-                RetainedExpansionFailure::ContextOverflow => {
-                    ctx.staged_auto_expansion = None;
-                }
-            }
-            active_prompt_cache.restore(&ctx.counters, &ctx.session_key);
-            ctx.counters.discard_expansion_checkpoint(
-                &ctx.session_key,
-                checkpoint.old_higgs_session_id,
-                checkpoint.summary_node_id,
-            );
-            ctx.retained_route_cleanup.disarm();
-        }
-    }
-
-    fn handle_retained_route_error(ctx: &mut TurnContext, error: &anyhow::Error) -> bool {
-        if matches!(
-            error.downcast_ref::<crate::errors::ProviderError>(),
-            Some(
-                crate::errors::ProviderError::HiggsRetentionCompactionRequired { .. }
-                    | crate::errors::ProviderError::HiggsRetainedSessionUnavailable { .. }
-                    | crate::errors::ProviderError::HiggsStaleRetentionContract { .. }
-            )
-        ) {
-            return false;
-        }
-        if ctx.higgs_session_route.retained_checkpoint().is_none() {
-            return false;
-        }
-        let Some(failure) = classify_retained_session_error(error).map(|kind| match kind {
-            RetainedSessionErrorKind::Unavailable => RetainedExpansionFailure::Unavailable,
-            RetainedSessionErrorKind::ContextOverflow => RetainedExpansionFailure::ContextOverflow,
-        }) else {
-            return false;
-        };
-        warn!(
-            session = %ctx.session_key,
-            error = %error,
-            "retained_expansion_foreground_failed_falling_back"
-        );
-        Self::fallback_retained_expansion_route(ctx, failure);
-        true
-    }
-
-    /// Validate the retained server state without generating tokens. This uses
-    /// the same provider object and request construction as foreground calls;
-    /// only the retained route control and zero completion budget differ.
-    async fn prepare_retained_expansion_route(
-        &self,
-        ctx: &mut TurnContext,
-        tool_defs_opt: Option<&[Value]>,
-        max_tokens: u32,
-    ) -> anyhow::Result<Option<StepResult>> {
-        if !ctx.core.provider.supports_higgs_session_cache()
-            || !matches!(
-                ctx.higgs_session_route,
-                HiggsSessionRoute::ActiveCompacted { .. }
-            )
-        {
-            return Ok(None);
-        }
-        let Some(plan) = ctx
-            .staged_auto_expansion
-            .as_ref()
-            .and_then(AppliedAutoExpansion::retained_plan)
-        else {
-            return Ok(None);
-        };
-        let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs_opt.unwrap_or(&[]));
-
-        let max_prompt_tokens = ctx
-            .effective_budget
-            .max_context()
-            .saturating_sub(max_tokens as usize)
-            .min(ctx.effective_budget.available_budget(0))
-            .min(u32::MAX as usize) as u32;
-        let frozen_tool_hash =
-            crate::agent::prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
-        let Some(reservation) = ctx.counters.reserve_retained_expansion_request(
-            &ctx.session_key,
-            &plan.checkpoint,
-            &ctx.core.model,
-            frozen_tool_hash,
-            max_prompt_tokens,
-            RuntimeCounters::now_epoch_ms(),
-        ) else {
-            Self::discard_selected_expansion_checkpoint(
-                ctx,
-                &plan.checkpoint,
-                RetainedExpansionFailure::Unavailable,
-            );
-            return Ok(None);
-        };
-        let sent_drop_ids = reservation.drop_ids().to_vec();
-        let mut messages = ctx
-            .staged_auto_expansion
-            .as_ref()
-            .map(|staged| staged.rendered_messages.clone())
-            .unwrap_or_else(|| render_via_protocol(&*ctx.protocol, &ctx.messages));
-        let prompt_estimate =
-            TokenBudget::estimate_tokens(&messages).saturating_add(tool_def_tokens);
-        if prompt_estimate > max_prompt_tokens as usize {
-            // Release the retained request before retiring its checkpoint.
-            // The foreground call must use the fitting compacted history,
-            // not the rejected request-local raw reconstruction.
-            drop(reservation);
-            Self::discard_selected_expansion_checkpoint(
-                ctx,
-                &plan.checkpoint,
-                RetainedExpansionFailure::ContextOverflow,
-            );
-            return Ok(None);
-        }
-        attach_higgs_session_control(&mut messages, reservation.control());
-        let recorded_request = RecordedProviderRequest {
-            messages: messages.clone(),
-            tools: tool_defs_opt.map(<[Value]>::to_vec),
-            model: ctx.core.model.clone(),
-            max_tokens: 0,
-            temperature: ctx.core.temperature,
-            thinking_budget: None,
-            top_p: None,
-            tool_choice: "auto".to_string(),
-            streaming: false,
-        };
-        let call_id = match ctx
-            .core
-            .sessions
-            .record_model_request(
-                &ctx.session_id,
-                &ctx.request_id,
-                ctx.turn_count,
-                ModelCallPurpose::RetainedExpansionPreflight,
-                &recorded_request,
-            )
-            .await
-        {
-            Ok(call_id) => call_id,
-            Err(error) => {
-                warn!(
-                    session = %ctx.session_key,
-                    %error,
-                    "retained_expansion_preflight_replay_persist_failed"
-                );
-                drop(reservation);
-                Self::discard_selected_expansion_checkpoint(
-                    ctx,
-                    &plan.checkpoint,
-                    RetainedExpansionFailure::Unavailable,
-                );
-                return Err(anyhow::anyhow!(
-                    "retained preflight request could not be recorded: {error}"
-                ));
-            }
-        };
-        let result = ctx
-            .core
-            .provider
-            .chat(
-                &messages,
-                tool_defs_opt,
-                Some(&ctx.core.model),
-                0,
-                ctx.core.temperature,
-                None,
-                None,
-            )
-            .await;
-        let failure = match result {
-            Ok(response) => {
-                if let Err(error) = ctx
-                    .core
-                    .sessions
-                    .record_model_response(
-                        &ctx.session_id,
-                        &ctx.request_id,
-                        ctx.turn_count,
-                        &call_id,
-                        &RecordedProviderResponse::from(&response),
-                    )
-                    .await
-                {
-                    return Err(anyhow::anyhow!(
-                        "retained preflight response replay persistence failed: {error}"
-                    ));
-                } else {
-                    response.outcome().err().map(anyhow::Error::new)
-                }
-            }
-            Err(error) => {
-                Self::persist_model_failure(ctx, &call_id, &error.to_string()).await?;
-                Some(error)
-            }
-        };
-        drop(reservation);
-        if let Some(error) = failure {
-            let failure = classify_retained_session_error(&error).map_or(
-                RetainedExpansionFailure::Unavailable,
-                |kind| match kind {
-                    RetainedSessionErrorKind::Unavailable => RetainedExpansionFailure::Unavailable,
-                    RetainedSessionErrorKind::ContextOverflow => {
-                        RetainedExpansionFailure::ContextOverflow
-                    }
-                },
-            );
-            warn!(
-                session = %ctx.session_key,
-                error = %error,
-                "retained_expansion_preflight_failed"
-            );
-            Self::discard_selected_expansion_checkpoint(ctx, &plan.checkpoint, failure);
-            return Ok(None);
-        }
-        if !sent_drop_ids.is_empty() {
-            ctx.counters
-                .clear_pending_higgs_session_drop_ids(&ctx.session_key, &sent_drop_ids);
-        }
-        // The retained request targets a different physical Higgs session.
-        // Snapshot and clear the active route's cache identity together so the
-        // first retained foreground call cannot be diagnosed against the
-        // compacted session's fingerprint. Later retained tool iterations then
-        // compare against the retained fingerprint installed by step_call_llm.
-        let active_prompt_cache =
-            PromptCacheSnapshot::capture_and_clear(&ctx.counters, &ctx.session_key);
-        ctx.higgs_session_route = HiggsSessionRoute::retained_expansion(
-            plan.checkpoint.clone(),
-            plan.compacted_prefix,
-            plan.fallback_prefix,
-            plan.exact_prefix_len,
-            active_prompt_cache.clone(),
-        );
-        ctx.retained_route_cleanup.arm(
-            Arc::clone(&ctx.counters),
-            ctx.session_key.clone(),
-            plan.checkpoint,
-            active_prompt_cache,
-        );
-        Ok(None)
     }
 
     async fn step_call_terminal_no_tools(
@@ -4281,18 +3549,6 @@ impl AgentLoopShared {
                 None
             }
         };
-        match self
-            .prepare_retained_expansion_route(ctx, tool_defs_opt, max_tokens)
-            .await
-        {
-            Ok(Some(step)) => return step,
-            Ok(None) => {}
-            Err(error) => {
-                counters.mark_inference_finished();
-                return StepResult::Done(IterationOutcome::Error(error.to_string()));
-            }
-        }
-
         // Expansion materialization is request-local until this call succeeds;
         // retries continue from the unchanged compacted logical conversation.
         let mut messages_for_llm = if let Some(staged) = &ctx.staged_auto_expansion {
@@ -4310,7 +3566,7 @@ impl AgentLoopShared {
         // local context). Make every such miss a one-line diagnosis.
         use crate::agent::prompt_fingerprint::{self, PromptDelta};
         let diag_t0 = std::time::Instant::now();
-        let mut prompt_fp = prompt_fingerprint::fingerprint(&messages_for_llm);
+        let prompt_fp = prompt_fingerprint::fingerprint(&messages_for_llm);
         // One checked invariant covering the five sites that write the prompt
         // HEAD: prepare_context's continuity note and stable-prompt assignment,
         // agent_core::append_to_system_prompt, context.rs's developer-message
@@ -4637,65 +3893,21 @@ impl AgentLoopShared {
             }) {
                 counters.restore_higgs_publication_hint(&ctx.session_key, &ctx.session_id);
             }
-            let frozen_tool_hash =
-                crate::agent::prompt_fingerprint::hash_tools(tool_defs_opt.unwrap_or(&[]));
             let max_prompt_tokens = ctx
                 .effective_budget
                 .max_context()
                 .saturating_sub(max_tokens as usize)
                 .min(ctx.effective_budget.available_budget(0))
                 .min(u32::MAX as usize) as u32;
-            let retained_checkpoint = ctx.higgs_session_route.retained_checkpoint().cloned();
-            let reservation = retained_checkpoint.as_ref().and_then(|checkpoint| {
-                counters.reserve_retained_expansion_request(
-                    &ctx.session_key,
-                    checkpoint,
-                    &ctx.core.model,
-                    frozen_tool_hash,
-                    max_prompt_tokens,
-                    RuntimeCounters::now_epoch_ms(),
-                )
-            });
-            let reservation = if let Some(reservation) = reservation {
-                reservation
-            } else {
-                if retained_checkpoint.is_some() {
-                    Self::fallback_retained_expansion_route(
-                        ctx,
-                        RetainedExpansionFailure::Unavailable,
-                    );
-                    messages_for_llm = if let Some(staged) = &ctx.staged_auto_expansion {
-                        staged.rendered_messages.clone()
-                    } else {
-                        ctx.rendered_messages.clone()
-                    };
-                    // The fallback re-render replaced the wire after the
-                    // fingerprint above was taken — re-hash so the stored
-                    // baseline matches the bytes actually shipped.
-                    prompt_fp = prompt_fingerprint::fingerprint(&messages_for_llm);
-                }
-                counters.reserve_higgs_session_request(
-                    &ctx.session_key,
-                    &ctx.session_id,
-                    &ctx.core.model,
-                    frozen_tool_hash,
-                    max_prompt_tokens,
-                    RuntimeCounters::now_epoch_ms(),
-                )
-            };
+            let reservation = counters.reserve_higgs_session_request(
+                &ctx.session_key,
+                &ctx.session_id,
+                max_prompt_tokens,
+            );
             pending_higgs_drop = reservation.drop_ids().to_vec();
             higgs_control = Some(reservation.control().clone());
             higgs_request_reservation = Some(reservation);
         }
-
-        let retry_policy = if higgs_control
-            .as_ref()
-            .is_some_and(|control| control.session_lease.is_some())
-        {
-            ProviderRequestRetryPolicy::OneShotLease
-        } else {
-            ProviderRequestRetryPolicy::Standard
-        };
 
         let request_hash = crate::agent::prompt_fingerprint::hash_provider_request(
             &messages_for_llm,
@@ -4833,10 +4045,6 @@ impl AgentLoopShared {
                                 record_error.to_string(),
                             ));
                         }
-                        if Self::handle_retained_route_error(ctx, &e) {
-                            counters.mark_inference_finished();
-                            return StepResult::Done(IterationOutcome::Continue);
-                        }
                         if let Some(step) = self
                             .handle_capacity_interruption(ctx, &e, &model_call_id)
                             .await
@@ -4852,14 +4060,7 @@ impl AgentLoopShared {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
                         }
-                        return Self::handle_llm_error(
-                            e,
-                            ctx,
-                            counters,
-                            "llm_stream_call",
-                            retry_policy,
-                        )
-                        .await;
+                        return Self::handle_llm_error(e, ctx, counters, "llm_stream_call").await;
                     }
                     Err(_) => {
                         counters.mark_inference_finished();
@@ -4892,10 +4093,6 @@ impl AgentLoopShared {
                                 record_error.to_string(),
                             ));
                         }
-                        if Self::handle_retained_route_error(ctx, &e) {
-                            counters.mark_inference_finished();
-                            return StepResult::Done(IterationOutcome::Continue);
-                        }
                         if let Some(step) = self
                             .handle_capacity_interruption(ctx, &e, &model_call_id)
                             .await
@@ -4911,14 +4108,7 @@ impl AgentLoopShared {
                             counters.mark_inference_finished();
                             return StepResult::Done(IterationOutcome::Continue);
                         }
-                        return Self::handle_llm_error(
-                            e,
-                            ctx,
-                            counters,
-                            "llm_stream_call",
-                            retry_policy,
-                        )
-                        .await;
+                        return Self::handle_llm_error(e, ctx, counters, "llm_stream_call").await;
                     }
                 }
             };
@@ -5158,10 +4348,6 @@ impl AgentLoopShared {
                         counters.mark_inference_finished();
                         return StepResult::Done(IterationOutcome::Error(record_error.to_string()));
                     }
-                    if Self::handle_retained_route_error(ctx, &e) {
-                        counters.mark_inference_finished();
-                        return StepResult::Done(IterationOutcome::Continue);
-                    }
                     if let Some(step) = self
                         .handle_capacity_interruption(ctx, &e, &model_call_id)
                         .await
@@ -5177,8 +4363,7 @@ impl AgentLoopShared {
                         counters.mark_inference_finished();
                         return StepResult::Done(IterationOutcome::Continue);
                     }
-                    return Self::handle_llm_error(e, ctx, counters, "llm_call", retry_policy)
-                        .await;
+                    return Self::handle_llm_error(e, ctx, counters, "llm_call").await;
                 }
             }
         };
@@ -5219,20 +4404,6 @@ impl AgentLoopShared {
         // Inference complete — allow watchdog health checks again.
         counters.mark_inference_finished();
 
-        if let Err(error) = response.outcome().map_err(anyhow::Error::new) {
-            if Self::handle_retained_route_error(ctx, &error) {
-                return StepResult::Done(IterationOutcome::Continue);
-            }
-        }
-
-        // A lease is a one-shot operation. Resolve the response that actually
-        // carried it before any forced-tool recovery can issue a second call.
-        if let Some(reservation) = higgs_request_reservation.as_mut() {
-            reservation.resolve_lease(response.usage.get("higgs_session_lease_active").copied());
-        }
-        let mut recovery_messages = messages_for_llm.clone();
-        strip_higgs_session_lease_control(&mut recovery_messages);
-
         // Tier-2 forced-tool recovery: if a local model botched a tool call
         // (intent prose / hallucinated syntax / empty block) instead of emitting
         // one, re-issue once with tool_choice=required so the Higgs backend
@@ -5241,7 +4412,7 @@ impl AgentLoopShared {
             .maybe_recover_botched_tool_call(
                 ctx,
                 response,
-                &recovery_messages,
+                &messages_for_llm,
                 tool_defs_opt,
                 max_tokens,
             )
@@ -5257,12 +4428,6 @@ impl AgentLoopShared {
                 return StepResult::Done(IterationOutcome::Error(error.to_string()));
             }
             ForcedToolRecoveryOutcome::ProviderError { original, error } => {
-                if Self::handle_retained_route_error(ctx, &error) {
-                    if ctx.flow.content_was_streamed {
-                        send_retract_reply_marker(&ctx.text_delta_tx);
-                    }
-                    return StepResult::Done(IterationOutcome::Continue);
-                }
                 warn!(
                     model = %ctx.core.model,
                     error = %error,
@@ -5293,12 +4458,6 @@ impl AgentLoopShared {
                         &ctx.session_key,
                         prompt_fp,
                     );
-                    ctx.higgs_session_route.mark_expansion_published();
-                } else {
-                    Self::fallback_retained_expansion_route(
-                        ctx,
-                        RetainedExpansionFailure::Unavailable,
-                    );
                 }
             } else {
                 let _transition = counters.lock_prompt_cache_transition();
@@ -5317,7 +4476,6 @@ impl AgentLoopShared {
             }
         } else {
             ctx.staged_auto_expansion = None;
-            Self::fallback_retained_expansion_route(ctx, RetainedExpansionFailure::Unavailable);
         }
 
         drop(higgs_request_reservation);
@@ -5874,169 +5032,14 @@ impl AgentLoopShared {
 mod tests {
     use super::{
         apply_auto_expansion_candidates, commit_staged_auto_expansion, divergent_message_digest,
-        materialize_auto_expansion, proactive_grounding_preserves_prefix_cache,
-        AppliedAutoExpansion, AutoExpansionMaterializationKind, HiggsSessionRoute, MessageLog,
-        PromptCacheSnapshot, RetainedExpansionFailure,
+        proactive_grounding_preserves_prefix_cache, render_via_protocol, AppliedAutoExpansion,
+        MessageLog,
     };
-    use crate::agent::agent_core::{
-        stable_higgs_session_id, ExpansionCheckpoint, RuntimeCounters, SessionRetirement,
-        ToolPresentationMode,
-    };
+    use crate::agent::agent_core::{stable_higgs_session_id, RuntimeCounters};
     use crate::agent::agent_loop::budget::attach_higgs_session_marker;
     use crate::agent::lcm::AutoExpansionCandidate;
     use crate::agent::protocol::CloudProtocol;
-    use crate::agent::token_budget::TokenBudget;
     use serde_json::{json, Value};
-    use std::sync::Arc;
-
-    #[test]
-    fn exact_auto_expansion_replaces_one_summary_in_place_with_original_tool_sequence() {
-        let summary = json!({
-            "role": "user",
-            "content": "summary placeholder",
-            "_lcm_summary": true,
-        });
-        let replaced_span = vec![
-            json!({
-                "role": "assistant",
-                "content": null,
-                "tool_calls": [{
-                    "id": "call-1",
-                    "type": "function",
-                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.rs\"}"},
-                }],
-                "_db_id": 11,
-            }),
-            json!({
-                "role": "tool",
-                "tool_call_id": "call-1",
-                "name": "read_file",
-                "content": "exact bytes",
-                "_db_id": 12,
-            }),
-            json!({
-                "role": "assistant",
-                "content": "The file contains exact bytes.",
-                "_db_id": 13,
-            }),
-        ];
-        let logical = vec![
-            json!({"role": "system", "content": "system"}),
-            json!({"role": "user", "content": "before", "_db_id": 10}),
-            summary.clone(),
-            json!({"role": "user", "content": "after", "_db_id": 14}),
-        ];
-        let candidate = AutoExpansionCandidate {
-            node_id: 7,
-            source_ids: vec![11, 12, 13],
-            estimated_tokens: 42,
-            flattened_fallback: json!({
-                "role": "user",
-                "content": "flattened fallback",
-                "_synthetic": true,
-            }),
-            summary_message: summary,
-        };
-        let checkpoint = ExpansionCheckpoint {
-            old_higgs_session_id: 91,
-            summary_node_id: 7,
-            replaced_span: replaced_span.clone(),
-            frozen_tool_hash: 1,
-            model: "bonsai".to_string(),
-            presentation_mode: ToolPresentationMode::Native,
-            catalog_generation: 1,
-            expires_at_ms: 900_000,
-            lease_confirmed: true,
-        };
-
-        let materialized = materialize_auto_expansion(&logical, &candidate, Some(&checkpoint));
-
-        assert_eq!(
-            materialized.kind,
-            AutoExpansionMaterializationKind::ExactCheckpoint
-        );
-        assert_eq!(
-            materialized.messages,
-            vec![
-                json!({"role": "system", "content": "system"}),
-                json!({"role": "user", "content": "before", "_db_id": 10}),
-                replaced_span[0].clone(),
-                replaced_span[1].clone(),
-                replaced_span[2].clone(),
-                json!({"role": "user", "content": "after", "_db_id": 14}),
-            ],
-            "exact expansion must preserve the original assistant/tool ordering at the summary index"
-        );
-    }
-
-    #[test]
-    fn unconfirmed_mismatched_or_incomplete_checkpoint_uses_flattened_fallback() {
-        let summary = json!({
-            "role": "user",
-            "content": "summary placeholder",
-            "_lcm_summary": true,
-        });
-        let logical = vec![
-            json!({"role": "system", "content": "system"}),
-            summary.clone(),
-            json!({"role": "user", "content": "latest"}),
-        ];
-        let candidate = AutoExpansionCandidate {
-            node_id: 7,
-            source_ids: vec![11, 12],
-            estimated_tokens: 20,
-            flattened_fallback: json!({
-                "role": "user",
-                "content": "flattened fallback",
-                "_synthetic": true,
-            }),
-            summary_message: summary,
-        };
-        let base = ExpansionCheckpoint {
-            old_higgs_session_id: 91,
-            summary_node_id: 7,
-            replaced_span: vec![
-                json!({"role": "user", "content": "raw one", "_db_id": 11}),
-                json!({"role": "assistant", "content": "raw two", "_db_id": 12}),
-            ],
-            frozen_tool_hash: 1,
-            model: "bonsai".to_string(),
-            presentation_mode: ToolPresentationMode::Native,
-            catalog_generation: 1,
-            expires_at_ms: 900_000,
-            lease_confirmed: true,
-        };
-        let mut unconfirmed = base.clone();
-        unconfirmed.lease_confirmed = false;
-        let mut node_mismatch = base.clone();
-        node_mismatch.summary_node_id = 8;
-        let mut incomplete = base.clone();
-        incomplete.replaced_span.pop();
-
-        for (case, checkpoint) in [
-            ("absent", None),
-            ("unconfirmed", Some(&unconfirmed)),
-            ("node mismatch", Some(&node_mismatch)),
-            ("incomplete raw coverage", Some(&incomplete)),
-        ] {
-            let materialized = materialize_auto_expansion(&logical, &candidate, checkpoint);
-            assert_eq!(
-                materialized.kind,
-                AutoExpansionMaterializationKind::FlattenedFallback,
-                "case {case}"
-            );
-            assert_eq!(
-                materialized.messages[..logical.len()],
-                logical,
-                "case {case}"
-            );
-            assert_eq!(
-                materialized.messages.last(),
-                Some(&candidate.flattened_fallback),
-                "case {case}"
-            );
-        }
-    }
 
     #[test]
     fn auto_expansion_application_renders_the_whole_prompt_and_rejects_overflow() {
@@ -6062,52 +5065,29 @@ mod tests {
             }),
             summary_message: summary,
         };
-        let checkpoint = ExpansionCheckpoint {
-            old_higgs_session_id: 91,
-            summary_node_id: 7,
-            replaced_span: vec![
-                json!({"role": "assistant", "content": "exact answer", "_db_id": 11}),
-                json!({"role": "user", "content": "exact follow-up", "_db_id": 12}),
-            ],
-            frozen_tool_hash: 1,
-            model: "bonsai".to_string(),
-            presentation_mode: ToolPresentationMode::Native,
-            catalog_generation: 1,
-            expires_at_ms: 900_000,
-            lease_confirmed: true,
-        };
 
         let applied = apply_auto_expansion_candidates(
             &CloudProtocol,
             &logical,
             &[candidate.clone()],
-            Some(&checkpoint),
             0,
             10_000,
         )
-        .expect("the exact reconstructed prompt fits");
+        .expect("the expanded prompt fits");
         assert_eq!(applied.node_ids, vec![7]);
         assert_eq!(
             applied.rendered_messages,
-            vec![
-                json!({"role": "system", "content": "system"}),
-                json!({"role": "user", "content": "before"}),
-                json!({"role": "assistant", "content": "exact answer"}),
-                json!({"role": "user", "content": "exact follow-up"}),
-                json!({"role": "user", "content": "after"}),
-            ],
-            "the entire reconstructed logical array must pass through CloudProtocol"
+            render_via_protocol(
+                &CloudProtocol,
+                &[logical.clone(), vec![candidate.flattened_fallback.clone()]].concat()
+            ),
+            "the summary stays in place and the flattened expansion is appended, \
+             rendered through the protocol as one array"
         );
 
-        assert!(apply_auto_expansion_candidates(
-            &CloudProtocol,
-            &logical,
-            &[candidate],
-            Some(&checkpoint),
-            0,
-            1,
-        )
-        .is_none());
+        assert!(
+            apply_auto_expansion_candidates(&CloudProtocol, &logical, &[candidate], 0, 1).is_none()
+        );
         assert_eq!(
             logical,
             vec![
@@ -6118,482 +5098,6 @@ mod tests {
             ],
             "oversize planning must not rewrite the compacted logical prompt"
         );
-    }
-
-    #[tokio::test]
-    async fn oversized_retained_preflight_falls_back_to_compacted_prompt() {
-        use super::{render_via_protocol, ActiveCompactedRoute};
-        let (agent, workspace) = crate::agent::agent_loop::tests::retained_overflow_test_harness();
-        let message =
-            crate::bus::events::InboundMessage::new("test", "user", "overflow", "continue");
-        let mut ctx = agent
-            .shared
-            .prepare_context(&message, None, None, None, None)
-            .await;
-        let summary = json!({"role": "user", "content": "compact evidence", "_lcm_summary": true});
-        let compacted = vec![
-            json!({"role":"system", "content":"system"}),
-            summary.clone(),
-        ];
-        ctx.messages = MessageLog::committed(compacted.clone());
-        ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
-        ctx.effective_budget = TokenBudget::new(256, 64);
-        ctx.higgs_session_route = HiggsSessionRoute::ActiveCompacted {
-            route: ActiveCompactedRoute::Active,
-        };
-        let counters = ctx.counters.clone();
-        let key = &ctx.session_key;
-        let model = &ctx.core.model;
-        let tools = Vec::new();
-        let tool_hash = crate::agent::prompt_fingerprint::hash_tools(&tools);
-        counters.install_tool_catalog(key, ToolPresentationMode::Native, tools);
-        let old_id = stable_higgs_session_id(&ctx.session_id, 0);
-        assert!(counters.record_higgs_session_id(key, old_id));
-        let now = RuntimeCounters::now_epoch_ms();
-        counters.retire_higgs_session(
-            key,
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: 7,
-                replaced_span: vec![
-                    json!({"role":"user", "content":"raw evidence ".repeat(500), "_db_id":11}),
-                ],
-                checkpoint_context: counters
-                    .expansion_checkpoint_context(key, model, tool_hash, now + 60_000)
-                    .unwrap(),
-            },
-        );
-        let mut lease = counters.reserve_higgs_session_request(
-            key,
-            &ctx.session_id,
-            model,
-            tool_hash,
-            30_000,
-            now,
-        );
-        lease.resolve_lease(Some(1));
-        drop(lease);
-        let checkpoint = counters
-            .confirmed_expansion_checkpoint(key, model, tool_hash, now)
-            .unwrap();
-        let candidate = AutoExpansionCandidate {
-            node_id: 7,
-            source_ids: vec![11],
-            estimated_tokens: 1_000,
-            flattened_fallback: json!({"role":"user", "content":"flattened evidence"}),
-            summary_message: summary,
-        };
-        ctx.staged_auto_expansion = apply_auto_expansion_candidates(
-            &*ctx.protocol,
-            &compacted,
-            &[candidate],
-            Some(&checkpoint),
-            0,
-            10_000,
-        );
-        assert!(ctx
-            .staged_auto_expansion
-            .as_ref()
-            .unwrap()
-            .retained_plan()
-            .is_some());
-        let result = agent
-            .shared
-            .prepare_retained_expansion_route(&mut ctx, None, 64)
-            .await
-            .unwrap();
-        assert!(
-            result.is_none(),
-            "continue through the ordinary compacted route"
-        );
-        assert!(
-            ctx.staged_auto_expansion.is_none(),
-            "oversized raw reconstruction must be discarded"
-        );
-        assert_eq!(ctx.messages.to_vec(), compacted);
-        assert!(counters.expansion_checkpoint(&ctx.session_key).is_none());
-        assert!(counters
-            .pending_higgs_session_drop_ids(&ctx.session_key)
-            .contains(&old_id));
-        let _ = std::fs::remove_dir_all(workspace);
-    }
-
-    #[test]
-    fn retained_route_fallback_preserves_post_expansion_tool_tail() {
-        let checkpoint = ExpansionCheckpoint {
-            old_higgs_session_id: 91,
-            summary_node_id: 7,
-            replaced_span: vec![json!({"role": "user", "content": "exact", "_db_id": 11})],
-            frozen_tool_hash: 1,
-            model: "bonsai".to_string(),
-            presentation_mode: ToolPresentationMode::Native,
-            catalog_generation: 1,
-            expires_at_ms: 900_000,
-            lease_confirmed: true,
-        };
-        let compacted_prefix = vec![
-            json!({"role": "system", "content": "system"}),
-            json!({"role": "user", "content": "summary"}),
-        ];
-        let fallback_prefix = vec![
-            compacted_prefix[0].clone(),
-            compacted_prefix[1].clone(),
-            json!({"role": "user", "content": "flattened fallback", "_synthetic": true}),
-        ];
-        let exact_prefix = vec![
-            compacted_prefix[0].clone(),
-            json!({"role": "user", "content": "exact", "_db_id": 11}),
-        ];
-        let tail = vec![
-            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "tc", "type": "function", "function": {"name": "read", "arguments": "{}"}}]}),
-            json!({"role": "tool", "tool_call_id": "tc", "content": "result"}),
-        ];
-
-        for (failure, expected_prefix) in [
-            (RetainedExpansionFailure::Unavailable, &fallback_prefix),
-            (RetainedExpansionFailure::ContextOverflow, &compacted_prefix),
-        ] {
-            let mut route = HiggsSessionRoute::retained_expansion(
-                checkpoint.clone(),
-                compacted_prefix.clone(),
-                Some(fallback_prefix.clone()),
-                exact_prefix.len(),
-                PromptCacheSnapshot::default(),
-            );
-            route.mark_expansion_published();
-            let mut logical = MessageLog::committed(exact_prefix.clone());
-            logical.extend_draft(tail.clone());
-            let mut rendered = Vec::new();
-
-            let retired = route
-                .fallback_from_retained(failure, &mut logical, &mut rendered, &CloudProtocol)
-                .expect("retained route must return its checkpoint for deletion");
-
-            assert_eq!(retired.0, checkpoint);
-            assert_eq!(route.cache_route(), "fallback");
-            assert_eq!(
-                &logical[..expected_prefix.len()],
-                expected_prefix.as_slice()
-            );
-            assert_eq!(&logical[expected_prefix.len()..], tail.as_slice());
-            assert_eq!(
-                rendered,
-                crate::agent::agent_loop::render_via_protocol(&CloudProtocol, &logical)
-            );
-        }
-    }
-
-    #[test]
-    fn exact_fit_with_oversized_flattened_variant_keeps_summary_only_fallback() {
-        let summary = json!({
-            "role": "user",
-            "content": "summary placeholder",
-            "_lcm_summary": true,
-        });
-        let compacted = vec![
-            json!({"role": "system", "content": "system"}),
-            summary.clone(),
-            json!({"role": "user", "content": "latest"}),
-        ];
-        let candidate = AutoExpansionCandidate {
-            node_id: 7,
-            source_ids: vec![11],
-            estimated_tokens: 1,
-            flattened_fallback: json!({
-                "role": "user",
-                "content": "oversized flattened detail ".repeat(4_000),
-                "_synthetic": true,
-            }),
-            summary_message: summary,
-        };
-        let checkpoint = ExpansionCheckpoint {
-            old_higgs_session_id: 91,
-            summary_node_id: 7,
-            replaced_span: vec![json!({
-                "role": "user",
-                "content": "tiny exact detail",
-                "_db_id": 11,
-            })],
-            frozen_tool_hash: 1,
-            model: "bonsai".to_string(),
-            presentation_mode: ToolPresentationMode::Native,
-            catalog_generation: 1,
-            expires_at_ms: 900_000,
-            lease_confirmed: true,
-        };
-        let exact = materialize_auto_expansion(&compacted, &candidate, Some(&checkpoint));
-        let exact_limit = TokenBudget::estimate_tokens(
-            &crate::agent::agent_loop::render_via_protocol(&CloudProtocol, &exact.messages),
-        );
-        let mut applied = apply_auto_expansion_candidates(
-            &CloudProtocol,
-            &compacted,
-            &[candidate],
-            Some(&checkpoint),
-            0,
-            exact_limit,
-        )
-        .expect("the exact route fits its authoritative prompt limit");
-        let plan = applied
-            .retained_plan()
-            .expect("exact route must be retained");
-        assert!(
-            plan.fallback_prefix.is_none(),
-            "the independently oversized flattened variant must not be staged"
-        );
-        assert!(!applied.use_flattened_fallback(&CloudProtocol));
-        assert_eq!(applied.logical_messages, exact.messages);
-    }
-
-    #[test]
-    fn leaving_retained_route_restores_active_fingerprint_and_watermark_together() {
-        let counters = RuntimeCounters::new(32_768);
-        let session = "cli:retained-cache-snapshot";
-        let active = crate::agent::prompt_fingerprint::fingerprint(&[
-            json!({"role": "system", "content": "system"}),
-            json!({"role": "user", "content": "summary"}),
-        ]);
-        counters
-            .prompt_fingerprints
-            .lock()
-            .insert(session.to_string(), active.clone());
-        counters
-            .prompt_cache_watermark
-            .lock()
-            .insert(session.to_string(), 2);
-        let snapshot = PromptCacheSnapshot::capture(&counters, session);
-
-        counters.prompt_fingerprints.lock().insert(
-            session.to_string(),
-            crate::agent::prompt_fingerprint::fingerprint(&[
-                json!({"role": "system", "content": "system"}),
-                json!({"role": "user", "content": "exact"}),
-            ]),
-        );
-        counters
-            .prompt_cache_watermark
-            .lock()
-            .insert(session.to_string(), 99);
-        snapshot.restore(&counters, session);
-
-        assert_eq!(
-            counters.prompt_fingerprints.lock().get(session),
-            Some(&active)
-        );
-        assert_eq!(
-            counters.prompt_cache_watermark.lock().get(session),
-            Some(&2)
-        );
-    }
-
-    #[test]
-    fn reset_before_retained_fallback_does_not_restore_stale_active_cache_state() {
-        let counters = RuntimeCounters::new(32_768);
-        let session = "cli:retained-cache-reset";
-        let durable = "sqlite:retained-cache-reset";
-        counters.install_tool_catalog(session, ToolPresentationMode::Native, Vec::new());
-        let old_active = counters.activate_higgs_session_id(session, durable);
-        let fingerprint = crate::agent::prompt_fingerprint::fingerprint(&[
-            json!({"role": "system", "content": "system"}),
-            json!({"role": "user", "content": "summary"}),
-        ]);
-        counters
-            .prompt_fingerprints
-            .lock()
-            .insert(session.to_string(), fingerprint);
-        counters
-            .prompt_cache_watermark
-            .lock()
-            .insert(session.to_string(), 2);
-        let snapshot = PromptCacheSnapshot::capture_and_clear(&counters, session);
-
-        counters.reset_session_prompt_state(session);
-        counters.install_tool_catalog(session, ToolPresentationMode::Native, Vec::new());
-        let fresh_active = counters.activate_higgs_session_id(session, durable);
-        assert_ne!(fresh_active, old_active);
-        snapshot.restore(&counters, session);
-
-        assert_eq!(counters.prompt_fingerprints.lock().get(session), None);
-        assert_eq!(counters.prompt_cache_watermark.lock().get(session), None);
-    }
-
-    #[test]
-    fn concurrent_reset_after_snapshot_identity_observation_wins_restore_transaction() {
-        let counters = Arc::new(RuntimeCounters::new(32_768));
-        let session = "cli:retained-cache-restore-race";
-        let durable = "sqlite:retained-cache-restore-race";
-        counters.install_tool_catalog(session, ToolPresentationMode::Native, Vec::new());
-        counters.activate_higgs_session_id(session, durable);
-        let stale_fingerprint = crate::agent::prompt_fingerprint::fingerprint(&[
-            json!({"role": "system", "content": "stale system"}),
-            json!({"role": "user", "content": "stale summary"}),
-        ]);
-        counters
-            .prompt_fingerprints
-            .lock()
-            .insert(session.to_string(), stale_fingerprint);
-        counters
-            .prompt_cache_watermark
-            .lock()
-            .insert(session.to_string(), 2);
-        let snapshot = PromptCacheSnapshot::capture_and_clear(&counters, session);
-        let identity_observed = Arc::new(std::sync::Barrier::new(2));
-        let release_restore = Arc::new(std::sync::Barrier::new(2));
-        let restore_thread = {
-            let counters = Arc::clone(&counters);
-            let identity_observed = Arc::clone(&identity_observed);
-            let release_restore = Arc::clone(&release_restore);
-            std::thread::spawn(move || {
-                snapshot.restore_observed(&counters, session, || {
-                    identity_observed.wait();
-                    release_restore.wait();
-                });
-            })
-        };
-        identity_observed.wait();
-
-        let reset_started = Arc::new(std::sync::Barrier::new(2));
-        let (reset_done_tx, reset_done_rx) = std::sync::mpsc::channel();
-        let reset_thread = {
-            let counters = Arc::clone(&counters);
-            let reset_started = Arc::clone(&reset_started);
-            std::thread::spawn(move || {
-                reset_started.wait();
-                counters.reset_session_prompt_state(session);
-                counters.install_tool_catalog(session, ToolPresentationMode::Native, Vec::new());
-                counters.activate_higgs_session_id(session, durable);
-                reset_done_tx.send(()).unwrap();
-            })
-        };
-        reset_started.wait();
-        // Without a shared transition lock the reset completes inside the
-        // observed check→write gap. With the fixed transaction it blocks here
-        // until restore is released, then clears the just-restored state.
-        let _ = reset_done_rx.recv_timeout(std::time::Duration::from_millis(100));
-        release_restore.wait();
-        restore_thread.join().unwrap();
-        reset_thread.join().unwrap();
-
-        assert_eq!(counters.prompt_fingerprints.lock().get(session), None);
-        assert_eq!(counters.prompt_cache_watermark.lock().get(session), None);
-
-        let fresh_fingerprint = crate::agent::prompt_fingerprint::fingerprint(&[
-            json!({"role": "system", "content": "fresh system"}),
-            json!({"role": "user", "content": "fresh prompt"}),
-        ]);
-        counters
-            .prompt_fingerprints
-            .lock()
-            .insert(session.to_string(), fresh_fingerprint.clone());
-        counters
-            .prompt_cache_watermark
-            .lock()
-            .insert(session.to_string(), 2);
-        let fresh_snapshot = PromptCacheSnapshot::capture_and_clear(&counters, session);
-        fresh_snapshot.restore(&counters, session);
-        assert_eq!(
-            counters.prompt_fingerprints.lock().get(session),
-            Some(&fresh_fingerprint)
-        );
-        assert_eq!(
-            counters.prompt_cache_watermark.lock().get(session),
-            Some(&2)
-        );
-    }
-
-    #[test]
-    fn concurrent_colliding_reservation_cannot_publish_prior_route_cache_state() {
-        let counters = Arc::new(RuntimeCounters::new(32_768));
-        let session = "cli:retained-cache-reservation-race";
-        let prior_durable = "sqlite:retained-cache-prior";
-        let changed_durable = "sqlite:retained-cache-changed";
-        let model = "bonsai";
-        let definitions = Vec::new();
-        let tool_hash = crate::agent::prompt_fingerprint::hash_tools(&definitions);
-        counters.install_tool_catalog(session, ToolPresentationMode::Native, definitions);
-
-        // Retirement advances the epoch to one. Retain exactly the ID the
-        // changed durable identity would derive at that epoch, forcing request
-        // activation to advance the epoch again while selecting its active ID.
-        let colliding_id = stable_higgs_session_id(changed_durable, 1);
-        assert!(counters.record_higgs_session_id(session, colliding_id));
-        counters.retire_higgs_session(
-            session,
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: 73,
-                replaced_span: vec![json!({"role": "user", "content": "exact raw"})],
-                checkpoint_context: counters
-                    .expansion_checkpoint_context(session, model, tool_hash, 900_000)
-                    .unwrap(),
-            },
-        );
-        let prior_active = counters.activate_higgs_session_id(session, prior_durable);
-        assert_ne!(prior_active, colliding_id);
-
-        let stale_fingerprint = crate::agent::prompt_fingerprint::fingerprint(&[
-            json!({"role": "system", "content": "prior system"}),
-            json!({"role": "user", "content": "prior summary"}),
-        ]);
-        counters
-            .prompt_fingerprints
-            .lock()
-            .insert(session.to_string(), stale_fingerprint);
-        counters
-            .prompt_cache_watermark
-            .lock()
-            .insert(session.to_string(), 2);
-        let snapshot = PromptCacheSnapshot::capture_and_clear(&counters, session);
-
-        let identity_observed = Arc::new(std::sync::Barrier::new(2));
-        let release_restore = Arc::new(std::sync::Barrier::new(2));
-        let restore_thread = {
-            let counters = Arc::clone(&counters);
-            let identity_observed = Arc::clone(&identity_observed);
-            let release_restore = Arc::clone(&release_restore);
-            std::thread::spawn(move || {
-                snapshot.restore_observed(&counters, session, || {
-                    identity_observed.wait();
-                    release_restore.wait();
-                });
-            })
-        };
-        identity_observed.wait();
-
-        let reservation_started = Arc::new(std::sync::Barrier::new(2));
-        let (reservation_done_tx, reservation_done_rx) = std::sync::mpsc::channel();
-        let reservation_thread = {
-            let counters = Arc::clone(&counters);
-            let reservation_started = Arc::clone(&reservation_started);
-            std::thread::spawn(move || {
-                reservation_started.wait();
-                let reservation = counters.reserve_higgs_session_request(
-                    session,
-                    changed_durable,
-                    model,
-                    tool_hash,
-                    31_744,
-                    600_000,
-                );
-                reservation_done_tx.send(reservation.active_id()).unwrap();
-            })
-        };
-        reservation_started.wait();
-        // The unfixed reservation can complete in this check→write gap. The
-        // fixed path waits for the transition, then invalidates the old route's
-        // restored cache maps as part of installing the changed active ID.
-        let completed_before_release = reservation_done_rx
-            .recv_timeout(std::time::Duration::from_millis(100))
-            .ok();
-        release_restore.wait();
-        restore_thread.join().unwrap();
-        let active_id =
-            completed_before_release.unwrap_or_else(|| reservation_done_rx.recv().unwrap());
-        reservation_thread.join().unwrap();
-
-        assert_eq!(active_id, stable_higgs_session_id(changed_durable, 2));
-        assert_eq!(counters.session_prompt_epoch(session), 2);
-        assert_eq!(counters.active_higgs_session_id(session), Some(active_id));
-        assert_eq!(counters.prompt_fingerprints.lock().get(session), None);
-        assert_eq!(counters.prompt_cache_watermark.lock().get(session), None);
     }
 
     #[test]
@@ -6629,7 +5133,6 @@ mod tests {
                 &CloudProtocol,
                 &logical,
                 &[candidate.clone()],
-                None,
                 0,
                 10_000,
             )
@@ -6686,9 +5189,7 @@ mod tests {
             logical_messages: vec![json!({"role": "user", "content": "expanded logical"})],
             rendered_messages: vec![json!({"role": "user", "content": "expanded wire"})],
             node_ids,
-            exact_count: 0,
             estimated_added_tokens: 4,
-            retained_plan: None,
         }
     }
 
@@ -6980,64 +5481,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unsent_higgs_request_id_is_not_repurposed_as_expansion_checkpoint() {
-        let counters = std::sync::Arc::new(RuntimeCounters::new(16_384));
-        let session_key = "cli:reserved-request";
-        let definitions = vec![json!({"type": "function", "name": "read"})];
-        counters.install_tool_catalog(
-            session_key,
-            ToolPresentationMode::Native,
-            definitions.clone(),
-        );
-        let tool_hash = crate::agent::prompt_fingerprint::hash_tools(&definitions);
-        let reservation = counters.reserve_higgs_session_request(
-            session_key,
-            "sqlite:reserved-request",
-            "bonsai",
-            tool_hash,
-            15_000,
-            600_000,
-        );
-        let emitted_active_id = reservation.active_id();
-
-        let retiring = std::sync::Arc::clone(&counters);
-        std::thread::spawn(move || {
-            retiring.retire_higgs_session(
-                session_key,
-                SessionRetirement::LeaseForExpansion {
-                    summary_node_id: 41,
-                    replaced_span: vec![json!({"role": "user", "content": "exact raw"})],
-                    checkpoint_context: retiring
-                        .expansion_checkpoint_context(session_key, "bonsai", tool_hash, 900_000)
-                        .unwrap(),
-                },
-            );
-        })
-        .join()
-        .unwrap();
-
-        let mut messages = vec![json!({"role": "system", "content": "system"})];
-        attach_higgs_session_marker(&mut messages, emitted_active_id, reservation.drop_ids());
-        let wire_active_id = messages[0]
-            [crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD]
-            .as_u64()
-            .unwrap();
-
-        assert_eq!(wire_active_id, emitted_active_id);
-        assert_ne!(
-            counters
-                .expansion_checkpoint(session_key)
-                .map(|checkpoint| checkpoint.old_higgs_session_id),
-            Some(wire_active_id),
-            "an ID reserved for an unsent request became the expansion checkpoint"
-        );
-        assert!(
-            !reservation.drop_ids().contains(&wire_active_id),
-            "the same request must not emit its active ID as a drop"
-        );
-    }
-
     // Pure decision helpers — one per `is_local` read site. Each mirrors the
     // exact expression used at the cited line. Keeping them here (test-only)
     // avoids adding production code while still giving us assertion targets.
@@ -7181,7 +5624,7 @@ mod tests {
 
 #[cfg(test)]
 mod forced_recovery_tests {
-    use super::{should_attempt_forced_recovery, ProviderRequestRetryPolicy};
+    use super::should_attempt_forced_recovery;
 
     #[test]
     fn context_reset_announcement_is_explicit_and_restricts_retry_tools() {
@@ -7260,13 +5703,11 @@ mod forced_recovery_tests {
     fn forced_recovery_does_not_require_retained_cache() {
         use crate::providers::openai_compat::{
             NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD, NANOBOT_HIGGS_SESSION_ID_FIELD,
-            NANOBOT_HIGGS_SESSION_LEASE_FIELD,
         };
         let source = vec![
             serde_json::json!({"role":"user", "content":"preserve this update",
             NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD:"require_continuation",
-            NANOBOT_HIGGS_SESSION_ID_FIELD:42,
-            NANOBOT_HIGGS_SESSION_LEASE_FIELD:{"session_id":42,"ttl_seconds":30}}),
+            NANOBOT_HIGGS_SESSION_ID_FIELD:42}),
         ];
         let retry = super::stateless_forced_recovery_messages(&source);
         assert_eq!(retry[0]["content"], source[0]["content"]);
@@ -7274,7 +5715,6 @@ mod forced_recovery_tests {
             .get(NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD)
             .is_none());
         assert!(retry[0].get(NANOBOT_HIGGS_SESSION_ID_FIELD).is_none());
-        assert!(retry[0].get(NANOBOT_HIGGS_SESSION_LEASE_FIELD).is_none());
         assert_eq!(
             source[0][NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD],
             "require_continuation"
@@ -7286,12 +5726,6 @@ mod forced_recovery_tests {
     const CLAIMED: &str = "Let me check that file for you."; // prose only — NOT an error
     const HALLUCINATED: &str = "I'll read it.\n[Called read_file({\"path\":\"/x\"})]"; // HallucinatedToolCall
     const CLEAN: &str = "The answer is 42."; // Ok — a genuine final answer
-
-    #[test]
-    fn one_shot_lease_request_disables_outer_retry() {
-        assert!(!ProviderRequestRetryPolicy::OneShotLease.allows_retry());
-        assert!(ProviderRequestRetryPolicy::Standard.allows_retry());
-    }
 
     /// Forced recovery re-issues the turn with `tool_choice=required`, which
     /// throws away whatever the model just wrote. Prose that merely sounds

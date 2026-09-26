@@ -155,44 +155,6 @@ enum PromptCacheBookkeeping {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HiggsSessionLease {
-    pub(crate) session_id: u64,
-    pub(crate) ttl_seconds: u32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ExpansionCheckpoint {
-    pub(crate) old_higgs_session_id: u64,
-    pub(crate) summary_node_id: usize,
-    pub(crate) replaced_span: Vec<Value>,
-    pub(crate) frozen_tool_hash: u64,
-    pub(crate) model: String,
-    pub(crate) presentation_mode: ToolPresentationMode,
-    pub(crate) catalog_generation: u64,
-    pub(crate) expires_at_ms: u64,
-    pub(crate) lease_confirmed: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ExpansionCheckpointContext {
-    model: String,
-    presentation_mode: ToolPresentationMode,
-    catalog_generation: u64,
-    frozen_tool_hash: u64,
-    expires_at_ms: u64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum SessionRetirement {
-    Drop,
-    LeaseForExpansion {
-        summary_node_id: usize,
-        replaced_span: Vec<Value>,
-        checkpoint_context: ExpansionCheckpointContext,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HiggsSessionReusePolicy {
     Seed,
     RequireContinuation,
@@ -211,7 +173,6 @@ impl HiggsSessionReusePolicy {
 pub(crate) struct HiggsSessionControl {
     pub(crate) active_id: u64,
     pub(crate) drop_ids: Vec<u64>,
-    pub(crate) session_lease: Option<HiggsSessionLease>,
     pub(crate) reuse_policy: HiggsSessionReusePolicy,
     pub(crate) max_prompt_tokens: u32,
 }
@@ -224,9 +185,6 @@ struct HiggsSessionState {
     /// or absent ID is explicitly unseeded and may not require continuation.
     published_active_id: Option<u64>,
     pending_drop_ids: Vec<u64>,
-    pending_lease: Option<HiggsSessionLease>,
-    claimed_lease_id: Option<u64>,
-    expansion_checkpoint: Option<ExpansionCheckpoint>,
     in_flight_active_ids: std::collections::HashMap<u64, usize>,
     /// One-shot exception for the intentional LCM session rotation: the next
     /// request may reuse the stable prefix anchor instead of looking cold.
@@ -237,7 +195,6 @@ pub(crate) struct HiggsSessionRequestReservation {
     counters: Arc<RuntimeCounters>,
     session_key: String,
     control: HiggsSessionControl,
-    lease_finalized: bool,
 }
 
 impl HiggsSessionRequestReservation {
@@ -262,31 +219,12 @@ impl HiggsSessionRequestReservation {
     pub(crate) fn control(&self) -> &HiggsSessionControl {
         &self.control
     }
-
-    pub(crate) fn resolve_lease(&mut self, lease_active: Option<i64>) {
-        let Some(lease) = self.control.session_lease else {
-            return;
-        };
-        if self.lease_finalized {
-            return;
-        }
-        self.counters.resolve_higgs_session_lease(
-            &self.session_key,
-            lease.session_id,
-            lease_active,
-        );
-        self.lease_finalized = true;
-    }
 }
 
 impl Drop for HiggsSessionRequestReservation {
     fn drop(&mut self) {
-        self.resolve_lease(None);
-        self.counters.release_higgs_session_request(
-            &self.session_key,
-            self.control.active_id,
-            self.control.session_lease.map(|lease| lease.session_id),
-        );
+        self.counters
+            .release_higgs_session_request(&self.session_key, self.control.active_id);
     }
 }
 
@@ -366,9 +304,9 @@ pub struct RuntimeCounters {
     /// here, then catalog → Higgs state → cache maps; no async work is allowed
     /// while held.
     prompt_cache_transition: parking_lot::Mutex<()>,
-    /// Retained-session transitions are one transaction: epoch, active id,
-    /// expansion lease/checkpoint, and pending drops must never be observed in
-    /// partially updated combinations by concurrent requests or resets.
+    /// Retained-session transitions are one transaction: epoch, active id and
+    /// pending drops must never be observed in partially updated combinations
+    /// by concurrent requests or resets.
     higgs_sessions: parking_lot::Mutex<std::collections::HashMap<String, HiggsSessionState>>,
     /// Eager-drop flusher, wired by the embedding loop with the active
     /// provider: fires a standalone higgs session-drop right after a
@@ -538,129 +476,6 @@ impl RuntimeCounters {
                 generation,
             },
         );
-        let mut sessions = self.higgs_sessions.lock();
-        let Some(state) = sessions.get_mut(session_key) else {
-            return;
-        };
-        if let Some(checkpoint) = state.expansion_checkpoint.take() {
-            Self::queue_higgs_session_drop(state, checkpoint.old_higgs_session_id);
-        }
-        if let Some(lease) = state.pending_lease.take() {
-            Self::queue_higgs_session_drop(state, lease.session_id);
-        }
-    }
-
-    pub(crate) fn expansion_checkpoint_context(
-        &self,
-        session_key: &str,
-        model: &str,
-        frozen_tool_hash: u64,
-        expires_at_ms: u64,
-    ) -> Option<ExpansionCheckpointContext> {
-        self.session_tool_catalogs
-            .lock()
-            .get(session_key)
-            .map(|catalog| ExpansionCheckpointContext {
-                model: model.to_string(),
-                presentation_mode: catalog.mode,
-                catalog_generation: catalog.generation,
-                frozen_tool_hash,
-                expires_at_ms,
-            })
-    }
-
-    /// Identity of the physical compacted prompt-cache route. Cache snapshots
-    /// captured for a retained turn may be restored only while all three
-    /// components still match; reset, rotation, and catalog replacement each
-    /// invalidate at least one component.
-    pub(crate) fn prompt_cache_route_identity(
-        &self,
-        session_key: &str,
-    ) -> (Option<u64>, u64, Option<u64>) {
-        let catalogs = self.session_tool_catalogs.lock();
-        let catalog_generation = catalogs.get(session_key).map(|catalog| catalog.generation);
-        let sessions = self.higgs_sessions.lock();
-        let state = sessions.get(session_key);
-        (
-            state.and_then(|state| state.active_id),
-            state.map_or(0, |state| state.epoch),
-            catalog_generation,
-        )
-    }
-
-    /// Return an exact-reconstruction checkpoint only when the lease and every
-    /// prompt-identity component still match the request being planned.
-    /// Selection is read-only; request reservation remains the invalidation
-    /// boundary that queues stale retained IDs for deletion.
-    pub(crate) fn confirmed_expansion_checkpoint(
-        &self,
-        session_key: &str,
-        model: &str,
-        frozen_tool_hash: u64,
-        now_ms: u64,
-    ) -> Option<ExpansionCheckpoint> {
-        self.confirmed_expansion_checkpoint_inner(
-            session_key,
-            model,
-            frozen_tool_hash,
-            now_ms,
-            || {},
-        )
-    }
-
-    fn confirmed_expansion_checkpoint_inner<F>(
-        &self,
-        session_key: &str,
-        model: &str,
-        frozen_tool_hash: u64,
-        now_ms: u64,
-        observe_catalog_snapshot: F,
-    ) -> Option<ExpansionCheckpoint>
-    where
-        F: FnOnce(),
-    {
-        let catalogs = self.session_tool_catalogs.lock();
-        let catalog_identity = catalogs
-            .get(session_key)
-            .map(|catalog| (catalog.mode, catalog.generation));
-        observe_catalog_snapshot();
-        let checkpoint = self
-            .higgs_sessions
-            .lock()
-            .get(session_key)
-            .and_then(|state| state.expansion_checkpoint.as_ref())
-            .filter(|checkpoint| {
-                checkpoint.lease_confirmed
-                    && checkpoint.expires_at_ms > now_ms
-                    && checkpoint.model == model
-                    && checkpoint.frozen_tool_hash == frozen_tool_hash
-                    && catalog_identity
-                        == Some((checkpoint.presentation_mode, checkpoint.catalog_generation))
-            })
-            .cloned();
-        drop(catalogs);
-        checkpoint
-    }
-
-    #[cfg(test)]
-    fn confirmed_expansion_checkpoint_observed<F>(
-        &self,
-        session_key: &str,
-        model: &str,
-        frozen_tool_hash: u64,
-        now_ms: u64,
-        observe_catalog_snapshot: F,
-    ) -> Option<ExpansionCheckpoint>
-    where
-        F: FnOnce(),
-    {
-        self.confirmed_expansion_checkpoint_inner(
-            session_key,
-            model,
-            frozen_tool_hash,
-            now_ms,
-            observe_catalog_snapshot,
-        )
     }
 
     pub(crate) fn clear_tool_catalog(&self, session_key: &str) -> bool {
@@ -677,7 +492,7 @@ impl RuntimeCounters {
             self.clear_tool_catalog(session_key);
             self.note_cache_reset(session_key, "session_reset");
         }
-        self.retire_higgs_session(session_key, SessionRetirement::Drop)
+        self.retire_higgs_session(session_key)
     }
 
     /// Reset all prompt-cache bookkeeping for a session and advance its prompt epoch.
@@ -757,36 +572,17 @@ impl RuntimeCounters {
     }
 
     #[cfg(test)]
-    pub fn record_higgs_session_id(&self, session_key: &str, session_id: u64) -> bool {
+    pub fn record_higgs_session_id(&self, session_key: &str, session_id: u64) {
         let mut sessions = self.higgs_sessions.lock();
         let state = sessions.entry(session_key.to_string()).or_default();
-        if state
-            .expansion_checkpoint
-            .as_ref()
-            .is_some_and(|checkpoint| checkpoint.old_higgs_session_id == session_id)
-        {
-            return false;
-        }
         state.active_id = Some(session_id);
-        true
     }
 
     fn activate_higgs_session_state(
         state: &mut HiggsSessionState,
         durable_session_id: &str,
     ) -> u64 {
-        let mut active_id = stable_higgs_session_id(durable_session_id, state.epoch);
-        while state
-            .expansion_checkpoint
-            .as_ref()
-            .is_some_and(|checkpoint| checkpoint.old_higgs_session_id == active_id)
-        {
-            state.epoch = state
-                .epoch
-                .checked_add(1)
-                .expect("Higgs prompt epoch exhausted");
-            active_id = stable_higgs_session_id(durable_session_id, state.epoch);
-        }
+        let active_id = stable_higgs_session_id(durable_session_id, state.epoch);
         state.active_id = Some(active_id);
         active_id
     }
@@ -824,36 +620,11 @@ impl RuntimeCounters {
         self: &Arc<Self>,
         session_key: &str,
         durable_session_id: &str,
-        model: &str,
-        frozen_tool_hash: u64,
         max_prompt_tokens: u32,
-        now_ms: u64,
     ) -> HiggsSessionRequestReservation {
         let _transition = self.prompt_cache_transition.lock();
-        let catalogs = self.session_tool_catalogs.lock();
-        let catalog_identity = catalogs
-            .get(session_key)
-            .map(|catalog| (catalog.mode, catalog.generation));
         let mut sessions = self.higgs_sessions.lock();
         let state = sessions.entry(session_key.to_string()).or_default();
-        let checkpoint_is_valid = state
-            .expansion_checkpoint
-            .as_ref()
-            .is_none_or(|checkpoint| {
-                checkpoint.expires_at_ms > now_ms
-                    && checkpoint.model == model
-                    && checkpoint.frozen_tool_hash == frozen_tool_hash
-                    && catalog_identity
-                        == Some((checkpoint.presentation_mode, checkpoint.catalog_generation))
-            });
-        if !checkpoint_is_valid {
-            if let Some(checkpoint) = state.expansion_checkpoint.take() {
-                Self::queue_higgs_session_drop(state, checkpoint.old_higgs_session_id);
-            }
-            if let Some(lease) = state.pending_lease.take() {
-                Self::queue_higgs_session_drop(state, lease.session_id);
-            }
-        }
         let prior_route_identity = (state.active_id, state.epoch);
         let active_id = Self::activate_higgs_session_state(state, durable_session_id);
         let preserve_prefix = state.preserved_prefix_epoch == Some(state.epoch);
@@ -863,17 +634,6 @@ impl RuntimeCounters {
         }
         state.preserved_prefix_epoch = None;
         *state.in_flight_active_ids.entry(active_id).or_default() += 1;
-        let session_lease = if state.claimed_lease_id.is_none() {
-            state.pending_lease.take().inspect(|lease| {
-                state.claimed_lease_id = Some(lease.session_id);
-                *state
-                    .in_flight_active_ids
-                    .entry(lease.session_id)
-                    .or_default() += 1;
-            })
-        } else {
-            None
-        };
         let drop_ids = state
             .pending_drop_ids
             .iter()
@@ -891,164 +651,24 @@ impl RuntimeCounters {
             control: HiggsSessionControl {
                 active_id,
                 drop_ids,
-                session_lease,
                 reuse_policy,
                 max_prompt_tokens,
             },
-            lease_finalized: false,
         }
     }
 
-    /// Pin a confirmed retained checkpoint for one request without changing
-    /// the compacted session's active ID. Catalog and checkpoint identity are
-    /// validated under the established catalog→Higgs lock order.
-    pub(crate) fn reserve_retained_expansion_request(
-        self: &Arc<Self>,
-        session_key: &str,
-        checkpoint: &ExpansionCheckpoint,
-        model: &str,
-        frozen_tool_hash: u64,
-        max_prompt_tokens: u32,
-        now_ms: u64,
-    ) -> Option<HiggsSessionRequestReservation> {
-        let catalogs = self.session_tool_catalogs.lock();
-        let catalog_identity = catalogs
-            .get(session_key)
-            .map(|catalog| (catalog.mode, catalog.generation));
-        let mut sessions = self.higgs_sessions.lock();
-        let state = sessions.get_mut(session_key)?;
-        let current_matches = state.expansion_checkpoint.as_ref().is_some_and(|current| {
-            current == checkpoint
-                && current.lease_confirmed
-                && current.expires_at_ms > now_ms
-                && current.model == model
-                && current.frozen_tool_hash == frozen_tool_hash
-                && catalog_identity == Some((current.presentation_mode, current.catalog_generation))
-        });
-        if !current_matches {
-            if state
-                .expansion_checkpoint
-                .as_ref()
-                .is_some_and(|current| current == checkpoint)
-            {
-                state.expansion_checkpoint = None;
-                Self::queue_higgs_session_drop(state, checkpoint.old_higgs_session_id);
-            }
-            return None;
-        }
-
-        let retained_id = checkpoint.old_higgs_session_id;
-        *state.in_flight_active_ids.entry(retained_id).or_default() += 1;
-        let drop_ids = state
-            .pending_drop_ids
-            .iter()
-            .copied()
-            .filter(|drop_id| !state.in_flight_active_ids.contains_key(drop_id))
-            .collect();
-        drop(catalogs);
-        Some(HiggsSessionRequestReservation {
-            counters: Arc::clone(self),
-            session_key: session_key.to_string(),
-            control: HiggsSessionControl {
-                active_id: retained_id,
-                drop_ids,
-                session_lease: None,
-                reuse_policy: HiggsSessionReusePolicy::RequireContinuation,
-                max_prompt_tokens,
-            },
-            lease_finalized: false,
-        })
-    }
-
-    /// Retire only the checkpoint selected by this turn. A newer replacement
-    /// remains intact; the compacted active ID is never rotated or overwritten.
-    pub(crate) fn discard_expansion_checkpoint(
-        &self,
-        session_key: &str,
-        old_higgs_session_id: u64,
-        summary_node_id: usize,
-    ) -> bool {
-        let mut sessions = self.higgs_sessions.lock();
-        let Some(state) = sessions.get_mut(session_key) else {
-            return false;
-        };
-        let matches = state
-            .expansion_checkpoint
-            .as_ref()
-            .is_some_and(|checkpoint| {
-                checkpoint.old_higgs_session_id == old_higgs_session_id
-                    && checkpoint.summary_node_id == summary_node_id
-            });
-        if !matches {
-            return false;
-        }
-        state.expansion_checkpoint = None;
-        Self::queue_higgs_session_drop(state, old_higgs_session_id);
-        true
-    }
-
-    pub(crate) fn resolve_higgs_session_lease(
-        &self,
-        session_key: &str,
-        leased_session_id: u64,
-        lease_active: Option<i64>,
-    ) {
+    fn release_higgs_session_request(&self, session_key: &str, active_id: u64) {
         let mut sessions = self.higgs_sessions.lock();
         let Some(state) = sessions.get_mut(session_key) else {
             return;
         };
-        if state.claimed_lease_id != Some(leased_session_id) {
-            return;
-        }
-        state.claimed_lease_id = None;
-        let checkpoint_matches = state
-            .expansion_checkpoint
-            .as_ref()
-            .is_some_and(|checkpoint| checkpoint.old_higgs_session_id == leased_session_id);
-        if !checkpoint_matches {
-            Self::queue_higgs_session_drop(state, leased_session_id);
-            return;
-        }
-        if lease_active == Some(1) {
-            if let Some(checkpoint) = state.expansion_checkpoint.as_mut() {
-                checkpoint.lease_confirmed = true;
-            }
-        } else {
-            state.expansion_checkpoint = None;
-            Self::queue_higgs_session_drop(state, leased_session_id);
-        }
-    }
-
-    fn release_higgs_session_request(
-        &self,
-        session_key: &str,
-        active_id: u64,
-        leased_session_id: Option<u64>,
-    ) {
-        let mut sessions = self.higgs_sessions.lock();
-        let Some(state) = sessions.get_mut(session_key) else {
+        let Some(in_flight) = state.in_flight_active_ids.get_mut(&active_id) else {
             return;
         };
-        for session_id in [Some(active_id), leased_session_id].into_iter().flatten() {
-            let Some(in_flight) = state.in_flight_active_ids.get_mut(&session_id) else {
-                continue;
-            };
-            *in_flight -= 1;
-            if *in_flight == 0 {
-                state.in_flight_active_ids.remove(&session_id);
-            }
+        *in_flight -= 1;
+        if *in_flight == 0 {
+            state.in_flight_active_ids.remove(&active_id);
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn activate_higgs_session_id(
-        &self,
-        session_key: &str,
-        durable_session_id: &str,
-    ) -> u64 {
-        let mut sessions = self.higgs_sessions.lock();
-        let state = sessions.entry(session_key.to_string()).or_default();
-        Self::activate_higgs_session_state(state, durable_session_id)
     }
 
     fn queue_higgs_session_drop(state: &mut HiggsSessionState, session_id: u64) {
@@ -1067,17 +687,8 @@ impl RuntimeCounters {
         *self.higgs_drop_flusher.lock() = Some(flusher);
     }
 
-    pub(crate) fn retire_higgs_session(
-        &self,
-        session_key: &str,
-        retirement: SessionRetirement,
-    ) -> u64 {
-        self.retire_higgs_session_inner(
-            session_key,
-            retirement,
-            PromptCacheBookkeeping::Clear,
-            || {},
-        )
+    pub(crate) fn retire_higgs_session(&self, session_key: &str) -> u64 {
+        self.retire_higgs_session_inner(session_key, PromptCacheBookkeeping::Clear)
     }
 
     /// Rotate the retained session after an LCM fold while keeping the exact
@@ -1086,27 +697,16 @@ impl RuntimeCounters {
     pub(crate) fn retire_higgs_session_preserving_prefix(
         &self,
         session_key: &str,
-        retirement: SessionRetirement,
         anchor: StablePromptAnchor,
     ) -> u64 {
-        self.retire_higgs_session_inner(
-            session_key,
-            retirement,
-            PromptCacheBookkeeping::Preserve(anchor),
-            || {},
-        )
+        self.retire_higgs_session_inner(session_key, PromptCacheBookkeeping::Preserve(anchor))
     }
 
-    fn retire_higgs_session_inner<F>(
+    fn retire_higgs_session_inner(
         &self,
         session_key: &str,
-        retirement: SessionRetirement,
         bookkeeping: PromptCacheBookkeeping,
-        observe_transaction: F,
-    ) -> u64
-    where
-        F: FnOnce(),
-    {
+    ) -> u64 {
         let _transition = self.prompt_cache_transition.lock();
         let mut sessions = self.higgs_sessions.lock();
         match &bookkeeping {
@@ -1128,66 +728,18 @@ impl RuntimeCounters {
             }
         }
         let state = sessions.entry(session_key.to_string()).or_default();
-        let prior_checkpoint = state.expansion_checkpoint.take();
-        let prior_lease = state.pending_lease.take();
-        if let Some(checkpoint) = prior_checkpoint {
-            Self::queue_higgs_session_drop(state, checkpoint.old_higgs_session_id);
-        }
-        if let Some(lease) = prior_lease {
-            Self::queue_higgs_session_drop(state, lease.session_id);
-        }
-
-        let active_id = state.active_id.take();
-        let active_is_in_flight =
-            active_id.is_some_and(|active_id| state.in_flight_active_ids.contains_key(&active_id));
-        observe_transaction();
-        match (retirement, active_id) {
-            (SessionRetirement::Drop, Some(active_id)) => {
-                Self::queue_higgs_session_drop(state, active_id);
-                // Eager reclaim: POST the drop to higgs now instead of
-                // waiting for the next chat request, so the retired
-                // session's resident KV frees before the next (smaller)
-                // prompt prefills. Best-effort — the piggybacked drop fields
-                // remain the durable fallback, and a session still in flight
-                // reports dropped=false and is covered by that fallback.
-                let flush = self.higgs_drop_flusher.lock().clone();
-                if let Some(flush) = flush {
-                    flush(active_id);
-                }
+        if let Some(active_id) = state.active_id.take() {
+            Self::queue_higgs_session_drop(state, active_id);
+            // Eager reclaim: POST the drop to higgs now instead of waiting for
+            // the next chat request, so the retired session's resident KV
+            // frees before the next (smaller) prompt prefills. Best-effort —
+            // the piggybacked drop fields remain the durable fallback, and a
+            // session still in flight reports dropped=false and is covered by
+            // that fallback.
+            let flush = self.higgs_drop_flusher.lock().clone();
+            if let Some(flush) = flush {
+                flush(active_id);
             }
-            (
-                SessionRetirement::LeaseForExpansion {
-                    summary_node_id,
-                    replaced_span,
-                    checkpoint_context,
-                },
-                Some(active_id),
-            ) if !active_is_in_flight => {
-                let lease = HiggsSessionLease {
-                    session_id: active_id,
-                    ttl_seconds: 300,
-                };
-                state.pending_lease = Some(lease);
-                state.expansion_checkpoint = Some(ExpansionCheckpoint {
-                    old_higgs_session_id: active_id,
-                    summary_node_id,
-                    replaced_span,
-                    frozen_tool_hash: checkpoint_context.frozen_tool_hash,
-                    model: checkpoint_context.model,
-                    presentation_mode: checkpoint_context.presentation_mode,
-                    catalog_generation: checkpoint_context.catalog_generation,
-                    expires_at_ms: checkpoint_context.expires_at_ms,
-                    lease_confirmed: false,
-                });
-            }
-            (SessionRetirement::LeaseForExpansion { .. }, Some(active_id)) => {
-                // A selected request may already carry this ID on its immutable
-                // wire payload. Retiring it as an expansion checkpoint before
-                // that request completes would make one ID both active and
-                // retained. Fall back to a one-shot drop on the next request.
-                Self::queue_higgs_session_drop(state, active_id);
-            }
-            (SessionRetirement::Drop | SessionRetirement::LeaseForExpansion { .. }, None) => {}
         }
 
         state.epoch = state.epoch.saturating_add(1);
@@ -1196,43 +748,6 @@ impl RuntimeCounters {
             PromptCacheBookkeeping::Preserve(_) => Some(state.epoch),
         };
         state.epoch
-    }
-
-    #[cfg(test)]
-    fn retire_higgs_session_observed<F>(
-        &self,
-        session_key: &str,
-        retirement: SessionRetirement,
-        observe_transaction: F,
-    ) -> u64
-    where
-        F: FnOnce(),
-    {
-        self.retire_higgs_session_inner(
-            session_key,
-            retirement,
-            PromptCacheBookkeeping::Clear,
-            observe_transaction,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn expansion_checkpoint(&self, session_key: &str) -> Option<ExpansionCheckpoint> {
-        self.higgs_sessions
-            .lock()
-            .get(session_key)
-            .and_then(|state| state.expansion_checkpoint.clone())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pending_higgs_session_lease(
-        &self,
-        session_key: &str,
-    ) -> Option<HiggsSessionLease> {
-        self.higgs_sessions
-            .lock()
-            .get(session_key)
-            .and_then(|state| state.pending_lease)
     }
 
     #[cfg(test)]
@@ -1692,8 +1207,6 @@ pub(crate) struct PendingCompaction {
     /// Exact live array that LCM compacted. Its leading system/developer prefix
     /// is non-durable and may change; the durable conversation bytes may not.
     pub snapshot: Vec<Value>,
-    /// DAG node created by this exact compaction transaction.
-    pub summary_node_id: usize,
 }
 
 pub(crate) fn prompt_prefix_len(messages: &[Value]) -> usize {
@@ -1724,47 +1237,6 @@ impl PendingCompaction {
 
     pub(crate) fn matches_snapshot_prefix(&self, messages: &[Value]) -> bool {
         self.live_conversation_watermark(messages).is_some()
-    }
-
-    /// Capture the single contiguous raw span replaced by the created summary.
-    /// A merge over an older summary cannot prove full raw coverage and must
-    /// use the normal compacted fallback rather than retained expansion.
-    pub(crate) fn expansion_retirement(
-        &self,
-        checkpoint_context: ExpansionCheckpointContext,
-    ) -> Option<SessionRetirement> {
-        let prefix_len = self
-            .snapshot
-            .iter()
-            .zip(&self.result.messages)
-            .take_while(|(before, after)| before == after)
-            .count();
-        let suffix_len = self.snapshot[prefix_len..]
-            .iter()
-            .rev()
-            .zip(self.result.messages[prefix_len..].iter().rev())
-            .take_while(|(before, after)| before == after)
-            .count();
-        let snapshot_end = self.snapshot.len().saturating_sub(suffix_len);
-        let result_end = self.result.messages.len().saturating_sub(suffix_len);
-        let replaced_span = self.snapshot.get(prefix_len..snapshot_end)?;
-        let replacement = self.result.messages.get(prefix_len..result_end)?;
-        let replaces_with_one_summary = replacement.len() == 1
-            && replacement[0]
-                .get("_lcm_summary")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-        let has_full_raw_span = !replaced_span.is_empty()
-            && replaced_span
-                .iter()
-                .all(|message| message.get("_db_id").is_some());
-        (replaces_with_one_summary && has_full_raw_span).then(|| {
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: self.summary_node_id,
-                replaced_span: replaced_span.to_vec(),
-                checkpoint_context,
-            }
-        })
     }
 }
 
@@ -1804,513 +1276,31 @@ pub(crate) fn apply_compaction_result(
 mod tests {
     use super::*;
 
-    fn checkpoint_context(frozen_tool_hash: u64, expires_at_ms: u64) -> ExpansionCheckpointContext {
-        ExpansionCheckpointContext {
-            model: "bonsai".to_string(),
-            presentation_mode: ToolPresentationMode::Native,
-            catalog_generation: 1,
-            frozen_tool_hash,
-            expires_at_ms,
-        }
-    }
-
-    #[test]
-    fn pending_compaction_recovers_one_exact_raw_replacement_span() {
-        let system = serde_json::json!({"role": "system", "content": "system"});
-        let first = serde_json::json!({"role": "user", "content": "first", "_db_id": 1});
-        let second = serde_json::json!({"role": "assistant", "content": "second", "_db_id": 2});
-        let tail = serde_json::json!({"role": "user", "content": "tail", "_db_id": 3});
-        let summary = serde_json::json!({
-            "role": "user",
-            "content": "summary",
-            "_lcm_summary": true
-        });
-        let pending = PendingCompaction {
-            result: crate::agent::compaction::CompactionResult {
-                messages: vec![system.clone(), summary, tail.clone()],
-            },
-            snapshot: vec![system, first.clone(), second.clone(), tail],
-            summary_node_id: 44,
-        };
-
-        let Some(SessionRetirement::LeaseForExpansion {
-            summary_node_id,
-            replaced_span,
-            checkpoint_context,
-        }) = pending.expansion_retirement(checkpoint_context(0xabc, 900_000))
-        else {
-            panic!("one contiguous raw replacement must be recoverable");
-        };
-        assert_eq!(summary_node_id, 44);
-        assert_eq!(replaced_span, vec![first, second]);
-        assert_eq!(checkpoint_context.frozen_tool_hash, 0xabc);
-        assert_eq!(checkpoint_context.expires_at_ms, 900_000);
-    }
-
-    #[test]
-    fn merged_summary_without_full_raw_span_is_not_checkpointed() {
-        let old_summary = serde_json::json!({
-            "role": "user",
-            "content": "older summary",
-            "_lcm_summary": true
-        });
-        let raw = serde_json::json!({"role": "user", "content": "new raw", "_db_id": 9});
-        let new_summary = serde_json::json!({
-            "role": "user",
-            "content": "merged summary",
-            "_lcm_summary": true
-        });
-        let pending = PendingCompaction {
-            result: crate::agent::compaction::CompactionResult {
-                messages: vec![new_summary],
-            },
-            snapshot: vec![old_summary, raw],
-            summary_node_id: 45,
-        };
-
-        assert_eq!(
-            pending.expansion_retirement(checkpoint_context(7, 900_000)),
-            None
-        );
-    }
-
-    #[test]
-    fn compaction_leases_old_id_and_reset_drops_every_retained_id() {
-        let counters = RuntimeCounters::new(32_768);
-        let session = "cli:checkpoint";
-        let old_id = stable_higgs_session_id(session, 0);
-        assert!(counters.record_higgs_session_id(session, old_id));
-
-        let next_epoch = counters.retire_higgs_session(
-            session,
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: 44,
-                replaced_span: vec![serde_json::json!({"role": "user", "content": "exact"})],
-                checkpoint_context: checkpoint_context(7, 900_000),
-            },
-        );
-        let checkpoint = counters
-            .expansion_checkpoint(session)
-            .expect("compaction must register a checkpoint");
-        assert_eq!(checkpoint.old_higgs_session_id, old_id);
-        assert_eq!(checkpoint.summary_node_id, 44);
-        assert_eq!(checkpoint.frozen_tool_hash, 7);
-        assert_eq!(checkpoint.expires_at_ms, 900_000);
-        assert!(!checkpoint.lease_confirmed);
-        assert_eq!(
-            counters.pending_higgs_session_lease(session),
-            Some(HiggsSessionLease {
-                session_id: old_id,
-                ttl_seconds: 300,
-            })
-        );
-        assert!(counters.pending_higgs_session_drop_ids(session).is_empty());
-
-        let fresh_id = stable_higgs_session_id(session, next_epoch);
-        assert_ne!(fresh_id, old_id);
-        assert!(counters.record_higgs_session_id(session, fresh_id));
-        assert!(
-            !counters.record_higgs_session_id(session, old_id),
-            "the retained expansion id must never become the compacted active id"
-        );
-
-        counters.reset_session_prompt_state(session);
-        assert_eq!(counters.expansion_checkpoint(session), None);
-        assert_eq!(counters.pending_higgs_session_lease(session), None);
-        let mut drops = counters.pending_higgs_session_drop_ids(session);
-        drops.sort_unstable();
-        let mut expected = vec![old_id, fresh_id];
-        expected.sort_unstable();
-        assert_eq!(drops, expected);
-    }
-
-    #[test]
-    fn newer_compaction_replaces_and_drops_prior_checkpoint() {
-        let counters = RuntimeCounters::new(32_768);
-        let session = "cli:replacement";
-        assert!(counters.record_higgs_session_id(session, 10));
-        counters.retire_higgs_session(
-            session,
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: 1,
-                replaced_span: vec![serde_json::json!({"role": "user", "content": "first"})],
-                checkpoint_context: checkpoint_context(100, 1_000),
-            },
-        );
-        assert!(counters.record_higgs_session_id(session, 20));
-
-        counters.retire_higgs_session(
-            session,
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: 2,
-                replaced_span: vec![serde_json::json!({"role": "user", "content": "second"})],
-                checkpoint_context: checkpoint_context(200, 2_000),
-            },
-        );
-
-        assert_eq!(counters.pending_higgs_session_drop_ids(session), vec![10]);
-        assert_eq!(
-            counters.pending_higgs_session_lease(session),
-            Some(HiggsSessionLease {
-                session_id: 20,
-                ttl_seconds: 300,
-            })
-        );
-        let checkpoint = counters.expansion_checkpoint(session).unwrap();
-        assert_eq!(checkpoint.old_higgs_session_id, 20);
-        assert_eq!(checkpoint.summary_node_id, 2);
-        assert_eq!(counters.active_higgs_session_id(session), None);
-    }
-
-    #[test]
-    fn exact_expansion_checkpoint_requires_confirmation_and_current_identity() {
-        let counters = Arc::new(RuntimeCounters::new(32_768));
-        let session = "cli:exact-expansion-identity";
-        let durable = "sqlite:exact-expansion-identity";
-        let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
-        let tool_hash = crate::agent::prompt_fingerprint::hash_tools(&definitions);
-        counters.install_tool_catalog(session, ToolPresentationMode::Native, definitions.clone());
-        let old_id = stable_higgs_session_id(durable, 0);
-        assert!(counters.record_higgs_session_id(session, old_id));
-        counters.retire_higgs_session(
-            session,
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: 7,
-                replaced_span: vec![
-                    serde_json::json!({"role": "user", "content": "raw", "_db_id": 11}),
-                ],
-                checkpoint_context: counters
-                    .expansion_checkpoint_context(session, "bonsai", tool_hash, 900_000)
-                    .unwrap(),
-            },
-        );
-
-        assert_eq!(
-            counters.confirmed_expansion_checkpoint(session, "bonsai", tool_hash, 600_000),
-            None,
-            "an unacknowledged lease must not authorize exact reconstruction"
-        );
-        let mut lease_attempt = counters
-            .reserve_higgs_session_request(session, durable, "bonsai", tool_hash, 31_744, 600_000);
-        lease_attempt.resolve_lease(Some(1));
-        drop(lease_attempt);
-
-        assert_eq!(
-            counters
-                .confirmed_expansion_checkpoint(session, "bonsai", tool_hash, 600_001)
-                .map(|checkpoint| checkpoint.summary_node_id),
-            Some(7)
-        );
-        for (case, model, hash, now_ms) in [
-            ("model", "other", tool_hash, 600_001),
-            ("tool hash", "bonsai", tool_hash.wrapping_add(1), 600_001),
-            ("expiry", "bonsai", tool_hash, 900_000),
-        ] {
-            assert_eq!(
-                counters.confirmed_expansion_checkpoint(session, model, hash, now_ms),
-                None,
-                "case {case}"
-            );
-        }
-
-        counters
-            .session_tool_catalogs
-            .lock()
-            .get_mut(session)
-            .unwrap()
-            .mode = ToolPresentationMode::Textual;
-        assert_eq!(
-            counters.confirmed_expansion_checkpoint(session, "bonsai", tool_hash, 600_001),
-            None,
-            "presentation mismatch"
-        );
-        let mut catalogs = counters.session_tool_catalogs.lock();
-        let catalog = catalogs.get_mut(session).unwrap();
-        catalog.mode = ToolPresentationMode::Native;
-        catalog.generation += 1;
-        drop(catalogs);
-        assert_eq!(
-            counters.confirmed_expansion_checkpoint(session, "bonsai", tool_hash, 600_001),
-            None,
-            "catalog generation mismatch"
-        );
-    }
-
-    #[test]
-    fn catalog_replacement_cannot_cross_a_confirmed_checkpoint_snapshot() {
-        let counters = Arc::new(RuntimeCounters::new(32_768));
-        let session = "cli:checkpoint-catalog-race";
-        let durable = "sqlite:checkpoint-catalog-race";
-        let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
-        let tool_hash = crate::agent::prompt_fingerprint::hash_tools(&definitions);
-        counters.install_tool_catalog(session, ToolPresentationMode::Native, definitions);
-        let old_id = stable_higgs_session_id(durable, 0);
-        assert!(counters.record_higgs_session_id(session, old_id));
-        counters.retire_higgs_session(
-            session,
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: 7,
-                replaced_span: vec![
-                    serde_json::json!({"role": "user", "content": "raw", "_db_id": 11}),
-                ],
-                checkpoint_context: counters
-                    .expansion_checkpoint_context(session, "bonsai", tool_hash, 900_000)
-                    .unwrap(),
-            },
-        );
-        let mut lease_attempt = counters
-            .reserve_higgs_session_request(session, durable, "bonsai", tool_hash, 31_744, 600_000);
-        lease_attempt.resolve_lease(Some(1));
-        drop(lease_attempt);
-
-        let snapshot_entered = Arc::new(std::sync::Barrier::new(2));
-        let release_snapshot = Arc::new(std::sync::Barrier::new(2));
-        let reading = Arc::clone(&counters);
-        let entered = Arc::clone(&snapshot_entered);
-        let release = Arc::clone(&release_snapshot);
-        let reader = std::thread::spawn(move || {
-            reading.confirmed_expansion_checkpoint_observed(
-                session,
-                "bonsai",
-                tool_hash,
-                600_001,
-                || {
-                    entered.wait();
-                    release.wait();
-                },
-            )
-        });
-        snapshot_entered.wait();
-
-        let replacing = Arc::clone(&counters);
-        let (replaced_tx, replaced_rx) = std::sync::mpsc::channel();
-        let replacer = std::thread::spawn(move || {
-            replacing.install_tool_catalog(
-                session,
-                ToolPresentationMode::Native,
-                vec![serde_json::json!({"type": "function", "name": "write"})],
-            );
-            replaced_tx.send(()).unwrap();
-        });
-        assert!(
-            replaced_rx
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err(),
-            "catalog replacement crossed a partially read checkpoint identity"
-        );
-
-        release_snapshot.wait();
-        assert_eq!(reader.join().unwrap().unwrap().summary_node_id, 7);
-        replaced_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("catalog replacement did not resume after checkpoint snapshot");
-        replacer.join().unwrap();
-        assert_eq!(
-            counters.confirmed_expansion_checkpoint(session, "bonsai", tool_hash, 600_001),
-            None,
-            "a checkpoint from the prior catalog generation survived replacement"
-        );
-    }
-
-    #[test]
-    fn drop_waits_for_the_entire_expansion_retirement_transaction() {
-        let counters = Arc::new(RuntimeCounters::new(32_768));
-        let session = "cli:atomic-drop";
-        assert!(counters.record_higgs_session_id(session, 10));
-
-        let retirement_entered = Arc::new(std::sync::Barrier::new(2));
-        let release_retirement = Arc::new(std::sync::Barrier::new(2));
-        let retiring = Arc::clone(&counters);
-        let entered = Arc::clone(&retirement_entered);
-        let release = Arc::clone(&release_retirement);
-        let lease_thread = std::thread::spawn(move || {
-            retiring.retire_higgs_session_observed(
-                session,
-                SessionRetirement::LeaseForExpansion {
-                    summary_node_id: 1,
-                    replaced_span: vec![serde_json::json!({"role": "user", "content": "raw"})],
-                    checkpoint_context: checkpoint_context(100, 1_000),
-                },
-                || {
-                    entered.wait();
-                    release.wait();
-                },
-            )
-        });
-        retirement_entered.wait();
-
-        let dropping = Arc::clone(&counters);
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let drop_thread = std::thread::spawn(move || {
-            dropping.retire_higgs_session(session, SessionRetirement::Drop);
-            done_tx.send(()).unwrap();
-        });
-        assert!(
-            done_rx
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err(),
-            "drop crossed a partially installed expansion retirement"
-        );
-
-        release_retirement.wait();
-        lease_thread.join().unwrap();
-        done_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("drop did not resume after retirement released the state lock");
-        drop_thread.join().unwrap();
-        assert_eq!(counters.expansion_checkpoint(session), None);
-        assert_eq!(counters.pending_higgs_session_lease(session), None);
-        assert_eq!(counters.pending_higgs_session_drop_ids(session), vec![10]);
-    }
-
-    #[test]
-    fn recording_the_expansion_id_waits_for_and_is_rejected_after_retirement() {
-        let counters = Arc::new(RuntimeCounters::new(32_768));
-        let session = "cli:atomic-record";
-        assert!(counters.record_higgs_session_id(session, 10));
-
-        let retirement_entered = Arc::new(std::sync::Barrier::new(2));
-        let release_retirement = Arc::new(std::sync::Barrier::new(2));
-        let retiring = Arc::clone(&counters);
-        let entered = Arc::clone(&retirement_entered);
-        let release = Arc::clone(&release_retirement);
-        let lease_thread = std::thread::spawn(move || {
-            retiring.retire_higgs_session_observed(
-                session,
-                SessionRetirement::LeaseForExpansion {
-                    summary_node_id: 1,
-                    replaced_span: vec![serde_json::json!({"role": "user", "content": "raw"})],
-                    checkpoint_context: checkpoint_context(100, 1_000),
-                },
-                || {
-                    entered.wait();
-                    release.wait();
-                },
-            )
-        });
-        retirement_entered.wait();
-
-        let recording = Arc::clone(&counters);
-        let (result_tx, result_rx) = std::sync::mpsc::channel();
-        let record_thread = std::thread::spawn(move || {
-            result_tx
-                .send(recording.record_higgs_session_id(session, 10))
-                .unwrap();
-        });
-        assert!(
-            result_rx
-                .recv_timeout(std::time::Duration::from_millis(100))
-                .is_err(),
-            "record crossed a partially installed expansion retirement"
-        );
-
-        release_retirement.wait();
-        lease_thread.join().unwrap();
-        assert!(!result_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
-            .expect("record did not resume after retirement released the state lock"));
-        record_thread.join().unwrap();
-        assert_eq!(counters.active_higgs_session_id(session), None);
-        assert_eq!(
-            counters
-                .expansion_checkpoint(session)
-                .unwrap()
-                .old_higgs_session_id,
-            10
-        );
-    }
-
-    #[test]
-    fn activating_after_retirement_skips_a_colliding_expansion_id_atomically() {
-        let counters = RuntimeCounters::new(32_768);
-        let session_key = "cli:atomic-activate";
-        let durable_session_id = "sqlite:atomic-activate";
-        let colliding_id = stable_higgs_session_id(durable_session_id, 1);
-        assert!(counters.record_higgs_session_id(session_key, colliding_id));
-        counters.retire_higgs_session(
-            session_key,
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: 1,
-                replaced_span: vec![serde_json::json!({"role": "user", "content": "raw"})],
-                checkpoint_context: checkpoint_context(100, 1_000),
-            },
-        );
-
-        let active_id = counters.activate_higgs_session_id(session_key, durable_session_id);
-
-        assert_ne!(active_id, colliding_id);
-        assert_eq!(active_id, stable_higgs_session_id(durable_session_id, 2));
-        assert_eq!(
-            counters.active_higgs_session_id(session_key),
-            Some(active_id)
-        );
-        assert_eq!(counters.session_prompt_epoch(session_key), 2);
-    }
-
     #[test]
     fn fallback_drop_waits_for_the_final_reservation_of_that_id() {
         let counters = Arc::new(RuntimeCounters::new(32_768));
         let session_key = "cli:deferred-in-flight-drop";
         let durable_session_id = "sqlite:deferred-in-flight-drop";
-        let first_x = counters.reserve_higgs_session_request(
-            session_key,
-            durable_session_id,
-            "bonsai",
-            0,
-            0,
-            0,
-        );
-        let second_x = counters.reserve_higgs_session_request(
-            session_key,
-            durable_session_id,
-            "bonsai",
-            0,
-            0,
-            0,
-        );
+        let first_x = counters.reserve_higgs_session_request(session_key, durable_session_id, 0);
+        let second_x = counters.reserve_higgs_session_request(session_key, durable_session_id, 0);
         let x = first_x.active_id();
         assert_eq!(second_x.active_id(), x);
 
-        counters.retire_higgs_session(
-            session_key,
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: 1,
-                replaced_span: vec![serde_json::json!({"role": "user", "content": "raw"})],
-                checkpoint_context: checkpoint_context(100, 1_000),
-            },
-        );
+        counters.retire_higgs_session(session_key);
 
-        let y_while_both_x_live = counters.reserve_higgs_session_request(
-            session_key,
-            durable_session_id,
-            "bonsai",
-            0,
-            0,
-            0,
-        );
+        let y_while_both_x_live =
+            counters.reserve_higgs_session_request(session_key, durable_session_id, 0);
         assert_ne!(y_while_both_x_live.active_id(), x);
         assert!(!y_while_both_x_live.drop_ids().contains(&x));
 
         drop(first_x);
-        let y_while_one_x_live = counters.reserve_higgs_session_request(
-            session_key,
-            durable_session_id,
-            "bonsai",
-            0,
-            0,
-            0,
-        );
+        let y_while_one_x_live =
+            counters.reserve_higgs_session_request(session_key, durable_session_id, 0);
         assert!(!y_while_one_x_live.drop_ids().contains(&x));
 
         drop(second_x);
-        let next_request = counters.reserve_higgs_session_request(
-            session_key,
-            durable_session_id,
-            "bonsai",
-            0,
-            0,
-            0,
-        );
+        let next_request =
+            counters.reserve_higgs_session_request(session_key, durable_session_id, 0);
         assert_eq!(
             next_request
                 .drop_ids()
@@ -2323,164 +1313,14 @@ mod tests {
     }
 
     #[test]
-    fn trim_retirement_drops_active_and_checkpoint_ids_without_leasing() {
-        let counters = RuntimeCounters::new(32_768);
-        let session = "cli:trim-retirement";
-        assert!(counters.record_higgs_session_id(session, 10));
-        counters.retire_higgs_session(
-            session,
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: 1,
-                replaced_span: vec![serde_json::json!({"role": "user", "content": "raw"})],
-                checkpoint_context: checkpoint_context(100, 1_000),
-            },
-        );
-        assert!(counters.record_higgs_session_id(session, 20));
-
-        assert!(counters.invalidate_prompt_cache(session, true));
-
-        assert_eq!(counters.expansion_checkpoint(session), None);
-        assert_eq!(counters.pending_higgs_session_lease(session), None);
-        assert_eq!(
-            counters.pending_higgs_session_drop_ids(session),
-            vec![10, 20]
-        );
-    }
-
-    #[test]
-    fn eligible_checkpoint_lease_is_confirmed_only_by_numeric_one() {
-        let counters = Arc::new(RuntimeCounters::new(32_768));
-        let session = "cli:lease-confirmation";
-        let durable = "sqlite:lease-confirmation";
-        let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
-        counters.install_tool_catalog(session, ToolPresentationMode::Native, definitions.clone());
-        let tool_hash = crate::agent::prompt_fingerprint::hash_tools(&definitions);
-        let checkpoint_context = counters
-            .expansion_checkpoint_context(session, "bonsai", tool_hash, 900_000)
-            .expect("installed tool catalog must produce checkpoint identity");
-        let old_id = stable_higgs_session_id(durable, 0);
-        assert!(counters.record_higgs_session_id(session, old_id));
-        counters.retire_higgs_session(
-            session,
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: 44,
-                replaced_span: vec![serde_json::json!({"role": "user", "content": "raw"})],
-                checkpoint_context,
-            },
-        );
-
-        let mut request = counters
-            .reserve_higgs_session_request(session, durable, "bonsai", tool_hash, 31_744, 600_000);
-        assert_ne!(request.control().active_id, old_id);
-        assert_eq!(
-            request.control().session_lease,
-            Some(HiggsSessionLease {
-                session_id: old_id,
-                ttl_seconds: 300,
-            })
-        );
-        assert_eq!(
-            request.control().reuse_policy,
-            HiggsSessionReusePolicy::Seed
-        );
-        assert_eq!(request.control().max_prompt_tokens, 31_744);
-        request.resolve_lease(Some(1));
-
-        let checkpoint = counters.expansion_checkpoint(session).unwrap();
-        assert!(checkpoint.lease_confirmed);
-        assert_eq!(counters.pending_higgs_session_lease(session), None);
-        assert!(!counters
-            .pending_higgs_session_drop_ids(session)
-            .contains(&old_id));
-    }
-
-    #[test]
-    fn retained_expansion_reservation_pins_old_id_without_replacing_active() {
-        let counters = Arc::new(RuntimeCounters::new(32_768));
-        let session = "cli:retained-expansion-route";
-        let durable = "sqlite:retained-expansion-route";
-        let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
-        counters.install_tool_catalog(session, ToolPresentationMode::Native, definitions.clone());
-        let tool_hash = crate::agent::prompt_fingerprint::hash_tools(&definitions);
-        let old_id = stable_higgs_session_id(durable, 0);
-        assert!(counters.record_higgs_session_id(session, old_id));
-        counters.retire_higgs_session(
-            session,
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: 44,
-                replaced_span: vec![
-                    serde_json::json!({"role": "user", "content": "exact", "_db_id": 7}),
-                ],
-                checkpoint_context: counters
-                    .expansion_checkpoint_context(session, "bonsai", tool_hash, 900_000)
-                    .unwrap(),
-            },
-        );
-        let mut lease = counters
-            .reserve_higgs_session_request(session, durable, "bonsai", tool_hash, 31_744, 600_000);
-        let fresh_id = lease.control().active_id;
-        assert_ne!(fresh_id, old_id);
-        lease.resolve_lease(Some(1));
-        drop(lease);
-        let checkpoint = counters.expansion_checkpoint(session).unwrap();
-
-        let retained = counters
-            .reserve_retained_expansion_request(
-                session,
-                &checkpoint,
-                "bonsai",
-                tool_hash,
-                31_744,
-                600_001,
-            )
-            .expect("confirmed current checkpoint must reserve its old ID");
-
-        assert_eq!(retained.control().active_id, old_id);
-        assert_eq!(retained.control().session_lease, None);
-        assert_eq!(
-            retained.control().reuse_policy,
-            HiggsSessionReusePolicy::RequireContinuation
-        );
-        assert_eq!(
-            retained.control().reuse_policy.as_wire(),
-            "require_continuation"
-        );
-        assert_eq!(retained.control().max_prompt_tokens, 31_744);
-        assert_eq!(counters.active_higgs_session_id(session), Some(fresh_id));
-        drop(retained);
-
-        assert!(counters.discard_expansion_checkpoint(session, old_id, 44));
-        assert_eq!(counters.expansion_checkpoint(session), None);
-        assert_eq!(
-            counters.pending_higgs_session_drop_ids(session),
-            vec![old_id]
-        );
-        assert_eq!(counters.active_higgs_session_id(session), Some(fresh_id));
-    }
-
-    #[test]
     fn fresh_session_seeds_once_then_requires_exact_continuation() {
         let counters = Arc::new(RuntimeCounters::new(32_768));
-        let first = counters.reserve_higgs_session_request(
-            "cli:seed",
-            "sqlite:seed",
-            "bonsai",
-            7,
-            24_576,
-            0,
-        );
+        let first = counters.reserve_higgs_session_request("cli:seed", "sqlite:seed", 24_576);
         assert_eq!(first.control().reuse_policy, HiggsSessionReusePolicy::Seed);
         first.publish_exact();
         drop(first);
 
-        let second = counters.reserve_higgs_session_request(
-            "cli:seed",
-            "sqlite:seed",
-            "bonsai",
-            7,
-            24_576,
-            1,
-        );
+        let second = counters.reserve_higgs_session_request("cli:seed", "sqlite:seed", 24_576);
         assert_eq!(
             second.control().reuse_policy,
             HiggsSessionReusePolicy::RequireContinuation
@@ -2492,14 +1332,7 @@ mod tests {
         let counters = Arc::new(RuntimeCounters::new(32_768));
         assert!(counters.restore_higgs_publication_hint("cli:resume", "sqlite:resume",));
 
-        let resumed = counters.reserve_higgs_session_request(
-            "cli:resume",
-            "sqlite:resume",
-            "bonsai",
-            7,
-            24_576,
-            0,
-        );
+        let resumed = counters.reserve_higgs_session_request("cli:resume", "sqlite:resume", 24_576);
         assert_eq!(
             resumed.control().reuse_policy,
             HiggsSessionReusePolicy::RequireContinuation
@@ -2507,371 +1340,11 @@ mod tests {
 
         counters.invalidate_prompt_cache("cli:resume", true);
         assert!(!counters.restore_higgs_publication_hint("cli:resume", "sqlite:resume",));
-        let rotated = counters.reserve_higgs_session_request(
-            "cli:resume",
-            "sqlite:resume",
-            "bonsai",
-            7,
-            24_576,
-            1,
-        );
+        let rotated = counters.reserve_higgs_session_request("cli:resume", "sqlite:resume", 24_576);
         assert_eq!(
             rotated.control().reuse_policy,
             HiggsSessionReusePolicy::Seed
         );
-    }
-
-    #[test]
-    fn every_retained_reservation_revalidates_current_model_tool_hash_and_catalog() {
-        for mismatch in ["model", "tool_hash", "catalog"] {
-            let counters = Arc::new(RuntimeCounters::new(32_768));
-            let session = format!("cli:retained-identity-{mismatch}");
-            let durable = format!("sqlite:retained-identity-{mismatch}");
-            let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
-            counters.install_tool_catalog(
-                &session,
-                ToolPresentationMode::Native,
-                definitions.clone(),
-            );
-            let tool_hash = crate::agent::prompt_fingerprint::hash_tools(&definitions);
-            let old_id = stable_higgs_session_id(&durable, 0);
-            assert!(counters.record_higgs_session_id(&session, old_id));
-            counters.retire_higgs_session(
-                &session,
-                SessionRetirement::LeaseForExpansion {
-                    summary_node_id: 44,
-                    replaced_span: vec![serde_json::json!({
-                        "role": "user",
-                        "content": "exact",
-                        "_db_id": 7,
-                    })],
-                    checkpoint_context: counters
-                        .expansion_checkpoint_context(&session, "bonsai", tool_hash, 900_000)
-                        .unwrap(),
-                },
-            );
-            let mut lease = counters.reserve_higgs_session_request(
-                &session, &durable, "bonsai", tool_hash, 31_744, 600_000,
-            );
-            let fresh_id = lease.control().active_id;
-            lease.resolve_lease(Some(1));
-            drop(lease);
-            let checkpoint = counters.expansion_checkpoint(&session).unwrap();
-
-            if mismatch == "catalog" {
-                counters.install_tool_catalog(
-                    &session,
-                    ToolPresentationMode::Native,
-                    definitions.clone(),
-                );
-            }
-            let request_model = if mismatch == "model" {
-                "different-model"
-            } else {
-                "bonsai"
-            };
-            let request_tool_hash = if mismatch == "tool_hash" {
-                tool_hash.wrapping_add(1)
-            } else {
-                tool_hash
-            };
-            assert!(counters
-                .reserve_retained_expansion_request(
-                    &session,
-                    &checkpoint,
-                    request_model,
-                    request_tool_hash,
-                    31_744,
-                    600_001,
-                )
-                .is_none());
-            assert_eq!(counters.active_higgs_session_id(&session), Some(fresh_id));
-            assert_eq!(counters.expansion_checkpoint(&session), None);
-            assert_eq!(
-                counters.pending_higgs_session_drop_ids(&session),
-                vec![old_id]
-            );
-        }
-    }
-
-    #[test]
-    fn missing_or_zero_lease_ack_discards_checkpoint_and_queues_old_id_once() {
-        for (suffix, acknowledgement) in [("missing", None), ("zero", Some(0))] {
-            let counters = Arc::new(RuntimeCounters::new(32_768));
-            let session = format!("cli:lease-{suffix}-ack");
-            let durable = format!("sqlite:lease-{suffix}-ack");
-            let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
-            counters.install_tool_catalog(
-                &session,
-                ToolPresentationMode::Native,
-                definitions.clone(),
-            );
-            let tool_hash = crate::agent::prompt_fingerprint::hash_tools(&definitions);
-            let checkpoint_context = counters
-                .expansion_checkpoint_context(&session, "bonsai", tool_hash, 900_000)
-                .unwrap();
-            let old_id = stable_higgs_session_id(&durable, 0);
-            assert!(counters.record_higgs_session_id(&session, old_id));
-            counters.retire_higgs_session(
-                &session,
-                SessionRetirement::LeaseForExpansion {
-                    summary_node_id: 44,
-                    replaced_span: vec![serde_json::json!({"role": "user", "content": "raw"})],
-                    checkpoint_context,
-                },
-            );
-            let mut request = counters.reserve_higgs_session_request(
-                &session, &durable, "bonsai", tool_hash, 31_744, 600_000,
-            );
-            assert_eq!(request.control().session_lease.unwrap().session_id, old_id);
-
-            request.resolve_lease(acknowledgement);
-
-            assert_eq!(counters.expansion_checkpoint(&session), None);
-            assert_eq!(counters.pending_higgs_session_lease(&session), None);
-            assert_eq!(
-                counters.pending_higgs_session_drop_ids(&session),
-                vec![old_id]
-            );
-        }
-    }
-
-    #[test]
-    fn checkpoint_identity_mismatch_or_expiry_discards_and_drops_old_id() {
-        for (suffix, request_model, request_hash, now_ms) in [
-            ("expired", "bonsai", 77, 900_000),
-            ("model", "other-model", 77, 600_000),
-            ("tool-hash", "bonsai", 78, 600_000),
-        ] {
-            let counters = Arc::new(RuntimeCounters::new(32_768));
-            let session = format!("cli:checkpoint-{suffix}");
-            let durable = format!("sqlite:checkpoint-{suffix}");
-            counters.install_tool_catalog(
-                &session,
-                ToolPresentationMode::Native,
-                vec![serde_json::json!({"type": "function", "name": "read"})],
-            );
-            let old_id = stable_higgs_session_id(&durable, 0);
-            assert!(counters.record_higgs_session_id(&session, old_id));
-            let checkpoint_context = counters
-                .expansion_checkpoint_context(&session, "bonsai", 77, 900_000)
-                .unwrap();
-            counters.retire_higgs_session(
-                &session,
-                SessionRetirement::LeaseForExpansion {
-                    summary_node_id: 44,
-                    replaced_span: vec![serde_json::json!({"role": "user", "content": "raw"})],
-                    checkpoint_context,
-                },
-            );
-
-            let request = counters.reserve_higgs_session_request(
-                &session,
-                &durable,
-                request_model,
-                request_hash,
-                31_744,
-                now_ms,
-            );
-
-            assert_eq!(request.control().session_lease, None, "case {suffix}");
-            assert_eq!(
-                counters.expansion_checkpoint(&session),
-                None,
-                "case {suffix}"
-            );
-            assert_eq!(
-                counters.pending_higgs_session_drop_ids(&session),
-                vec![old_id],
-                "case {suffix}"
-            );
-        }
-    }
-
-    #[test]
-    fn presentation_or_catalog_generation_change_discards_checkpoint() {
-        for (suffix, replacement_mode) in [
-            ("presentation", ToolPresentationMode::Textual),
-            ("generation", ToolPresentationMode::Native),
-        ] {
-            let counters = RuntimeCounters::new(32_768);
-            let session = format!("cli:catalog-{suffix}");
-            counters.install_tool_catalog(
-                &session,
-                ToolPresentationMode::Native,
-                vec![serde_json::json!({"type": "function", "name": "read"})],
-            );
-            assert!(counters.record_higgs_session_id(&session, 41));
-            let checkpoint_context = counters
-                .expansion_checkpoint_context(&session, "bonsai", 77, 900_000)
-                .unwrap();
-            counters.retire_higgs_session(
-                &session,
-                SessionRetirement::LeaseForExpansion {
-                    summary_node_id: 44,
-                    replaced_span: vec![serde_json::json!({"role": "user", "content": "raw"})],
-                    checkpoint_context,
-                },
-            );
-
-            counters.install_tool_catalog(
-                &session,
-                replacement_mode,
-                vec![serde_json::json!({"type": "function", "name": "write"})],
-            );
-
-            assert_eq!(
-                counters.expansion_checkpoint(&session),
-                None,
-                "case {suffix}"
-            );
-            assert_eq!(
-                counters.pending_higgs_session_lease(&session),
-                None,
-                "case {suffix}"
-            );
-            assert_eq!(counters.pending_higgs_session_drop_ids(&session), vec![41]);
-        }
-    }
-
-    #[test]
-    fn pending_lease_is_claimed_by_exactly_one_concurrent_reservation() {
-        let counters = Arc::new(RuntimeCounters::new(32_768));
-        let session = "cli:single-lease-claim";
-        let durable = "sqlite:single-lease-claim";
-        let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
-        counters.install_tool_catalog(session, ToolPresentationMode::Native, definitions.clone());
-        let tool_hash = crate::agent::prompt_fingerprint::hash_tools(&definitions);
-        let old_id = stable_higgs_session_id(durable, 0);
-        assert!(counters.record_higgs_session_id(session, old_id));
-        counters.retire_higgs_session(
-            session,
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: 44,
-                replaced_span: vec![serde_json::json!({"role": "user", "content": "raw"})],
-                checkpoint_context: counters
-                    .expansion_checkpoint_context(session, "bonsai", tool_hash, 900_000)
-                    .unwrap(),
-            },
-        );
-
-        let first = counters
-            .reserve_higgs_session_request(session, durable, "bonsai", tool_hash, 31_744, 600_000);
-        let second = counters
-            .reserve_higgs_session_request(session, durable, "bonsai", tool_hash, 31_744, 600_000);
-
-        assert_eq!(first.control().session_lease.unwrap().session_id, old_id);
-        assert_eq!(second.control().session_lease, None);
-    }
-
-    #[test]
-    fn invalidated_claimed_lease_is_not_dropped_until_attempt_releases() {
-        let counters = Arc::new(RuntimeCounters::new(32_768));
-        let session = "cli:in-flight-lease-drop";
-        let durable = "sqlite:in-flight-lease-drop";
-        let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
-        counters.install_tool_catalog(session, ToolPresentationMode::Native, definitions.clone());
-        let tool_hash = crate::agent::prompt_fingerprint::hash_tools(&definitions);
-        let old_id = stable_higgs_session_id(durable, 0);
-        assert!(counters.record_higgs_session_id(session, old_id));
-        counters.retire_higgs_session(
-            session,
-            SessionRetirement::LeaseForExpansion {
-                summary_node_id: 44,
-                replaced_span: vec![serde_json::json!({"role": "user", "content": "raw"})],
-                checkpoint_context: counters
-                    .expansion_checkpoint_context(session, "bonsai", tool_hash, 900_000)
-                    .unwrap(),
-            },
-        );
-        let lease_attempt = counters
-            .reserve_higgs_session_request(session, durable, "bonsai", tool_hash, 31_744, 600_000);
-        assert_eq!(
-            lease_attempt.control().session_lease.unwrap().session_id,
-            old_id
-        );
-
-        counters.install_tool_catalog(
-            session,
-            ToolPresentationMode::Native,
-            vec![serde_json::json!({"type": "function", "name": "write"})],
-        );
-        let while_lease_live = counters
-            .reserve_higgs_session_request(session, durable, "bonsai", tool_hash, 31_744, 600_001);
-        assert!(!while_lease_live.drop_ids().contains(&old_id));
-
-        drop(lease_attempt);
-        let after_release = counters
-            .reserve_higgs_session_request(session, durable, "bonsai", tool_hash, 31_744, 600_002);
-        assert_eq!(
-            after_release
-                .drop_ids()
-                .iter()
-                .filter(|candidate| **candidate == old_id)
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn unresolved_lease_terminal_paths_discard_checkpoint() {
-        for terminal_path in [
-            "blocking error",
-            "stream error",
-            "cancellation",
-            "timeout",
-            "stream without Done",
-        ] {
-            let counters = Arc::new(RuntimeCounters::new(32_768));
-            let session = format!("cli:lease-attempt-drop:{terminal_path}");
-            let durable = format!("sqlite:lease-attempt-drop:{terminal_path}");
-            let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
-            counters.install_tool_catalog(
-                &session,
-                ToolPresentationMode::Native,
-                definitions.clone(),
-            );
-            let tool_hash = crate::agent::prompt_fingerprint::hash_tools(&definitions);
-            let old_id = stable_higgs_session_id(&durable, 0);
-            assert!(counters.record_higgs_session_id(&session, old_id));
-            counters.retire_higgs_session(
-                &session,
-                SessionRetirement::LeaseForExpansion {
-                    summary_node_id: 44,
-                    replaced_span: vec![serde_json::json!({"role": "user", "content": "raw"})],
-                    checkpoint_context: counters
-                        .expansion_checkpoint_context(&session, "bonsai", tool_hash, 900_000)
-                        .unwrap(),
-                },
-            );
-            let attempt = counters.reserve_higgs_session_request(
-                &session, &durable, "bonsai", tool_hash, 31_744, 600_000,
-            );
-            assert!(
-                attempt.control().session_lease.is_some(),
-                "{terminal_path} must claim the lease"
-            );
-
-            // Every provider exit owns the reservation until the exit boundary.
-            // Dropping it is the shared fail-closed finalizer for all five paths.
-            drop(attempt);
-
-            assert_eq!(
-                counters.expansion_checkpoint(&session),
-                None,
-                "{terminal_path} must discard the unconfirmed checkpoint"
-            );
-            assert_eq!(
-                counters.pending_higgs_session_lease(&session),
-                None,
-                "{terminal_path} must not leave the lease retransmittable"
-            );
-            assert_eq!(
-                counters.pending_higgs_session_drop_ids(&session),
-                vec![old_id],
-                "{terminal_path} must queue the old session for deletion"
-            );
-        }
     }
 
     #[test]
@@ -2902,7 +1375,6 @@ mod tests {
                 messages: vec![snapshot[0].clone(), snapshot[1].clone(), summary.clone()],
             },
             snapshot,
-            summary_node_id: 0,
         };
 
         let swapped = apply_compaction_result(&live, pending).expect("swap must apply");
@@ -2934,7 +1406,6 @@ mod tests {
                 messages: vec![snapshot[0].clone(), summary.clone()],
             },
             snapshot,
-            summary_node_id: 0,
         };
 
         let swapped = apply_compaction_result(&live, pending).expect("swap must apply");
@@ -2963,7 +1434,6 @@ mod tests {
                 ],
             },
             snapshot,
-            summary_node_id: 0,
         };
 
         // With the input taken by shared reference, rejection cannot mutate.
@@ -3094,7 +1564,7 @@ mod tests {
             tool_hash: 77,
         };
 
-        assert!(counters.record_higgs_session_id(session, 10));
+        counters.record_higgs_session_id(session, 10);
         counters
             .prompt_fingerprints
             .lock()
@@ -3108,11 +1578,7 @@ mod tests {
             .lock()
             .insert(session.to_string(), 77);
 
-        let epoch = counters.retire_higgs_session_preserving_prefix(
-            session,
-            SessionRetirement::Drop,
-            anchor.clone(),
-        );
+        let epoch = counters.retire_higgs_session_preserving_prefix(session, anchor.clone());
         assert_eq!(epoch, 1);
         assert_eq!(counters.take_cache_reset(session), None);
         assert_eq!(
@@ -3125,8 +1591,7 @@ mod tests {
         );
         assert_eq!(counters.prompt_tool_hashes.lock().get(session), Some(&77));
 
-        let request =
-            counters.reserve_higgs_session_request(session, durable, "bonsai", 77, 16_000, 0);
+        let request = counters.reserve_higgs_session_request(session, durable, 16_000);
         assert_ne!(request.control().active_id, 10);
         assert_eq!(
             counters.prompt_fingerprints.lock().get(session),
@@ -3345,9 +1810,9 @@ mod higgs_drop_flusher_tests {
         }));
 
         // A live retained session (as the wire-lease flow would have left it).
-        assert!(counters.record_higgs_session_id("flush-hook", 777));
+        counters.record_higgs_session_id("flush-hook", 777);
 
-        let epoch = counters.retire_higgs_session("flush-hook", SessionRetirement::Drop);
+        let epoch = counters.retire_higgs_session("flush-hook");
         assert!(epoch >= 1);
         assert_eq!(
             flushed.lock().unwrap().as_slice(),
@@ -3359,8 +1824,8 @@ mod higgs_drop_flusher_tests {
     #[test]
     fn drop_retirement_without_flusher_is_a_clean_noop() {
         let counters = RuntimeCounters::new(32_768);
-        assert!(counters.record_higgs_session_id("no-flush", 555));
-        let epoch = counters.retire_higgs_session("no-flush", SessionRetirement::Drop);
+        counters.record_higgs_session_id("no-flush", 555);
+        let epoch = counters.retire_higgs_session("no-flush");
         assert!(epoch >= 1, "rotation proceeds with no flusher wired");
     }
 }

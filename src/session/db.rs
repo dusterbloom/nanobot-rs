@@ -284,7 +284,9 @@ pub struct WorkingMemoryRecord {
 ///
 /// This is persisted instead of inferred from the surrounding messages so a
 /// replay can distinguish ordinary inference from recovery without consulting
-/// the current agent implementation.
+/// the current agent implementation. `RetainedExpansionPreflight`, `Router`,
+/// `Specialist` and `ToolRunner` are no longer produced; they stay so journals
+/// written before those paths were removed still deserialize.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelCallPurpose {

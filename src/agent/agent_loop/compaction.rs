@@ -549,17 +549,12 @@ pub(super) async fn execute_lcm_compaction(
     // omits system/developer messages.
     let reduced =
         TokenBudget::estimate_tokens(&compacted_messages) < TokenBudget::estimate_tokens(&messages);
-    let summary_node_id = summary_node.as_ref().map(|node| node.0);
-    let pending = match (summary_node_id, reduced) {
-        (Some(summary_node_id), true) => Some(PendingCompaction {
-            result: crate::agent::compaction::CompactionResult {
-                messages: compacted_messages,
-            },
-            snapshot: messages,
-            summary_node_id,
-        }),
-        _ => None,
-    };
+    let pending = (summary_node.is_some() && reduced).then(|| PendingCompaction {
+        result: crate::agent::compaction::CompactionResult {
+            messages: compacted_messages,
+        },
+        snapshot: messages,
+    });
 
     if pending.is_some() && (cancellation.is_cancelled() || !publication.begin_publication()) {
         let _ = replay.turn_finished("cancelled_before_publication").await;

@@ -161,8 +161,8 @@ pub(super) fn retention_attachment(
     }
 }
 
-/// Opt one request into the retained-session contract: session identity,
-/// queued drops and lease, plus the reuse policy, epoch and contract revision.
+/// Opt one request into the retained-session contract: session identity and
+/// queued drops, plus the reuse policy, epoch and contract revision.
 pub(super) fn attach_retained_session_control(
     messages: &mut [Value],
     control: &HiggsSessionControl,
@@ -211,15 +211,6 @@ pub(super) fn attach_higgs_session_control(messages: &mut [Value], control: &Hig
                 );
             }
         }
-        if let Some(lease) = control.session_lease {
-            first.insert(
-                crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD.to_string(),
-                json!({
-                    "session_id": lease.session_id,
-                    "ttl_seconds": lease.ttl_seconds,
-                }),
-            );
-        }
         first.insert(
             crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD.to_string(),
             json!(control.reuse_policy.as_wire()),
@@ -228,12 +219,6 @@ pub(super) fn attach_higgs_session_control(messages: &mut [Value], control: &Hig
             crate::providers::openai_compat::NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD.to_string(),
             json!(control.max_prompt_tokens),
         );
-    }
-}
-
-pub(super) fn strip_higgs_session_lease_control(messages: &mut [Value]) {
-    if let Some(first) = messages.first_mut().and_then(Value::as_object_mut) {
-        first.remove(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD);
     }
 }
 
@@ -248,7 +233,6 @@ pub(super) fn attach_higgs_session_marker(
         &HiggsSessionControl {
             active_id: session_id,
             drop_ids: drop_session_ids.to_vec(),
-            session_lease: None,
             reuse_policy: HiggsSessionReusePolicy::Seed,
             max_prompt_tokens: 0,
         },
@@ -340,41 +324,6 @@ mod history_window_near_tests {
     #[test]
     fn zero_configured_turn_limit_is_unbounded() {
         assert!(!history_window_near(u64::MAX, 0));
-    }
-}
-
-#[cfg(test)]
-mod lease_control_tests {
-    use super::strip_higgs_session_lease_control;
-    use serde_json::json;
-
-    #[test]
-    fn forced_recovery_messages_strip_only_the_one_shot_lease() {
-        let mut messages = vec![json!({
-            "role": "system",
-            "content": "stable prefix",
-            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
-            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD: {
-                "session_id": 41_u64,
-                "ttl_seconds": 300_u32,
-            },
-            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD: "best_effort",
-            crate::providers::openai_compat::NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD: 31_744_u32,
-        })];
-
-        strip_higgs_session_lease_control(&mut messages);
-
-        assert!(messages[0]
-            .get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_LEASE_FIELD)
-            .is_none());
-        assert_eq!(
-            messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD],
-            json!(42)
-        );
-        assert_eq!(
-            messages[0][crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD],
-            json!("best_effort")
-        );
     }
 }
 

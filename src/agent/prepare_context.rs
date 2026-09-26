@@ -699,8 +699,6 @@ impl AgentLoopShared {
             compaction,
             soft_compaction_requested: false,
             staged_auto_expansion: None,
-            higgs_session_route: Default::default(),
-            retained_route_cleanup: Default::default(),
             content_gate,
             counters: self.core_handle.counters.clone(),
             capacity: self.core_handle.capacity.clone(),

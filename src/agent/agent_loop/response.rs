@@ -1128,7 +1128,7 @@ impl AgentLoopShared {
             timestamp: chrono::Local::now().to_rfc3339(),
             request_id: ctx.request_id.clone(),
             logical_session: ctx.session_id.clone(),
-            cache_route: ctx.higgs_session_route.cache_route().into(),
+            cache_route: "active".into(),
             role: "main".into(),
             model: ctx.core.model.clone(),
             provider_base: ctx.core.provider.get_api_base().unwrap_or("unknown").into(),

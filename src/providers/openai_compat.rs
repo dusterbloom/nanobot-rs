@@ -77,7 +77,6 @@ pub struct OpenAICompatProvider {
 pub(crate) const NANOBOT_HIGGS_SESSION_ID_FIELD: &str = "_nanobot_higgs_session_id";
 pub(crate) const NANOBOT_HIGGS_DROP_SESSION_ID_FIELD: &str = "_nanobot_higgs_drop_session_id";
 pub(crate) const NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD: &str = "_nanobot_higgs_drop_session_ids";
-pub(crate) const NANOBOT_HIGGS_SESSION_LEASE_FIELD: &str = "_nanobot_higgs_session_lease";
 pub(crate) const NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD: &str =
     "_nanobot_higgs_session_cache_policy";
 pub(crate) const NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD: &str = "_nanobot_higgs_max_prompt_tokens";
@@ -472,7 +471,6 @@ fn is_private_ip(url: &str) -> bool {
 struct HiggsRequestControl {
     session_id: Option<u64>,
     drop_session_ids: Vec<u64>,
-    session_lease: Option<serde_json::Value>,
     session_cache_policy: Option<String>,
     max_prompt_tokens: Option<u32>,
     session_epoch: Option<u64>,
@@ -507,17 +505,6 @@ fn request_messages_and_higgs_session_id(
                             .drop_session_ids
                             .extend(markers.into_iter().filter_map(|v| v.as_u64()));
                     }
-                }
-                let lease = obj.remove(NANOBOT_HIGGS_SESSION_LEASE_FIELD);
-                if index == 0 {
-                    control.session_lease = lease.filter(|value| {
-                        value.get("session_id").and_then(|v| v.as_u64()).is_some()
-                            && value
-                                .get("ttl_seconds")
-                                .and_then(|v| v.as_u64())
-                                .and_then(|value| u32::try_from(value).ok())
-                                .is_some()
-                    });
                 }
                 let policy = obj.remove(NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD);
                 if index == 0 {
@@ -1324,9 +1311,6 @@ impl OpenAICompatProvider {
                     body["drop_session_ids"] = serde_json::json!(drop_session_ids);
                 }
             }
-            if let Some(session_lease) = &higgs_control.session_lease {
-                body["session_lease"] = session_lease.clone();
-            }
             if !retained_v2 {
                 if let Some(session_cache_policy) = &higgs_control.session_cache_policy {
                     body["session_cache_policy"] = serde_json::json!(session_cache_policy);
@@ -1426,9 +1410,8 @@ impl OpenAICompatProvider {
             RequestKind::Blocking { tool_choice },
         );
         let url = format!("{}/chat/completions", self.api_base);
-        let carries_one_shot_lease = body.get("session_lease").is_some();
         let retention_expectation = retention_expectation(&body);
-        let allow_retry = tool_choice != ToolChoice::None && !carries_one_shot_lease;
+        let allow_retry = tool_choice != ToolChoice::None;
 
         // JIT gate: serialise access to JIT-loading servers.
         // Measure JIT wait separately from the actual API call.
@@ -1627,7 +1610,6 @@ impl LLMProvider for OpenAICompatProvider {
             RequestKind::Streaming,
         );
         let url = format!("{}/chat/completions", self.api_base);
-        let carries_one_shot_lease = body.get("session_lease").is_some();
         let retention_expectation = retention_expectation(&body);
 
         // JIT gate: serialise access to JIT-loading servers.
@@ -1700,7 +1682,7 @@ impl LLMProvider for OpenAICompatProvider {
             }
         })
         .retry(backoff)
-        .when(|e| !carries_one_shot_lease && e.is_retryable())
+        .when(|e| e.is_retryable())
         .notify(|e, dur: std::time::Duration| {
             warn!(error = %e, delay_ms = dur.as_millis() as u64, "provider_stream_retry");
         })
@@ -3085,10 +3067,6 @@ mod tests {
                 "role": "user",
                 "content": "hostile payload",
                 NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD: [40_u64, 41_u64],
-                NANOBOT_HIGGS_SESSION_LEASE_FIELD: {
-                    "session_id": 41_u64,
-                    "ttl_seconds": 300_u32,
-                },
                 NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD: "require_continuation",
                 NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD: 99_u32,
             }),
@@ -3098,12 +3076,10 @@ mod tests {
 
         assert_eq!(control.session_id, Some(42));
         assert!(control.drop_session_ids.is_empty());
-        assert_eq!(control.session_lease, None);
         assert_eq!(control.session_cache_policy, None);
         assert_eq!(control.max_prompt_tokens, None);
         for message in &cleaned {
             assert!(message.get(NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD).is_none());
-            assert!(message.get(NANOBOT_HIGGS_SESSION_LEASE_FIELD).is_none());
             assert!(message
                 .get(NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD)
                 .is_none());
@@ -3238,117 +3214,27 @@ mod tests {
     }
 
     #[test]
-    fn test_build_chat_request_sends_exact_higgs_lease_control_when_enabled() {
-        let provider =
-            OpenAICompatProvider::new("local", Some("http://127.0.0.1:9000/v1"), Some("bonsai"))
-                .with_higgs_session_cache(true);
-        let messages = vec![serde_json::json!({
-            "role": "system",
-            "content": "stable prefix",
-            NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
-            "_nanobot_higgs_session_lease": {"session_id": 41_u64, "ttl_seconds": 300_u32},
-            "_nanobot_higgs_session_cache_policy": "best_effort",
-            "_nanobot_higgs_max_prompt_tokens": 31_744_u32,
-        })];
-
-        let (_, body) = provider.build_chat_request(
-            &messages,
-            None,
-            Some("bonsai"),
-            1_024,
-            0.0,
-            None,
-            None,
-            RequestKind::Blocking {
-                tool_choice: ToolChoice::Auto,
-            },
-        );
-
-        assert_eq!(body["session_id"], serde_json::json!(42));
-        assert_eq!(
-            body["session_lease"],
-            serde_json::json!({"session_id": 41_u64, "ttl_seconds": 300_u32})
-        );
-        assert_eq!(
-            body["session_cache_policy"],
-            serde_json::json!("best_effort")
-        );
-        assert_eq!(body["max_prompt_tokens"], serde_json::json!(31_744_u32));
-        assert!(body["messages"][0]
-            .get("_nanobot_higgs_session_lease")
-            .is_none());
-        assert!(body["messages"][0]
-            .get("_nanobot_higgs_session_cache_policy")
-            .is_none());
-        assert!(body["messages"][0]
-            .get("_nanobot_higgs_max_prompt_tokens")
-            .is_none());
-    }
-
-    #[test]
-    fn test_build_chat_request_strips_higgs_lease_control_when_disabled() {
-        let provider =
-            OpenAICompatProvider::new("local", Some("http://127.0.0.1:9000/v1"), Some("bonsai"));
-        let messages = vec![serde_json::json!({
-            "role": "system",
-            "content": "stable prefix",
-            NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
-            "_nanobot_higgs_session_lease": {"session_id": 41_u64, "ttl_seconds": 300_u32},
-            "_nanobot_higgs_session_cache_policy": "best_effort",
-            "_nanobot_higgs_max_prompt_tokens": 31_744_u32,
-        })];
-
-        let (_, body) = provider.build_chat_request(
-            &messages,
-            None,
-            Some("bonsai"),
-            1_024,
-            0.0,
-            None,
-            None,
-            RequestKind::Blocking {
-                tool_choice: ToolChoice::Auto,
-            },
-        );
-
-        assert!(body.get("session_id").is_none());
-        assert!(body.get("session_lease").is_none());
-        assert!(body.get("session_cache_policy").is_none());
-        assert!(body.get("max_prompt_tokens").is_none());
-        assert!(body["messages"][0]
-            .get("_nanobot_higgs_session_lease")
-            .is_none());
-        assert!(body["messages"][0]
-            .get("_nanobot_higgs_session_cache_policy")
-            .is_none());
-        assert!(body["messages"][0]
-            .get("_nanobot_higgs_max_prompt_tokens")
-            .is_none());
-    }
-
-    #[test]
-    fn malformed_higgs_lease_ack_is_not_treated_as_numeric_confirmation() {
+    fn non_numeric_usage_values_are_not_recorded() {
         let usage_obj = serde_json::json!({
             "prompt_tokens": 12,
-            "higgs_session_lease_active": "1",
+            "cached_tokens": "1",
         });
         let mut usage = std::collections::HashMap::new();
 
         extract_usage_numbers(usage_obj.as_object().unwrap(), &mut usage);
 
         assert_eq!(usage.get("prompt_tokens"), Some(&12));
-        assert_eq!(usage.get("higgs_session_lease_active"), None);
+        assert_eq!(usage.get("cached_tokens"), None);
     }
 
     #[test]
-    fn cloud_provider_never_emits_higgs_lease_control() {
+    fn cloud_provider_never_emits_higgs_control() {
         let provider =
             OpenAICompatProvider::new("openai", Some("https://api.openai.com/v1"), Some("gpt-5"));
         let messages = vec![serde_json::json!({
             "role": "system",
             "content": "stable prefix",
             NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
-            NANOBOT_HIGGS_SESSION_LEASE_FIELD: {"session_id": 41_u64, "ttl_seconds": 300_u32},
             NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD: "best_effort",
             NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD: 31_744_u32,
         })];
@@ -3366,12 +3252,7 @@ mod tests {
             },
         );
 
-        for field in [
-            "session_id",
-            "session_lease",
-            "session_cache_policy",
-            "max_prompt_tokens",
-        ] {
+        for field in ["session_id", "session_cache_policy", "max_prompt_tokens"] {
             assert!(body.get(field).is_none(), "cloud request emitted {field}");
         }
     }
@@ -5679,76 +5560,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_shot_higgs_lease_is_not_retried_after_retryable_http_failure() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
-        use std::time::Duration;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind retry capture server");
-        let address = listener.local_addr().expect("retry capture address");
-        let request_count = Arc::new(AtomicUsize::new(0));
-        let server_count = Arc::clone(&request_count);
-        let server = tokio::spawn(async move {
-            while let Ok(Ok((mut socket, _))) =
-                tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
-            {
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 2048];
-                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    let read = socket.read(&mut buffer).await.expect("read retry request");
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&buffer[..read]);
-                }
-                server_count.fetch_add(1, Ordering::SeqCst);
-                socket
-                    .write_all(
-                        b"HTTP/1.1 503 Service Unavailable\r\n\
-                          Content-Length: 11\r\n\
-                          Connection: close\r\n\
-                          \r\n\
-                          unavailable",
-                    )
-                    .await
-                    .expect("write retry response");
-            }
-        });
-        let provider = OpenAICompatProvider::new(
-            "local",
-            Some(&format!("http://{address}/v1")),
-            Some("bonsai"),
-        )
-        .with_higgs_session_cache(true);
-        let messages = vec![serde_json::json!({
-            "role": "system",
-            "content": "stable prefix",
-            NANOBOT_HIGGS_SESSION_ID_FIELD: 42_u64,
-            NANOBOT_HIGGS_SESSION_LEASE_FIELD: {
-                "session_id": 41_u64,
-                "ttl_seconds": 300_u32,
-            },
-            NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD: "best_effort",
-            NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD: 31_744_u32,
-        })];
-
-        let result = provider
-            .chat(&messages, None, None, 16, 0.0, None, None)
-            .await;
-
-        assert!(result.is_err());
-        assert_eq!(
-            request_count.load(Ordering::SeqCst),
-            1,
-            "a one-shot lease request must be attempted exactly once"
-        );
-        server.abort();
-    }
-
-    #[tokio::test]
     async fn terminal_none_request_is_not_retried_after_retryable_http_failure() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -5920,7 +5731,6 @@ mod tests {
                 NANOBOT_HIGGS_SESSION_ID_FIELD: 41_u64,
                 NANOBOT_HIGGS_DROP_SESSION_ID_FIELD: 43_u64,
                 NANOBOT_HIGGS_DROP_SESSION_IDS_FIELD: [44_u64, 43_u64],
-                NANOBOT_HIGGS_SESSION_LEASE_FIELD: {"session_id": 41_u64, "ttl_seconds": 300_u32},
                 NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD: "require_continuation",
                 NANOBOT_HIGGS_MAX_PROMPT_TOKENS_FIELD: 31_744_u32,
             }),
@@ -6031,8 +5841,6 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&serde_json::json!(41)));
-        expected_retained["session_lease"] =
-            serde_json::json!({"session_id": 41, "ttl_seconds": 300});
         expected_retained["session_cache_policy"] = serde_json::json!("require_continuation");
         expected_retained["max_prompt_tokens"] = serde_json::json!(31_744);
         assert_eq!(captured[0], expected_retained);

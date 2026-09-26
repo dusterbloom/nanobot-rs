@@ -1055,18 +1055,6 @@ fn build_local_inline_harness_with_model(
     build_local_inline_harness_with_lcm(main, model, 4096, LcmSchemaConfig::default())
 }
 
-pub(super) fn retained_overflow_test_harness() -> (AgentLoop, std::path::PathBuf) {
-    build_local_inline_harness_with_lcm(
-        Arc::new(WireRecordingProvider::new_higgs_capable(
-            "retained-overflow-test",
-            vec![WireRecordingProvider::text_response("ok")],
-        )),
-        "retained-overflow-test",
-        32_768,
-        LcmSchemaConfig::default(),
-    )
-}
-
 fn build_local_inline_harness_with_lcm(
     main: Arc<dyn LLMProvider>,
     model: &str,
@@ -2328,7 +2316,7 @@ impl LLMProvider for ReplayStableSoftProvider {
             self.foreground_max_tokens.lock().unwrap().push(max_tokens);
             calls.len()
         };
-        let mut response = if self.force_recovery_on_second && call == 2 {
+        let response = if self.force_recovery_on_second && call == 2 {
             WireRecordingProvider::plain_text_response(
                 "I'll read it.\n[Called read_file({\"path\":\"/x\"})]",
             )
@@ -2352,11 +2340,6 @@ impl LLMProvider for ReplayStableSoftProvider {
                 "turn two reply"
             })
         };
-        if call == 2 {
-            response
-                .usage
-                .insert("higgs_session_lease_active".to_string(), 1);
-        }
         Ok(response)
     }
 
@@ -3599,7 +3582,6 @@ async fn final_handle_drop_aborts_generation_but_preserves_publication_handoff()
                         })],
                     },
                     snapshot: Vec::new(),
-                    summary_node_id: 0,
                 })
             })
             .await
@@ -3666,7 +3648,6 @@ async fn compaction_shutdown_waits_for_publication_and_reaps_generation() {
                         })],
                     },
                     snapshot: Vec::new(),
-                    summary_node_id: 0,
                 })
             })
             .await
@@ -3760,7 +3741,6 @@ async fn agent_clear_reaps_job_and_discards_pending_checkpoint() {
                         })],
                     },
                     snapshot: Vec::new(),
-                    summary_node_id: 0,
                 })
             })
             .await
@@ -3949,7 +3929,6 @@ async fn interactive_clear_is_atomic_against_session_admission() {
                         })],
                     },
                     snapshot: Vec::new(),
-                    summary_node_id: 0,
                 };
                 assert!(publication.begin_publication());
                 *task_pending_handoff.lock().unwrap() = Some(pending);
@@ -4319,7 +4298,6 @@ async fn pending_compaction_checkpoint_hides_unpublished_dag() {
             })],
         },
         snapshot,
-        summary_node_id: 0,
     });
     msg.content = "second".to_string();
     let second = agent_loop

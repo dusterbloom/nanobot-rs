@@ -305,8 +305,8 @@ mod tests {
 
     use crate::agent::agent_core::{build_swappable_core, RuntimeCounters, SwappableCoreConfig};
     use crate::agent::agent_loop::{
-        CompactionHandle, FlowControl, HiggsSessionRoute, MessageLog, ProviderCallMode,
-        ProviderRequestState, RetainedRouteCleanupGuard, RetentionEligibility, TurnOutcome,
+        CompactionHandle, FlowControl, MessageLog, ProviderCallMode, ProviderRequestState,
+        RetentionEligibility, TurnOutcome,
     };
     use crate::agent::lane::Lane;
     use crate::agent::protocol::CloudProtocol;
@@ -416,8 +416,6 @@ mod tests {
             compaction: CompactionHandle::new(),
             soft_compaction_requested: false,
             staged_auto_expansion: None,
-            higgs_session_route: HiggsSessionRoute::default(),
-            retained_route_cleanup: RetainedRouteCleanupGuard::default(),
             content_gate: crate::agent::context_gate::ContentGate::new(4096, 0.25),
             counters,
             capacity: Arc::new(crate::agent::capacity::CapacityRuntime::default()),

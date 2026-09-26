@@ -55,8 +55,9 @@ pub struct RequestMetrics {
     /// Stable Nanobot session key spanning every provider call in one logical
     /// conversation, independent of retained Higgs session-id rotations.
     pub logical_session: String,
-    /// Prompt-cache branch used for this request. Wire values are `active`,
-    /// `retained_expansion`, and `fallback`.
+    /// Prompt-cache branch used for this request. Always `active` since the
+    /// retained-expansion route was removed; kept so existing metric readers
+    /// keep parsing.
     pub cache_route: String,
     pub role: String,
     pub model: String,
