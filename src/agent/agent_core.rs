@@ -490,6 +490,8 @@ impl RuntimeCounters {
         if matches!(scope, PromptResetScope::LogicalSession) {
             self.clear_local_artifact_intent(session_key);
             self.clear_tool_catalog(session_key);
+            // A new logical session may legitimately start with a new head.
+            self.prompt_head_hashes.lock().remove(session_key);
             self.note_cache_reset(session_key, "session_reset");
         }
         self.retire_higgs_session(session_key)
@@ -1704,12 +1706,17 @@ mod tests {
             .prompt_cache_watermark
             .lock()
             .insert(session.to_string(), 7);
+        counters
+            .prompt_head_hashes
+            .lock()
+            .insert(session.to_string(), 42);
         counters.record_local_artifact_intent(session, 10, true);
 
         counters.record_higgs_session_id(session, 10);
         assert_eq!(counters.reset_session_prompt_state(session), 1);
         assert!(!counters.prompt_fingerprints.lock().contains_key(session));
         assert!(!counters.prompt_cache_watermark.lock().contains_key(session));
+        assert!(!counters.prompt_head_hashes.lock().contains_key(session));
         assert_eq!(counters.local_artifact_intent_is_rich(session, 10), None);
         assert_eq!(counters.session_prompt_epoch(session), 1);
         assert_eq!(counters.pending_higgs_session_drop_ids(session), vec![10]);

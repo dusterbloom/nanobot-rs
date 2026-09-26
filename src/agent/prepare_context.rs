@@ -277,10 +277,17 @@ impl AgentLoopShared {
 
         // Resolve the concrete SQLite session before constructing any state
         // that must not leak across idle rollover.
-        let session_meta = core
+        let (session_meta, origin) = core
             .sessions
             .get_or_resume_with_idle(&session_key, core.session_complete_after_secs)
             .await;
+        // An idle rollover is a logical-session boundary, like `/clear`: the
+        // fresh concrete session starts a new Higgs route and a new prompt
+        // (its continuity note), so reset the key's prompt-cache bookkeeping
+        // instead of letting the old route's baselines judge the new one.
+        if origin == crate::session::db::SessionOrigin::Rotated {
+            counters.reset_session_prompt_state(&session_key);
+        }
         let session_id = session_meta.id.clone();
         let (compaction, compaction_admission) = loop {
             let candidate = self.compaction_handle_for_session(&session_id).await;

@@ -201,6 +201,18 @@ const WORKING_MEMORY_SELECT_WITH_STATUS: &str = "\
 // Public types
 // ---------------------------------------------------------------------------
 
+/// How [`SessionDb::get_or_resume_with_idle`] obtained its session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOrigin {
+    /// The latest session for the key was continued.
+    Resumed,
+    /// The latest session had been idle past the limit; a fresh session
+    /// replaced it under the same key.
+    Rotated,
+    /// The key had no session yet.
+    Created,
+}
+
 /// Metadata for a session (returned by list/get operations).
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
@@ -2091,11 +2103,16 @@ impl SessionDb {
     /// that many seconds, a fresh session is created instead of resuming the
     /// stale one. Pass `0` to always resume (the old behaviour).
     pub async fn get_or_resume(&self, key: &str) -> SessionMeta {
-        self.get_or_resume_with_idle(key, 0).await
+        self.get_or_resume_with_idle(key, 0).await.0
     }
 
-    /// Like [`get_or_resume`] but with an explicit idle timeout.
-    pub async fn get_or_resume_with_idle(&self, key: &str, max_idle_secs: u64) -> SessionMeta {
+    /// Like [`get_or_resume`] but with an explicit idle timeout. Also reports
+    /// whether the session was resumed, rotated after idling, or created.
+    pub async fn get_or_resume_with_idle(
+        &self,
+        key: &str,
+        max_idle_secs: u64,
+    ) -> (SessionMeta, SessionOrigin) {
         if let Some(meta) = self.get_latest_session(key).await {
             if max_idle_secs > 0 {
                 let idle = chrono::Utc::now() - meta.updated_at;
@@ -2121,7 +2138,7 @@ impl SessionDb {
                         );
                     }
                     drop(conn);
-                    return self.create_session(key).await;
+                    return (self.create_session(key).await, SessionOrigin::Rotated);
                 }
             }
 
@@ -2137,9 +2154,9 @@ impl SessionDb {
                     "failed to reactivate resumed session working memory"
                 );
             }
-            return meta;
+            return (meta, SessionOrigin::Resumed);
         }
-        self.create_session(key).await
+        (self.create_session(key).await, SessionOrigin::Created)
     }
 
     /// Select one concrete session for explicit resume.
@@ -5094,7 +5111,8 @@ mod tests {
         }
 
         // With max_idle_secs=3600 (1 hour), the 2-hour-old session is stale.
-        let fresh = db.get_or_resume_with_idle("telegram:42", 3600).await;
+        let (fresh, origin) = db.get_or_resume_with_idle("telegram:42", 3600).await;
+        assert_eq!(origin, SessionOrigin::Rotated);
         assert_ne!(
             fresh.id, original.id,
             "stale session should not be resumed; a new one should be created"
@@ -5116,7 +5134,8 @@ mod tests {
 
         // Session was just created (updated_at is now). With 3600s idle timeout
         // it should be resumed, not replaced.
-        let resumed = db.get_or_resume_with_idle("telegram:99", 3600).await;
+        let (resumed, origin) = db.get_or_resume_with_idle("telegram:99", 3600).await;
+        assert_eq!(origin, SessionOrigin::Resumed);
         assert_eq!(
             resumed.id, original.id,
             "recent session must be resumed, not replaced"
@@ -5140,7 +5159,7 @@ mod tests {
             .unwrap();
         }
 
-        let fresh = db
+        let (fresh, _) = db
             .get_or_resume_with_idle("telegram:idle-memory", 3600)
             .await;
         assert_ne!(fresh.id, original.id);
