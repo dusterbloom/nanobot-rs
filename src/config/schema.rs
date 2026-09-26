@@ -207,9 +207,7 @@ pub struct AgentDefaults {
     /// Custom API base for local inference (e.g. "http://192.168.1.22:1234/v1").
     /// Highest-priority discovery candidate: when set AND healthy, local mode
     /// uses it. When empty or dead, startup discovers Higgs / LM Studio /
-    /// cluster peers instead. All trio roles (main, router, specialist) share
-    /// this endpoint; model differentiation happens via the `model` field in
-    /// each API request (JIT loading).
+    /// cluster peers instead.
     #[serde(default)]
     pub local_api_base: String,
     /// API key for local inference server (default: "local").
@@ -889,153 +887,33 @@ pub struct ToolsConfig {
 }
 
 // ---------------------------------------------------------------------------
-// Trio router config
+// Local-model tuning (kept under the historical `trio` key)
 // ---------------------------------------------------------------------------
-
-fn default_trio_router_port() -> u16 {
-    8094
-}
-
-fn default_trio_router_ctx_tokens() -> usize {
-    4096
-}
-
-fn default_trio_router_temperature() -> f64 {
-    0.2
-}
-
-fn default_trio_router_top_p() -> f64 {
-    0.95
-}
-
-fn default_trio_router_no_think() -> bool {
-    true
-}
 
 fn default_trio_main_no_think() -> bool {
     true
 }
 
-fn default_trio_specialist_port() -> u16 {
-    8095
-}
-
-fn default_trio_specialist_ctx_tokens() -> usize {
-    8192
-}
-
-fn default_trio_specialist_temperature() -> f64 {
-    0.7
-}
-
-fn default_trio_specialist_top_p() -> f64 {
-    0.95
-}
-
-fn default_vram_cap_gb() -> f64 {
-    16.0
-}
-
-/// Circuit breaker tuning. Nested under trio.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct CircuitBreakerConfig {
-    /// Number of consecutive failures before tripping (default: 3).
-    pub threshold: u32,
-    /// Cooldown period in seconds after tripping (default: 300).
-    pub cooldown_secs: u64,
-}
-
-impl Default for CircuitBreakerConfig {
-    fn default() -> Self {
-        Self {
-            threshold: 3,
-            cooldown_secs: 300,
-        }
-    }
-}
-
-/// A URL + model pair identifying a specific model on a specific server.
-///
-/// Used for trio roles (router, specialist) so that both single-server (LM Studio)
-/// and multi-server (llama.cpp) setups are expressed the same way.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ModelEndpoint {
-    /// Full API base URL, e.g. "http://localhost:1234/v1".
-    pub url: String,
-    /// Model identifier sent in the API request, e.g. "nvidia_orchestrator-8b".
-    pub model: String,
-}
-
-/// Configuration for the SLM trio (router + specialist helpers).
-/// Default trio: gemma-3n-e4b-it (main) + nvidia_orchestrator-8b (router) + ministral-3-8b (specialist).
+/// Local-model tuning that outlived the router/specialist trio. The JSON key
+/// stays `trio` so existing configs keep loading.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrioConfig {
-    /// Enable the trio workflow (defaults to false).
-    #[serde(default)]
-    pub enabled: bool,
-    /// Use /no_think mode for main model (gemma-3n) to output directly to content.
+    /// Use /no_think mode for the main model so it answers directly into content.
     #[serde(default = "default_trio_main_no_think")]
     pub main_no_think: bool,
-    /// Local GGUF filename for the router (nvidia_orchestrator-8b). Stored in ~/models/.
-    #[serde(default)]
-    pub router_model: String,
-    /// TCP port for the router server (default: 8094).
-    #[serde(default = "default_trio_router_port")]
-    pub router_port: u16,
-    /// Context size for the router (default: 4096).
-    #[serde(default = "default_trio_router_ctx_tokens")]
-    pub router_ctx_tokens: usize,
-    /// Temperature for router sampling (default: 0.6).
-    #[serde(default = "default_trio_router_temperature")]
-    pub router_temperature: f64,
-    /// Top-p for router sampling (default: 0.95).
-    #[serde(default = "default_trio_router_top_p")]
-    pub router_top_p: f64,
-    /// Use /no_think mode for direct JSON output (default: true).
-    #[serde(default = "default_trio_router_no_think")]
-    pub router_no_think: bool,
-    /// Specialist SLM (summary/coder) filename stored in ~/models/.
-    #[serde(default)]
-    pub specialist_model: String,
-    /// Port for the specialist server (default: 8095).
-    #[serde(default = "default_trio_specialist_port")]
-    pub specialist_port: u16,
-    /// Context size for the specialist (default: 8192).
-    #[serde(default = "default_trio_specialist_ctx_tokens")]
-    pub specialist_ctx_tokens: usize,
-    /// Temperature for the specialist LLM (default: 0.7).
-    #[serde(default = "default_trio_specialist_temperature")]
-    pub specialist_temperature: f64,
-    /// top_p for the specialist LLM (default: 0.95). Wired into the specialist
-    /// call so reasoning models (e.g. VibeThinker: temp 1.0 / top_p 0.95) sample
-    /// per their model card instead of hardcoded values.
-    #[serde(default = "default_trio_specialist_top_p")]
-    pub specialist_top_p: f64,
-    /// Explicit endpoint for the router role (takes priority over router_port + router_model).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub router_endpoint: Option<ModelEndpoint>,
-    /// Explicit endpoint for the specialist role (takes priority over specialist_port + specialist_model).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub specialist_endpoint: Option<ModelEndpoint>,
-    /// VRAM budget cap in GB (default: 16). Context sizes auto-computed to fit.
-    #[serde(default = "default_vram_cap_gb")]
-    pub vram_cap_gb: f64,
     /// Anti-drift hooks for SLM context quality stabilization.
     #[serde(default)]
     pub anti_drift: AntiDriftConfig,
-    /// Circuit breaker tuning for trio provider health tracking.
-    #[serde(default)]
-    pub circuit_breaker: CircuitBreakerConfig,
-    /// When true, specialist is instructed to return a strict JSON envelope
-    /// (`SpecialistResponse`) and the raw output is parsed accordingly.
-    /// Defaults to false for backward compatibility.
-    #[serde(default)]
-    pub specialist_output_schema: bool,
-    #[serde(default)]
-    pub trace_log: bool,
+}
+
+impl Default for TrioConfig {
+    fn default() -> Self {
+        Self {
+            main_no_think: default_trio_main_no_think(),
+            anti_drift: AntiDriftConfig::default(),
+        }
+    }
 }
 
 /// Anti-drift configuration for SLM context stabilization.
@@ -1091,33 +969,6 @@ impl Default for AntiDriftConfig {
     }
 }
 
-impl Default for TrioConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            main_no_think: default_trio_main_no_think(),
-            router_model: String::new(),
-            router_port: default_trio_router_port(),
-            router_ctx_tokens: default_trio_router_ctx_tokens(),
-            router_temperature: default_trio_router_temperature(),
-            router_top_p: default_trio_router_top_p(),
-            router_no_think: default_trio_router_no_think(),
-            specialist_model: String::new(),
-            specialist_port: default_trio_specialist_port(),
-            specialist_ctx_tokens: default_trio_specialist_ctx_tokens(),
-            specialist_temperature: default_trio_specialist_temperature(),
-            specialist_top_p: default_trio_specialist_top_p(),
-            router_endpoint: None,
-            specialist_endpoint: None,
-            vram_cap_gb: default_vram_cap_gb(),
-            anti_drift: AntiDriftConfig::default(),
-            circuit_breaker: CircuitBreakerConfig::default(),
-            specialist_output_schema: false,
-            trace_log: false,
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Memory config
 // ---------------------------------------------------------------------------
@@ -1151,7 +1002,7 @@ pub struct MemoryConfig {
 
     /// Model to use for LCM compaction and reflection.
     /// If empty: Anthropic/OpenRouter defaults to "haiku", other cloud providers
-    /// fall back to the main model, local defaults to trio specialist if available.
+    /// fall back to the main model, local uses the main model.
     /// Override with any model name, e.g. "gemini/gemini-2.5-flash".
     #[serde(default)]
     pub model: String,
@@ -1352,506 +1203,32 @@ impl Default for SubagentTuning {
 }
 
 // ---------------------------------------------------------------------------
-// Router tuning config
+// Tool-call and subagent tuning (kept under the historical `toolDelegation` key)
 // ---------------------------------------------------------------------------
 
-/// Tuning knobs for the LLM-based router decisions and tool result truncation.
-/// Nested under `toolDelegation.routerTuning`.
+/// Tool-call and subagent tuning. The JSON key stays `toolDelegation` so
+/// existing configs keep loading.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct RouterTuningConfig {
-    /// Max tokens for a single router LLM call (default: 256).
-    pub max_tokens: u32,
-    /// Max characters kept from a tool result before injection into the router
-    /// context (default: 2400).
-    pub max_tool_result_chars: usize,
-    /// Max characters per message in the conversation tail passed to the
-    /// router (default: 200).
-    pub tail_max_msg_chars: usize,
-    /// Max total characters for the whole conversation tail (default: 800).
-    pub tail_max_chars: usize,
-}
-
-fn default_router_max_tokens() -> u32 {
-    256
-}
-fn default_router_max_tool_result_chars() -> usize {
-    2400
-}
-fn default_router_tail_max_msg_chars() -> usize {
-    200
-}
-fn default_router_tail_max_chars() -> usize {
-    800
-}
-
-impl Default for RouterTuningConfig {
-    fn default() -> Self {
-        Self {
-            max_tokens: default_router_max_tokens(),
-            max_tool_result_chars: default_router_max_tool_result_chars(),
-            tail_max_msg_chars: default_router_tail_max_msg_chars(),
-            tail_max_chars: default_router_tail_max_chars(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tool delegation config
-// ---------------------------------------------------------------------------
-
-fn default_td_max_iterations() -> u32 {
-    10
-}
-
-fn default_td_max_tokens() -> u32 {
-    1024
-}
-
-/// High-level delegation mode with its strict routing policy attached.
-///
-/// Use this instead of configuring individual `strict_*` booleans:
-/// - **Inline**: Main model calls tools directly (no delegation).
-/// - **Delegated**: Tools delegated to a cheaper tool runner model.
-/// - **Trio**: Strict separation — main=conversation, router=dispatch, specialist=execution.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DelegationMode {
-    /// Main model calls tools directly (delegation disabled).
-    Inline(DelegationStrictPolicy),
-    /// Tools delegated to tool runner model (default).
-    Delegated(DelegationStrictPolicy),
-    /// Strict trio: main=orchestrator, router=dispatch, specialist=tools.
-    Trio(DelegationStrictPolicy),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DelegationStrictPolicy {
-    strict_no_tools_main: bool,
-    strict_router_schema: bool,
-    strict_local_only: bool,
-    strict_toolplan_validation: bool,
-}
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-enum DelegationModeName {
-    Inline,
-    #[default]
-    Delegated,
-    Trio,
-}
-
-#[derive(Default)]
-struct LegacyStrictPolicy {
-    strict_no_tools_main: Option<bool>,
-    strict_router_schema: Option<bool>,
-    strict_local_only: Option<bool>,
-    strict_toolplan_validation: Option<bool>,
-}
-
-impl Default for DelegationMode {
-    fn default() -> Self {
-        Self::delegated()
-    }
-}
-
-impl Serialize for DelegationMode {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        self.name().serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for DelegationMode {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Ok(match DelegationModeName::deserialize(deserializer)? {
-            DelegationModeName::Inline => Self::inline(),
-            DelegationModeName::Delegated => Self::delegated(),
-            DelegationModeName::Trio => Self::trio(),
-        })
-    }
-}
-
-impl DelegationMode {
-    pub const fn inline() -> Self {
-        Self::Inline(DelegationStrictPolicy::inline())
-    }
-
-    pub const fn delegated() -> Self {
-        Self::Delegated(DelegationStrictPolicy::delegated())
-    }
-
-    pub const fn trio() -> Self {
-        Self::Trio(DelegationStrictPolicy::trio())
-    }
-
-    pub fn is_inline(&self) -> bool {
-        matches!(self, Self::Inline(_))
-    }
-
-    pub fn is_delegated(&self) -> bool {
-        matches!(self, Self::Delegated(_))
-    }
-
-    pub fn is_trio(&self) -> bool {
-        matches!(self, Self::Trio(_))
-    }
-
-    pub fn strict_no_tools_main(&self) -> bool {
-        self.strict_policy().strict_no_tools_main
-    }
-
-    pub fn strict_router_schema(&self) -> bool {
-        self.strict_policy().strict_router_schema
-    }
-
-    pub fn strict_local_only(&self) -> bool {
-        self.strict_policy().strict_local_only
-    }
-
-    pub fn strict_toolplan_validation(&self) -> bool {
-        self.strict_policy().strict_toolplan_validation
-    }
-
-    fn name(&self) -> DelegationModeName {
-        match self {
-            Self::Inline(_) => DelegationModeName::Inline,
-            Self::Delegated(_) => DelegationModeName::Delegated,
-            Self::Trio(_) => DelegationModeName::Trio,
-        }
-    }
-
-    fn strict_policy(&self) -> DelegationStrictPolicy {
-        match *self {
-            Self::Inline(policy) | Self::Delegated(policy) | Self::Trio(policy) => policy,
-        }
-    }
-
-    fn with_legacy_strict(self, legacy: LegacyStrictPolicy) -> Self {
-        let policy = self.strict_policy().with_legacy(legacy);
-        match self {
-            Self::Inline(_) => Self::Inline(policy),
-            Self::Delegated(_) => Self::Delegated(policy),
-            Self::Trio(_) => Self::Trio(policy),
-        }
-    }
-
-    fn without_strict_router(self) -> Self {
-        let policy = self.strict_policy().without_strict_router();
-        match self {
-            Self::Inline(_) => Self::Inline(policy),
-            Self::Delegated(_) => Self::Delegated(policy),
-            Self::Trio(_) => Self::Trio(policy),
-        }
-    }
-}
-
-impl DelegationStrictPolicy {
-    const fn inline() -> Self {
-        Self {
-            strict_no_tools_main: false,
-            strict_router_schema: false,
-            strict_local_only: false,
-            strict_toolplan_validation: true,
-        }
-    }
-
-    const fn delegated() -> Self {
-        Self::inline()
-    }
-
-    const fn trio() -> Self {
-        Self {
-            strict_no_tools_main: true,
-            strict_router_schema: true,
-            strict_local_only: false,
-            strict_toolplan_validation: true,
-        }
-    }
-
-    fn with_legacy(self, legacy: LegacyStrictPolicy) -> Self {
-        Self {
-            strict_no_tools_main: legacy
-                .strict_no_tools_main
-                .unwrap_or(self.strict_no_tools_main),
-            strict_router_schema: legacy
-                .strict_router_schema
-                .unwrap_or(self.strict_router_schema),
-            strict_local_only: legacy.strict_local_only.unwrap_or(self.strict_local_only),
-            strict_toolplan_validation: legacy
-                .strict_toolplan_validation
-                .unwrap_or(self.strict_toolplan_validation),
-        }
-    }
-
-    fn without_strict_router(self) -> Self {
-        Self {
-            strict_no_tools_main: false,
-            strict_router_schema: false,
-            ..self
-        }
-    }
-}
-
-/// Configuration for delegating tool execution loops to a cheaper model.
-///
-/// When enabled, tool calls from the main LLM are handed off to a lightweight
-/// model that executes the tools and interprets their results, conserving the
-/// main model's context window for reasoning.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct ToolDelegationConfig {
-    /// High-level mode and strict routing policy.
-    /// Defaults to `Delegated`. Set to `trio` for strict separation or
-    /// `inline` to disable delegation entirely.
-    #[serde(default)]
-    pub mode: DelegationMode,
-    /// Enable tool delegation (default: true).
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-
-    /// Model to use for the tool runner. Empty string = use main model.
-    #[serde(default)]
-    pub model: String,
-
-    /// Optional separate provider for the tool runner.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<ProviderConfig>,
-
-    /// Max tool loop iterations for the runner (default: 10).
-    #[serde(default = "default_td_max_iterations")]
-    pub max_iterations: u32,
-
-    /// Max tokens per runner LLM call (default: 4096).
-    #[serde(default = "default_td_max_tokens")]
-    pub max_tokens: u32,
-
-    /// Inject only truncated previews of tool results into the main context
-    /// instead of full output. The runner's summary carries the meaning.
-    /// Default: true (the whole point of delegation is context savings).
-    #[serde(default = "default_true")]
-    pub slim_results: bool,
-
-    /// Max chars per tool result preview injected into the main context
-    /// when `slim_results` is enabled (default: 200).
-    #[serde(default = "default_td_preview_chars")]
-    pub max_result_preview_chars: usize,
-
-    /// Auto-spawn a local delegation server when in local mode and no
-    /// explicit provider is configured (default: true).
-    #[serde(default = "default_true")]
-    pub auto_local: bool,
-
-    /// Maximum cost in USD per delegation round (default: 0.01 = 1 cent).
-    /// Set to 0.0 to disable cost limiting. Prices fetched from OpenRouter.
-    #[serde(default = "default_td_cost_budget")]
-    pub cost_budget: f64,
-
     /// Default model for spawned subagents when no explicit model is provided.
     /// Prevents expensive main models from being used as workers.
     /// Example: "haiku", "zhipu/glm-4.5-air", "local".
     /// Empty string = fall back to main model (not recommended).
-    #[serde(default)]
     pub default_subagent_model: String,
-
-    /// When true, build and use role-scoped context packs per turn.
-    #[serde(default)]
-    pub role_scoped_context_packs: bool,
-
-    /// When true, use deterministic fallback routing when router output is invalid.
-    #[serde(default = "default_true")]
-    pub deterministic_router_fallback: bool,
-
     /// Maximum identical tool calls allowed in one turn (dedup guard).
-    #[serde(default = "default_td_max_same_tool_call")]
     pub max_same_tool_call_per_turn: u32,
-
     /// Tuning knobs for subagent execution.
-    #[serde(default)]
     pub subagent: SubagentTuning,
-
-    /// Tuning knobs for the LLM-based router (token budgets, context limits).
-    #[serde(default)]
-    pub router_tuning: RouterTuningConfig,
-
-    /// When true (default), the specialist response is injected into messages
-    /// and the main model synthesizes it in its own voice (Continue).
-    /// When false, the specialist response goes directly to the user (Break).
-    #[serde(default = "default_true")]
-    pub specialist_synthesis: bool,
-}
-
-fn default_td_cost_budget() -> f64 {
-    0.01
-}
-
-fn default_td_preview_chars() -> usize {
-    200
-}
-
-fn default_td_max_same_tool_call() -> u32 {
-    3
 }
 
 impl Default for ToolDelegationConfig {
     fn default() -> Self {
         Self {
-            mode: DelegationMode::default(),
-            enabled: true,
-            model: String::new(),
-            provider: None,
-            max_iterations: default_td_max_iterations(),
-            max_tokens: default_td_max_tokens(),
-            slim_results: true,
-            max_result_preview_chars: default_td_preview_chars(),
-            auto_local: true,
-            cost_budget: default_td_cost_budget(),
             default_subagent_model: String::new(),
-            role_scoped_context_packs: false,
-            deterministic_router_fallback: true,
-            max_same_tool_call_per_turn: default_td_max_same_tool_call(),
+            max_same_tool_call_per_turn: 3,
             subagent: SubagentTuning::default(),
-            router_tuning: RouterTuningConfig::default(),
-            specialist_synthesis: true,
         }
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-struct ToolDelegationConfigWire {
-    mode: DelegationMode,
-    enabled: bool,
-    model: String,
-    provider: Option<ProviderConfig>,
-    max_iterations: u32,
-    max_tokens: u32,
-    slim_results: bool,
-    max_result_preview_chars: usize,
-    auto_local: bool,
-    cost_budget: f64,
-    default_subagent_model: String,
-    strict_no_tools_main: Option<bool>,
-    strict_router_schema: Option<bool>,
-    role_scoped_context_packs: bool,
-    strict_local_only: Option<bool>,
-    strict_toolplan_validation: Option<bool>,
-    deterministic_router_fallback: bool,
-    max_same_tool_call_per_turn: u32,
-    subagent: SubagentTuning,
-    router_tuning: RouterTuningConfig,
-    specialist_synthesis: bool,
-}
-
-impl Default for ToolDelegationConfigWire {
-    fn default() -> Self {
-        let default = ToolDelegationConfig::default();
-        Self {
-            mode: default.mode,
-            enabled: default.enabled,
-            model: default.model,
-            provider: default.provider,
-            max_iterations: default.max_iterations,
-            max_tokens: default.max_tokens,
-            slim_results: default.slim_results,
-            max_result_preview_chars: default.max_result_preview_chars,
-            auto_local: default.auto_local,
-            cost_budget: default.cost_budget,
-            default_subagent_model: default.default_subagent_model,
-            strict_no_tools_main: None,
-            strict_router_schema: None,
-            role_scoped_context_packs: default.role_scoped_context_packs,
-            strict_local_only: None,
-            strict_toolplan_validation: None,
-            deterministic_router_fallback: default.deterministic_router_fallback,
-            max_same_tool_call_per_turn: default.max_same_tool_call_per_turn,
-            subagent: default.subagent,
-            router_tuning: default.router_tuning,
-            specialist_synthesis: default.specialist_synthesis,
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for ToolDelegationConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let wire = ToolDelegationConfigWire::deserialize(deserializer)?;
-        let mode = wire.mode.with_legacy_strict(LegacyStrictPolicy {
-            strict_no_tools_main: wire.strict_no_tools_main,
-            strict_router_schema: wire.strict_router_schema,
-            strict_local_only: wire.strict_local_only,
-            strict_toolplan_validation: wire.strict_toolplan_validation,
-        });
-
-        Ok(Self {
-            mode,
-            enabled: wire.enabled,
-            model: wire.model,
-            provider: wire.provider,
-            max_iterations: wire.max_iterations,
-            max_tokens: wire.max_tokens,
-            slim_results: wire.slim_results,
-            max_result_preview_chars: wire.max_result_preview_chars,
-            auto_local: wire.auto_local,
-            cost_budget: wire.cost_budget,
-            default_subagent_model: wire.default_subagent_model,
-            role_scoped_context_packs: wire.role_scoped_context_packs,
-            deterministic_router_fallback: wire.deterministic_router_fallback,
-            max_same_tool_call_per_turn: wire.max_same_tool_call_per_turn,
-            subagent: wire.subagent,
-            router_tuning: wire.router_tuning,
-            specialist_synthesis: wire.specialist_synthesis,
-        })
-    }
-}
-
-impl ToolDelegationConfig {
-    /// Apply the high-level `mode` to the individual strict flags.
-    ///
-    /// Call after deserialization to ensure the mode takes effect.
-    /// The strict policy itself lives inside `mode`; this only aligns the
-    /// non-strict runtime switches that still derive from the preset.
-    pub fn apply_mode(&mut self) {
-        match self.mode {
-            DelegationMode::Inline(_) => {
-                self.enabled = false;
-                self.role_scoped_context_packs = false;
-            }
-            DelegationMode::Delegated(_) => {
-                self.enabled = true;
-            }
-            DelegationMode::Trio(_) => {
-                self.enabled = true;
-                self.role_scoped_context_packs = true;
-            }
-        }
-    }
-
-    pub fn strict_no_tools_main(&self) -> bool {
-        self.mode.strict_policy().strict_no_tools_main
-    }
-
-    pub fn strict_router_schema(&self) -> bool {
-        self.mode.strict_policy().strict_router_schema
-    }
-
-    pub fn strict_local_only(&self) -> bool {
-        self.mode.strict_policy().strict_local_only
-    }
-
-    pub fn strict_toolplan_validation(&self) -> bool {
-        self.mode.strict_policy().strict_toolplan_validation
-    }
-
-    pub fn clear_strict_router(&mut self) {
-        self.mode = self.mode.without_strict_router();
     }
 }
 
@@ -2727,94 +2104,27 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_delegation_config_defaults() {
-        let td = ToolDelegationConfig::default();
-        assert!(td.enabled);
-        assert!(td.model.is_empty());
-        assert!(td.provider.is_none());
-        assert_eq!(td.max_iterations, 10);
-        assert_eq!(td.max_tokens, 1024);
-        assert!(td.slim_results);
-        assert_eq!(td.max_result_preview_chars, 200);
-        assert!(td.auto_local);
-        assert!(!td.strict_no_tools_main());
-        assert!(!td.strict_router_schema());
-        assert!(!td.role_scoped_context_packs);
-        assert!(!td.strict_local_only());
-        assert!(td.strict_toolplan_validation());
-        assert!(td.deterministic_router_fallback);
-        assert_eq!(td.max_same_tool_call_per_turn, 3);
-    }
-
-    #[test]
-    fn test_tool_delegation_config_roundtrip() {
-        let td = ToolDelegationConfig {
-            enabled: true,
-            model: "qwen2-0.5b".to_string(),
-            provider: Some(ProviderConfig {
-                api_key: "local".to_string(),
-                api_base: Some("http://localhost:8080/v1".to_string()),
-            }),
-            max_iterations: 10,
-            max_tokens: 2048,
-            slim_results: true,
-            max_result_preview_chars: 300,
-            auto_local: true,
-            cost_budget: 0.01,
-            default_subagent_model: String::new(),
-            role_scoped_context_packs: true,
-            deterministic_router_fallback: true,
-            max_same_tool_call_per_turn: 1,
-            specialist_synthesis: true,
-            mode: DelegationMode::trio(),
-            subagent: SubagentTuning::default(),
-            router_tuning: RouterTuningConfig::default(),
-        };
-        let json = serde_json::to_string(&td).unwrap();
-        let td2: ToolDelegationConfig = serde_json::from_str(&json).unwrap();
-        assert!(td2.enabled);
-        assert_eq!(td2.model, "qwen2-0.5b");
-        assert_eq!(td2.max_iterations, 10);
-        assert_eq!(td2.max_tokens, 2048);
-        assert!(td2.provider.is_some());
-        assert!(td2.strict_no_tools_main());
-        assert!(td2.strict_router_schema());
-        assert!(td2.role_scoped_context_packs);
-        assert!(!td2.strict_local_only());
-        assert!(td2.strict_toolplan_validation());
-        assert!(td2.deterministic_router_fallback);
-        assert_eq!(td2.max_same_tool_call_per_turn, 1);
-    }
-
-    #[test]
-    fn test_tool_delegation_old_shape_strict_flags_deserialize() {
+    fn test_pre_cut_trio_and_delegation_keys_still_load() {
+        // Configs written while trio/delegation existed carry keys nothing reads
+        // anymore; they must still load and keep the settings that are live.
         let json = r#"{
-            "enabled": true,
-            "mode": "delegated",
-            "strictNoToolsMain": true,
-            "strictRouterSchema": true,
-            "strictLocalOnly": true,
-            "strictToolplanValidation": false
+            "toolDelegation": {
+                "mode": "trio", "enabled": true, "strictNoToolsMain": true,
+                "routerTuning": {"maxTokens": 256}, "maxSameToolCallPerTurn": 2,
+                "defaultSubagentModel": "local", "subagent": {"maxIterations": 20}
+            },
+            "trio": {
+                "enabled": true, "routerModel": "r", "circuitBreaker": {"threshold": 5},
+                "routerEndpoint": {"url": "http://127.0.0.1:8094/v1", "model": "r"},
+                "mainNoThink": false, "antiDrift": {"anchorInterval": 7}
+            }
         }"#;
-        let td: ToolDelegationConfig = serde_json::from_str(json).unwrap();
-
-        assert!(td.enabled);
-        assert!(td.mode.is_delegated());
-        assert!(td.strict_no_tools_main());
-        assert!(td.strict_router_schema());
-        assert!(td.strict_local_only());
-        assert!(!td.strict_toolplan_validation());
-    }
-
-    #[test]
-    fn test_tool_delegation_config_in_root() {
-        let json =
-            r#"{"toolDelegation": {"enabled": true, "model": "small-model", "maxIterations": 5}}"#;
         let cfg: Config = serde_json::from_str(json).unwrap();
-        assert!(cfg.tool_delegation.enabled);
-        assert_eq!(cfg.tool_delegation.model, "small-model");
-        assert_eq!(cfg.tool_delegation.max_iterations, 5);
-        assert_eq!(cfg.tool_delegation.max_tokens, 1024); // default
+        assert_eq!(cfg.tool_delegation.max_same_tool_call_per_turn, 2);
+        assert_eq!(cfg.tool_delegation.default_subagent_model, "local");
+        assert_eq!(cfg.tool_delegation.subagent.max_iterations, 20);
+        assert!(!cfg.trio.main_no_think);
+        assert_eq!(cfg.trio.anti_drift.anchor_interval, 7);
     }
 
     #[test]
@@ -2870,45 +2180,6 @@ mod tests {
         assert!(cfg.provenance.show_tool_calls); // default true
         assert!(cfg.provenance.strict_mode); // default true
         assert!(cfg.provenance.response_boundary); // default true
-    }
-
-    // -- auto_local config field tests --
-
-    #[test]
-    fn test_auto_local_defaults_to_true() {
-        // When auto_local is absent from JSON, it should default to true
-        let json = r#"{"enabled": true, "model": "small-model"}"#;
-        let td: ToolDelegationConfig = serde_json::from_str(json).unwrap();
-        assert!(
-            td.auto_local,
-            "auto_local should default to true when absent"
-        );
-    }
-
-    #[test]
-    fn test_auto_local_explicit_false() {
-        let json = r#"{"enabled": true, "autoLocal": false}"#;
-        let td: ToolDelegationConfig = serde_json::from_str(json).unwrap();
-        assert!(
-            !td.auto_local,
-            "auto_local should be false when explicitly set"
-        );
-    }
-
-    #[test]
-    fn test_auto_local_explicit_true() {
-        let json = r#"{"enabled": true, "autoLocal": true}"#;
-        let td: ToolDelegationConfig = serde_json::from_str(json).unwrap();
-        assert!(td.auto_local);
-    }
-
-    #[test]
-    fn test_auto_local_in_root_config() {
-        // auto_local should be accessible through the root Config object
-        let json = r#"{"toolDelegation": {"enabled": true, "autoLocal": false}}"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        assert!(cfg.tool_delegation.enabled);
-        assert!(!cfg.tool_delegation.auto_local);
     }
 
     #[test]
@@ -2975,21 +2246,6 @@ mod tests {
         let say: TtsEngineConfig = serde_json::from_str(r#""say""#).unwrap();
         assert_eq!(supertonic, TtsEngineConfig::Supertonic);
         assert_eq!(say, TtsEngineConfig::Say);
-    }
-
-    #[test]
-    fn test_auto_local_roundtrip_preserves_value() {
-        let td = ToolDelegationConfig {
-            enabled: true,
-            auto_local: false,
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&td).unwrap();
-        let td2: ToolDelegationConfig = serde_json::from_str(&json).unwrap();
-        assert!(
-            !td2.auto_local,
-            "Roundtrip should preserve auto_local=false"
-        );
     }
 
     #[test]
@@ -3086,151 +2342,6 @@ mod tests {
         assert_eq!(
             cfg.agents.defaults.max_tool_result_chars,
             DEFAULT_MAX_TOOL_RESULT_CHARS
-        );
-    }
-
-    // -- ModelEndpoint + TrioConfig endpoint tests --
-
-    #[test]
-    fn test_model_endpoint_deserialization() {
-        let json = r#"{"url": "http://localhost:1234/v1", "model": "nvidia_orchestrator-8b"}"#;
-        let ep: ModelEndpoint = serde_json::from_str(json).unwrap();
-        assert_eq!(ep.url, "http://localhost:1234/v1");
-        assert_eq!(ep.model, "nvidia_orchestrator-8b");
-    }
-
-    #[test]
-    fn test_trio_config_endpoints_absent_by_default() {
-        let json = r#"{}"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        assert!(cfg.trio.router_endpoint.is_none());
-        assert!(cfg.trio.specialist_endpoint.is_none());
-    }
-
-    #[test]
-    fn test_trio_config_router_endpoint_lmstudio() {
-        // Single LM Studio server: both roles share same URL, different models.
-        let json = r#"{
-            "trio": {
-                "enabled": true,
-                "routerEndpoint": {
-                    "url": "http://localhost:1234/v1",
-                    "model": "nvidia_orchestrator-8b"
-                },
-                "specialistEndpoint": {
-                    "url": "http://localhost:1234/v1",
-                    "model": "ministral-3-8b-instruct-2512"
-                }
-            }
-        }"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        assert!(cfg.trio.enabled);
-        let re = cfg.trio.router_endpoint.as_ref().unwrap();
-        assert_eq!(re.url, "http://localhost:1234/v1");
-        assert_eq!(re.model, "nvidia_orchestrator-8b");
-        let se = cfg.trio.specialist_endpoint.as_ref().unwrap();
-        assert_eq!(se.url, "http://localhost:1234/v1");
-        assert_eq!(se.model, "ministral-3-8b-instruct-2512");
-    }
-
-    #[test]
-    fn test_trio_config_endpoint_separate_servers() {
-        // llama.cpp: separate servers on different ports.
-        let json = r#"{
-            "trio": {
-                "routerEndpoint": {
-                    "url": "http://localhost:8094/v1",
-                    "model": "orchestrator"
-                },
-                "specialistEndpoint": {
-                    "url": "http://localhost:8095/v1",
-                    "model": "specialist"
-                }
-            }
-        }"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        let re = cfg.trio.router_endpoint.as_ref().unwrap();
-        assert_eq!(re.url, "http://localhost:8094/v1");
-        let se = cfg.trio.specialist_endpoint.as_ref().unwrap();
-        assert_eq!(se.url, "http://localhost:8095/v1");
-    }
-
-    #[test]
-    fn test_trio_config_backwards_compat_port_model() {
-        // Old-style config with routerPort + routerModel still works.
-        let json = r#"{
-            "trio": {
-                "enabled": true,
-                "routerModel": "nemotron-orchestrator",
-                "routerPort": 8094
-            }
-        }"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        assert!(cfg.trio.enabled);
-        assert_eq!(cfg.trio.router_model, "nemotron-orchestrator");
-        assert_eq!(cfg.trio.router_port, 8094);
-        assert!(
-            cfg.trio.router_endpoint.is_none(),
-            "endpoint should be absent when not set"
-        );
-    }
-
-    #[test]
-    fn test_trio_config_endpoint_roundtrip() {
-        let trio = TrioConfig {
-            enabled: true,
-            router_endpoint: Some(ModelEndpoint {
-                url: "http://localhost:1234/v1".to_string(),
-                model: "router-model".to_string(),
-            }),
-            specialist_endpoint: Some(ModelEndpoint {
-                url: "http://localhost:1234/v1".to_string(),
-                model: "specialist-model".to_string(),
-            }),
-            ..Default::default()
-        };
-        let json = serde_json::to_string(&trio).unwrap();
-        let trio2: TrioConfig = serde_json::from_str(&json).unwrap();
-        assert!(trio2.router_endpoint.is_some());
-        assert_eq!(trio2.router_endpoint.unwrap().model, "router-model");
-        assert!(trio2.specialist_endpoint.is_some());
-        assert_eq!(trio2.specialist_endpoint.unwrap().model, "specialist-model");
-    }
-
-    #[test]
-    fn test_trio_vram_cap_gb_default() {
-        let json = r#"{}"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        assert!((cfg.trio.vram_cap_gb - 16.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_trio_vram_cap_gb_roundtrip() {
-        let mut trio = TrioConfig::default();
-        trio.vram_cap_gb = 12.0;
-        let json = serde_json::to_string(&trio).unwrap();
-        let trio2: TrioConfig = serde_json::from_str(&json).unwrap();
-        assert!((trio2.vram_cap_gb - 12.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_trio_vram_cap_gb_from_json() {
-        let json = r#"{"trio": {"vramCapGb": 8.5}}"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        assert!((cfg.trio.vram_cap_gb - 8.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_trio_config_endpoint_not_serialized_when_none() {
-        let trio = TrioConfig::default();
-        let json = serde_json::to_string(&trio).unwrap();
-        assert!(
-            !json.contains("routerEndpoint"),
-            "None endpoints should be skipped"
-        );
-        assert!(
-            !json.contains("specialistEndpoint"),
-            "None endpoints should be skipped"
         );
     }
 
@@ -3331,21 +2442,6 @@ mod tests {
         assert_eq!(cfg.tool_delegation.subagent.max_spawn_depth, 5);
         // Unspecified fields get defaults
         assert_eq!(cfg.tool_delegation.subagent.local_fallback_context, 8192);
-    }
-
-    #[test]
-    fn test_circuit_breaker_config_defaults() {
-        let c = CircuitBreakerConfig::default();
-        assert_eq!(c.threshold, 3);
-        assert_eq!(c.cooldown_secs, 300);
-    }
-
-    #[test]
-    fn test_circuit_breaker_config_in_root_config() {
-        let json = r#"{"trio": {"circuitBreaker": {"threshold": 5, "cooldownSecs": 600}}}"#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.trio.circuit_breaker.threshold, 5);
-        assert_eq!(cfg.trio.circuit_breaker.cooldown_secs, 600);
     }
 
     #[test]

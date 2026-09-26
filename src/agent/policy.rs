@@ -1,9 +1,5 @@
 //! Session-level policy enforcement for reliable local tool execution.
 
-use std::collections::HashMap;
-
-use serde_json::Value;
-
 /// Sticky per-session policy flags.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SessionPolicy {
@@ -54,26 +50,6 @@ pub fn enforce_subagent_model(policy: &SessionPolicy, requested: Option<String>)
         Some(m) if is_local_model(&m) => Some(m),
         _ => Some("local".to_string()),
     }
-}
-
-/// Validate that a spawn tool request has a non-empty task.
-pub fn validate_spawn_args(params: &HashMap<String, Value>) -> Result<(), String> {
-    let action = params
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("spawn");
-    if action != "spawn" {
-        return Ok(());
-    }
-    let task = params
-        .get("task")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    if task.is_empty() {
-        return Err("Tool 'spawn' requires non-empty 'task' parameter".to_string());
-    }
-    Ok(())
 }
 
 #[cfg(test)]

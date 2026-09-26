@@ -15,14 +15,13 @@
 //! compaction utilities.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde_json::Value;
 use tracing::debug;
 
 use crate::agent::agent_profiles;
-use crate::agent::circuit_breaker::CircuitBreaker;
 use crate::agent::compaction::ContextCompactor;
 use crate::agent::context::ContextBuilder;
 use crate::agent::lane::Lane;
@@ -31,8 +30,7 @@ use crate::agent::runtime_mode::RuntimeMode;
 use crate::agent::token_budget::TokenBudget;
 use crate::agent::working_memory::WorkingMemoryStore;
 use crate::config::schema::{
-    AdaptiveTokenConfig, CircuitBreakerConfig, MemoryConfig, ProvenanceConfig,
-    ToolDelegationConfig, TrioConfig,
+    AdaptiveTokenConfig, MemoryConfig, ProvenanceConfig, ToolDelegationConfig, TrioConfig,
 };
 use crate::providers::base::LLMProvider;
 use crate::session::db::SessionDb;
@@ -89,17 +87,6 @@ pub struct SwappableCore {
     /// removed in R6 — it duplicated information already carried by this enum.
     pub mode: RuntimeMode,
     pub lane: Lane,
-    pub tool_runner_provider: Option<Arc<dyn LLMProvider>>,
-    pub tool_runner_model: Option<String>,
-    pub router_provider: Option<Arc<dyn LLMProvider>>,
-    pub router_model: Option<String>,
-    pub router_no_think: bool,
-    pub router_temperature: f64,
-    pub router_top_p: f64,
-    pub specialist_provider: Option<Arc<dyn LLMProvider>>,
-    pub specialist_model: Option<String>,
-    pub specialist_temperature: f64,
-    pub specialist_top_p: f64,
     pub tool_delegation_config: ToolDelegationConfig,
     pub provenance_config: ProvenanceConfig,
     pub max_tool_result_chars: usize,
@@ -110,10 +97,6 @@ pub struct SwappableCore {
     /// `agent::retention` — replaces the formerly separate `anti_drift` and
     /// `hygiene_keep_last_messages` fields.
     pub retention: crate::agent::retention::RetentionPolicy,
-    /// When true, specialist is instructed to return strict JSON and the response
-    /// is parsed as `SpecialistResponse`. Sourced from `TrioConfig::specialist_output_schema`.
-    pub specialist_output_schema: bool,
-    pub trace_log: bool,
     pub reasoning_config: crate::config::schema::ReasoningConfig,
     /// Code execution tool config.
     pub code_execution: crate::config::schema::CodeExecutionConfig,
@@ -136,24 +119,11 @@ impl SwappableCore {
     }
 }
 
-/// Current trio routing state — transitions logged once, not per-check.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum TrioState {
-    /// Trio routing fully operational.
-    Active = 0,
-    /// Trio degraded — some components unhealthy, falling back.
-    Degraded = 1,
-    /// Trio disabled — running as standalone single model.
-    Standalone = 2,
-}
-
 /// How the final post-policy tool catalog is presented to the main model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolPresentationMode {
     Native,
     Textual,
-    Trio,
 }
 
 #[derive(Clone, Debug)]
@@ -320,25 +290,6 @@ impl Drop for HiggsSessionRequestReservation {
     }
 }
 
-/// Observability counters for trio routing, populated by router.rs.
-pub struct TrioMetrics {
-    pub router_preflight_fired: AtomicBool,
-    pub router_action: parking_lot::Mutex<Option<String>>,
-    pub specialist_dispatched: AtomicBool,
-    pub tool_dispatched: parking_lot::Mutex<Option<String>>,
-}
-
-impl Default for TrioMetrics {
-    fn default() -> Self {
-        Self {
-            router_preflight_fired: AtomicBool::new(false),
-            router_action: parking_lot::Mutex::new(None),
-            specialist_dispatched: AtomicBool::new(false),
-            tool_dispatched: parking_lot::Mutex::new(None),
-        }
-    }
-}
-
 /// Atomic counters that survive core swaps — never behind `RwLock`.
 ///
 /// These counters persist across `/local` and `/model` hot-swaps because
@@ -351,15 +302,6 @@ pub struct RuntimeCounters {
     pub last_message_count: AtomicU64,
     pub last_working_memory_tokens: AtomicU64,
     pub last_tools_called: parking_lot::Mutex<Vec<String>>,
-    /// Tracks whether the delegation provider is alive. Set to `false` when
-    /// the delegation LLM returns a hard error or times out, causing subsequent
-    /// calls to fall through to inline execution. Reset to `true` on core
-    /// rebuild (`rebuild_core`) and `/restart` command.
-    pub delegation_healthy: AtomicBool,
-    /// Counts tool calls since delegation was marked unhealthy. Used to
-    /// periodically re-probe: every 10 inline calls, try delegation once
-    /// more in case the server recovered.
-    pub delegation_retry_counter: AtomicU64,
     /// Extended thinking budget in tokens. 0 = disabled, >0 = enabled with that budget.
     /// Toggled by `/think` or `/t`. `/think 16000` sets a specific budget.
     pub thinking_budget: AtomicU32,
@@ -390,14 +332,6 @@ pub struct RuntimeCounters {
     pub inference_active: Arc<AtomicBool>,
     /// Timestamp (epoch ms) when the most recent inference finished.
     pub last_inference_finished_ms: AtomicU64,
-    /// Trio routing observability.
-    pub trio_metrics: TrioMetrics,
-    /// Circuit breaker for trio routing providers.
-    pub trio_circuit_breaker: parking_lot::Mutex<CircuitBreaker>,
-    /// Current trio routing state for observability.
-    pub trio_state: AtomicU8,
-    /// Per-domain ring buffer memory for specialist multi-turn context.
-    pub specialist_memory: parking_lot::Mutex<crate::agent::router::SpecialistMemory>,
     /// Per-session prompt fingerprints for the prefix-divergence diagnostic
     /// (~8 bytes per message per session). See `agent::prompt_fingerprint`.
     pub prompt_fingerprints: parking_lot::Mutex<
@@ -478,7 +412,7 @@ pub struct RuntimeCounters {
 }
 
 impl RuntimeCounters {
-    pub fn new_with_config(max_context_tokens: usize, cb_config: &CircuitBreakerConfig) -> Self {
+    pub fn new(max_context_tokens: usize) -> Self {
         Self {
             learning_turn_counter: AtomicU64::new(0),
             last_context_used: AtomicU64::new(0),
@@ -486,8 +420,6 @@ impl RuntimeCounters {
             last_message_count: AtomicU64::new(0),
             last_working_memory_tokens: AtomicU64::new(0),
             last_tools_called: parking_lot::Mutex::new(Vec::new()),
-            delegation_healthy: AtomicBool::new(true),
-            delegation_retry_counter: AtomicU64::new(0),
             thinking_budget: AtomicU32::new(0),
             long_mode_turns: AtomicU32::new(0),
             last_actual_prompt_tokens: AtomicU64::new(0),
@@ -498,12 +430,6 @@ impl RuntimeCounters {
             suppress_thinking_in_tts: AtomicBool::new(false),
             inference_active: Arc::new(AtomicBool::new(false)),
             last_inference_finished_ms: AtomicU64::new(0),
-            trio_metrics: TrioMetrics::default(),
-            trio_circuit_breaker: parking_lot::Mutex::new(CircuitBreaker::new(cb_config)),
-            trio_state: AtomicU8::new(TrioState::Standalone as u8),
-            specialist_memory: parking_lot::Mutex::new(
-                crate::agent::router::SpecialistMemory::default(),
-            ),
             prompt_fingerprints: parking_lot::Mutex::new(std::collections::HashMap::new()),
             prompt_head_hashes: parking_lot::Mutex::new(std::collections::HashMap::new()),
             prompt_tool_hashes: parking_lot::Mutex::new(std::collections::HashMap::new()),
@@ -1428,28 +1354,6 @@ impl RuntimeCounters {
         self.last_inference_finished_ms
             .store(Self::now_epoch_ms(), Ordering::Relaxed);
     }
-
-    /// Update trio state, logging only on transitions.
-    pub fn set_trio_state(&self, new_state: TrioState) {
-        let old = self
-            .trio_state
-            .swap(new_state as u8, std::sync::atomic::Ordering::Relaxed);
-        if old != new_state as u8 {
-            match new_state {
-                TrioState::Active => tracing::info!("trio_state_transition: -> Active"),
-                TrioState::Degraded => tracing::warn!("trio_state_transition: -> Degraded"),
-                TrioState::Standalone => tracing::warn!("trio_state_transition: -> Standalone"),
-            }
-        }
-    }
-
-    pub fn get_trio_state(&self) -> TrioState {
-        match self.trio_state.load(std::sync::atomic::Ordering::Relaxed) {
-            0 => TrioState::Active,
-            1 => TrioState::Degraded,
-            _ => TrioState::Standalone,
-        }
-    }
 }
 
 /// Combined handle: cheap to clone (two pointer bumps).
@@ -1520,8 +1424,6 @@ pub struct SwappableCoreConfig {
     pub tool_delegation: ToolDelegationConfig,
     pub provenance: ProvenanceConfig,
     pub max_tool_result_chars: usize,
-    pub delegation_provider: Option<Arc<dyn LLMProvider>>,
-    pub specialist_provider: Option<Arc<dyn LLMProvider>>,
     pub trio_config: TrioConfig,
     pub model_capabilities_overrides: std::collections::HashMap<
         String,
@@ -1550,7 +1452,7 @@ pub struct SwappableCoreConfig {
 /// Build a `SwappableCore` from the given config.
 ///
 /// Called once at startup and again for every `/local` or `/model` toggle.
-/// Resolves provider selection, memory config, tool delegation, and router setup.
+/// Resolves provider selection and memory config.
 #[allow(deprecated)] // reads lazy_skills for backward-compat wire-through
 pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
     let SwappableCoreConfig {
@@ -1575,8 +1477,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         tool_delegation,
         provenance,
         max_tool_result_chars,
-        delegation_provider,
-        specialist_provider,
         trio_config,
         model_capabilities_overrides,
         reasoning_config,
@@ -1604,7 +1504,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         is_local,
         "is_local and RuntimeMode must agree during parallel rollout"
     );
-    let router_provider = delegation_provider.clone();
     // Branch 1 (Wave 2): context constructor selection is driven by RuntimeMode.
     let mut context = match mode {
         RuntimeMode::Local { .. } => ContextBuilder::new_lite(&workspace),
@@ -1642,13 +1541,8 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
 
     // Branch 3 (Wave 2): memory-provider resolution is extracted into a named
     // helper dispatched via `match mode`. See `resolve_memory_provider` below.
-    let (memory_provider, memory_model) = resolve_memory_provider(
-        &mode,
-        &memory_config,
-        &model,
-        &provider,
-        specialist_provider.as_ref(),
-    );
+    let (memory_provider, memory_model) =
+        resolve_memory_provider(&mode, &memory_config, &model, &provider);
 
     // Branch 4 (Wave 2): response-reserve cap is derived from the runtime mode.
     // Cloud: passthrough of `max_tokens`. Local: clamp to 25% of the context
@@ -1663,53 +1557,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         "agent_core: main-model compactor initialized"
     );
     let working_memory = WorkingMemoryStore::new(sessions.clone());
-
-    // Build tool runner provider if delegation is enabled.
-    let (tool_runner_provider, tool_runner_model) = if tool_delegation.enabled {
-        let is_auto_local = delegation_provider.is_some();
-        let tr_provider: Arc<dyn LLMProvider> = if let Some(dp) = delegation_provider {
-            dp // Auto-spawned local delegation server
-        } else if let Some(ref tr_cfg) = tool_delegation.provider {
-            let model_hint = if !tool_delegation.model.is_empty() {
-                Some(tool_delegation.model.as_str())
-            } else {
-                None
-            };
-            let default_base = match mode {
-                RuntimeMode::Local { .. } => provider.get_api_base(),
-                RuntimeMode::Cloud => None,
-            };
-            crate::providers::factory::from_provider_config_for_model_with_default_base(
-                tr_cfg,
-                model_hint,
-                default_base,
-            )
-        } else {
-            provider.clone() // Fallback to main
-        };
-        // Pick the delegation model. When config is empty, fall back to the
-        // delegation provider's own default (e.g. local server's model) rather
-        // than the main model — the main model may be a cloud name like
-        // "anthropic/claude-opus-4-5" that the local server doesn't understand.
-        let tr_model = if !tool_delegation.model.is_empty() {
-            tool_delegation.model.clone()
-        } else if is_auto_local || model.contains('/') {
-            // Auto-spawned local delegation, or cloud model name — use provider default.
-            tr_provider.get_default_model().to_string()
-        } else {
-            model.clone()
-        };
-        (Some(tr_provider), Some(tr_model))
-    } else {
-        (None, None)
-    };
-
-    let specialist_model = specialist_provider
-        .as_ref()
-        .map(|provider| provider.get_default_model().to_string());
-    let router_model = router_provider
-        .as_ref()
-        .map(|provider| provider.get_default_model().to_string());
 
     SwappableCore {
         provider,
@@ -1748,17 +1595,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         memory_file_max_words: memory_config.memory_file_max_words,
         mode,
         lane,
-        tool_runner_provider,
-        tool_runner_model,
-        router_provider,
-        router_model,
-        router_no_think: trio_config.router_no_think,
-        router_temperature: trio_config.router_temperature,
-        router_top_p: trio_config.router_top_p,
-        specialist_provider,
-        specialist_model,
-        specialist_temperature: trio_config.specialist_temperature,
-        specialist_top_p: trio_config.specialist_top_p,
         tool_delegation_config: tool_delegation,
         provenance_config: provenance,
         max_tool_result_chars,
@@ -1769,8 +1605,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
             &memory_config,
             &trio_config.anti_drift,
         ),
-        specialist_output_schema: trio_config.specialist_output_schema,
-        trace_log: trio_config.trace_log,
         reasoning_config,
         tool_heartbeat_secs,
         health_check_timeout_secs,
@@ -1791,7 +1625,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
 ///  1. Explicit `memory.model` / `memory.provider`.
 ///  2. Cloud default: "haiku" (cheap, fast summarisation) when the main
 ///     provider is Anthropic native or OpenRouter; otherwise the main model.
-///  3. Local default: trio specialist (if available) → main provider.
+///  3. Local default: the main provider.
 ///
 /// This selection is reflection-only. LCM is constructed directly from the
 /// foreground provider/model and therefore cannot acquire a second context
@@ -1801,18 +1635,13 @@ fn resolve_memory_provider(
     memory_config: &MemoryConfig,
     model: &str,
     provider: &Arc<dyn LLMProvider>,
-    specialist_provider: Option<&Arc<dyn LLMProvider>>,
 ) -> (Arc<dyn LLMProvider>, String) {
     match mode {
         RuntimeMode::Local { .. } => {
-            let mem_model = if !memory_config.model.is_empty() {
-                memory_config.model.clone()
-            } else if memory_config.provider.is_some() {
+            let mem_model = if memory_config.model.is_empty() {
                 model.to_string()
-            } else if let Some(sp) = specialist_provider {
-                sp.get_default_model().to_string()
             } else {
-                model.to_string()
+                memory_config.model.clone()
             };
             let mem_provider: Arc<dyn LLMProvider> =
                 if let Some(ref mem_provider_cfg) = memory_config.provider {
@@ -1821,10 +1650,6 @@ fn resolve_memory_provider(
                         Some(&mem_model),
                         provider.get_api_base(),
                     )
-                } else if memory_config.model.is_empty() {
-                    specialist_provider
-                        .cloned()
-                        .unwrap_or_else(|| provider.clone())
                 } else {
                     provider.clone()
                 };
@@ -1978,7 +1803,6 @@ pub(crate) fn apply_compaction_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::schema::CircuitBreakerConfig;
 
     fn checkpoint_context(frozen_tool_hash: u64, expires_at_ms: u64) -> ExpansionCheckpointContext {
         ExpansionCheckpointContext {
@@ -2052,7 +1876,7 @@ mod tests {
 
     #[test]
     fn compaction_leases_old_id_and_reset_drops_every_retained_id() {
-        let counters = RuntimeCounters::new_with_config(32_768, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(32_768);
         let session = "cli:checkpoint";
         let old_id = stable_higgs_session_id(session, 0);
         assert!(counters.record_higgs_session_id(session, old_id));
@@ -2102,7 +1926,7 @@ mod tests {
 
     #[test]
     fn newer_compaction_replaces_and_drops_prior_checkpoint() {
-        let counters = RuntimeCounters::new_with_config(32_768, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(32_768);
         let session = "cli:replacement";
         assert!(counters.record_higgs_session_id(session, 10));
         counters.retire_higgs_session(
@@ -2140,10 +1964,7 @@ mod tests {
 
     #[test]
     fn exact_expansion_checkpoint_requires_confirmation_and_current_identity() {
-        let counters = Arc::new(RuntimeCounters::new_with_config(
-            32_768,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = Arc::new(RuntimeCounters::new(32_768));
         let session = "cli:exact-expansion-identity";
         let durable = "sqlite:exact-expansion-identity";
         let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
@@ -2217,10 +2038,7 @@ mod tests {
 
     #[test]
     fn catalog_replacement_cannot_cross_a_confirmed_checkpoint_snapshot() {
-        let counters = Arc::new(RuntimeCounters::new_with_config(
-            32_768,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = Arc::new(RuntimeCounters::new(32_768));
         let session = "cli:checkpoint-catalog-race";
         let durable = "sqlite:checkpoint-catalog-race";
         let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
@@ -2296,10 +2114,7 @@ mod tests {
 
     #[test]
     fn drop_waits_for_the_entire_expansion_retirement_transaction() {
-        let counters = Arc::new(RuntimeCounters::new_with_config(
-            32_768,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = Arc::new(RuntimeCounters::new(32_768));
         let session = "cli:atomic-drop";
         assert!(counters.record_higgs_session_id(session, 10));
 
@@ -2350,10 +2165,7 @@ mod tests {
 
     #[test]
     fn recording_the_expansion_id_waits_for_and_is_rejected_after_retirement() {
-        let counters = Arc::new(RuntimeCounters::new_with_config(
-            32_768,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = Arc::new(RuntimeCounters::new(32_768));
         let session = "cli:atomic-record";
         assert!(counters.record_higgs_session_id(session, 10));
 
@@ -2410,7 +2222,7 @@ mod tests {
 
     #[test]
     fn activating_after_retirement_skips_a_colliding_expansion_id_atomically() {
-        let counters = RuntimeCounters::new_with_config(32_768, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(32_768);
         let session_key = "cli:atomic-activate";
         let durable_session_id = "sqlite:atomic-activate";
         let colliding_id = stable_higgs_session_id(durable_session_id, 1);
@@ -2437,10 +2249,7 @@ mod tests {
 
     #[test]
     fn fallback_drop_waits_for_the_final_reservation_of_that_id() {
-        let counters = Arc::new(RuntimeCounters::new_with_config(
-            32_768,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = Arc::new(RuntimeCounters::new(32_768));
         let session_key = "cli:deferred-in-flight-drop";
         let durable_session_id = "sqlite:deferred-in-flight-drop";
         let first_x = counters.reserve_higgs_session_request(
@@ -2515,7 +2324,7 @@ mod tests {
 
     #[test]
     fn trim_retirement_drops_active_and_checkpoint_ids_without_leasing() {
-        let counters = RuntimeCounters::new_with_config(32_768, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(32_768);
         let session = "cli:trim-retirement";
         assert!(counters.record_higgs_session_id(session, 10));
         counters.retire_higgs_session(
@@ -2540,10 +2349,7 @@ mod tests {
 
     #[test]
     fn eligible_checkpoint_lease_is_confirmed_only_by_numeric_one() {
-        let counters = Arc::new(RuntimeCounters::new_with_config(
-            32_768,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = Arc::new(RuntimeCounters::new(32_768));
         let session = "cli:lease-confirmation";
         let durable = "sqlite:lease-confirmation";
         let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
@@ -2590,10 +2396,7 @@ mod tests {
 
     #[test]
     fn retained_expansion_reservation_pins_old_id_without_replacing_active() {
-        let counters = Arc::new(RuntimeCounters::new_with_config(
-            32_768,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = Arc::new(RuntimeCounters::new(32_768));
         let session = "cli:retained-expansion-route";
         let durable = "sqlite:retained-expansion-route";
         let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
@@ -2657,10 +2460,7 @@ mod tests {
 
     #[test]
     fn fresh_session_seeds_once_then_requires_exact_continuation() {
-        let counters = Arc::new(RuntimeCounters::new_with_config(
-            32_768,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = Arc::new(RuntimeCounters::new(32_768));
         let first = counters.reserve_higgs_session_request(
             "cli:seed",
             "sqlite:seed",
@@ -2689,10 +2489,7 @@ mod tests {
 
     #[test]
     fn resumed_process_restores_required_continuation_hint_once() {
-        let counters = Arc::new(RuntimeCounters::new_with_config(
-            32_768,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = Arc::new(RuntimeCounters::new(32_768));
         assert!(counters.restore_higgs_publication_hint("cli:resume", "sqlite:resume",));
 
         let resumed = counters.reserve_higgs_session_request(
@@ -2727,10 +2524,7 @@ mod tests {
     #[test]
     fn every_retained_reservation_revalidates_current_model_tool_hash_and_catalog() {
         for mismatch in ["model", "tool_hash", "catalog"] {
-            let counters = Arc::new(RuntimeCounters::new_with_config(
-                32_768,
-                &CircuitBreakerConfig::default(),
-            ));
+            let counters = Arc::new(RuntimeCounters::new(32_768));
             let session = format!("cli:retained-identity-{mismatch}");
             let durable = format!("sqlite:retained-identity-{mismatch}");
             let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
@@ -2803,10 +2597,7 @@ mod tests {
     #[test]
     fn missing_or_zero_lease_ack_discards_checkpoint_and_queues_old_id_once() {
         for (suffix, acknowledgement) in [("missing", None), ("zero", Some(0))] {
-            let counters = Arc::new(RuntimeCounters::new_with_config(
-                32_768,
-                &CircuitBreakerConfig::default(),
-            ));
+            let counters = Arc::new(RuntimeCounters::new(32_768));
             let session = format!("cli:lease-{suffix}-ack");
             let durable = format!("sqlite:lease-{suffix}-ack");
             let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
@@ -2852,10 +2643,7 @@ mod tests {
             ("model", "other-model", 77, 600_000),
             ("tool-hash", "bonsai", 78, 600_000),
         ] {
-            let counters = Arc::new(RuntimeCounters::new_with_config(
-                32_768,
-                &CircuitBreakerConfig::default(),
-            ));
+            let counters = Arc::new(RuntimeCounters::new(32_768));
             let session = format!("cli:checkpoint-{suffix}");
             let durable = format!("sqlite:checkpoint-{suffix}");
             counters.install_tool_catalog(
@@ -2906,8 +2694,7 @@ mod tests {
             ("presentation", ToolPresentationMode::Textual),
             ("generation", ToolPresentationMode::Native),
         ] {
-            let counters =
-                RuntimeCounters::new_with_config(32_768, &CircuitBreakerConfig::default());
+            let counters = RuntimeCounters::new(32_768);
             let session = format!("cli:catalog-{suffix}");
             counters.install_tool_catalog(
                 &session,
@@ -2949,10 +2736,7 @@ mod tests {
 
     #[test]
     fn pending_lease_is_claimed_by_exactly_one_concurrent_reservation() {
-        let counters = Arc::new(RuntimeCounters::new_with_config(
-            32_768,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = Arc::new(RuntimeCounters::new(32_768));
         let session = "cli:single-lease-claim";
         let durable = "sqlite:single-lease-claim";
         let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
@@ -2982,10 +2766,7 @@ mod tests {
 
     #[test]
     fn invalidated_claimed_lease_is_not_dropped_until_attempt_releases() {
-        let counters = Arc::new(RuntimeCounters::new_with_config(
-            32_768,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = Arc::new(RuntimeCounters::new(32_768));
         let session = "cli:in-flight-lease-drop";
         let durable = "sqlite:in-flight-lease-drop";
         let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
@@ -3041,10 +2822,7 @@ mod tests {
             "timeout",
             "stream without Done",
         ] {
-            let counters = Arc::new(RuntimeCounters::new_with_config(
-                32_768,
-                &CircuitBreakerConfig::default(),
-            ));
+            let counters = Arc::new(RuntimeCounters::new(32_768));
             let session = format!("cli:lease-attempt-drop:{terminal_path}");
             let durable = format!("sqlite:lease-attempt-drop:{terminal_path}");
             let definitions = vec![serde_json::json!({"type": "function", "name": "read"})];
@@ -3200,7 +2978,7 @@ mod tests {
     /// session's `/clear` must not be blamed on another's next turn.
     #[test]
     fn cache_reset_reason_is_taken_once_per_session() {
-        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(16384);
 
         // Never reset → nothing to attribute; this is a genuine cold start.
         assert_eq!(counters.take_cache_reset("a"), None);
@@ -3224,14 +3002,8 @@ mod tests {
     }
 
     #[test]
-    fn test_trio_state_default_is_standalone() {
-        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
-        assert_eq!(counters.get_trio_state(), TrioState::Standalone);
-    }
-
-    #[test]
     fn cache_metrics_are_aggregated_by_logical_session() {
-        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(16384);
 
         counters.record_cache_metrics("logical-a", 100, Some(75), Some(25));
         counters.record_cache_metrics("logical-a", 50, Some(0), Some(50));
@@ -3252,7 +3024,7 @@ mod tests {
 
     #[test]
     fn frozen_tool_catalog_reuses_final_defs_until_presentation_mode_changes() {
-        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(16384);
         let session = "cli:catalog";
         let native = vec![serde_json::json!({"function": {"name": "read_file"}})];
         let availability_flip = vec![serde_json::json!({"function": {"name": "exec"}})];
@@ -3270,7 +3042,7 @@ mod tests {
         assert_ne!(native, availability_flip);
 
         let mut previous_mode = ToolPresentationMode::Native;
-        for mode in [ToolPresentationMode::Textual, ToolPresentationMode::Trio] {
+        for mode in [ToolPresentationMode::Textual, ToolPresentationMode::Native] {
             assert!(counters.tool_presentation_mode_changed(session, mode));
             assert_eq!(
                 counters.tool_presentation_mode(session),
@@ -3288,7 +3060,7 @@ mod tests {
 
     #[test]
     fn compaction_rotation_preserves_catalog_but_logical_reset_clears_it() {
-        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(16384);
         let session = "cli:catalog-reset";
         let defs = vec![serde_json::json!({"function": {"name": "read_file"}})];
         counters.install_tool_catalog(session, ToolPresentationMode::Native, defs.clone());
@@ -3310,10 +3082,7 @@ mod tests {
 
     #[test]
     fn lcm_rotation_keeps_prefix_anchor_without_sanctioned_reset() {
-        let counters = Arc::new(RuntimeCounters::new_with_config(
-            16_384,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = Arc::new(RuntimeCounters::new(16_384));
         let session = "cli:lcm-prefix-anchor";
         let durable = "sqlite:lcm-prefix-anchor";
         let fingerprint = crate::agent::prompt_fingerprint::fingerprint(&[
@@ -3370,31 +3139,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_trio_state_transitions() {
-        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
-
-        counters.set_trio_state(TrioState::Active);
-        assert_eq!(counters.get_trio_state(), TrioState::Active);
-
-        counters.set_trio_state(TrioState::Degraded);
-        assert_eq!(counters.get_trio_state(), TrioState::Degraded);
-
-        counters.set_trio_state(TrioState::Standalone);
-        assert_eq!(counters.get_trio_state(), TrioState::Standalone);
-    }
-
-    #[test]
-    fn test_trio_state_no_log_on_same_state() {
-        // Setting the same state twice should not log (swap returns same value).
-        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
-
-        counters.set_trio_state(TrioState::Active);
-        // Second call with same state — no log, no panic.
-        counters.set_trio_state(TrioState::Active);
-        assert_eq!(counters.get_trio_state(), TrioState::Active);
-    }
-
     /// Epoch rotation is the SOLE cache-invalidation mechanism after a reset:
     /// it folds into `stable_higgs_session_id`, giving the server a brand-new
     /// session id (cold start). System-message content is no longer mutated,
@@ -3422,7 +3166,7 @@ mod tests {
     /// compaction paths share via `invalidate_prompt_cache_for_rewrite`.
     #[test]
     fn test_invalidate_prompt_cache_rotates_when_higgs_capable_clears_otherwise() {
-        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(16384);
         let s = "cli:trim";
 
         // Warm state: an active higgs session, a stored fingerprint, a watermark.
@@ -3480,7 +3224,7 @@ mod tests {
 
     #[test]
     fn test_reset_session_prompt_state_clears_cache_and_bumps_epoch() {
-        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(16384);
         let session = "cli:test";
         let fp = crate::agent::prompt_fingerprint::fingerprint(&[serde_json::json!({
             "role": "user",
@@ -3515,7 +3259,7 @@ mod tests {
 
     #[test]
     fn test_reset_session_prompt_state_queues_multiple_higgs_drops() {
-        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(16384);
         let session = "cli:test";
 
         for (epoch, drop_id) in [10, 11, 12].into_iter().enumerate() {
@@ -3542,7 +3286,7 @@ mod tests {
 
     #[test]
     fn test_pending_higgs_drop_keeps_id_from_before_session_rollover() {
-        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(16384);
         let session_key = "cli:test";
         let original_session_id = "sqlite-session-before-clear";
         let rolled_over_session_id = "sqlite-session-after-clear";
@@ -3563,7 +3307,7 @@ mod tests {
 
     #[test]
     fn test_local_artifact_intent_is_bounded_by_turn_count() {
-        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(16384);
         let session = "cli:test";
 
         counters.record_local_artifact_intent(session, 10, true);
@@ -3590,11 +3334,10 @@ mod tests {
 #[cfg(test)]
 mod higgs_drop_flusher_tests {
     use super::*;
-    use crate::config::schema::CircuitBreakerConfig;
 
     #[test]
     fn drop_retirement_fires_the_eager_flush_hook() {
-        let counters = RuntimeCounters::new_with_config(32_768, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(32_768);
         let flushed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let flushed_clone = std::sync::Arc::clone(&flushed);
         counters.set_higgs_drop_flusher(std::sync::Arc::new(move |session_id| {
@@ -3615,7 +3358,7 @@ mod higgs_drop_flusher_tests {
 
     #[test]
     fn drop_retirement_without_flusher_is_a_clean_noop() {
-        let counters = RuntimeCounters::new_with_config(32_768, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(32_768);
         assert!(counters.record_higgs_session_id("no-flush", 555));
         let epoch = counters.retire_higgs_session("no-flush", SessionRetirement::Drop);
         assert!(epoch >= 1, "rotation proceeds with no flusher wired");

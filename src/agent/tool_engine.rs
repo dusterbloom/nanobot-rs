@@ -9,7 +9,7 @@
     clippy::indexing_slicing,
     clippy::shadow_reuse
 )]
-//! Tool execution engine: delegated and inline paths.
+//! Tool execution engine: the inline path every tool call takes.
 //!
 //! Extracted from `agent_loop.rs` to isolate tool execution logic.
 
@@ -17,9 +17,8 @@ use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{json, Value};
-use tracing::{debug, instrument, warn, Instrument};
+use tracing::{debug, warn, Instrument};
 
-use crate::agent::agent_core::RuntimeCounters;
 use crate::agent::audit::ToolEvent;
 use crate::agent::context::ContextBuilder;
 use crate::providers::base::{LLMResponse, ToolCallRequest};
@@ -450,31 +449,6 @@ fn digest_tool_result(
     build_tool_result_preview(tool_name, args, data, prompt_cap, tool_call_id)
 }
 
-pub(crate) fn local_model_key(model: &str) -> String {
-    model
-        .strip_prefix("local:")
-        .unwrap_or(model)
-        .trim()
-        .to_ascii_lowercase()
-}
-
-/// True when tool delegation would reuse the SAME local model as the main agent.
-///
-/// Such delegation is pure prefix-cache poison: the delegation sub-loop runs
-/// many distinct prompts on the same local server+model, evicting the main
-/// conversation's KV/radix prefix and forcing a full re-prefill (~60-90s at
-/// large context, measured) every tool round — for zero token-cost benefit
-/// (same model). The caller runs tools inline instead, keeping one warm prefix.
-/// A genuinely separate delegation model (different name) returns false, and a
-/// cloud main model (`is_local == false`) returns false.
-pub(crate) fn delegation_reuses_main_local_model(
-    is_local: bool,
-    main_model: &str,
-    delegation_model: Option<&str>,
-) -> bool {
-    is_local && delegation_model.map(local_model_key) == Some(local_model_key(main_model))
-}
-
 /// Tools that receive a reasoning checkpoint before execution when configured.
 pub(crate) fn is_side_effect_tool(name: &str) -> bool {
     matches!(name, "exec" | "write_file" | "edit_file" | "apply_patch")
@@ -565,54 +539,6 @@ pub(crate) fn append_tool_call_carrier(
     ctx.messages.with_draft(|draft| {
         ContextBuilder::add_assistant_message(draft, response.content.as_deref(), Some(&tc_json));
     });
-}
-
-/// Route configured delegation through the same durable execution chokepoint.
-///
-/// Delegation used to run an independent tool loop that could execute an entire
-/// batch before raw/post-result persistence was checked. Keeping one executor
-/// makes every provider-initiated call obey the same carrier → pre → raw → post
-/// lifecycle and prevents later calls after a persistence failure.
-#[instrument(
-    name = "execute_tools_delegated",
-    skip(
-        ctx,
-        _counters,
-        routed_tool_calls,
-        response,
-        _delegation_provider,
-        _delegation_model
-    ),
-    fields(
-        tools = tracing::field::Empty,
-        outcome = tracing::field::Empty,
-    )
-)]
-pub(crate) async fn execute_tools_delegated(
-    ctx: &mut TurnContext,
-    _counters: &RuntimeCounters,
-    routed_tool_calls: &[ToolCallRequest],
-    response: &LLMResponse,
-    _delegation_provider: &Option<Arc<dyn crate::providers::base::LLMProvider>>,
-    _delegation_model: &Option<String>,
-) -> bool {
-    let tool_names_summary = routed_tool_calls
-        .iter()
-        .map(|call| call.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    tracing::Span::current().record("tools", &tool_names_summary.as_str());
-
-    execute_tools_inline(ctx, routed_tool_calls, response).await;
-    tracing::Span::current().record(
-        "outcome",
-        if ctx.flow.infra_error.is_some() {
-            "persistence_error"
-        } else {
-            "ok"
-        },
-    );
-    true
 }
 
 /// Collects everything produced by a single tool execution, ready for
@@ -1893,18 +1819,6 @@ mod tests {
     }
 
     #[test]
-    fn test_local_model_key_strips_internal_prefix() {
-        assert_eq!(
-            local_model_key("local:Qwen3.6-35B-A3B-4bit"),
-            "qwen3.6-35b-a3b-4bit"
-        );
-        assert_eq!(
-            local_model_key("Qwen3.6-35B-A3B-4bit"),
-            "qwen3.6-35b-a3b-4bit"
-        );
-    }
-
-    #[test]
     fn test_tool_concurrency_is_declared_by_implementation() {
         let registry =
             ToolRegistry::with_standard_tools(&ToolConfig::new(std::path::Path::new(".")));
@@ -1922,40 +1836,6 @@ mod tests {
         for name in ["exec", "write_file", "find_files", "unknown_tool"] {
             assert_eq!(registry.concurrency(name), ToolConcurrency::Sequential);
         }
-    }
-
-    #[test]
-    fn test_delegation_reuses_main_local_model() {
-        // Same local model (with/without the "local:" prefix, any case) → reuse
-        // → must NOT delegate (delegation would evict the main prefix cache).
-        assert!(delegation_reuses_main_local_model(
-            true,
-            "local:qwen36-35b",
-            Some("qwen36-35b")
-        ));
-        assert!(delegation_reuses_main_local_model(
-            true,
-            "Qwen36-35B",
-            Some("local:qwen36-35b")
-        ));
-        // A genuinely separate delegation model → real offload → delegate.
-        assert!(!delegation_reuses_main_local_model(
-            true,
-            "local:qwen36-35b",
-            Some("qwen3.5-2b")
-        ));
-        // Cloud main model → no shared local KV cache → delegation is fine.
-        assert!(!delegation_reuses_main_local_model(
-            false,
-            "claude-opus-4-6",
-            Some("claude-opus-4-6")
-        ));
-        // No delegation model resolved → cannot reuse.
-        assert!(!delegation_reuses_main_local_model(
-            true,
-            "local:qwen36-35b",
-            None
-        ));
     }
 
     #[tokio::test]

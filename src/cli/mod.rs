@@ -310,14 +310,7 @@ mod tests {
         cfg.providers.openrouter.api_key = "sk-or-cloud-key".to_string();
         cfg.providers.openrouter.api_base = Some("https://openrouter.ai/api/v1".to_string());
 
-        let handle = build_core_handle(
-            &cfg,
-            "18080",
-            Some("Qwen3-8B-Q4_K_M.gguf"),
-            None,
-            None,
-            true,
-        );
+        let handle = build_core_handle(&cfg, "18080", Some("Qwen3-8B-Q4_K_M.gguf"), true);
         let core = handle.swappable();
 
         assert!(
@@ -346,14 +339,7 @@ mod tests {
             api_base: Some("https://reflection.example/v1".to_string()),
         });
 
-        let handle = build_core_handle(
-            &cfg,
-            "18080",
-            Some("Qwen3-8B-Q4_K_M.gguf"),
-            None,
-            None,
-            true,
-        );
+        let handle = build_core_handle(&cfg, "18080", Some("Qwen3-8B-Q4_K_M.gguf"), true);
         let core = handle.swappable();
 
         assert_eq!(
@@ -371,7 +357,7 @@ mod tests {
         cfg.agents.defaults.local_model = "usermma/VibeThinker-3B-mlx-8Bit".to_string();
         cfg.agents.defaults.lms_main_model = "active".to_string();
 
-        let handle = build_core_handle(&cfg, "18080", Some("active"), None, None, true);
+        let handle = build_core_handle(&cfg, "18080", Some("active"), true);
         let core = handle.swappable();
 
         assert_eq!(
@@ -396,7 +382,7 @@ mod tests {
         cfg.agents.defaults.local_model = "usermma/VibeThinker-3B-mlx-8Bit".to_string();
         cfg.agents.defaults.lms_main_model = "active".to_string();
 
-        let handle = build_core_handle(&cfg, "18080", None, None, None, true);
+        let handle = build_core_handle(&cfg, "18080", None, true);
         let core = handle.swappable();
 
         assert_eq!(
@@ -634,29 +620,12 @@ pub(crate) fn cmd_gateway(port: u16, verbose: bool) {
         port
     );
 
-    let mut config = load_config(None);
+    let config = load_config(None);
     check_api_key(&config);
-
-    // Trio auto-detection (same logic as REPL startup)
-    if crate::repl::should_auto_activate_trio(
-        !config.agents.defaults.local_api_base.is_empty(),
-        &config.trio.router_model,
-        &config.trio.specialist_model,
-        config.trio.router_endpoint.is_some(),
-        config.trio.specialist_endpoint.is_some(),
-        &config.tool_delegation.mode,
-    ) {
-        crate::repl::trio_enable(&mut config);
-        tracing::info!(
-            router_model = %config.trio.router_model,
-            specialist_model = %config.trio.specialist_model,
-            "trio_auto_activated_gateway"
-        );
-    }
 
     let core_handle = {
         let is_local = !config.agents.defaults.local_api_base.is_empty();
-        build_core_handle(&config, "8080", None, None, None, is_local)
+        build_core_handle(&config, "8080", None, is_local)
     };
 
     // Build setup closure that wires MLX provider into the agent loop.
@@ -1036,7 +1005,7 @@ pub(crate) fn cmd_whatsapp() {
     println!("  Scan the QR code when it appears");
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None, false);
+    let core_handle = build_core_handle(&config, "8080", None, false);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None, None));
 }
@@ -1097,7 +1066,7 @@ pub(crate) fn cmd_telegram(token_arg: Option<String>) {
 
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None, false);
+    let core_handle = build_core_handle(&config, "8080", None, false);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None, None));
 }
@@ -1215,7 +1184,7 @@ pub(crate) fn cmd_email(
 
     println!("  Press Ctrl+C to stop\n");
 
-    let core_handle = build_core_handle(&config, "8080", None, None, None, false);
+    let core_handle = build_core_handle(&config, "8080", None, false);
     let runtime = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
     runtime.block_on(run_gateway_async(config, core_handle, None, None, None));
 }

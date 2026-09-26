@@ -240,18 +240,11 @@ impl AgentLoopShared {
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("{}:{}", msg.channel, msg.chat_id));
 
-        let session_policy = {
+        {
             let mut map = self.session_policies.lock().await;
             let entry = map.entry(session_key.clone()).or_default();
-            if core.tool_delegation_config.strict_local_only() {
-                entry.local_only = true;
-            }
             policy::update_from_user_text(entry, &msg.content);
-            entry.clone()
-        };
-        let strict_local_only =
-            core.tool_delegation_config.strict_local_only() || session_policy.local_only;
-
+        }
         tracing::debug!(
             "Processing message{} from {} on {}: {}",
             if streaming { " (streaming)" } else { "" },
@@ -680,8 +673,6 @@ impl AgentLoopShared {
             request_id,
             session_key,
             session_id,
-            session_policy,
-            strict_local_only,
             turn_count,
             streaming,
             audit,
@@ -704,7 +695,6 @@ impl AgentLoopShared {
             final_content: String::new(),
             turn_outcome: TurnOutcome::LimitExhausted,
             turn_tool_entries: Vec::new(),
-            router_synthetic_call_sequence: Default::default(),
             iterations_used: 0,
             compaction,
             soft_compaction_requested: false,
@@ -716,7 +706,6 @@ impl AgentLoopShared {
             capacity: self.core_handle.capacity.clone(),
             effective_budget: configured_budget,
             flow: FlowControl {
-                router_preflight_done: false,
                 tool_guard,
                 iterations_since_compaction: 0,
                 content_was_streamed: false,

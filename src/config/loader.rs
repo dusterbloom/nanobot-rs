@@ -107,8 +107,7 @@ pub fn load_config(config_path: Option<&Path>) -> Config {
         match fs::read_to_string(&path) {
             Ok(contents) => {
                 match serde_json::from_str::<Config>(&strip_jsonc_comments(&contents)) {
-                    Ok(mut cfg) => {
-                        cfg.tool_delegation.apply_mode();
+                    Ok(cfg) => {
                         crate::agent::model_capabilities::set_global_overrides(
                             cfg.model_capabilities.clone(),
                         );

@@ -366,14 +366,8 @@ impl AgentLoopShared {
         let agent_host = Arc::new(AgentHost {
             subagents: self.subagents.clone(),
             session_policies: self.session_policies.clone(),
-            pipeline_provider: core
-                .tool_runner_provider
-                .clone()
-                .unwrap_or_else(|| core.provider.clone()),
-            pipeline_model: core
-                .tool_runner_model
-                .clone()
-                .unwrap_or_else(|| core.model.clone()),
+            pipeline_provider: core.provider.clone(),
+            pipeline_model: core.model.clone(),
             workspace: core.workspace.clone(),
             outbound: self.bus_outbound_tx.clone(),
             channel: channel.to_string(),

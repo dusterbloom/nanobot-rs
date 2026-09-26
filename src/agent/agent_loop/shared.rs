@@ -52,7 +52,7 @@ use crate::cron::service::CronService;
 use crate::errors::{
     classify_retained_session_error, is_retryable_provider_error, RetainedSessionErrorKind,
 };
-use crate::providers::base::{FinishReason, LLMResponse, StreamChunk, ToolChoice};
+use crate::providers::base::{LLMResponse, StreamChunk, ToolChoice};
 use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProviderResponse};
 
 use crate::agent::agent_core::{
@@ -61,7 +61,7 @@ use crate::agent::agent_core::{
     ToolPresentationMode,
 };
 
-use super::{last_user_message, render_via_protocol, should_strip_tools_for_trio};
+use super::{last_user_message, render_via_protocol};
 
 // `response` is a sibling module declared in `mod.rs`. RetryState is re-exported
 // from there; we just need a local alias for the field type below.
@@ -317,30 +317,12 @@ pub(crate) enum PromptRewrite {
 /// Owns all per-turn mutable state that previously lived as local variables
 /// inside `process_message`. No lifetimes needed — values are cloned from the
 /// inbound message where required.
-#[derive(Default)]
-pub(crate) struct RouterSyntheticCallSequence {
-    next: u64,
-}
-
-impl RouterSyntheticCallSequence {
-    pub(crate) fn allocate(&mut self, turn: u64, lane: &str, target: &str) -> String {
-        let sequence = self.next;
-        self.next = self
-            .next
-            .checked_add(1)
-            .expect("router synthetic call id sequence exhausted");
-        format!("router-{turn}-{sequence}-{lane}-{}", target.trim())
-    }
-}
-
 pub(crate) struct TurnContext {
     // --- Config (set during prepare, immutable after) ---
     pub(crate) core: Arc<SwappableCore>,
     pub(crate) request_id: String,
     pub(crate) session_key: String,
     pub(crate) session_id: String,
-    pub(crate) session_policy: policy::SessionPolicy,
-    pub(crate) strict_local_only: bool,
     pub(crate) turn_count: u64,
     pub(crate) streaming: bool,
     pub(crate) audit: Option<AuditLog>,
@@ -386,10 +368,6 @@ pub(crate) struct TurnContext {
     pub(crate) final_content: String,
     pub(crate) turn_outcome: TurnOutcome,
     pub(crate) turn_tool_entries: Vec<crate::agent::audit::TurnToolEntry>,
-    /// Monotonic namespace for tool calls synthesized by the router during
-    /// this turn. Preflight and post-tool routing share it, so neither replay
-    /// lifecycle nor model-visible receipts can collide on a reused id.
-    pub(crate) router_synthetic_call_sequence: RouterSyntheticCallSequence,
     /// Number of LLM iterations consumed in this agent turn (for calibration).
     pub(crate) iterations_used: u32,
 
@@ -976,11 +954,6 @@ impl SoftCompactionRequest {
 }
 
 impl TurnContext {
-    pub(crate) fn next_router_tool_call_id(&mut self, lane: &str, target: &str) -> String {
-        self.router_synthetic_call_sequence
-            .allocate(self.turn_count, lane, target)
-    }
-
     /// Check whether this turn has been cancelled (e.g. user pressed Esc in REPL).
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancellation_token
@@ -1203,13 +1176,11 @@ pub(crate) enum RetentionEligibility {
 /// Per-turn flow control flags.
 ///
 /// These are orthogonal fields (not a linear state machine):
-/// - `router_preflight_done`: one-shot, set after router runs
 /// - `content_was_streamed`: one-shot, set when TextDelta chunks are sent
 /// - `iterations_since_compaction`: counter, reset when compaction swaps in
 /// - `tool_guard`: per-turn tool call policy enforcement
 /// - `retries`: typed per-failure counters (validation, continuation, rescue, etc.)
 pub(crate) struct FlowControl {
-    pub(crate) router_preflight_done: bool,
     pub(crate) tool_guard: ToolGuard,
     pub(crate) iterations_since_compaction: u32,
     pub(crate) content_was_streamed: bool,
@@ -1487,16 +1458,7 @@ pub(crate) enum IterationPhase {
     /// Validate response, rescue pass, error check, token telemetry.
     Processing { response: LLMResponse },
     /// Route and execute tool calls (delegated or inline).
-    Executing {
-        response: LLMResponse,
-        routing: ToolRouting,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ToolRouting {
-    NeedsRouting,
-    AlreadyRouted,
+    Executing { response: LLMResponse },
 }
 
 /// Outcome of a single iteration, returned to the outer loop.
@@ -1977,7 +1939,6 @@ impl AgentLoopShared {
     /// drives the inner state machine through `IterationPhase` steps.
     #[instrument(name = "agent_loop", skip(self, ctx), fields(
         session = %ctx.session_key,
-        mode = if ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main() { "trio" } else { "inline" },
         model = %ctx.core.model,
         streaming = ctx.streaming,
     ))]
@@ -2375,8 +2336,8 @@ impl AgentLoopShared {
                 IterationPhase::Processing { response } => {
                     self.step_process_response(ctx, response).await
                 }
-                IterationPhase::Executing { response, routing } => {
-                    self.step_execute_tools(ctx, response, routing).await
+                IterationPhase::Executing { response } => {
+                    self.step_execute_tools(ctx, response).await
                 }
             } {
                 StepResult::Next(next_phase) => phase = next_phase,
@@ -2454,7 +2415,6 @@ impl AgentLoopShared {
                 counters.last_context_used.load(Ordering::Relaxed),
                 counters.last_context_max.load(Ordering::Relaxed),
                 ctx.turn_count,
-                counters.delegation_healthy.load(Ordering::Relaxed),
                 active_subs,
                 0, // pending_aha_signals filled below
             );
@@ -2799,23 +2759,21 @@ impl AgentLoopShared {
     }
 
     // -----------------------------------------------------------------------
-    // Step 2: PreCall — build tool defs, trim, compaction, repair, preflight
+    // Step 2: PreCall — build tool defs, trim, compaction, repair
     // -----------------------------------------------------------------------
 
     /// Pre-LLM-call orchestrator: delegates to [`select_tool_definitions`],
     /// [`manage_compaction`], and [`compute_adaptive_max_tokens`], with inline
-    /// trimming, grounding, rendering, emergency trim, and router preflight.
+    /// trimming, grounding, rendering, and emergency trim.
     #[instrument(name = "step_pre_call", skip(self, ctx), fields(
         iteration,
-        trio_mode = ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main(),
         msg_count = ctx.messages.len(),
     ))]
     async fn step_pre_call(&self, ctx: &mut TurnContext, iteration: u32) -> StepResult {
         // Select and filter tool definitions for this turn. Tool-lease
         // enforcement happens at execution time: rejections remain paired
         // protocol messages and never change the schema Higgs caches.
-        let (mut tool_defs, saved_tool_defs, mut tool_presentation_mode) =
-            self.select_tool_definitions(ctx);
+        let (mut tool_defs, tool_presentation_mode) = self.select_tool_definitions(ctx);
         // Reuse only a catalog previously installed from a final provider
         // array. First-use candidates are not installed until router policy
         // below has had its chance to restore native definitions.
@@ -2925,49 +2883,6 @@ impl AgentLoopShared {
         // `ctx.rendered_messages` is what gets sent to the provider.
         ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
 
-        // Router-first preflight for strict trio mode. The router can only
-        // strip tools when trio is active, so the passthrough-restore below
-        // is only meaningful then. When trio is off (the common local
-        // single-model setup), the preflight is a pure passthrough, so gating
-        // the whole block makes trio-off absent from the hot path.
-        let trio_active =
-            ctx.core.mode().is_local() && ctx.core.tool_delegation_config.strict_no_tools_main();
-        if trio_active {
-            match crate::agent::router::router_preflight(ctx, self.health_registry.as_deref()).await
-            {
-                crate::agent::router::PreflightResult::Continue => {
-                    return StepResult::Done(IterationOutcome::Continue);
-                }
-                crate::agent::router::PreflightResult::Break(msg) => {
-                    return StepResult::Done(IterationOutcome::Complete {
-                        content: msg,
-                        outcome: TurnOutcome::Finished,
-                    });
-                }
-                crate::agent::router::PreflightResult::Error(msg) => {
-                    return StepResult::Done(IterationOutcome::Error(msg));
-                }
-                crate::agent::router::PreflightResult::Execute(tool_calls) => {
-                    return StepResult::Next(IterationPhase::Executing {
-                        response: LLMResponse {
-                            content: None,
-                            tool_calls,
-                            finish_reason: FinishReason::ToolCalls,
-                            usage: std::collections::HashMap::new(),
-                        },
-                        routing: ToolRouting::AlreadyRouted,
-                    });
-                }
-                crate::agent::router::PreflightResult::Passthrough => {
-                    if tool_defs.is_empty() && !saved_tool_defs.is_empty() {
-                        debug!("router_preflight=Passthrough — restoring tool_defs for main model fallback");
-                        tool_defs = saved_tool_defs;
-                        tool_presentation_mode = ToolPresentationMode::Native;
-                    }
-                }
-            }
-        }
-
         tool_defs = self.freeze_final_tool_catalog(ctx, tool_presentation_mode, tool_defs);
 
         ctx.advertised_tool_names = Some(advertised_tool_names(&tool_defs));
@@ -3049,12 +2964,8 @@ impl AgentLoopShared {
 
     /// Select and filter tool definitions for this turn.
     ///
-    /// Returns `(active_defs, saved_defs, mode)` where `saved_defs` preserves
-    /// the native post-policy state for router passthrough fallback.
-    fn select_tool_definitions(
-        &self,
-        ctx: &mut TurnContext,
-    ) -> (Vec<Value>, Vec<Value>, ToolPresentationMode) {
+    /// Returns the active definitions and how they are presented to the model.
+    fn select_tool_definitions(&self, ctx: &mut TurnContext) -> (Vec<Value>, ToolPresentationMode) {
         // One protocol for local and cloud: hot tools have native schemas and
         // the proxy exposes the long tail. Bonsai otherwise mixes the proxy
         // envelope with native calls (for example exec(args={command: ...})).
@@ -3080,76 +2991,6 @@ impl AgentLoopShared {
             }
             tool_defs.clear();
         }
-        // Save tool_defs before potential stripping so we can restore them if
-        // the router preflight returns Passthrough (router said "respond") — in
-        // that case the main model must have tools as fallback.
-        let saved_tool_defs = ctx
-            .counters
-            .frozen_tool_definitions(&ctx.session_key, ToolPresentationMode::Native)
-            .unwrap_or_else(|| tool_defs.clone());
-        if mode == ToolPresentationMode::Native
-            && ctx.core.mode().is_local()
-            && ctx.core.tool_delegation_config.strict_no_tools_main()
-        {
-            // Hard separation (local trio only): main model is conversation/orchestration only.
-            // Cloud providers handle tools natively and must never have them stripped.
-            // BUT: if trio routing is degraded, keep tools so main model can still act.
-            let router_probe_healthy = self
-                .health_registry
-                .as_ref()
-                .map_or(false, |reg| reg.is_healthy("trio_router"));
-            // Use the same key format as router.rs: "router:{model}".
-            // Fallback to "trio_router" only when no router model is configured
-            // (in which case trio won't run anyway).
-            let cb_key = ctx
-                .core
-                .router_model
-                .as_deref()
-                .map_or_else(|| "trio_router".to_string(), |m| format!("router:{}", m));
-            let cb_available = ctx
-                .counters
-                .trio_circuit_breaker
-                .lock()
-                .is_available(&cb_key);
-            if should_strip_tools_for_trio(
-                ctx.core.mode().is_local(),
-                ctx.core.tool_delegation_config.strict_no_tools_main(),
-                router_probe_healthy,
-                cb_available,
-            ) {
-                ctx.counters
-                    .set_trio_state(crate::agent::agent_core::TrioState::Active);
-                tool_defs.clear();
-                mode = ToolPresentationMode::Trio;
-                // Tell the main model it's in orchestration mode (tools
-                // stripped). Deduped: select_tool_definitions runs every
-                // iteration, and re-appending the identical block would
-                // rewrite the sent system head each iteration and bust the
-                // prefix cache (same guard as the textual-tools lesson).
-                const ORCHESTRATION_MODE_MARKER: &str = "## Orchestration Mode (Active)";
-                let already_told = ctx
-                    .messages
-                    .first()
-                    .and_then(|m| m["content"].as_str())
-                    .is_some_and(|s| s.contains(ORCHESTRATION_MODE_MARKER));
-                if !already_told {
-                    ctx.messages.append_to_system(concat!(
-                        "\n\n## Orchestration Mode (Active)\n",
-                        "A trio routing system handles tool execution on your behalf.\n",
-                        "- You do NOT have direct tool access in this mode.\n",
-                        "- If a tool result appears as `[router:tool:X]` or `[specialist:X]`, ",
-                        "incorporate that result into your response.\n",
-                        "- If you need additional tool actions, describe them clearly ",
-                        "(e.g., \"I need to read src/main.rs\") and the next turn will route it.\n",
-                        "- Focus on reasoning, planning, and conversation.\n",
-                    ));
-                }
-            } else {
-                ctx.counters
-                    .set_trio_state(crate::agent::agent_core::TrioState::Degraded);
-                debug!("trio degraded — keeping tools for main model fallback");
-            }
-        }
         // Tool gating runs for cloud models only. Local models already get
         // condensed tool descriptions (~350 tokens for 12 tools, <1.1% of 32K
         // context) and real availability is enforced by `is_available()`, so
@@ -3172,7 +3013,7 @@ impl AgentLoopShared {
             }
         }
 
-        (tool_defs, saved_tool_defs, mode)
+        (tool_defs, mode)
     }
 
     /// Freeze the exact array that will be passed to the provider. The catalog
@@ -5689,20 +5530,16 @@ impl AgentLoopShared {
     // Step 5: Executing — route and execute tool calls
     // -----------------------------------------------------------------------
 
-    /// Route tool calls through the router, check context pressure,
-    /// delegation decision + execute, inline fallback, priority message
-    /// check, cancellation check.
+    /// Guard and record the tool calls, execute the allowed ones inline, then
+    /// run the priority-message and cancellation checks.
     #[instrument(name = "step_execute_tools", skip(self, ctx, response), fields(
-        delegation_enabled = ctx.core.tool_delegation_config.enabled,
         n_tool_calls = response.tool_calls.len(),
     ))]
     pub(super) async fn step_execute_tools(
         &self,
         ctx: &mut TurnContext,
         response: LLMResponse,
-        routing: ToolRouting,
     ) -> StepResult {
-        let counters = &self.core_handle.counters;
         // Reset the per-round dispatched-key record; set again only when tools
         // actually execute so a no-tool round can't leave a stale key behind.
         ctx.flow.last_round_keys.clear();
@@ -5711,10 +5548,7 @@ impl AgentLoopShared {
             ctx,
             response.content.as_deref(),
             response.tool_calls.clone(),
-            routing,
-        )
-        .await
-        {
+        ) {
             crate::agent::router::RouteResult::Continue => {
                 ctx.emit_pending_request_metrics(0);
                 ctx.flow.tool_rounds_completed = ctx.flow.tool_rounds_completed.saturating_add(1);
@@ -5726,10 +5560,6 @@ impl AgentLoopShared {
                     content: msg,
                     outcome: TurnOutcome::Finished,
                 });
-            }
-            crate::agent::router::RouteResult::Error(msg) => {
-                ctx.emit_pending_request_metrics(0);
-                return StepResult::Done(IterationOutcome::Error(msg));
             }
             crate::agent::router::RouteResult::Execute(batch) => batch,
         };
@@ -5937,110 +5767,7 @@ impl AgentLoopShared {
             .map(|tc| crate::agent::tool_runner::normalize_call_key(&tc.name, &tc.arguments))
             .collect();
 
-        // Context pressure check: if high, log a warning. The correct
-        // response is compaction, NOT spawning the main model as its
-        // own tool runner (which doubles cost for no benefit).
-        let context_tokens = TokenBudget::estimate_tokens(&ctx.messages);
-        let max_tokens = ctx.core.token_budget.max_context();
-        let pressure = if max_tokens > 0 {
-            context_tokens as f64 / max_tokens as f64
-        } else {
-            0.0
-        };
-        if pressure > 0.7 && !ctx.core.tool_delegation_config.enabled {
-            debug!(
-                "Context pressure {:.0}% but delegation disabled — consider enabling delegation or compaction",
-                pressure * 100.0,
-            );
-        }
-
-        // Lazily start auxiliary server if delegation targets a local endpoint.
-
-        // Check if we should delegate to the tool runner.
-        // Skip delegation if the provider was previously marked dead.
-        let mut delegation_alive = counters.delegation_healthy.load(Ordering::Relaxed);
-        // Periodically re-probe: every 10 inline calls, try delegation
-        // once in case the server recovered (e.g. user restarted it).
-        if !delegation_alive && ctx.core.tool_delegation_config.enabled {
-            let retries = counters
-                .delegation_retry_counter
-                .fetch_add(1, Ordering::Relaxed);
-            if retries > 0 && retries % 10 == 0 {
-                info!(
-                    "Re-probing delegation provider (attempt {} since failure)",
-                    retries
-                );
-                delegation_alive = true; // try this one time
-            } else {
-                debug!(
-                    "Delegation provider unhealthy — inline execution ({}/10 until re-probe)",
-                    retries % 10
-                );
-            }
-        }
-        // Resolve provider+model from explicit config.
-        let delegation_provider = ctx.core.tool_runner_provider.clone();
-        let delegation_model = ctx.core.tool_runner_model.clone();
-        // Same-model local delegation is pure prefix-cache poison. The delegation
-        // sub-loop runs many distinct prompts on the SAME local server+model as
-        // the main agent; those calls evict the main conversation's KV/radix
-        // prefix, forcing a full re-prefill (~60-90s at large context, measured)
-        // every tool round. It also yields ZERO token-cost benefit (same model).
-        // When delegation would reuse the main local model, run tools inline so
-        // the main prefix stays warm. A genuinely separate delegation model
-        // (different name/server) is unaffected.
-        let delegation_reuses_main_model =
-            crate::agent::tool_engine::delegation_reuses_main_local_model(
-                ctx.core.mode().is_local(),
-                &ctx.core.model,
-                delegation_model.as_deref(),
-            );
-        if delegation_reuses_main_model {
-            debug!(
-                model = %ctx.core.model,
-                "delegation skipped: same local model as main — inline keeps the prefix cache warm"
-            );
-        }
-        let should_delegate = ctx.core.tool_delegation_config.enabled
-            && delegation_alive
-            && !delegation_reuses_main_model;
-
         let tool_entries_before = ctx.turn_tool_entries.len();
-        if should_delegate {
-            if crate::agent::tool_engine::execute_tools_delegated(
-                ctx,
-                counters,
-                &routed_tool_calls,
-                &response,
-                &delegation_provider,
-                &delegation_model,
-            )
-            .await
-            {
-                let settled = ctx
-                    .turn_tool_entries
-                    .len()
-                    .saturating_sub(tool_entries_before);
-                for entry in ctx.turn_tool_entries.iter().skip(tool_entries_before) {
-                    ctx.flow.lease.record_tool_result(entry.ok);
-                }
-                ctx.flow
-                    .lease
-                    .release_pending(routed_tool_calls.len().saturating_sub(settled) as u32);
-                // Stash invariant violation (Hole 1): the immutable store
-                // rejected a write. Fail the turn with the infra error — never
-                // re-run a side-effect tool, never show a raw body.
-                if let Some(e) = ctx.flow.infra_error.take() {
-                    return StepResult::Done(IterationOutcome::Error(e));
-                }
-                // Delegation handled execution — continue the main loop.
-                ctx.emit_pending_request_metrics(routed_tool_calls.len() as u32);
-                ctx.flow.tool_rounds_completed = ctx.flow.tool_rounds_completed.saturating_add(1);
-                ctx.flow.last_round_keys = dispatched_keys.clone();
-                return StepResult::Done(IterationOutcome::Continue);
-            }
-        }
-
         // Auto-checkpoint before risky tools (exec, write_file) when enabled.
         if ctx.core.reasoning_config.auto_checkpoint_before_exec {
             let should_checkpoint = routed_tool_calls
@@ -6124,15 +5851,11 @@ impl AgentLoopShared {
 // derived value, one of these tests fails.
 //
 // Branch sites covered here (file:line from 09-RESEARCH.md):
-//   :331   — trio mode tracing tag (`is_local && strict_no_tools_main`)   → `is_trio_mode_active`
 //   :625   — anti-drift gate (`is_local && anti_drift.enabled`)           → `anti_drift_enabled_for_turn`
 //   :671-673 (same as :625; historical dup in RESEARCH)                    → `anti_drift_enabled_for_turn`
-//   :743   — pre-call tracing (`is_local && strict_no_tools_main`)        → `is_trio_mode_active`
 //   :820   — grounding role ternary                                       → `grounding_role`
 //   :866-868 (same as :820; documented row in RESEARCH)                    → `grounding_role`
 //   :900   — `select_tool_definitions`                                    → Lean production surface
-//   :920   — trio-strip outer gate (`is_local && strict_no_tools_main`)   → `is_trio_mode_active`
-//   :942-951 — `should_strip_tools_for_trio` free fn                      → pinned in `agent_heuristics::tests`
 //   :983   — ToolGate cloud gate (`!is_local`)                            → `tool_gate_enabled_for_turn`
 //   :1029-1036 (same decision as :983; RESEARCH row)                       → `tool_gate_enabled_for_turn`
 //   :1411  — thinking-cap small-model guard                               → `thinking_cap_applied`
@@ -6163,7 +5886,6 @@ mod tests {
     use crate::agent::lcm::AutoExpansionCandidate;
     use crate::agent::protocol::CloudProtocol;
     use crate::agent::token_budget::TokenBudget;
-    use crate::config::schema::CircuitBreakerConfig;
     use serde_json::{json, Value};
     use std::sync::Arc;
 
@@ -6624,7 +6346,7 @@ mod tests {
 
     #[test]
     fn leaving_retained_route_restores_active_fingerprint_and_watermark_together() {
-        let counters = RuntimeCounters::new_with_config(32_768, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(32_768);
         let session = "cli:retained-cache-snapshot";
         let active = crate::agent::prompt_fingerprint::fingerprint(&[
             json!({"role": "system", "content": "system"}),
@@ -6665,7 +6387,7 @@ mod tests {
 
     #[test]
     fn reset_before_retained_fallback_does_not_restore_stale_active_cache_state() {
-        let counters = RuntimeCounters::new_with_config(32_768, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(32_768);
         let session = "cli:retained-cache-reset";
         let durable = "sqlite:retained-cache-reset";
         counters.install_tool_catalog(session, ToolPresentationMode::Native, Vec::new());
@@ -6696,10 +6418,7 @@ mod tests {
 
     #[test]
     fn concurrent_reset_after_snapshot_identity_observation_wins_restore_transaction() {
-        let counters = Arc::new(RuntimeCounters::new_with_config(
-            32_768,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = Arc::new(RuntimeCounters::new(32_768));
         let session = "cli:retained-cache-restore-race";
         let durable = "sqlite:retained-cache-restore-race";
         counters.install_tool_catalog(session, ToolPresentationMode::Native, Vec::new());
@@ -6783,10 +6502,7 @@ mod tests {
 
     #[test]
     fn concurrent_colliding_reservation_cannot_publish_prior_route_cache_state() {
-        let counters = Arc::new(RuntimeCounters::new_with_config(
-            32_768,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = Arc::new(RuntimeCounters::new(32_768));
         let session = "cli:retained-cache-reservation-race";
         let prior_durable = "sqlite:retained-cache-prior";
         let changed_durable = "sqlite:retained-cache-changed";
@@ -6986,7 +6702,7 @@ mod tests {
                 (session_id.to_string(), std::sync::Arc::clone(&engine)),
             ])));
         let engine_guard = engine.lock().await;
-        let counters = RuntimeCounters::new_with_config(16_384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(16_384);
         let compacted = vec![json!({"role": "user", "content": "compacted"})];
         let compacted_wire = compacted.clone();
         let old_fingerprint = crate::agent::prompt_fingerprint::fingerprint(&compacted_wire);
@@ -7038,7 +6754,7 @@ mod tests {
     #[tokio::test]
     async fn missing_or_false_expansion_commit_keeps_compacted_prompt_and_cache() {
         let session_key = "cli:failed-expansion-commit";
-        let counters = RuntimeCounters::new_with_config(16_384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(16_384);
         let logical = vec![json!({"role": "user", "content": "compacted"})];
         let rendered = logical.clone();
         let old_fingerprint = crate::agent::prompt_fingerprint::fingerprint(&rendered);
@@ -7104,7 +6820,7 @@ mod tests {
             std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::from([
                 (session_id.to_string(), std::sync::Arc::clone(&engine)),
             ])));
-        let counters = RuntimeCounters::new_with_config(16_384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(16_384);
         let mut logical =
             MessageLog::committed(vec![json!({"role": "user", "content": "compacted"})]);
         let rendered_pre = vec![json!({"role": "user", "content": "compacted"})];
@@ -7238,7 +6954,7 @@ mod tests {
 
     #[test]
     fn test_higgs_marker_sends_drop_id_queued_before_session_rollover() {
-        let counters = RuntimeCounters::new_with_config(16384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(16384);
         let session_key = "cli:test";
         let original_drop_id = stable_higgs_session_id("sqlite-session-before-clear", 0);
         let current_session_id = stable_higgs_session_id("sqlite-session-after-clear", 1);
@@ -7266,10 +6982,7 @@ mod tests {
 
     #[test]
     fn unsent_higgs_request_id_is_not_repurposed_as_expansion_checkpoint() {
-        let counters = std::sync::Arc::new(RuntimeCounters::new_with_config(
-            16_384,
-            &CircuitBreakerConfig::default(),
-        ));
+        let counters = std::sync::Arc::new(RuntimeCounters::new(16_384));
         let session_key = "cli:reserved-request";
         let definitions = vec![json!({"type": "function", "name": "read"})];
         counters.install_tool_catalog(
@@ -7329,12 +7042,6 @@ mod tests {
     // exact expression used at the cited line. Keeping them here (test-only)
     // avoids adding production code while still giving us assertion targets.
 
-    /// Mirrors `agent_shared.rs:331, :743, :920` —
-    /// `ctx.core.is_local && ctx.core.tool_delegation_config.strict_no_tools_main`.
-    fn is_trio_mode_active(is_local: bool, strict_no_tools_main: bool) -> bool {
-        is_local && strict_no_tools_main
-    }
-
     /// Mirrors `agent_shared.rs:625, :671-673` —
     /// `ctx.core.is_local && ctx.core.anti_drift.enabled`.
     fn anti_drift_enabled_for_turn(is_local: bool, anti_drift_cfg_enabled: bool) -> bool {
@@ -7377,25 +7084,6 @@ mod tests {
         assert!(
             !proactive_grounding_preserves_prefix_cache(true),
             "local default skips synthetic per-turn grounding to avoid msg-N cache resets"
-        );
-    }
-
-    #[test]
-    fn test_is_local_trio_mode_gate() {
-        // Pins agent_shared.rs:331, :743, :920 — trio mode is ACTIVE only when
-        // both `is_local` and `strict_no_tools_main` are true.
-        assert!(is_trio_mode_active(true, true), "local + strict → trio ON");
-        assert!(
-            !is_trio_mode_active(true, false),
-            "local without strict → trio OFF"
-        );
-        assert!(
-            !is_trio_mode_active(false, true),
-            "cloud never trios even with strict"
-        );
-        assert!(
-            !is_trio_mode_active(false, false),
-            "cloud + not-strict → trio OFF"
         );
     }
 
@@ -7485,9 +7173,7 @@ mod tests {
     // registry, ToolRegistry, system_state). Building that harness for a
     // read-only pin would exceed Wave 0's zero-production-change scope.
     // The decision expressions at those sites are structurally identical to
-    // the helpers above, which ARE exercised:
-    //   :942-951 → `should_strip_tools_for_trio` free fn (pinned in
-    //              agent_heuristics::tests::test_should_strip_tools_for_trio_is_local_gate)
+    // the helpers above, which ARE exercised.
     // Wave 1 will replace every `ctx.core.is_local` site with a
     // `ctx.core.mode()` method call; the invariant suite in Wave 0's
     // runtime_mode.rs will then act as the deep-path regression net.

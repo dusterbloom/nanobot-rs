@@ -10,7 +10,6 @@
 //! `SystemState`. This enables phase-aware tool scoping, heartbeat grounding,
 //! and priority interrupt signaling.
 
-
 // ---------------------------------------------------------------------------
 // Task Phase
 // ---------------------------------------------------------------------------
@@ -111,7 +110,6 @@ pub struct SystemState {
     /// Context pressure: 0.0 = empty, 1.0 = full.
     pub context_pressure: f32,
     pub turn_number: u64,
-    pub delegation_healthy: bool,
     pub active_subagents: u8,
     pub pending_aha_signals: u8,
 }
@@ -123,7 +121,6 @@ impl SystemState {
         context_used: u64,
         context_max: u64,
         turn_number: u64,
-        delegation_healthy: bool,
         active_subagents: u8,
         pending_aha_signals: u8,
     ) -> Self {
@@ -136,7 +133,6 @@ impl SystemState {
             task_phase,
             context_pressure: pressure,
             turn_number,
-            delegation_healthy,
             active_subagents,
             pending_aha_signals,
         }
@@ -149,7 +145,6 @@ impl Default for SystemState {
             task_phase: TaskPhase::Idle,
             context_pressure: 0.0,
             turn_number: 0,
-            delegation_healthy: true,
             active_subagents: 0,
             pending_aha_signals: 0,
         }
@@ -163,16 +158,10 @@ impl Default for SystemState {
 /// Format a grounding message from the current system state.
 pub fn format_grounding(state: &SystemState) -> String {
     format!(
-        "[grounding] Turn {}. Context: {:.0}% used. Phase: {}. \
-         Delegation: {}. Subagents: {}.{}",
+        "[grounding] Turn {}. Context: {:.0}% used. Phase: {}. Subagents: {}.{}",
         state.turn_number,
         state.context_pressure * 100.0,
         state.task_phase,
-        if state.delegation_healthy {
-            "ok"
-        } else {
-            "down"
-        },
         state.active_subagents,
         if state.pending_aha_signals > 0 {
             format!(" {} pending signals.", state.pending_aha_signals)
@@ -317,35 +306,19 @@ mod tests {
 
     #[test]
     fn test_snapshot_pressure_computation() {
-        let state = SystemState::snapshot(
-            TaskPhase::Idle,
-            50_000,
-            100_000,
-            5,
-            true,
-            0,
-            0,
-        );
+        let state = SystemState::snapshot(TaskPhase::Idle, 50_000, 100_000, 5, 0, 0);
         assert!((state.context_pressure - 0.5).abs() < 0.01);
     }
 
     #[test]
     fn test_snapshot_zero_max_context() {
-        let state = SystemState::snapshot(TaskPhase::Idle, 50_000, 0, 1, true, 0, 0);
+        let state = SystemState::snapshot(TaskPhase::Idle, 50_000, 0, 1, 0, 0);
         assert_eq!(state.context_pressure, 0.0);
     }
 
     #[test]
     fn test_snapshot_clamped_pressure() {
-        let state = SystemState::snapshot(
-            TaskPhase::Idle,
-            200_000,
-            100_000,
-            1,
-            true,
-            0,
-            0,
-        );
+        let state = SystemState::snapshot(TaskPhase::Idle, 200_000, 100_000, 1, 0, 0);
         assert_eq!(state.context_pressure, 1.0);
     }
 
@@ -387,15 +360,7 @@ mod tests {
 
     #[test]
     fn test_format_grounding_contains_key_info() {
-        let state = SystemState::snapshot(
-            TaskPhase::FileEditing,
-            67_000,
-            100_000,
-            12,
-            true,
-            1,
-            0,
-        );
+        let state = SystemState::snapshot(TaskPhase::FileEditing, 67_000, 100_000, 12, 1, 0);
         let text = format_grounding(&state);
         assert!(text.contains("Turn 12"));
         assert!(text.contains("67%"));
@@ -405,8 +370,7 @@ mod tests {
 
     #[test]
     fn test_format_grounding_with_signals() {
-        let state =
-            SystemState::snapshot(TaskPhase::Idle, 0, 100_000, 1, true, 0, 3);
+        let state = SystemState::snapshot(TaskPhase::Idle, 0, 100_000, 1, 0, 3);
         let text = format_grounding(&state);
         assert!(text.contains("3 pending signals"));
     }

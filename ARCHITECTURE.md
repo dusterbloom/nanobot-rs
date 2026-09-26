@@ -77,9 +77,6 @@ AgentHandle (cloneable)
 **SwappableCore** contains (key fields shown):
 - `provider: Arc<dyn LLMProvider>` - Main LLM
 - `memory_provider: Arc<dyn LLMProvider>` - For compaction/reflection
-- `router_provider: Option<Arc<dyn LLMProvider>>` - For trio routing
-- `specialist_provider: Option<Arc<dyn LLMProvider>>` - For trio execution
-- `tool_runner_provider: Option<Arc<dyn LLMProvider>>` - For delegated tool execution
 - `context: ContextBuilder` - System prompt assembly
 - `sessions: Arc<SessionDb>` - Canonical SQLite conversation persistence
 - `token_budget: TokenBudget` - Context window management
@@ -87,10 +84,10 @@ AgentHandle (cloneable)
 - `compaction_manager: Option<Arc<CompactionSidecarManager>>` - Shared on-demand Higgs owner
 - `working_memory: WorkingMemoryStore` - Per-session state
 - Plus: `workspace`, `model`, `mode: RuntimeMode`, iteration/token settings,
-  search and execution settings, and delegation/provenance configs
+  search and execution settings, and provenance config
 
 **RuntimeCounters** survives core swaps:
-- `delegation_healthy`, `thinking_budget`, `long_mode_turns`, `inference_active`, `last_tools_called`, etc.
+- `thinking_budget`, `long_mode_turns`, `inference_active`, `last_tools_called`, etc.
 
 **Processing Phases:**
 
@@ -101,9 +98,8 @@ AgentHandle (cloneable)
    - Initialize tracking state
 
 2. **run_agent_loop()** - Main loop:
-   - Router preflight (trio mode)
    - LLM streaming call
-   - Tool execution (delegated or inline)
+   - Tool execution (inline)
    - Context compaction triggers
    - Response finalization
 
@@ -119,21 +115,16 @@ Modules extracted from or supporting `agent_loop.rs`:
 | Module | Purpose |
 |--------|---------|
 | `agent_core.rs` | SwappableCore, RuntimeCounters, AgentHandle structs; core build helpers |
-| `tool_engine.rs` | Tool execution engine (delegated + inline paths) |
-| `tool_runner.rs` | Dedicated tool execution with separate LLM provider |
+| `tool_engine.rs` | Tool execution engine (inline path) |
+| `tool_runner.rs` | Tool-call helpers shared by the loop, subagents and pipelines |
 | `tool_guard.rs` | Tool dedup/blocking guard — prevents repeated identical tool calls; read tools limited to 2 identical calls per turn (B9) |
 | `tool_wiring.rs` | Dynamic per-phase tool registry assembly |
-| `toolplan.rs` | `ToolPlan` / `ToolPlanAction` types for router output |
-| `worker_tools.rs` | Worker-only tools: `verify`, `python_eval`, `diff_apply`, `fmt_convert` |
-| `router.rs` | Trio router preflight, dispatch, and specialist coordination |
-| `router_fallback.rs` | Deterministic fallback patterns (9 patterns + default) |
+| `router.rs` | Tool-call routing: proxy canonicalization, execution defaults, tool guard |
 | `anti_drift.rs` | Context hygiene hooks: pollution scoring, turn eviction, babble collapse, format anchors (I6) |
-| `circuit_breaker.rs` | Tool loop circuit breaker — forces text response after consecutive all-blocked rounds (B8) |
 | `metrics.rs` | Per-request JSONL metrics with 10MB rotation |
-| `pipeline.rs` | Multi-step tool pipelines for router (I0) |
+| `pipeline.rs` | Multi-step tool pipelines (I0) |
 | `thread_repair.rs` | Message protocol repair for local models (role alternation, orphan tools) |
 | `policy.rs` | `SessionPolicy` — per-session flags (e.g. `local_only`) |
-| `role_policy.rs` | Role-based policy enforcement |
 | `context_gate.rs` | ContentGate — pass raw / structural briefing / drill-down (I3) |
 | `confidence_gate.rs` | Confidence-based gating for router decisions |
 | `budget_calibrator.rs` | Per-task-type budget calibration |
@@ -390,25 +381,16 @@ Config {
     provenance: ProvenanceConfig,
     proprioception: ProprioceptionConfig,
     trio: TrioConfig,
-    worker: WorkerConfig,
     lcm: LcmSchemaConfig
 }
 ```
 
-**TrioConfig (SLM Trio, 16 fields):**
-- `enabled` — Enable trio workflow
+**TrioConfig (historical `trio` key; the router/specialist trio is gone, 2 fields):**
 - `main_no_think` — Suppress `<think>` for main model
-- `router_model`, `router_port`, `router_ctx_tokens`, `router_temperature`, `router_top_p`, `router_no_think` — Router config
-- `specialist_model`, `specialist_port`, `specialist_ctx_tokens`, `specialist_temperature` — Specialist config
-- `router_endpoint`, `specialist_endpoint` — Optional explicit `ModelEndpoint` overrides (take priority over port+model)
-- `vram_cap_gb` — VRAM budget cap; context sizes auto-computed to fit
 - `anti_drift: AntiDriftConfig` — Nested anti-drift hooks for SLM context stabilization
 
 **AntiDriftConfig (nested in TrioConfig, 5 fields):**
 - `enabled`, `anchor_interval`, `pollution_threshold`, `babble_max_tokens`, `repetition_min_count`
-
-**WorkerConfig (5 fields):**
-- `enabled`, `max_depth` (delegation depth, default 3), `python` (enable python_eval), `delegate` (enable recursive workers), `budget_multiplier` (0.0-1.0, default 0.5)
 
 **LcmSchemaConfig (6 fields):**
 - `tau_soft` (async compaction threshold, default 0.5), `tau_hard` (blocking compaction threshold, default 0.85), `deterministic_target` (Level 3 target, default 512), `compaction_model_dir`, `compaction_port`, and `compaction_context_size` (default 4096)
@@ -416,10 +398,8 @@ Config {
 **ProprioceptionConfig:**
 - `enabled`, `audience_aware_compaction`, `grounding_interval`, `gradient_memory`, `raw_window`, `light_window`, `aha_channel`, `proactive_retrieval`
 
-**ToolDelegationConfig (18 fields):**
-- `mode: DelegationMode` — enum: `Inline` (no delegation), `Delegated` (default, tool runner model), `Trio` (strict role separation)
-- `apply_mode()` — Applies mode to flags: Inline disables all, Delegated enables tool runner, Trio enables `strict_no_tools_main` + `strict_router_schema` + `role_scoped_context_packs`
-- Key fields: `enabled`, `model`, `provider`, `max_iterations`, `max_tokens`, `slim_results`, `max_result_preview_chars`, `auto_local`, `cost_budget`, `default_subagent_model`, `strict_no_tools_main`, `strict_router_schema`, `role_scoped_context_packs`, `strict_local_only`, `strict_toolplan_validation`, `deterministic_router_fallback`, `max_same_tool_call_per_turn`
+**ToolDelegationConfig (historical `toolDelegation` key; tool delegation is gone, 3 fields):**
+- `default_subagent_model`, `max_same_tool_call_per_turn`, `subagent: SubagentTuning`
 
 ### 11. Heartbeat & Health (`src/heartbeat/`)
 
@@ -547,9 +527,6 @@ TurnContext prepared
     ├── Session history loaded
     ├── System prompt built
     └── Tools registered
-    │
-    ▼
-Router preflight (if trio mode)
     │
     ▼
 LLM streaming call

@@ -28,7 +28,7 @@
         clippy::nursery,
     )
 )]
-//! nanobot library — exposes internal modules for the trio_bench binary.
+//! nanobot library: the modules behind the `nanobot` binary and its tests.
 
 pub(crate) const VERSION: &str = "0.1.0";
 pub(crate) const LOGO: &str = "*";

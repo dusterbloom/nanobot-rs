@@ -161,23 +161,13 @@ pub(super) fn local_base_url(config: &Config, fallback_port: &str) -> String {
     }
 }
 
-/// Resolved local providers for the foreground, delegation, and specialist roles.
+/// Resolved local provider plus the facts the core needs about it.
 pub(super) struct LocalProviders {
     pub main: Arc<dyn LLMProvider>,
     /// Real model identity used for capabilities, prompt policy, UI, and snapshots.
     pub semantic_model_id: String,
-    pub delegation: Option<Arc<dyn LLMProvider>>,
-    pub specialist: Option<Arc<dyn LLMProvider>>,
     pub max_context_tokens: usize,
     pub runtime_contract: Option<RuntimeModelContract>,
-}
-
-fn shared_local_role_model<'a>(configured_role_model: &'a str, main_model_id: &'a str) -> &'a str {
-    if configured_role_model.is_empty() {
-        main_model_id
-    } else {
-        configured_role_model
-    }
 }
 
 fn local_transport_model_id(config: &Config, local_model_name: Option<&str>) -> String {
@@ -216,19 +206,11 @@ fn local_semantic_model_id(config: &Config, transport_model_id: &str) -> String 
     transport_model_id.to_string()
 }
 
-/// Build providers for all local roles from config + endpoint resolution.
-///
-/// Endpoint priority per trio role:
-///   1. `trio.router_endpoint` / `trio.specialist_endpoint` (explicit URL+model)
-///   2. `localApiBase` + `trio.router_model` / `trio.specialist_model` (shared JIT server)
-///   3. Separate port fallback (delegation_port / specialist_port)
-///   4. None (disabled)
+/// Build the local provider from config and probe its context window.
 pub(super) fn make_local_providers(
     config: &Config,
     local_port: &str,
     local_model_name: Option<&str>,
-    delegation_port: Option<&str>,
-    specialist_port: Option<&str>,
 ) -> LocalProviders {
     let has_custom_base = !config.agents.defaults.local_api_base.is_empty();
     let base_url = local_base_url(config, local_port);
@@ -254,7 +236,6 @@ pub(super) fn make_local_providers(
         };
 
     let api_key = &config.agents.defaults.local_api_key;
-    let constrained = config.agents.defaults.constrained_tool_calls;
     let (repetition_penalty, frequency_penalty, presence_penalty) = (
         config.agents.defaults.repetition_penalty,
         config.agents.defaults.frequency_penalty,
@@ -270,7 +251,7 @@ pub(super) fn make_local_providers(
 
     let main: Arc<dyn LLMProvider> = factory::create_openai_compat_with_contract(
         factory::ProviderSpec::local_with_key(&base_url, Some(&model_id), api_key)
-            .with_jit_gate_opt(jit_gate.clone())
+            .with_jit_gate_opt(jit_gate)
             .with_timeout_config(&config.timeouts)
             .with_retry(config.retry.clone())
             .with_sampling_penalties(repetition_penalty, frequency_penalty, presence_penalty)
@@ -307,103 +288,9 @@ pub(super) fn make_local_providers(
     let max_context_tokens =
         max_context_tokens.min(config.agents.defaults.local_max_context_tokens);
 
-    // Helper: create a provider for a trio role with endpoint resolution.
-    let make_role_provider = |role_name: &str,
-                              endpoint: &Option<crate::config::schema::ModelEndpoint>,
-                              trio_model: &str,
-                              fallback_port: Option<&str>|
-     -> Option<Arc<dyn LLMProvider>> {
-        // Priority 1: explicit endpoint (url + model)
-        if let Some(ep) = endpoint {
-            // Use JIT gate if endpoint URL matches the shared base (same server).
-            let gate = jit_gate.as_ref().filter(|_| ep.url == base_url).cloned();
-            return Some(factory::create_openai_compat(factory::ProviderSpec {
-                api_key: api_key.to_string(),
-                api_base: Some(ep.url.clone()),
-                model: Some(ep.model.clone()),
-                jit_gate: gate,
-                retry: config.retry.clone(),
-                timeout_secs: config.timeouts.provider_http_secs,
-                lms_native_probe_secs: config.timeouts.lms_native_probe_secs,
-                constrained_tool_calls: constrained,
-                higgs_session_cache: false,
-                repetition_penalty,
-                frequency_penalty,
-                presence_penalty,
-            }));
-        }
-
-        // Priority 2: shared JIT server (localApiBase set) + trio model name
-        if has_custom_base {
-            let model = shared_local_role_model(trio_model, &model_id);
-            if trio_model.is_empty() {
-                tracing::warn!(
-                    role = role_name,
-                    model = %model,
-                    "No local role model configured; reusing main local model"
-                );
-            }
-            return Some(factory::create_openai_compat(
-                factory::ProviderSpec::local_with_key(&base_url, Some(model), api_key)
-                    .with_jit_gate_opt(jit_gate.clone())
-                    .with_timeout_config(&config.timeouts)
-                    .with_retry(config.retry.clone())
-                    .with_constrained_tool_calls(constrained)
-                    .with_sampling_penalties(
-                        repetition_penalty,
-                        frequency_penalty,
-                        presence_penalty,
-                    ),
-            ));
-        }
-
-        // Priority 3: separate port fallback
-        fallback_port.map(|p| -> Arc<dyn LLMProvider> {
-            factory::create_openai_compat(
-                factory::ProviderSpec::local_with_key(
-                    &local_base_url(config, p),
-                    Some(role_name),
-                    api_key,
-                )
-                .with_timeout_config(&config.timeouts)
-                .with_retry(config.retry.clone())
-                .with_constrained_tool_calls(constrained)
-                .with_sampling_penalties(
-                    repetition_penalty,
-                    frequency_penalty,
-                    presence_penalty,
-                ),
-            )
-        })
-    };
-
-    let delegation = if config.tool_delegation.enabled || config.trio.enabled {
-        make_role_provider(
-            "local-delegation",
-            &config.trio.router_endpoint,
-            &config.trio.router_model,
-            delegation_port,
-        )
-    } else {
-        None
-    };
-
-    let specialist = if config.trio.enabled {
-        make_role_provider(
-            "local-specialist",
-            &config.trio.specialist_endpoint,
-            &config.trio.specialist_model,
-            specialist_port,
-        )
-    } else {
-        None
-    };
-
     LocalProviders {
         main,
         semantic_model_id,
-        delegation,
-        specialist,
         max_context_tokens,
         runtime_contract,
     }
@@ -437,8 +324,6 @@ fn core_config_from(
     model: String,
     max_context_tokens: usize,
     is_local: bool,
-    delegation: Option<Arc<dyn LLMProvider>>,
-    specialist: Option<Arc<dyn LLMProvider>>,
 ) -> SwappableCoreConfig {
     let lane = config
         .agents
@@ -478,8 +363,6 @@ fn core_config_from(
         tool_delegation: config.tool_delegation.clone(),
         provenance: config.provenance.clone(),
         max_tool_result_chars: config.agents.defaults.max_tool_result_chars,
-        delegation_provider: delegation,
-        specialist_provider: specialist,
         trio_config: config.trio.clone(),
         model_capabilities_overrides: config.model_capabilities.clone(),
         reasoning_config: config.reasoning.clone(),
@@ -499,35 +382,20 @@ pub(crate) fn build_core_handle(
     config: &Config,
     local_port: &str,
     local_model_name: Option<&str>,
-    delegation_port: Option<&str>,
-    specialist_port: Option<&str>,
     is_local: bool,
 ) -> SharedCoreHandle {
-    let (provider, model, max_context_tokens, dp, sp, runtime_contract) = if is_local {
-        let lp = make_local_providers(
-            config,
-            local_port,
-            local_model_name,
-            delegation_port,
-            specialist_port,
-        );
+    let (provider, model, max_context_tokens, runtime_contract) = if is_local {
+        let lp = make_local_providers(config, local_port, local_model_name);
         let model = format!("local:{}", lp.semantic_model_id);
         // Use lp.max_context_tokens directly — model_context_size would override
         // the memory-safe cap with .max(131072) for Qwen3.6, breaking compaction.
         let ctx = lp.max_context_tokens;
-        (
-            lp.main,
-            model,
-            ctx,
-            lp.delegation,
-            lp.specialist,
-            lp.runtime_contract,
-        )
+        (lp.main, model, ctx, lp.runtime_contract)
     } else {
         let provider = create_provider(config);
         let model = config.agents.defaults.model.clone();
         let ctx = model_context_size(&model, config.agents.defaults.max_context_tokens);
-        (provider, model, ctx, None, None, None)
+        (provider, model, ctx, None)
     };
 
     let core = adopt_runtime_contract(
@@ -537,13 +405,10 @@ pub(crate) fn build_core_handle(
             model,
             max_context_tokens,
             is_local,
-            dp,
-            sp,
         )),
         runtime_contract.as_ref(),
     );
-    let counters =
-        RuntimeCounters::new_with_config(max_context_tokens, &config.trio.circuit_breaker);
+    let counters = RuntimeCounters::new(max_context_tokens);
     // When main_no_think is enabled, suppress thinking display from the start
     // so the user doesn't need to run /nothink manually each session.
     if config.trio.main_no_think {
@@ -562,34 +427,19 @@ pub(crate) fn rebuild_core(
     config: &Config,
     local_port: &str,
     local_model_name: Option<&str>,
-    delegation_port: Option<&str>,
-    specialist_port: Option<&str>,
     is_local: bool,
 ) {
-    let (provider, model, max_context_tokens, dp, sp, runtime_contract) = if is_local {
-        let lp = make_local_providers(
-            config,
-            local_port,
-            local_model_name,
-            delegation_port,
-            specialist_port,
-        );
+    let (provider, model, max_context_tokens, runtime_contract) = if is_local {
+        let lp = make_local_providers(config, local_port, local_model_name);
         let model = format!("local:{}", lp.semantic_model_id);
         // Use lp.max_context_tokens directly (same fix as build_core_handle).
         let ctx = lp.max_context_tokens;
-        (
-            lp.main,
-            model,
-            ctx,
-            lp.delegation,
-            lp.specialist,
-            lp.runtime_contract,
-        )
+        (lp.main, model, ctx, lp.runtime_contract)
     } else {
         let provider = create_provider(config);
         let model = config.agents.defaults.model.clone();
         let ctx = model_context_size(&model, config.agents.defaults.max_context_tokens);
-        (provider, model, ctx, None, None, None)
+        (provider, model, ctx, None)
     };
 
     let new_core = adopt_runtime_contract(
@@ -599,8 +449,6 @@ pub(crate) fn rebuild_core(
             model,
             max_context_tokens,
             is_local,
-            dp,
-            sp,
         )),
         runtime_contract.as_ref(),
     );
@@ -611,15 +459,6 @@ pub(crate) fn rebuild_core(
         .counters
         .last_context_max
         .store(max_context_tokens as u64, Ordering::Relaxed);
-    // Reset delegation health -- new core may have a fresh delegation server.
-    handle
-        .counters
-        .delegation_healthy
-        .store(true, Ordering::Relaxed);
-    handle
-        .counters
-        .delegation_retry_counter
-        .store(0, Ordering::Relaxed);
 }
 
 /// Create an agent loop with per-instance channels, using the shared core handle.
@@ -683,22 +522,6 @@ pub(crate) fn setup_cluster_for_repl(
 #[cfg(test)]
 mod matching_tests {
     use super::*;
-
-    #[test]
-    fn test_shared_local_role_model_reuses_main_when_unconfigured() {
-        assert_eq!(
-            shared_local_role_model("", "Qwen3.6-35B-A3B-4bit"),
-            "Qwen3.6-35B-A3B-4bit"
-        );
-    }
-
-    #[test]
-    fn test_shared_local_role_model_uses_configured_role_model() {
-        assert_eq!(
-            shared_local_role_model("Qwen3.5-0.8B-8bit", "Qwen3.6-35B-A3B-4bit"),
-            "Qwen3.5-0.8B-8bit"
-        );
-    }
 
     #[test]
     fn test_resolved_local_context_tokens_caps_apple_fm() {

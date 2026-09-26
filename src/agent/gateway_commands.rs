@@ -79,11 +79,9 @@ async fn cmd_status(shared: &AgentLoopShared) -> String {
     let ctx_max = counters.last_context_max.load(Ordering::Relaxed);
     let msg_count = counters.last_message_count.load(Ordering::Relaxed);
     let running = shared.subagents.get_running_count().await;
-    let trio_state = counters.get_trio_state();
 
     let mut lines = vec![
         format!("Model: {}", model),
-        format!("Trio: {:?}", trio_state),
         format!("Context: {}/{} tokens", ctx_used, ctx_max),
         format!("Messages in context: {}", msg_count),
     ];

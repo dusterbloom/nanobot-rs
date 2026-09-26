@@ -14,7 +14,6 @@
 //! Extracted from `agent_loop.rs` as a `#[path]` submodule.
 
 use serde_json::Value;
-use tracing::instrument;
 
 use crate::agent::protocol::ConversationProtocol;
 use crate::agent::turn::turn_from_legacy;
@@ -68,29 +67,6 @@ pub(super) fn render_via_protocol(
         .collect();
 
     protocol.render(&system, &turns)
-}
-
-/// Decide whether trio routing is healthy enough to strip tools from the main model.
-/// Pure function: takes health status as booleans, returns true if tools should be stripped.
-#[instrument(
-    name = "should_strip_tools_for_trio",
-    fields(
-        is_local,
-        strict_no_tools_main,
-        router_probe_healthy,
-        circuit_breaker_available,
-    )
-)]
-pub(super) fn should_strip_tools_for_trio(
-    is_local: bool,
-    strict_no_tools_main: bool,
-    router_probe_healthy: bool,
-    circuit_breaker_available: bool,
-) -> bool {
-    let result =
-        is_local && strict_no_tools_main && router_probe_healthy && circuit_breaker_available;
-    tracing::debug!(strip_tools = result, "trio_strip_decision");
-    result
 }
 
 /// Outcome of the repeated successful tool-call breaker for one executed round.
@@ -424,82 +400,16 @@ pub(crate) fn appears_incomplete(content: &str) -> bool {
 //   .planning/phases/09-runtime-mode-spine/00-wave-0-coverage-PLAN.md
 //
 // These tests capture the output of every `is_local` branch read in this file
-// (agent_heuristics.rs:73-83 and :119-127) so the Wave 1 → Wave 3 refactor to
-// `RuntimeMode` can be audited via `cargo test --lib`. The two helpers in this
-// module (`should_strip_tools_for_trio`, `adaptive_max_tokens`) are called
-// from `agent_shared.rs:942-951` and `agent_shared.rs:1351` respectively, so
-// these tests ALSO anchor two of the `agent_shared.rs` branch sites that
-// couldn't be unit-tested in place.
+// so the Wave 1 → Wave 3 refactor to `RuntimeMode` can be audited via
+// `cargo test --lib`.
 // ============================================================================
 #[cfg(test)]
 mod tests {
     use super::{
         adaptive_max_tokens_for_artifact_action, evaluate_repeated_tool_round,
-        local_artifact_action_with_sticky, should_strip_tools_for_trio, LocalArtifactAction,
-        RepeatBreakerAction,
+        local_artifact_action_with_sticky, LocalArtifactAction, RepeatBreakerAction,
     };
     use crate::config::schema::AdaptiveTokenConfig;
-
-    // -----------------------------------------------------------------------
-    // should_strip_tools_for_trio — pins agent_heuristics.rs:73-83
-    // (trio-strip AND-chain: is_local, strict_no_tools_main, router health,
-    //  circuit breaker availability). Also covers agent_shared.rs:942-951.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_should_strip_tools_for_trio_is_local_gate() {
-        // pins agent_heuristics.rs:73-83 — trio strip AND-chain
-        // Cloud (is_local=false) must NEVER strip tools regardless of the
-        // other three permissions (cloud providers handle tools natively).
-        assert!(
-            !should_strip_tools_for_trio(false, true, true, true),
-            "cloud must never strip tools even when every downstream permission is granted"
-        );
-        assert!(
-            !should_strip_tools_for_trio(false, false, false, false),
-            "cloud with no permissions → still never strip"
-        );
-
-        // Local with all permissions → strip.
-        assert!(
-            should_strip_tools_for_trio(true, true, true, true),
-            "local + strict + healthy + cb-available → strip"
-        );
-
-        // Local + any permission missing → do NOT strip (AND-chain).
-        assert!(
-            !should_strip_tools_for_trio(true, false, true, true),
-            "local without strict → do not strip"
-        );
-        assert!(
-            !should_strip_tools_for_trio(true, true, false, true),
-            "local with degraded router probe → do not strip"
-        );
-        assert!(
-            !should_strip_tools_for_trio(true, true, true, false),
-            "local with tripped circuit breaker → do not strip"
-        );
-    }
-
-    #[test]
-    fn test_should_strip_tools_for_trio_truth_table() {
-        // pins agent_heuristics.rs:80 — boolean AND of four flags
-        // Exhaustive 16-row truth table: the output is `true` iff all four
-        // inputs are `true`.
-        for mask in 0u8..16 {
-            let is_local = mask & 0b1000 != 0;
-            let strict = mask & 0b0100 != 0;
-            let healthy = mask & 0b0010 != 0;
-            let cb = mask & 0b0001 != 0;
-            let expected = is_local && strict && healthy && cb;
-            let got = should_strip_tools_for_trio(is_local, strict, healthy, cb);
-            assert_eq!(
-                got, expected,
-                "mask={:04b} — is_local={} strict={} healthy={} cb={} → expected {}",
-                mask, is_local, strict, healthy, cb, expected
-            );
-        }
-    }
 
     #[test]
     fn test_local_artifact_action_with_sticky_recognizes_followups() {

@@ -31,8 +31,7 @@ use crate::session::db::{ModelCallPurpose, RecordedProviderRequest, RecordedProv
 use crate::turn_stream::ControlMarker;
 
 use super::{
-    AgentLoopShared, IterationOutcome, IterationPhase, StepResult, ToolRouting, TurnContext,
-    TurnOutcome,
+    AgentLoopShared, IterationOutcome, IterationPhase, StepResult, TurnContext, TurnOutcome,
 };
 
 async fn recorded_auxiliary_chat(
@@ -546,10 +545,7 @@ impl AgentLoopShared {
                         *content = stripped;
                     }
                 }
-                StepResult::Next(IterationPhase::Executing {
-                    response,
-                    routing: ToolRouting::NeedsRouting,
-                })
+                StepResult::Next(IterationPhase::Executing { response })
             }
 
             ResponseKind::Text(content) => {
@@ -1696,8 +1692,6 @@ mod tests {
                 tool_delegation: crate::config::schema::ToolDelegationConfig::default(),
                 provenance: crate::config::schema::ProvenanceConfig::default(),
                 max_tool_result_chars: 2_000,
-                delegation_provider: None,
-                specialist_provider: None,
                 trio_config: crate::config::schema::TrioConfig::default(),
                 model_capabilities_overrides: HashMap::new(),
                 reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -1710,11 +1704,7 @@ mod tests {
                 cua: crate::config::schema::CuaToolConfig::default(),
             },
         );
-        let counters =
-            std::sync::Arc::new(crate::agent::agent_core::RuntimeCounters::new_with_config(
-                32_768,
-                &crate::config::schema::CircuitBreakerConfig::default(),
-            ));
+        let counters = std::sync::Arc::new(crate::agent::agent_core::RuntimeCounters::new(32_768));
         let core_handle = crate::agent::agent_core::AgentHandle::new(core, counters);
         let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel();
         let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel();

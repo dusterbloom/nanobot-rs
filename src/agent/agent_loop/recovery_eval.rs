@@ -8,6 +8,7 @@ use crate::agent::agent_loop::AgentLoop;
 use crate::agent::tools::base::{Tool, ToolContext, ToolResult};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::config::schema::*;
+use crate::providers::base::FinishReason;
 use crate::providers::openai_compat::OpenAICompatProvider;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -618,15 +619,9 @@ fn make_agent_configured(
         },
         is_local: true,
         lane: crate::agent::lane::Lane::default(),
-        tool_delegation: ToolDelegationConfig {
-            enabled: false,
-            auto_local: false,
-            ..Default::default()
-        },
+        tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 8000,
-        delegation_provider: None,
-        specialist_provider: None,
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: HashMap::new(),
         reasoning_config: ReasoningConfig {
@@ -644,10 +639,7 @@ fn make_agent_configured(
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
     });
-    let counters = Arc::new(RuntimeCounters::new_with_config(
-        ceiling,
-        &CircuitBreakerConfig::default(),
-    ));
+    let counters = Arc::new(RuntimeCounters::new(ceiling));
     let handle = AgentHandle::new(core, counters);
     let (it, ir) = tokio::sync::mpsc::unbounded_channel();
     let (ot, _or) = tokio::sync::mpsc::unbounded_channel();
@@ -684,7 +676,7 @@ async fn seed(agent: &AgentLoop, case: &Case) -> String {
         "src/agent/policy.rs",
         "src/agent/turn.rs",
         "src/agent/memory.rs",
-        "src/agent/circuit_breaker.rs",
+        "src/agent/tool_guard.rs",
     ]
     .iter()
     .enumerate()
@@ -921,16 +913,13 @@ async fn context_reset_announcement_recovery_live() {
         .map(|call| call.name.clone())
         .collect();
     let mut entered_tool_loop = false;
-    if let StepResult::Next(IterationPhase::Executing { response, routing }) = agent
+    if let StepResult::Next(IterationPhase::Executing { response }) = agent
         .shared
         .step_process_response(&mut ctx, recovered)
         .await
     {
         entered_tool_loop = true;
-        let _ = agent
-            .shared
-            .step_execute_tools(&mut ctx, response, routing)
-            .await;
+        let _ = agent.shared.step_execute_tools(&mut ctx, response).await;
         if boundary_ready(&ctx).await {
             ctx.turn_outcome = TurnOutcome::Finished;
         } else {

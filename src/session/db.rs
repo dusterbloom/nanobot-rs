@@ -1063,7 +1063,6 @@ pub struct SessionDb {
 #[derive(Default)]
 pub(crate) struct JournalFaultsForTests {
     turn_finished: AtomicUsize,
-    model_request: AtomicUsize,
     model_response: AtomicUsize,
     model_interrupted: AtomicUsize,
 }
@@ -1074,13 +1073,6 @@ impl SessionDb {
     pub(crate) fn fail_turn_finished_writes_for_tests(&self, count: usize) {
         self.test_journal_faults
             .turn_finished
-            .store(count, AtomicOrdering::SeqCst);
-    }
-
-    /// Make the next `count` `model_request` journal writes fail.
-    pub(crate) fn fail_model_request_writes_for_tests(&self, count: usize) {
-        self.test_journal_faults
-            .model_request
             .store(count, AtomicOrdering::SeqCst);
     }
 
@@ -1383,8 +1375,6 @@ impl SessionDb {
         purpose: ModelCallPurpose,
         request: &RecordedProviderRequest,
     ) -> Result<String, ReplayError> {
-        #[cfg(test)]
-        self.consume_test_fault(&self.test_journal_faults.model_request)?;
         let bytes = serde_json::to_vec(request)?;
         let digest = self
             .store_replay_artifact(session_id, "application/json", &bytes)

@@ -6,17 +6,13 @@
 
 use super::*;
 use crate::agent::lane::Lane;
-use crate::agent::router::{
-    extract_json_object, parse_lenient_router_decision, request_strict_router_decision,
-};
 use crate::config::schema::{
     AdaptiveTokenConfig, CodeExecutionConfig, CuaToolConfig, MemoryConfig, ProvenanceConfig,
-    ProviderConfig, PythonKernelConfig, ToolDelegationConfig, TrioConfig,
+    PythonKernelConfig, ToolDelegationConfig, TrioConfig,
 };
 use crate::providers::base::{FinishReason, LLMProvider};
 use crate::providers::openai_compat::OpenAICompatProvider;
 use async_trait::async_trait;
-use backon::BackoffBuilder;
 
 fn attested_text(content: &str) -> String {
     // Attestation protocol removed — text is itself the final answer.
@@ -64,9 +60,8 @@ impl LLMProvider for MockLLM {
 fn test_runtime_counters(
     max_context_tokens: usize,
 ) -> Arc<crate::agent::agent_core::RuntimeCounters> {
-    Arc::new(crate::agent::agent_core::RuntimeCounters::new_with_config(
+    Arc::new(crate::agent::agent_core::RuntimeCounters::new(
         max_context_tokens,
-        &crate::config::schema::CircuitBreakerConfig::default(),
     ))
 }
 
@@ -117,23 +112,12 @@ impl LLMProvider for StaticResponseLLM {
 }
 
 /// Helper to build a SwappableCore with minimal config for wiring tests.
-fn build_test_core(
-    delegation_enabled: bool,
-    delegation_provider: Option<Arc<dyn LLMProvider>>,
-    config_provider: Option<ProviderConfig>,
-) -> SwappableCore {
+fn build_test_core() -> SwappableCore {
     let workspace = tempfile::tempdir().unwrap().keep();
     // Isolate the session DB per test so parallel runs don't contend on the
     // user's real ~/.nanobot/sessions.db.
     let sessions_db = workspace.join("sessions.db");
     let main = MockLLM::named("main-provider");
-    let td = ToolDelegationConfig {
-        enabled: delegation_enabled,
-        model: "delegation-model".to_string(),
-        provider: config_provider,
-        auto_local: true,
-        ..Default::default()
-    };
     build_swappable_core(SwappableCoreConfig {
         provider: main,
         workspace,
@@ -153,11 +137,9 @@ fn build_test_core(
         memory_config: MemoryConfig::default(),
         is_local: false,
         lane: Lane::default(),
-        tool_delegation: td,
+        tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
-        delegation_provider,
-        specialist_provider: None,
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -171,683 +153,12 @@ fn build_test_core(
     })
 }
 
-#[test]
-fn test_extract_json_object_from_markdown_fence() {
-    let raw =
-        "```json\n{\"action\":\"tool\",\"target\":\"exec\",\"args\":{},\"confidence\":0.9}\n```";
-    let obj = extract_json_object(raw).expect("json object");
-    assert!(obj.starts_with('{'));
-    assert!(obj.ends_with('}'));
-    assert!(obj.contains("\"action\":\"tool\""));
-}
+// -- LCM provider binding tests --
 
 #[test]
-fn test_extract_json_object_none_when_missing() {
-    assert!(extract_json_object("no json here").is_none());
-}
-
-#[tokio::test]
-async fn test_request_strict_router_decision_action_matrix() {
-    let cases = vec![
-        (
-            r#"{"action":"tool","target":"read_file","args":{"path":"README.md"},"confidence":0.9}"#,
-            "tool",
-        ),
-        (
-            r#"{"action":"subagent","target":"builder","args":{"task":"x"},"confidence":0.8}"#,
-            "subagent",
-        ),
-        (
-            r#"{"action":"specialist","target":"summarizer","args":{"style":"tight"},"confidence":0.7}"#,
-            "specialist",
-        ),
-        (
-            r#"{"action":"ask_user","target":"clarify","args":{"question":"Need path?"},"confidence":0.6}"#,
-            "ask_user",
-        ),
-    ];
-
-    for (raw, expected_action) in cases {
-        let llm = StaticResponseLLM::plain("router", raw);
-        let decision = request_strict_router_decision(
-            &llm,
-            "router",
-            "route this action with strict schema",
-            false,
-            0.6,
-            1.0,
-            "",
-            256,
-            None,
-        )
-        .await
-        .expect("valid strict router decision");
-        assert_eq!(decision.action, expected_action);
-    }
-}
-
-#[tokio::test]
-async fn router_journal_failure_prevents_auxiliary_provider_call() {
-    // The router decision is a provider side effect just like the main call:
-    // its exact request must be durable before it leaves the process.
-    let dir = tempfile::tempdir().unwrap();
-    let sessions =
-        std::sync::Arc::new(crate::session::db::SessionDb::new(&dir.path().join("s.db")));
-    let meta = sessions.create_session("cli:router-journal-fault").await;
-    sessions.fail_model_request_writes_for_tests(1);
-    let replay = crate::session::db::TurnReplayRecorder::new(
-        std::sync::Arc::clone(&sessions),
-        meta.id.clone(),
-        "turn-1".to_string(),
-        1,
-    );
-    let llm = SequenceProvider::new(
-        "router",
-        vec![r#"{"action":"respond","target":"main","args":{},"confidence":0.9}"#],
-    );
-
-    let decision = request_strict_router_decision(
-        &llm,
-        "router",
-        "route this action with strict schema",
-        false,
-        0.6,
-        1.0,
-        "",
-        256,
-        Some(&replay),
-    )
-    .await;
-
-    assert!(matches!(
-        decision,
-        Err(crate::agent::router::AuxiliaryCallError::Persistence(_))
-    ));
-    assert_eq!(llm.call_count(), 0);
-}
-
-#[tokio::test]
-async fn provider_error_with_persistence_words_remains_call_error() {
-    // The former string-prefix classifier treated provider-controlled text as
-    // an infrastructure failure. The typed carrier must classify by origin.
-    let provider = RetryableFailureProvider {
-        name: "router".to_string(),
-        message: "auxiliary replay persistence failed: provider-authored text".to_string(),
-        call_count: std::sync::atomic::AtomicU32::new(0),
-    };
-
-    let result = request_strict_router_decision(
-        &provider,
-        "router",
-        "route this",
-        false,
-        0.2,
-        1.0,
-        "read_file",
-        128,
-        None,
-    )
-    .await;
-
-    assert!(matches!(
-        result,
-        Err(crate::agent::router::AuxiliaryCallError::Call(error))
-            if error.contains("auxiliary replay persistence failed")
-    ));
-    assert_eq!(
-        provider
-            .call_count
-            .load(std::sync::atomic::Ordering::Relaxed),
-        2
-    );
-}
-
-#[tokio::test]
-async fn strict_router_preflight_tool_uses_durable_tool_lifecycle() {
-    let side_effect_dir = tempfile::tempdir().unwrap();
-    let side_effect_path = side_effect_dir.path().join("router-must-not-write.txt");
-    let router_body = json!({
-        "action": "tool",
-        "target": "write_file",
-        "args": {
-            "path": side_effect_path.to_string_lossy().to_string(),
-            "content": "forbidden"
-        },
-        "confidence": 0.99
-    })
-    .to_string();
-    let main = Arc::new(SequenceProvider::new("offline-main", vec!["must not run"]));
-    // SequenceProvider emits content rather than native tool calls, so the
-    // strict router consumes its text-fallback response on the second call.
-    let router = Arc::new(SequenceProvider::new(
-        "offline-router",
-        vec![&router_body, &router_body],
-    ));
-    let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
-        "offline-specialist",
-        "specialist unused",
-    ));
-    let (agent_loop, workspace) = build_trio_offline_harness(
-        main.clone() as Arc<dyn LLMProvider>,
-        router.clone() as Arc<dyn LLMProvider>,
-        specialist,
-    );
-    let session_key = format!("router-tool-lifecycle-{}", uuid::Uuid::new_v4());
-    let core = agent_loop.shared.core_handle.swappable();
-    {
-        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
-        conn.execute_batch(
-            "CREATE TRIGGER fail_router_tool_pre_execute \
-             BEFORE INSERT ON session_events WHEN NEW.event_kind = 'tool_pre_execute' \
-             BEGIN SELECT RAISE(ABORT, 'synthetic router tool pre-execute failure'); END;",
-        )
-        .unwrap();
-    }
-
-    let response = agent_loop
-        .process_direct("write the routed file", &session_key, "test", "offline")
-        .await;
-
-    assert!(response.contains("pre-execution"), "{response:?}");
-    assert_eq!(router.call_count(), 2);
-    assert_eq!(main.call_count(), 0);
-    assert!(!side_effect_path.exists());
-    let session = core
-        .sessions
-        .get_latest_session(&session_key)
-        .await
-        .expect("router lifecycle session");
-    assert_eq!(
-        persisted_turn_outcome(&core.sessions, &session.id).await,
-        "error"
-    );
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-/// Real-provider trio probe.
-///
-/// Runs against live OpenAI-compatible endpoints (e.g. LM Studio):
-/// - main: `NANOBOT_REAL_MAIN_BASE` (default: http://127.0.0.1:8080/v1)
-/// - router: `NANOBOT_REAL_ROUTER_BASE` (default: http://127.0.0.1:8094/v1)
-/// - specialist: `NANOBOT_REAL_SPECIALIST_BASE` (default: http://127.0.0.1:8095/v1)
-///
-/// Optional model overrides:
-/// - `NANOBOT_REAL_MAIN_MODEL`
-/// - `NANOBOT_REAL_ROUTER_MODEL`
-/// - `NANOBOT_REAL_SPECIALIST_MODEL`
-#[tokio::test]
-#[ignore = "requires running local providers on main/router/specialist ports"]
-async fn test_real_providers_trio_probe() {
-    let main_base = std::env::var("NANOBOT_REAL_MAIN_BASE")
-        .unwrap_or_else(|_| "http://127.0.0.1:8080/v1".to_string());
-    let router_base = std::env::var("NANOBOT_REAL_ROUTER_BASE")
-        .unwrap_or_else(|_| "http://127.0.0.1:8094/v1".to_string());
-    let specialist_base = std::env::var("NANOBOT_REAL_SPECIALIST_BASE")
-        .unwrap_or_else(|_| "http://127.0.0.1:8095/v1".to_string());
-    let main_model =
-        std::env::var("NANOBOT_REAL_MAIN_MODEL").unwrap_or_else(|_| "local-model".to_string());
-    let router_model = std::env::var("NANOBOT_REAL_ROUTER_MODEL")
-        .unwrap_or_else(|_| "local-delegation".to_string());
-    let specialist_model = std::env::var("NANOBOT_REAL_SPECIALIST_MODEL")
-        .unwrap_or_else(|_| "local-specialist".to_string());
-
-    let main = OpenAICompatProvider::new("local", Some(&main_base), Some(&main_model));
-    let router = OpenAICompatProvider::new("local", Some(&router_base), Some(&router_model));
-    let specialist =
-        OpenAICompatProvider::new("local", Some(&specialist_base), Some(&specialist_model));
-
-    let mut failures: Vec<String> = Vec::new();
-
-    // Router: force each action in a constrained prompt and verify strict parsing.
-    let router_cases = vec![
-        (
-            "tool",
-            "Return action=tool target=read_file args={\"path\":\"README.md\"}.",
-        ),
-        (
-            "subagent",
-            "Return action=subagent target=builder args={\"task\":\"diagnose issue\"}.",
-        ),
-        (
-            "specialist",
-            "Return action=specialist target=summarizer args={\"objective\":\"compress\"}.",
-        ),
-        (
-            "ask_user",
-            "Return action=ask_user target=clarify args={\"question\":\"Which file?\"}.",
-        ),
-    ];
-    for (expected_action, directive) in router_cases {
-        let pack = format!("{}\nFollow schema strictly.", directive);
-        match request_strict_router_decision(
-            &router,
-            &router_model,
-            &pack,
-            false,
-            0.6,
-            1.0,
-            "",
-            256,
-            None,
-        )
-        .await
-        {
-            Ok(d) => {
-                if d.action != expected_action {
-                    failures.push(format!(
-                        "router action mismatch: expected={}, got={} target={}",
-                        expected_action, d.action, d.target
-                    ));
-                }
-            }
-            Err(e) => failures.push(format!("router {} failed: {}", expected_action, e)),
-        }
-    }
-
-    // Specialist must produce non-empty response (with warmup retries).
-    let specialist_messages = vec![
-        json!({"role":"system","content":"ROLE=SPECIALIST\nReturn concise output."}),
-        json!({"role":"user","content":"Summarize: tool call failed because server was down and port conflicted."}),
-    ];
-    let mut specialist_ok = false;
-    let mut warmup_backoff = backon::ConstantBuilder::default()
-        .with_delay(Duration::from_secs(2))
-        .with_max_times(10)
-        .build();
-    loop {
-        match specialist
-            .chat(
-                &specialist_messages,
-                None,
-                Some(&specialist_model),
-                256,
-                0.2,
-                None,
-                None,
-            )
-            .await
-        {
-            Ok(resp) => {
-                let text = resp.content.unwrap_or_default();
-                if !text.trim().is_empty() {
-                    specialist_ok = true;
-                    break;
-                }
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                let lower = msg.to_lowercase();
-                if !lower.contains("loading model") && !lower.contains("503") {
-                    failures.push(format!("specialist call failed: {}", msg));
-                    break;
-                }
-            }
-        }
-        match warmup_backoff.next() {
-            Some(delay) => tokio::time::sleep(delay).await,
-            None => break,
-        }
-    }
-    if !specialist_ok {
-        failures.push("specialist did not become ready / returned empty output".to_string());
-    }
-
-    // Main provider smoke: should answer plain text with no tools when none offered.
-    let main_messages = vec![json!({"role":"user","content":"Reply with exactly: main-ok"})];
-    match main
-        .chat(&main_messages, None, Some(&main_model), 64, 0.0, None, None)
-        .await
-    {
-        Ok(resp) => {
-            if resp.has_tool_calls() {
-                failures.push("main returned tool calls unexpectedly".to_string());
-            }
-            let text = resp.content.unwrap_or_default();
-            if !text.to_lowercase().contains("main-ok") {
-                failures.push(format!("main output mismatch: {}", text));
-            }
-        }
-        Err(e) => failures.push(format!("main call failed: {}", e)),
-    }
-
-    if !failures.is_empty() {
-        panic!(
-            "real trio probe failed (main={}, router={}, specialist={}):\n{}",
-            main_base,
-            router_base,
-            specialist_base,
-            failures.join("\n")
-        );
-    }
-}
-
-// -- Delegation provider wiring tests --
-
-#[test]
-fn test_delegation_disabled_no_runner_provider() {
-    let core = build_test_core(false, None, None);
-    assert!(
-        core.tool_runner_provider.is_none(),
-        "When delegation is disabled, tool_runner_provider should be None"
-    );
-    assert!(core.tool_runner_model.is_none());
-}
-
-#[test]
-fn test_delegation_enabled_with_auto_provider() {
-    // When an auto-spawned delegation provider is passed, it should be used
-    let dp = MockLLM::named("auto-delegation");
-    let core = build_test_core(true, Some(dp), None);
-
-    assert!(core.tool_runner_provider.is_some());
-    let provider = core.tool_runner_provider.as_ref().unwrap();
-    assert_eq!(
-        provider.get_default_model(),
-        "auto-delegation",
-        "Should use the auto-spawned delegation provider"
-    );
-    assert_eq!(core.tool_runner_model.as_deref(), Some("delegation-model"));
-}
-
-#[test]
-fn test_delegation_auto_provider_takes_priority_over_config() {
-    // Auto-spawned provider should take priority over config provider
-    let dp = MockLLM::named("auto-delegation");
-    let config_provider = ProviderConfig {
-        api_key: "key".to_string(),
-        api_base: Some("http://localhost:9999/v1".to_string()),
-    };
-    let core = build_test_core(true, Some(dp), Some(config_provider));
-
-    let provider = core.tool_runner_provider.as_ref().unwrap();
-    assert_eq!(
-        provider.get_default_model(),
-        "auto-delegation",
-        "Auto-spawned provider should beat config provider"
-    );
-}
-
-#[test]
-fn test_delegation_config_provider_used_when_no_auto() {
-    // When no auto provider, but config has one, it should create OpenAICompatProvider
-    let config_provider = ProviderConfig {
-        api_key: "key".to_string(),
-        api_base: Some("http://localhost:9999/v1".to_string()),
-    };
-    let core = build_test_core(true, None, Some(config_provider));
-
-    assert!(
-        core.tool_runner_provider.is_some(),
-        "Should have a provider from config"
-    );
-}
-
-#[test]
-fn test_delegation_falls_back_to_main_provider() {
-    // When delegation enabled but no auto provider and no config provider,
-    // should fall back to main
-    let core = build_test_core(true, None, None);
-
-    assert!(core.tool_runner_provider.is_some());
-    let provider = core.tool_runner_provider.as_ref().unwrap();
-    assert_eq!(
-        provider.get_default_model(),
-        "main-provider",
-        "Should fall back to main provider"
-    );
-}
-
-#[test]
-fn test_delegation_model_uses_config_model() {
-    let core = build_test_core(true, None, None);
-    assert_eq!(
-        core.tool_runner_model.as_deref(),
-        Some("delegation-model"),
-        "Should use the model from ToolDelegationConfig"
-    );
-}
-
-#[test]
-fn test_delegation_model_falls_back_to_main_when_empty() {
-    let workspace = tempfile::tempdir().unwrap().keep();
-    let main = MockLLM::named("main-provider");
-    let td = ToolDelegationConfig {
-        enabled: true,
-        model: String::new(), // Empty → fall back to main model
-        auto_local: true,
-        ..Default::default()
-    };
-    let core = build_swappable_core(SwappableCoreConfig {
-        provider: main,
-        workspace,
-        model: "main-model".to_string(),
-        max_iterations: 10,
-        max_continuations: 2,
-        max_tokens: 4096,
-        temperature: 0.7,
-        max_context_tokens: 16384,
-        brave_api_key: None,
-        search_provider: "searxng".to_string(),
-        searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
-        search_max_results: 5,
-        exec_timeout: 30,
-        restrict_to_workspace: false,
-        memory_config: MemoryConfig::default(),
-        is_local: false,
-        lane: Lane::default(),
-        tool_delegation: td,
-        provenance: ProvenanceConfig::default(),
-        max_tool_result_chars: 2000,
-        delegation_provider: None,
-        specialist_provider: None,
-        trio_config: TrioConfig::default(),
-        model_capabilities_overrides: std::collections::HashMap::new(),
-        reasoning_config: crate::config::schema::ReasoningConfig::default(),
-        tool_heartbeat_secs: 2,
-        health_check_timeout_secs: 2,
-        code_execution: CodeExecutionConfig::default(),
-        python_kernel: PythonKernelConfig::default(),
-        cua: CuaToolConfig::default(),
-        adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(
-            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
-        ),
-    });
-    assert_eq!(
-        core.tool_runner_model.as_deref(),
-        Some("main-model"),
-        "Empty delegation model should fall back to main model"
-    );
-}
-
-#[test]
-fn test_delegation_disabled_ignores_passed_provider() {
-    // Even if a delegation_provider is passed, it should be ignored
-    // when delegation is disabled.
-    let dp = MockLLM::named("auto-delegation");
-    let core = build_test_core(false, Some(dp), None);
-
-    assert!(
-        core.tool_runner_provider.is_none(),
-        "Delegation disabled should ignore passed provider"
-    );
-    assert!(core.tool_runner_model.is_none());
-}
-
-#[test]
-fn test_delegation_with_is_local_true() {
-    // Verify wiring works when is_local=true (uses lite context builder)
-    let workspace = tempfile::tempdir().unwrap().keep();
-    let main = MockLLM::named("local-main");
-    let dp = MockLLM::named("local-delegation");
-    let td = ToolDelegationConfig {
-        enabled: true,
-        model: "delegation-model".to_string(),
-        auto_local: true,
-        ..Default::default()
-    };
-    let core = build_swappable_core(SwappableCoreConfig {
-        provider: main,
-        workspace,
-        model: "local-model".to_string(),
-        max_iterations: 10,
-        max_continuations: 2,
-        max_tokens: 4096,
-        temperature: 0.7,
-        max_context_tokens: 16384,
-        brave_api_key: None,
-        search_provider: "searxng".to_string(),
-        searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
-        search_max_results: 5,
-        exec_timeout: 30,
-        restrict_to_workspace: false,
-        memory_config: MemoryConfig::default(),
-        is_local: true,
-        lane: Lane::default(),
-        tool_delegation: td,
-        provenance: ProvenanceConfig::default(),
-        max_tool_result_chars: 2000,
-        delegation_provider: Some(dp),
-        specialist_provider: None,
-        trio_config: TrioConfig::default(),
-        model_capabilities_overrides: std::collections::HashMap::new(),
-        reasoning_config: crate::config::schema::ReasoningConfig::default(),
-        tool_heartbeat_secs: 2,
-        health_check_timeout_secs: 2,
-        code_execution: CodeExecutionConfig::default(),
-        python_kernel: PythonKernelConfig::default(),
-        cua: CuaToolConfig::default(),
-        adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(
-            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
-        ),
-    });
-
-    assert!(core.mode().is_local());
-    assert!(core.tool_runner_provider.is_some());
-    assert_eq!(
-        core.tool_runner_provider
-            .as_ref()
-            .unwrap()
-            .get_default_model(),
-        "local-delegation",
-        "Local mode should still use the delegation provider"
-    );
-}
-
-/// Wave 0 cloud-path sibling of `test_delegation_with_is_local_true`.
-///
-/// Pins the `is_local=false` branches in `build_swappable_core`
-/// (agent_core.rs:460-509 memory provider, :516-520 reserve cap) so
-/// Wave 1→3 can't silently regress cloud delegation wiring.
-///
-/// Phase 09 plan:
-///   .planning/phases/09-runtime-mode-spine/00-wave-0-coverage-PLAN.md
-#[test]
-fn test_delegation_with_is_local_false_cloud() {
-    // Verify wiring + cloud-specific derivations when is_local=false.
-    // MockLLM returns `None` from `get_api_base()` — treated as Anthropic
-    // native → memory_model defaults to "haiku" (cheap summarisation).
-    let workspace = tempfile::tempdir().unwrap().keep();
-    let main = MockLLM::named("cloud-main");
-    let dp = MockLLM::named("cloud-delegation");
-    let td = ToolDelegationConfig {
-        enabled: true,
-        model: "delegation-model".to_string(),
-        auto_local: true,
-        ..Default::default()
-    };
-    let core = build_swappable_core(SwappableCoreConfig {
-        provider: main,
-        workspace,
-        model: "cloud-model".to_string(),
-        max_iterations: 10,
-        max_continuations: 2,
-        max_tokens: 4096,
-        temperature: 0.7,
-        max_context_tokens: 16384,
-        brave_api_key: None,
-        search_provider: "searxng".to_string(),
-        searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
-        search_max_results: 5,
-        exec_timeout: 30,
-        restrict_to_workspace: false,
-        memory_config: MemoryConfig::default(),
-        is_local: false,
-        lane: Lane::default(),
-        tool_delegation: td,
-        provenance: ProvenanceConfig::default(),
-        max_tool_result_chars: 2000,
-        delegation_provider: Some(dp),
-        specialist_provider: None,
-        trio_config: TrioConfig::default(),
-        model_capabilities_overrides: std::collections::HashMap::new(),
-        reasoning_config: crate::config::schema::ReasoningConfig::default(),
-        tool_heartbeat_secs: 2,
-        health_check_timeout_secs: 2,
-        code_execution: CodeExecutionConfig::default(),
-        python_kernel: PythonKernelConfig::default(),
-        cua: CuaToolConfig::default(),
-        adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(
-            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
-        ),
-    });
-
-    // pins agent_core.rs: is_local plumbs through to the core unchanged
-    assert!(
-        !core.mode().is_local(),
-        "cloud core must carry is_local=false"
-    );
-
-    // pins agent_core.rs: delegation provider still wired through in cloud mode
-    assert!(
-        core.tool_runner_provider.is_some(),
-        "cloud mode must still wire delegation provider"
-    );
-    assert_eq!(
-        core.tool_runner_provider
-            .as_ref()
-            .unwrap()
-            .get_default_model(),
-        "cloud-delegation",
-        "Cloud mode must use the delegation provider we passed in"
-    );
-
-    // pins agent_core.rs:487-498 cloud memory-model default (haiku for
-    // Anthropic-native / OpenRouter — MockLLM.get_api_base() == None, so
-    // the Anthropic branch wins).
-    assert_eq!(core.memory_model, "haiku");
-    assert_eq!(core.compactor.model(), "cloud-model");
-
-    // pins agent_core.rs:516-520 reserve cap: cloud mode leaves max_tokens
-    // as-is; local mode clamps to max_context/4. Here max_tokens=4096,
-    // max_context=16384, so local would also be 4096 — a pure-cloud distinct
-    // assertion belongs elsewhere, but we pin the cloud path doesn't
-    // spuriously clamp when max_tokens > max_context/4 is not triggered.
-    // (The stronger clamp-difference assertion is in the paired
-    // `_cloud_reserve_uncapped` test below.)
-    assert!(
-        core.token_budget.max_context() == 16384,
-        "max_context must pass through untouched in cloud mode"
-    );
-}
-
-#[test]
-fn test_local_reflection_and_delegation_providers_do_not_reroute_lcm() {
+fn test_local_reflection_model_does_not_reroute_lcm() {
     let workspace = tempfile::tempdir().unwrap().keep();
     let main = MockLLM::named("main");
-    let reflection = MockLLM::named("reflection");
-    let delegation = MockLLM::named("delegation");
-    let td = ToolDelegationConfig {
-        enabled: true,
-        model: "deleg-model".to_string(),
-        auto_local: true,
-        ..Default::default()
-    };
     let core = build_swappable_core(SwappableCoreConfig {
         provider: main,
         workspace,
@@ -864,14 +175,15 @@ fn test_local_reflection_and_delegation_providers_do_not_reroute_lcm() {
         search_max_results: 5,
         exec_timeout: 30,
         restrict_to_workspace: false,
-        memory_config: MemoryConfig::default(),
+        memory_config: MemoryConfig {
+            model: "reflection-model".to_string(),
+            ..MemoryConfig::default()
+        },
         is_local: true,
         lane: Lane::default(),
-        tool_delegation: td,
+        tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
-        delegation_provider: Some(delegation),
-        specialist_provider: Some(reflection),
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -886,38 +198,18 @@ fn test_local_reflection_and_delegation_providers_do_not_reroute_lcm() {
         ),
     });
 
-    assert_eq!(
-        core.memory_provider.get_default_model(),
-        "reflection",
-        "local reflection should reuse the specialist provider"
-    );
-    assert_eq!(core.memory_model, "reflection");
+    assert_eq!(core.memory_model, "reflection-model");
     assert_eq!(
         core.compactor.model(),
         "main-model",
         "LCM must remain bound to the foreground model"
     );
-    assert_eq!(
-        core.tool_runner_provider
-            .as_ref()
-            .unwrap()
-            .get_default_model(),
-        "delegation",
-        "Tool runner should use delegation provider"
-    );
 }
 
 #[test]
-fn test_cloud_memory_and_delegation_do_not_reroute_lcm() {
+fn test_cloud_memory_does_not_reroute_lcm() {
     let workspace = tempfile::tempdir().unwrap().keep();
     let main = MockLLM::named("main");
-    let delegation = MockLLM::named("delegation");
-    let td = ToolDelegationConfig {
-        enabled: true,
-        model: "deleg-model".to_string(),
-        auto_local: true,
-        ..Default::default()
-    };
     let core = build_swappable_core(SwappableCoreConfig {
         provider: main,
         workspace,
@@ -937,11 +229,9 @@ fn test_cloud_memory_and_delegation_do_not_reroute_lcm() {
         memory_config: MemoryConfig::default(),
         is_local: false,
         lane: Lane::default(),
-        tool_delegation: td,
+        tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
-        delegation_provider: Some(delegation),
-        specialist_provider: None,
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -967,16 +257,6 @@ fn test_cloud_memory_and_delegation_do_not_reroute_lcm() {
         "cloud reflection reuses the main provider by default"
     );
     assert_eq!(core.memory_model, "haiku");
-
-    // Delegation plumbing still works identically on both paths.
-    assert_eq!(
-        core.tool_runner_provider
-            .as_ref()
-            .unwrap()
-            .get_default_model(),
-        "delegation",
-        "Cloud mode: tool runner still uses delegation provider"
-    );
 }
 
 // -----------------------------------------------------------------------
@@ -1053,8 +333,6 @@ async fn test_real_lcm_e2e_compact_and_expand() {
         tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
-        delegation_provider: None,
-        specialist_provider: None,
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -1247,868 +525,7 @@ async fn test_real_lcm_e2e_compact_and_expand() {
 }
 
 // -----------------------------------------------------------------------
-// Trio E2E test harness
-//
-// All tests require a single LM Studio endpoint serving three models.
-// Configure via env vars:
-//   NANOBOT_TRIO_BASE            — API base (default: http://192.168.1.22:1234/v1)
-//   NANOBOT_TRIO_MAIN_MODEL      — Main model name
-//   NANOBOT_TRIO_ROUTER_MODEL    — Router model name
-//   NANOBOT_TRIO_SPECIALIST_MODEL — Specialist model name
-//
-// Run with: cargo test test_trio_e2e -- --ignored --nocapture
-// -----------------------------------------------------------------------
-
-/// Read trio E2E env vars (single shared endpoint).
-fn trio_e2e_env() -> (String, String, String, String) {
-    let base = std::env::var("NANOBOT_TRIO_BASE")
-        .unwrap_or_else(|_| "http://192.168.1.22:1234/v1".to_string());
-    let main_model =
-        std::env::var("NANOBOT_TRIO_MAIN_MODEL").unwrap_or_else(|_| "gemma-3n-e4b-it".to_string());
-    let router_model = std::env::var("NANOBOT_TRIO_ROUTER_MODEL")
-        .unwrap_or_else(|_| "nvidia_orchestrator-8b".to_string());
-    let specialist_model =
-        std::env::var("NANOBOT_TRIO_SPECIALIST_MODEL").unwrap_or_else(|_| "qwen3-1.7b".to_string());
-    (base, main_model, router_model, specialist_model)
-}
-
-/// Build an AgentLoop wired for trio E2E testing.
-///
-/// All three providers share one LM Studio endpoint, differentiated by model name.
-/// A shared JitGate serialises requests to prevent concurrent model-loading crashes.
-fn build_trio_e2e_harness(
-    base_url: &str,
-    main_model: &str,
-    router_model: &str,
-    specialist_model: &str,
-) -> (AgentLoop, std::path::PathBuf) {
-    use crate::config::schema::LcmSchemaConfig;
-    use crate::providers::factory;
-    use crate::providers::jit_gate::JitGate;
-
-    let jit_gate = std::sync::Arc::new(JitGate::new());
-
-    let main_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(base_url, Some(main_model))
-            .with_jit_gate_opt(Some(jit_gate.clone())),
-    );
-    let router_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(base_url, Some(router_model))
-            .with_jit_gate_opt(Some(jit_gate.clone())),
-    );
-    let specialist_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(base_url, Some(specialist_model))
-            .with_jit_gate_opt(Some(jit_gate.clone())),
-    );
-
-    let workspace = tempfile::tempdir().unwrap().keep();
-
-    let mut td = ToolDelegationConfig {
-        mode: crate::config::schema::DelegationMode::trio(),
-        ..Default::default()
-    };
-    td.apply_mode();
-
-    let trio_config = TrioConfig {
-        enabled: true,
-        router_model: router_model.to_string(),
-        specialist_model: specialist_model.to_string(),
-        ..Default::default()
-    };
-
-    let core = build_swappable_core(SwappableCoreConfig {
-        provider: main_provider,
-        workspace: workspace.clone(),
-        model: main_model.to_string(),
-        max_iterations: 5,
-        max_continuations: 2,
-        max_tokens: 512,
-        temperature: 0.3,
-        max_context_tokens: 4096,
-        brave_api_key: None,
-        search_provider: "searxng".to_string(),
-        searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
-        search_max_results: 5,
-        exec_timeout: 30,
-        restrict_to_workspace: true,
-        memory_config: MemoryConfig::default(),
-        is_local: true,
-        lane: Lane::default(),
-        tool_delegation: td,
-        provenance: ProvenanceConfig::default(),
-        max_tool_result_chars: 2000,
-        delegation_provider: Some(router_provider),
-        specialist_provider: Some(specialist_provider),
-        trio_config,
-        model_capabilities_overrides: std::collections::HashMap::new(),
-        reasoning_config: crate::config::schema::ReasoningConfig::default(),
-        tool_heartbeat_secs: 2,
-        health_check_timeout_secs: 2,
-        code_execution: CodeExecutionConfig::default(),
-        python_kernel: PythonKernelConfig::default(),
-        cua: CuaToolConfig::default(),
-        adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(
-            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
-        ),
-    });
-
-    let counters = test_runtime_counters(4096);
-    let core_handle = AgentHandle::new(core, counters);
-
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
-    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
-
-    let agent_loop = AgentLoop::new(
-        core_handle,
-        inbound_rx,
-        outbound_tx,
-        inbound_tx,
-        None,
-        1,
-        None,
-        None,
-        None,
-        ProprioceptionConfig::default(),
-        LcmSchemaConfig::default(),
-        None,
-    );
-
-    (agent_loop, workspace)
-}
-
-/// Warmup a provider with backon retries (models may need JIT loading time).
-async fn warmup_trio_provider(provider: &dyn LLMProvider, model: &str, role: &str) {
-    use backon::ConstantBuilder;
-
-    let messages = vec![serde_json::json!({"role": "user", "content": "Reply with: ok"})];
-    let mut backoff = ConstantBuilder::default()
-        .with_delay(Duration::from_secs(2))
-        .with_max_times(10)
-        .build();
-    loop {
-        match provider
-            .chat(&messages, None, Some(model), 32, 0.0, None, None)
-            .await
-        {
-            Ok(resp) => {
-                let text = resp.content.unwrap_or_default();
-                if !text.trim().is_empty() {
-                    eprintln!("  {} warmup OK: {}", role, &text[..text.len().min(40)]);
-                    return;
-                }
-            }
-            Err(e) => {
-                let msg = e.to_string().to_lowercase();
-                if !msg.contains("loading") && !msg.contains("503") {
-                    panic!("{} warmup failed (non-retryable): {}", role, e);
-                }
-            }
-        }
-        match backoff.next() {
-            Some(delay) => {
-                eprintln!("  {} warming up, retrying in {:?}...", role, delay);
-                tokio::time::sleep(delay).await;
-            }
-            None => panic!("{} did not become ready after retries", role),
-        }
-    }
-}
-
-#[tokio::test]
-#[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
-async fn test_trio_e2e_preflight() {
-    let (base, main_model, router_model, specialist_model) = trio_e2e_env();
-    eprintln!("trio E2E preflight: base={}", base);
-
-    // 1. Verify LM Studio /models endpoint is reachable
-    let _models_url = format!(
-        "{}/models",
-        base.trim_end_matches("/v1").trim_end_matches('/')
-    );
-    // Try the /v1/models path first (standard OpenAI-compat)
-    let models_url_v1 = format!("{}/models", base.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-    let models_resp = client
-        .get(&models_url_v1)
-        .header("Authorization", "Bearer local")
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await;
-
-    match &models_resp {
-        Ok(resp) if resp.status().is_success() => {
-            eprintln!("  /models endpoint OK (status {})", resp.status());
-        }
-        Ok(resp) => {
-            panic!(
-                "preflight FAILED: /models returned HTTP {} — is LM Studio running at {}?",
-                resp.status(),
-                base
-            );
-        }
-        Err(e) => {
-            panic!(
-                "preflight FAILED: cannot reach {} — {}\nStart LM Studio or set NANOBOT_TRIO_BASE.",
-                models_url_v1, e
-            );
-        }
-    }
-
-    // 2. Parse model list and check availability
-    let body: serde_json::Value = models_resp
-        .unwrap()
-        .json()
-        .await
-        .expect("preflight: /models response is not valid JSON");
-
-    let model_ids: Vec<String> = body
-        .get("data")
-        .and_then(|d| d.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    eprintln!("  available models: {:?}", model_ids);
-
-    // Note: LM Studio with JIT loading may not list all models upfront.
-    // We log availability but don't fail — the warmup step below is the real gate.
-    for (name, role) in [
-        (&main_model, "main"),
-        (&router_model, "router"),
-        (&specialist_model, "specialist"),
-    ] {
-        if model_ids.iter().any(|id| id.contains(name.as_str())) {
-            eprintln!("  {} model '{}' found in /models", role, name);
-        } else {
-            eprintln!(
-                "  {} model '{}' NOT listed (may JIT-load on demand)",
-                role, name
-            );
-        }
-    }
-
-    // 3. Build harness and warmup all 3 providers (the real gate)
-    let (agent_loop, workspace) =
-        build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
-
-    let core = agent_loop.shared.core_handle.swappable();
-    warmup_trio_provider(&*core.provider, &main_model, "main").await;
-    warmup_trio_provider(
-        core.router_provider.as_ref().unwrap().as_ref(),
-        &router_model,
-        "router",
-    )
-    .await;
-    warmup_trio_provider(
-        core.specialist_provider.as_ref().unwrap().as_ref(),
-        &specialist_model,
-        "specialist",
-    )
-    .await;
-
-    eprintln!("trio E2E preflight: ALL OK — infrastructure ready");
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-#[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
-async fn test_trio_e2e_respond() {
-    let (base, main_model, router_model, specialist_model) = trio_e2e_env();
-    eprintln!("trio E2E respond: base={}", base);
-
-    let (agent_loop, workspace) =
-        build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
-
-    // Warmup all 3 models
-    let core = agent_loop.shared.core_handle.swappable();
-    warmup_trio_provider(&*core.provider, &main_model, "main").await;
-    warmup_trio_provider(
-        core.router_provider.as_ref().unwrap().as_ref(),
-        &router_model,
-        "router",
-    )
-    .await;
-    warmup_trio_provider(
-        core.specialist_provider.as_ref().unwrap().as_ref(),
-        &specialist_model,
-        "specialist",
-    )
-    .await;
-
-    let resp = tokio::time::timeout(
-        Duration::from_secs(180),
-        agent_loop.process_direct(
-            "Hello, what is 2 + 2?",
-            "trio-e2e-respond",
-            "test",
-            "trio-e2e",
-        ),
-    )
-    .await
-    .expect("test timed out");
-
-    eprintln!(
-        "trio E2E respond: response ({} chars): {}",
-        resp.len(),
-        &resp[..resp.len().min(200)]
-    );
-    assert!(!resp.is_empty(), "response should be non-empty");
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-#[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
-async fn test_trio_e2e_tool_dispatch() {
-    let (base, main_model, router_model, specialist_model) = trio_e2e_env();
-    eprintln!("trio E2E tool dispatch: base={}", base);
-
-    let (agent_loop, workspace) =
-        build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
-
-    // Write a known file to workspace
-    std::fs::write(
-        workspace.join("README.md"),
-        "Nanobot is a lightweight AI assistant framework written in Rust.",
-    )
-    .unwrap();
-
-    let core = agent_loop.shared.core_handle.swappable();
-    warmup_trio_provider(&*core.provider, &main_model, "main").await;
-    warmup_trio_provider(
-        core.router_provider.as_ref().unwrap().as_ref(),
-        &router_model,
-        "router",
-    )
-    .await;
-    warmup_trio_provider(
-        core.specialist_provider.as_ref().unwrap().as_ref(),
-        &specialist_model,
-        "specialist",
-    )
-    .await;
-
-    let resp = tokio::time::timeout(
-        Duration::from_secs(180),
-        agent_loop.process_direct(
-            "Read the file README.md and tell me what it says",
-            "trio-e2e-tool",
-            "test",
-            "trio-e2e",
-        ),
-    )
-    .await
-    .expect("test timed out");
-
-    eprintln!(
-        "trio E2E tool dispatch: response ({} chars): {}",
-        resp.len(),
-        &resp[..resp.len().min(200)]
-    );
-    assert!(!resp.is_empty(), "response should be non-empty");
-
-    // Check TrioMetrics
-    let metrics = &agent_loop.shared.core_handle.counters.trio_metrics;
-    eprintln!(
-        "  metrics: preflight={} action={:?} specialist={} tool={:?}",
-        metrics
-            .router_preflight_fired
-            .load(std::sync::atomic::Ordering::Relaxed),
-        metrics.router_action.lock(),
-        metrics
-            .specialist_dispatched
-            .load(std::sync::atomic::Ordering::Relaxed),
-        metrics.tool_dispatched.lock(),
-    );
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-#[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
-async fn test_trio_e2e_specialist_dispatch() {
-    let (base, main_model, router_model, specialist_model) = trio_e2e_env();
-    eprintln!("trio E2E specialist: base={}", base);
-
-    let (agent_loop, workspace) =
-        build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
-
-    let core = agent_loop.shared.core_handle.swappable();
-    warmup_trio_provider(&*core.provider, &main_model, "main").await;
-    warmup_trio_provider(
-        core.router_provider.as_ref().unwrap().as_ref(),
-        &router_model,
-        "router",
-    )
-    .await;
-    warmup_trio_provider(
-        core.specialist_provider.as_ref().unwrap().as_ref(),
-        &specialist_model,
-        "specialist",
-    )
-    .await;
-
-    let resp = tokio::time::timeout(
-        Duration::from_secs(180),
-        agent_loop.process_direct(
-            "Provide a detailed technical analysis of REST vs GraphQL",
-            "trio-e2e-specialist",
-            "test",
-            "trio-e2e",
-        ),
-    )
-    .await
-    .expect("test timed out");
-
-    eprintln!(
-        "trio E2E specialist: response ({} chars): {}",
-        resp.len(),
-        &resp[..resp.len().min(200)]
-    );
-    assert!(!resp.is_empty(), "response should be non-empty");
-    assert!(
-        resp.len() > 50,
-        "specialist response should be substantive (>50 chars)"
-    );
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-#[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
-async fn test_trio_e2e_ask_user() {
-    let (base, main_model, router_model, specialist_model) = trio_e2e_env();
-    eprintln!("trio E2E ask_user: base={}", base);
-
-    let (agent_loop, workspace) =
-        build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
-
-    let core = agent_loop.shared.core_handle.swappable();
-    warmup_trio_provider(&*core.provider, &main_model, "main").await;
-    warmup_trio_provider(
-        core.router_provider.as_ref().unwrap().as_ref(),
-        &router_model,
-        "router",
-    )
-    .await;
-    warmup_trio_provider(
-        core.specialist_provider.as_ref().unwrap().as_ref(),
-        &specialist_model,
-        "specialist",
-    )
-    .await;
-
-    let resp = tokio::time::timeout(
-        Duration::from_secs(180),
-        agent_loop.process_direct(
-            "Do that thing with the file",
-            "trio-e2e-ask",
-            "test",
-            "trio-e2e",
-        ),
-    )
-    .await
-    .expect("test timed out");
-
-    eprintln!(
-        "trio E2E ask_user: response ({} chars): {}",
-        resp.len(),
-        &resp[..resp.len().min(200)]
-    );
-    assert!(!resp.is_empty(), "response should be non-empty");
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-#[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
-async fn test_trio_e2e_router_unreachable() {
-    let (base, main_model, _router_model, specialist_model) = trio_e2e_env();
-    eprintln!("trio E2E router unreachable: base={}", base);
-
-    // Router on dead port, main + specialist on real endpoint
-    let (agent_loop, workspace) = build_trio_e2e_harness(
-        &base,
-        &main_model,
-        &"unreachable-router-model".to_string(), // model doesn't matter since we override the provider
-        &specialist_model,
-    );
-
-    // Actually, the harness uses shared base for all providers.
-    // For unreachable router, we need a custom build with bad router URL.
-    // Let's build it manually.
-    drop(agent_loop);
-    let _ = std::fs::remove_dir_all(&workspace);
-
-    use crate::config::schema::{DelegationMode, LcmSchemaConfig};
-    use crate::providers::factory;
-    use crate::providers::jit_gate::JitGate;
-
-    let jit_gate = std::sync::Arc::new(JitGate::new());
-    let main_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(&base, Some(&main_model))
-            .with_jit_gate_opt(Some(jit_gate.clone())),
-    );
-    // Router points to dead port
-    let router_provider: Arc<dyn LLMProvider> = Arc::new(OpenAICompatProvider::new(
-        "local",
-        Some("http://127.0.0.1:19999/v1"),
-        Some("dead-router"),
-    ));
-    let specialist_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(&base, Some(&specialist_model))
-            .with_jit_gate_opt(Some(jit_gate.clone())),
-    );
-
-    let workspace = tempfile::tempdir().unwrap().keep();
-    let mut td = ToolDelegationConfig {
-        mode: DelegationMode::trio(),
-        ..Default::default()
-    };
-    td.apply_mode();
-
-    let trio_config = TrioConfig {
-        enabled: true,
-        router_model: "dead-router".to_string(),
-        specialist_model: specialist_model.to_string(),
-        ..Default::default()
-    };
-
-    let core = build_swappable_core(SwappableCoreConfig {
-        provider: main_provider,
-        workspace: workspace.clone(),
-        model: main_model.to_string(),
-        max_iterations: 5,
-        max_continuations: 2,
-        max_tokens: 512,
-        temperature: 0.3,
-        max_context_tokens: 4096,
-        brave_api_key: None,
-        search_provider: "searxng".to_string(),
-        searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
-        search_max_results: 5,
-        exec_timeout: 30,
-        restrict_to_workspace: true,
-        memory_config: MemoryConfig::default(),
-        is_local: true,
-        lane: Lane::default(),
-        tool_delegation: td,
-        provenance: ProvenanceConfig::default(),
-        max_tool_result_chars: 2000,
-        delegation_provider: Some(router_provider),
-        specialist_provider: Some(specialist_provider),
-        trio_config,
-        model_capabilities_overrides: std::collections::HashMap::new(),
-        reasoning_config: crate::config::schema::ReasoningConfig::default(),
-        tool_heartbeat_secs: 2,
-        health_check_timeout_secs: 2,
-        code_execution: CodeExecutionConfig::default(),
-        python_kernel: PythonKernelConfig::default(),
-        cua: CuaToolConfig::default(),
-        adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(
-            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
-        ),
-    });
-    let counters = test_runtime_counters(4096);
-    let core_handle = AgentHandle::new(core, counters);
-
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
-    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
-
-    let agent_loop = AgentLoop::new(
-        core_handle,
-        inbound_rx,
-        outbound_tx,
-        inbound_tx,
-        None,
-        1,
-        None,
-        None,
-        None,
-        ProprioceptionConfig::default(),
-        LcmSchemaConfig::default(),
-        None,
-    );
-
-    // Only warmup main (router is intentionally dead)
-    let core = agent_loop.shared.core_handle.swappable();
-    warmup_trio_provider(&*core.provider, &main_model, "main").await;
-
-    let resp = tokio::time::timeout(
-        Duration::from_secs(60),
-        agent_loop.process_direct("Hello", "trio-e2e-router-dead", "test", "trio-e2e"),
-    )
-    .await
-    .expect("test timed out");
-
-    eprintln!(
-        "trio E2E router unreachable: response ({} chars): {}",
-        resp.len(),
-        &resp[..resp.len().min(200)]
-    );
-    assert!(!resp.is_empty(), "should get error response, not panic");
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-#[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
-async fn test_trio_e2e_specialist_unreachable() {
-    let (base, main_model, router_model, _specialist_model) = trio_e2e_env();
-    eprintln!("trio E2E specialist unreachable: base={}", base);
-
-    use crate::config::schema::{DelegationMode, LcmSchemaConfig};
-    use crate::providers::factory;
-    use crate::providers::jit_gate::JitGate;
-
-    let jit_gate = std::sync::Arc::new(JitGate::new());
-    let main_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(&base, Some(&main_model))
-            .with_jit_gate_opt(Some(jit_gate.clone())),
-    );
-    let router_provider: Arc<dyn LLMProvider> = factory::create_openai_compat(
-        factory::ProviderSpec::local(&base, Some(&router_model))
-            .with_jit_gate_opt(Some(jit_gate.clone())),
-    );
-    // Specialist points to dead port
-    let specialist_provider: Arc<dyn LLMProvider> = Arc::new(OpenAICompatProvider::new(
-        "local",
-        Some("http://127.0.0.1:19999/v1"),
-        Some("dead-specialist"),
-    ));
-
-    let workspace = tempfile::tempdir().unwrap().keep();
-    let mut td = ToolDelegationConfig {
-        mode: DelegationMode::trio(),
-        ..Default::default()
-    };
-    td.apply_mode();
-
-    let trio_config = TrioConfig {
-        enabled: true,
-        router_model: router_model.to_string(),
-        specialist_model: "dead-specialist".to_string(),
-        ..Default::default()
-    };
-
-    let core = build_swappable_core(SwappableCoreConfig {
-        provider: main_provider,
-        workspace: workspace.clone(),
-        model: main_model.to_string(),
-        max_iterations: 5,
-        max_continuations: 2,
-        max_tokens: 512,
-        temperature: 0.3,
-        max_context_tokens: 4096,
-        brave_api_key: None,
-        search_provider: "searxng".to_string(),
-        searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
-        search_max_results: 5,
-        exec_timeout: 30,
-        restrict_to_workspace: true,
-        memory_config: MemoryConfig::default(),
-        is_local: true,
-        lane: Lane::default(),
-        tool_delegation: td,
-        provenance: ProvenanceConfig::default(),
-        max_tool_result_chars: 2000,
-        delegation_provider: Some(router_provider),
-        specialist_provider: Some(specialist_provider),
-        trio_config,
-        model_capabilities_overrides: std::collections::HashMap::new(),
-        reasoning_config: crate::config::schema::ReasoningConfig::default(),
-        tool_heartbeat_secs: 2,
-        health_check_timeout_secs: 2,
-        code_execution: CodeExecutionConfig::default(),
-        python_kernel: PythonKernelConfig::default(),
-        cua: CuaToolConfig::default(),
-        adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(
-            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
-        ),
-    });
-    let counters = test_runtime_counters(4096);
-    let core_handle = AgentHandle::new(core, counters);
-
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
-    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
-
-    let agent_loop = AgentLoop::new(
-        core_handle,
-        inbound_rx,
-        outbound_tx,
-        inbound_tx,
-        None,
-        1,
-        None,
-        None,
-        None,
-        ProprioceptionConfig::default(),
-        LcmSchemaConfig::default(),
-        None,
-    );
-
-    let core = agent_loop.shared.core_handle.swappable();
-    warmup_trio_provider(&*core.provider, &main_model, "main").await;
-    warmup_trio_provider(
-        core.router_provider.as_ref().unwrap().as_ref(),
-        &router_model,
-        "router",
-    )
-    .await;
-
-    let resp = tokio::time::timeout(
-        Duration::from_secs(180),
-        agent_loop.process_direct(
-            "Provide a detailed technical analysis of REST vs GraphQL",
-            "trio-e2e-specialist-dead",
-            "test",
-            "trio-e2e",
-        ),
-    )
-    .await
-    .expect("test timed out");
-
-    eprintln!(
-        "trio E2E specialist unreachable: response ({} chars): {}",
-        resp.len(),
-        &resp[..resp.len().min(200)]
-    );
-    assert!(
-        !resp.is_empty(),
-        "should get response despite dead specialist"
-    );
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-#[ignore = "requires LM Studio at NANOBOT_TRIO_BASE"]
-async fn test_trio_e2e_multi_turn() {
-    let (base, main_model, router_model, specialist_model) = trio_e2e_env();
-    eprintln!("trio E2E multi-turn: base={}", base);
-
-    let (agent_loop, workspace) =
-        build_trio_e2e_harness(&base, &main_model, &router_model, &specialist_model);
-
-    // Write test file
-    std::fs::write(
-        workspace.join("README.md"),
-        "Nanobot is a lightweight AI assistant.",
-    )
-    .unwrap();
-
-    let core = agent_loop.shared.core_handle.swappable();
-    warmup_trio_provider(&*core.provider, &main_model, "main").await;
-    warmup_trio_provider(
-        core.router_provider.as_ref().unwrap().as_ref(),
-        &router_model,
-        "router",
-    )
-    .await;
-    warmup_trio_provider(
-        core.specialist_provider.as_ref().unwrap().as_ref(),
-        &specialist_model,
-        "specialist",
-    )
-    .await;
-
-    let session_key = "trio-e2e-multi";
-
-    // Turn 1: simple greeting (respond path)
-    let resp1 = tokio::time::timeout(
-        Duration::from_secs(180),
-        agent_loop.process_direct("Hello", session_key, "test", "trio-e2e"),
-    )
-    .await
-    .expect("turn 1 timed out");
-    eprintln!(
-        "turn 1 ({} chars): {}",
-        resp1.len(),
-        &resp1[..resp1.len().min(100)]
-    );
-    assert!(!resp1.is_empty(), "turn 1 should be non-empty");
-
-    // Turn 2: tool path
-    let resp2 = tokio::time::timeout(
-        Duration::from_secs(180),
-        agent_loop.process_direct("Read README.md", session_key, "test", "trio-e2e"),
-    )
-    .await
-    .expect("turn 2 timed out");
-    eprintln!(
-        "turn 2 ({} chars): {}",
-        resp2.len(),
-        &resp2[..resp2.len().min(100)]
-    );
-    assert!(!resp2.is_empty(), "turn 2 should be non-empty");
-
-    // Turn 3: follow-up (tests session state persistence)
-    let resp3 = tokio::time::timeout(
-        Duration::from_secs(180),
-        agent_loop.process_direct("Summarize what you found", session_key, "test", "trio-e2e"),
-    )
-    .await
-    .expect("turn 3 timed out");
-    eprintln!(
-        "turn 3 ({} chars): {}",
-        resp3.len(),
-        &resp3[..resp3.len().min(100)]
-    );
-    assert!(!resp3.is_empty(), "turn 3 should be non-empty");
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-// -----------------------------------------------------------------------
-// should_strip_tools_for_trio — pure function tests
-// -----------------------------------------------------------------------
-
-#[test]
-fn test_should_strip_tools_all_healthy() {
-    assert!(should_strip_tools_for_trio(true, true, true, true));
-}
-
-#[test]
-fn test_should_strip_tools_not_local() {
-    // Cloud mode: never strip tools via this path.
-    assert!(!should_strip_tools_for_trio(false, true, true, true));
-}
-
-#[test]
-fn test_should_strip_tools_no_strict_mode() {
-    // strict_no_tools_main is false: don't strip.
-    assert!(!should_strip_tools_for_trio(true, false, true, true));
-}
-
-#[test]
-fn test_should_strip_tools_router_unhealthy() {
-    // Router probe degraded: keep tools for fallback.
-    assert!(!should_strip_tools_for_trio(true, true, false, true));
-}
-
-#[test]
-fn test_should_strip_tools_circuit_breaker_open() {
-    // Circuit breaker tripped: keep tools for fallback.
-    assert!(!should_strip_tools_for_trio(true, true, true, false));
-}
-
-#[test]
-fn test_should_strip_tools_both_degraded() {
-    // Both degraded: definitely keep tools.
-    assert!(!should_strip_tools_for_trio(true, true, false, false));
-}
-
-// -----------------------------------------------------------------------
-// Offline trio E2E tests (no network required — all providers are mocks)
+// Offline mock providers (no network required)
 // -----------------------------------------------------------------------
 
 /// A mock LLM provider that returns responses from a pre-loaded queue.
@@ -2539,120 +956,6 @@ impl LLMProvider for RecordingProvider {
     }
 }
 
-/// Build an offline trio harness from pre-built mock providers.
-///
-/// Mirrors `build_trio_e2e_harness` but accepts providers directly rather
-/// than constructing real HTTP clients. No background probes are wired.
-fn build_trio_offline_harness(
-    main: Arc<dyn LLMProvider>,
-    router: Arc<dyn LLMProvider>,
-    specialist: Arc<dyn LLMProvider>,
-) -> (AgentLoop, std::path::PathBuf) {
-    build_trio_offline_harness_with_registry(main, router, specialist, None)
-}
-
-/// Variant wiring a health registry: an EMPTY registry is optimistically
-/// healthy (`is_healthy` defaults true for unknown probes), which arms the
-/// strict-trio strip path (`should_strip_tools_for_trio` needs a healthy
-/// router probe).
-fn build_trio_offline_harness_with_registry(
-    main: Arc<dyn LLMProvider>,
-    router: Arc<dyn LLMProvider>,
-    specialist: Arc<dyn LLMProvider>,
-    health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
-) -> (AgentLoop, std::path::PathBuf) {
-    build_trio_offline_harness_with_iters(main, router, specialist, health_registry, 5)
-}
-
-fn build_trio_offline_harness_with_iters(
-    main: Arc<dyn LLMProvider>,
-    router: Arc<dyn LLMProvider>,
-    specialist: Arc<dyn LLMProvider>,
-    health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
-    max_iterations: u32,
-) -> (AgentLoop, std::path::PathBuf) {
-    use crate::config::schema::LcmSchemaConfig;
-
-    let workspace = tempfile::tempdir().unwrap().keep();
-
-    let mut td = ToolDelegationConfig {
-        mode: crate::config::schema::DelegationMode::trio(),
-        ..Default::default()
-    };
-    td.apply_mode(); // trio mode carries strict_no_tools_main + strict_router_schema
-
-    let router_model = router.get_default_model().to_string();
-    let specialist_model = specialist.get_default_model().to_string();
-
-    let trio_config = TrioConfig {
-        enabled: true,
-        router_model: router_model.clone(),
-        specialist_model: specialist_model.clone(),
-        ..Default::default()
-    };
-
-    let core = build_swappable_core(SwappableCoreConfig {
-        provider: main,
-        workspace: workspace.clone(),
-        model: "offline-main".to_string(),
-        max_iterations,
-        max_continuations: 2,
-        max_tokens: 512,
-        temperature: 0.3,
-        max_context_tokens: 4096,
-        brave_api_key: None,
-        search_provider: "searxng".to_string(),
-        searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
-        search_max_results: 5,
-        exec_timeout: 30,
-        restrict_to_workspace: true,
-        memory_config: MemoryConfig::default(),
-        is_local: true,
-        lane: Lane::default(),
-        tool_delegation: td,
-        provenance: ProvenanceConfig::default(),
-        max_tool_result_chars: 2000,
-        delegation_provider: Some(router),
-        specialist_provider: Some(specialist),
-        trio_config,
-        model_capabilities_overrides: std::collections::HashMap::new(),
-        reasoning_config: crate::config::schema::ReasoningConfig::default(),
-        tool_heartbeat_secs: 2,
-        health_check_timeout_secs: 2,
-        code_execution: CodeExecutionConfig::default(),
-        python_kernel: PythonKernelConfig::default(),
-        cua: CuaToolConfig::default(),
-        adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(
-            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
-        ),
-    });
-
-    let counters = test_runtime_counters(4096);
-    let core_handle = AgentHandle::new(core, counters);
-
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
-    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
-
-    let agent_loop = AgentLoop::new(
-        core_handle,
-        inbound_rx,
-        outbound_tx,
-        inbound_tx,
-        None,
-        1,
-        None,
-        None,
-        None,
-        ProprioceptionConfig::default(),
-        LcmSchemaConfig::default(),
-        health_registry,
-    );
-
-    (agent_loop, workspace)
-}
-
 fn build_local_inline_harness(main: Arc<dyn LLMProvider>) -> (AgentLoop, std::path::PathBuf) {
     build_local_inline_harness_with_model(main, "local-qwen-test")
 }
@@ -2669,8 +972,6 @@ fn build_local_inline_harness_with_iters(
         main,
         max_iterations,
         crate::config::schema::ReasoningConfig::default(),
-        ToolDelegationConfig::default(),
-        None,
     )
 }
 
@@ -2678,25 +979,14 @@ fn build_local_harness_with_runtime_options(
     main: Arc<dyn LLMProvider>,
     max_iterations: u32,
     reasoning_config: crate::config::schema::ReasoningConfig,
-    tool_delegation: ToolDelegationConfig,
-    delegation_provider: Option<Arc<dyn LLMProvider>>,
 ) -> (AgentLoop, std::path::PathBuf) {
-    build_local_harness_with_runtime_options_context(
-        main,
-        max_iterations,
-        reasoning_config,
-        tool_delegation,
-        delegation_provider,
-        4096,
-    )
+    build_local_harness_with_runtime_options_context(main, max_iterations, reasoning_config, 4096)
 }
 
 fn build_local_harness_with_runtime_options_context(
     main: Arc<dyn LLMProvider>,
     max_iterations: u32,
     reasoning_config: crate::config::schema::ReasoningConfig,
-    tool_delegation: ToolDelegationConfig,
-    delegation_provider: Option<Arc<dyn LLMProvider>>,
     max_context_tokens: usize,
 ) -> (AgentLoop, std::path::PathBuf) {
     let workspace = tempfile::tempdir().unwrap().keep();
@@ -2719,11 +1009,9 @@ fn build_local_harness_with_runtime_options_context(
         memory_config: MemoryConfig::default(),
         is_local: true,
         lane: Lane::default(),
-        tool_delegation,
+        tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
-        delegation_provider,
-        specialist_provider: None,
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config,
@@ -2801,28 +1089,6 @@ fn build_local_inline_harness_with_memory(
     lcm_config: LcmSchemaConfig,
     memory_config: MemoryConfig,
 ) -> (AgentLoop, std::path::PathBuf) {
-    build_local_inline_harness_with_memory_and_reflection(
-        main,
-        model,
-        max_context_tokens,
-        lcm_config,
-        memory_config,
-        None,
-    )
-}
-
-/// Same as [`build_local_inline_harness_with_memory`], but lets a test wire a
-/// distinct specialist fallback for durable-memory reflection. LCM still uses
-/// `main`; keeping this separate proves reflection configuration cannot reroute
-/// context compaction.
-fn build_local_inline_harness_with_memory_and_reflection(
-    main: Arc<dyn LLMProvider>,
-    model: &str,
-    max_context_tokens: usize,
-    lcm_config: LcmSchemaConfig,
-    memory_config: MemoryConfig,
-    reflection: Option<Arc<dyn LLMProvider>>,
-) -> (AgentLoop, std::path::PathBuf) {
     let workspace = tempfile::tempdir().unwrap().keep();
     let core = build_swappable_core(SwappableCoreConfig {
         provider: main,
@@ -2846,8 +1112,6 @@ fn build_local_inline_harness_with_memory_and_reflection(
         tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
-        delegation_provider: None,
-        specialist_provider: reflection,
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -2921,8 +1185,6 @@ fn build_cloud_inline_harness_with_memory(
         tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
-        delegation_provider: None,
-        specialist_provider: None,
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -3610,13 +1872,12 @@ async fn hard_lcm_checkpoint_is_installed_before_foreground_inference() {
         keep_prefix_fraction: 0.0,
         ..Default::default()
     };
-    let (agent_loop, _workspace) = build_local_inline_harness_with_memory_and_reflection(
+    let (agent_loop, _workspace) = build_local_inline_harness_with_memory(
         provider.clone() as Arc<dyn LLMProvider>,
         "local-hard-lcm-test",
         8192,
         lcm_config,
         MemoryConfig::default(),
-        None,
     );
     let session_key = format!("hard-lcm-barrier-{}", uuid::Uuid::new_v4());
     let core = agent_loop.shared.core_handle.swappable();
@@ -3736,12 +1997,6 @@ async fn soft_lcm_uses_main_provider_and_preserves_foreground_context() {
         "local-soft-lcm-test",
         vec![WireRecordingProvider::text_response("foreground reply")],
     ));
-    let memory_provider = Arc::new(WireRecordingProvider::new(
-        "memory-soft-lcm-test",
-        vec![WireRecordingProvider::plain_text_response(
-            "- memory summary",
-        )],
-    ));
     let lcm_config = LcmSchemaConfig {
         // Exercises the cloud model-summary pipeline on a local harness.
         checkpoint_writer: Some(crate::agent::lcm::CheckpointWriter::Model),
@@ -3756,13 +2011,12 @@ async fn soft_lcm_uses_main_provider_and_preserves_foreground_context() {
         ..Default::default()
     };
 
-    let (agent_loop, _workspace) = build_local_inline_harness_with_memory_and_reflection(
+    let (agent_loop, _workspace) = build_local_inline_harness_with_memory(
         main_provider.clone() as Arc<dyn LLMProvider>,
         "local-soft-lcm-test",
         1_000_000,
         lcm_config,
         MemoryConfig::default(),
-        Some(memory_provider.clone() as Arc<dyn LLMProvider>),
     );
     let session_key = format!("soft-lcm-preserve-{}", uuid::Uuid::new_v4());
     let core = agent_loop.shared.core_handle.swappable();
@@ -3803,8 +2057,7 @@ async fn soft_lcm_uses_main_provider_and_preserves_foreground_context() {
         .await;
     assert_eq!(response, "foreground reply");
 
-    // Async (soft) compaction must use the main provider even though a distinct
-    // provider is configured for memory reflection.
+    // Async (soft) compaction must use the main provider.
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         while main_provider.calls().len() <= 1 {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -3821,10 +2074,6 @@ async fn soft_lcm_uses_main_provider_and_preserves_foreground_context() {
         calls.len() > 1,
         "compaction must have been attempted against the main provider, got {} call(s)",
         calls.len()
-    );
-    assert!(
-        memory_provider.calls().is_empty(),
-        "LCM must not send compaction requests to the reflection provider"
     );
     // The last call is the LCM escalation attempt (Level 1/2 summarization),
     // not the original foreground chat call — it must still carry the
@@ -7148,8 +5397,6 @@ fn build_unrestricted_exec_harness_with_context(
         tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
-        delegation_provider: None,
-        specialist_provider: None,
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -7794,9 +6041,7 @@ async fn test_read_after_write_same_turn_is_not_blocked_by_stale_receipt() {
             name: "read_file".to_string(),
             arguments: read_args,
         }],
-        crate::agent::agent_loop::ToolRouting::NeedsRouting,
-    )
-    .await;
+    );
 
     match result {
         crate::agent::router::RouteResult::Execute(batch) => {
@@ -7809,9 +6054,6 @@ async fn test_read_after_write_same_turn_is_not_blocked_by_stale_receipt() {
         }
         crate::agent::router::RouteResult::Break(text) => {
             panic!("post-write read was blocked: {text}")
-        }
-        crate::agent::router::RouteResult::Error(text) => {
-            panic!("post-write read hit infrastructure error: {text}")
         }
         crate::agent::router::RouteResult::Continue => panic!("post-write read should execute"),
     }
@@ -7930,7 +6172,7 @@ async fn duplicate_recovery_is_persisted_after_carrier_and_receipt() {
     };
     let _ = agent_loop
         .shared
-        .step_execute_tools(&mut ctx, response, ToolRouting::AlreadyRouted)
+        .step_execute_tools(&mut ctx, response)
         .await;
 
     let appended = &ctx.messages[before..];
@@ -8167,8 +6409,6 @@ async fn empty_plan_step_does_not_poison_later_success() {
         provider.clone() as Arc<dyn LLMProvider>,
         5,
         reasoning,
-        ToolDelegationConfig::default(),
-        None,
     );
     let session_key = format!("empty-then-success-{}", uuid::Uuid::new_v4());
 
@@ -8224,8 +6464,6 @@ async fn plan_guided_failed_plan_step_stops_at_step_budget() {
         provider.clone() as Arc<dyn LLMProvider>,
         8,
         reasoning,
-        ToolDelegationConfig::default(),
-        None,
     );
     let session_key = format!("failed-plan-step-{}", uuid::Uuid::new_v4());
 
@@ -8296,8 +6534,6 @@ async fn plan_checkpoint_rewind_preserves_active_step_at_step_budget() {
         provider.clone() as Arc<dyn LLMProvider>,
         8,
         reasoning,
-        ToolDelegationConfig::default(),
-        None,
     );
     let session_key = format!("plan-checkpoint-rewind-{}", uuid::Uuid::new_v4());
 
@@ -8743,85 +6979,6 @@ async fn post_result_persistence_failure_prevents_subsequent_provider_call() {
     assert_eq!(
         persisted_turn_outcome(&core.sessions, &session.id).await,
         "error"
-    );
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-async fn delegated_batch_routes_through_inline_persistence_chokepoint() {
-    let side_effect_dir = tempfile::tempdir().unwrap();
-    let first_path = side_effect_dir.path().join("delegated-first.txt");
-    let forbidden_path = side_effect_dir.path().join("delegated-must-not-run.txt");
-    let main = Arc::new(ResponseSequenceProvider::new(
-        "local-main",
-        vec![crate::providers::base::LLMResponse {
-            content: Some(String::new()),
-            tool_calls: vec![
-                crate::providers::base::ToolCallRequest {
-                    id: "tc-delegated-first".to_string(),
-                    name: "write_file".to_string(),
-                    arguments: HashMap::from([
-                        (
-                            "path".to_string(),
-                            json!(first_path.to_string_lossy().to_string()),
-                        ),
-                        ("content".to_string(), json!("ran once")),
-                    ]),
-                },
-                crate::providers::base::ToolCallRequest {
-                    id: "tc-delegated-forbidden".to_string(),
-                    name: "write_file".to_string(),
-                    arguments: HashMap::from([
-                        (
-                            "path".to_string(),
-                            json!(forbidden_path.to_string_lossy().to_string()),
-                        ),
-                        ("content".to_string(), json!("must not run")),
-                    ]),
-                },
-            ],
-            finish_reason: FinishReason::ToolCalls,
-            usage: HashMap::new(),
-        }],
-    ));
-    let delegation = Arc::new(SequenceProvider::new("delegation-model", vec!["summary"]));
-    let tool_delegation = ToolDelegationConfig {
-        enabled: true,
-        model: "delegation-model".to_string(),
-        max_iterations: 1,
-        ..Default::default()
-    };
-    let (agent_loop, workspace) = build_local_harness_with_runtime_options(
-        main.clone() as Arc<dyn LLMProvider>,
-        5,
-        crate::config::schema::ReasoningConfig::default(),
-        tool_delegation,
-        Some(delegation.clone() as Arc<dyn LLMProvider>),
-    );
-    let session_key = format!("delegated-inline-chokepoint-{}", uuid::Uuid::new_v4());
-    let core = agent_loop.shared.core_handle.swappable();
-    {
-        let conn = rusqlite::Connection::open(core.sessions.path()).unwrap();
-        conn.execute_batch(
-            "CREATE TRIGGER fail_delegated_raw_result \
-             BEFORE INSERT ON session_events WHEN NEW.event_kind = 'tool_execute' \
-             BEGIN SELECT RAISE(ABORT, 'synthetic delegated raw result failure'); END;",
-        )
-        .unwrap();
-    }
-
-    let response = agent_loop
-        .process_direct("write both", &session_key, "test", "offline")
-        .await;
-
-    assert!(response.contains("execution result"), "{response:?}");
-    assert!(first_path.exists());
-    assert!(!forbidden_path.exists());
-    assert_eq!(main.call_count(), 1);
-    assert_eq!(
-        delegation.call_count(),
-        0,
-        "delegated selection must not create an alternate execution pipeline"
     );
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -10197,75 +8354,12 @@ async fn test_tts_suppression_does_not_hide_vibethinker_display() {
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
-// -----------------------------------------------------------------------
-// Test 1: router decides "respond" — specialist is never called
-// -----------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_trio_offline_e2e_respond() {
-    let router_resp = r#"{"action":"respond","target":"main","args":{},"confidence":0.9}"#;
-    let main_resp = "Four.";
-
-    let router: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(
-        "offline-router",
-        vec![router_resp, router_resp, router_resp],
-    ));
-    let main: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new("offline-main", main_resp));
-    let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
-        "offline-specialist",
-        "specialist unused",
-    ));
-
-    let (agent_loop, workspace) = build_trio_offline_harness(main, router, specialist);
-
-    let resp = agent_loop
-        .process_direct("What is 2+2?", "trio-offline-respond", "test", "offline")
-        .await;
-
-    eprintln!(
-        "test_trio_offline_e2e_respond: response ({} chars): {}",
-        resp.len(),
-        &resp[..resp.len().min(200)]
-    );
-
-    let counters = &agent_loop.shared.core_handle.counters;
-    let metrics = &counters.trio_metrics;
-
-    assert!(
-        metrics
-            .router_preflight_fired
-            .load(std::sync::atomic::Ordering::Relaxed),
-        "router preflight should have fired"
-    );
-    assert_eq!(
-        metrics.router_action.lock().as_deref(),
-        Some("respond"),
-        "router_action should be 'respond'"
-    );
-    assert!(
-        !metrics
-            .specialist_dispatched
-            .load(std::sync::atomic::Ordering::Relaxed),
-        "specialist should NOT have been dispatched for a 'respond' decision"
-    );
-    assert!(!resp.is_empty(), "response should be non-empty");
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
 #[tokio::test]
 async fn test_local_thinking_reserves_max_tokens_end_to_end() {
-    let router_resp = r#"{"action":"respond","target":"main","args":{},"confidence":0.9}"#;
-    let router: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(
-        "offline-router",
-        vec![router_resp, router_resp, router_resp],
-    ));
     let main = Arc::new(RecordingProvider::new("offline-main", "ok"));
     let main_dyn: Arc<dyn LLMProvider> = main.clone();
-    let specialist: Arc<dyn LLMProvider> =
-        Arc::new(StaticResponseLLM::new("offline-specialist", "unused"));
 
-    let (agent_loop, workspace) = build_trio_offline_harness(main_dyn, router, specialist);
+    let (agent_loop, workspace) = build_local_inline_harness(main_dyn);
     agent_loop
         .shared
         .core_handle
@@ -10287,482 +8381,6 @@ async fn test_local_thinking_reserves_max_tokens_end_to_end() {
         640,
         "local thinking should add budget on top of base max_tokens=512 (512+128=640)"
     );
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-// -----------------------------------------------------------------------
-// Test 2: router decides "specialist" — specialist is called
-// -----------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_trio_offline_e2e_specialist_dispatch() {
-    let router_resp = r#"{"action":"specialist","target":"coding","args":{"task":"explain loops"},"confidence":0.85}"#;
-
-    let router: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(
-        "offline-router",
-        vec![router_resp, router_resp, router_resp],
-    ));
-    let main: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new("offline-main", "delegating"));
-    let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
-        "offline-specialist",
-        "Here is the specialist answer.",
-    ));
-
-    let (agent_loop, workspace) = build_trio_offline_harness(main, router, specialist);
-
-    let resp = agent_loop
-        .process_direct(
-            "Explain for loops",
-            "trio-offline-specialist",
-            "test",
-            "offline",
-        )
-        .await;
-
-    eprintln!(
-        "test_trio_offline_e2e_specialist_dispatch: response ({} chars): {}",
-        resp.len(),
-        &resp[..resp.len().min(200)]
-    );
-
-    let metrics = &agent_loop.shared.core_handle.counters.trio_metrics;
-
-    assert_eq!(
-        metrics.router_action.lock().as_deref(),
-        Some("specialist"),
-        "router_action should be 'specialist'"
-    );
-    assert!(
-        metrics
-            .specialist_dispatched
-            .load(std::sync::atomic::Ordering::Relaxed),
-        "specialist should have been dispatched"
-    );
-    assert!(!resp.is_empty(), "response should be non-empty");
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-// -----------------------------------------------------------------------
-// Test 3: circuit breaker cascade
-//
-// The router returns non-JSON 3+ times. Each failure is recorded under
-// the key "router:{model}" (as router.rs does). However, agent_loop.rs
-// checks availability under "trio_router" — so the CB check at the
-// should_strip_tools_for_trio call site never sees the tripped breaker.
-//
-// This test documents that discrepancy explicitly.
-// -----------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_trio_offline_e2e_circuit_breaker_cascade() {
-    // All 4 router calls return non-JSON to trip the circuit breaker.
-    let router: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(
-        "offline-router",
-        vec![
-            "this is not json at all !!!",
-            "this is not json at all !!!",
-            "this is not json at all !!!",
-            "this is not json at all !!!",
-        ],
-    ));
-    let main: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
-        "offline-main",
-        "main fallback response",
-    ));
-    let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
-        "offline-specialist",
-        "specialist unused",
-    ));
-
-    let (agent_loop, workspace) = build_trio_offline_harness(main, router, specialist);
-
-    // Send 4 messages — each failure increments the CB counter.
-    // After 3 failures (default threshold) the CB is tripped.
-    // The 4th call will be via Passthrough (router returns early) because
-    // the CB key "router:offline-router" is open. Main answers directly.
-    for i in 0..4u32 {
-        let resp = agent_loop
-            .process_direct(
-                &format!("message {}", i),
-                "trio-offline-cb",
-                "test",
-                "offline",
-            )
-            .await;
-        eprintln!(
-            "  cascade msg {}: ({} chars) {}",
-            i,
-            resp.len(),
-            &resp[..resp.len().min(80)]
-        );
-    }
-
-    let counters = &agent_loop.shared.core_handle.counters;
-
-    // After repeated failures the trio state should be Degraded.
-    let state = counters.get_trio_state();
-    eprintln!("trio_state after cascade: {:?}", state);
-    assert_eq!(
-        state,
-        crate::agent::agent_core::TrioState::Degraded,
-        "trio_state should be Degraded after repeated router failures"
-    );
-
-    // Verify CB key alignment after the fix.
-    //
-    // The offline harness returns mock responses that fail strict AND lenient
-    // parsing (lenient no longer defaults to phantom "clarify" target — it
-    // returns None when no target can be extracted). Each parse failure records
-    // a CB failure, so after 4 turns the CB should be tripped.
-    //
-    // The shared CB key format ("router:{model}") ensures that the
-    // tool-stripping guard in step_pre_call and the routing skip in
-    // router_preflight observe the same state.
-    let cb_correct_key_available = counters
-        .trio_circuit_breaker
-        .lock()
-        .is_available("router:offline-router");
-    eprintln!(
-        "CB 'router:offline-router' available after 4 turns: {}",
-        cb_correct_key_available
-    );
-    // Parse failures are now correctly recorded — CB should be tripped.
-    assert!(
-        !cb_correct_key_available,
-        "CB 'router:offline-router' should be tripped: parse failures are now recorded"
-    );
-    // The legacy key "trio_router" is also untouched.
-    let cb_legacy_key_available = counters
-        .trio_circuit_breaker
-        .lock()
-        .is_available("trio_router");
-    assert!(
-        cb_legacy_key_available,
-        "CB 'trio_router' should be untouched — agent_loop now uses 'router:{{model}}' key"
-    );
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-// -----------------------------------------------------------------------
-// Test 4: health gate — degraded router probe bypasses preflight
-// -----------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_trio_offline_e2e_health_gate() {
-    use crate::config::schema::LcmSchemaConfig;
-    use crate::heartbeat::health::{HealthProbe, HealthRegistry, ProbeResult};
-
-    // A mock probe that always returns unhealthy (simulates router being down).
-    struct AlwaysUnhealthyProbe;
-
-    #[async_trait]
-    impl HealthProbe for AlwaysUnhealthyProbe {
-        fn name(&self) -> &str {
-            "trio_router"
-        }
-
-        fn interval_secs(&self) -> u64 {
-            0 // always due
-        }
-
-        async fn check(&self) -> ProbeResult {
-            ProbeResult {
-                healthy: false,
-                latency_ms: 0,
-            }
-        }
-    }
-
-    // Build a registry and degrade the trio_router probe.
-    let mut health_registry = HealthRegistry::new();
-    health_registry.register(Box::new(AlwaysUnhealthyProbe));
-    // Run 3 times to reach DEGRADED_THRESHOLD = 3.
-    for _ in 0..3 {
-        health_registry.run_due_probes().await;
-    }
-    assert!(
-        !health_registry.is_healthy("trio_router"),
-        "trio_router should be degraded after 3 failures"
-    );
-    let health_registry = Arc::new(health_registry);
-
-    // The router SequenceProvider would fail the test if called (empty queue).
-    // We keep a typed Arc so we can read call_count() after the run.
-    let router_seq = Arc::new(SequenceProvider::new(
-        "offline-router",
-        vec![], // empty — calling this would return the sentinel error
-    ));
-    let router: Arc<dyn LLMProvider> = router_seq.clone();
-    let main: Arc<dyn LLMProvider> =
-        Arc::new(StaticResponseLLM::new("offline-main", "main answer"));
-    let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
-        "offline-specialist",
-        "specialist unused",
-    ));
-
-    // Build harness manually so we can wire in the health registry.
-    let workspace = tempfile::tempdir().unwrap().keep();
-    let mut td = ToolDelegationConfig {
-        mode: crate::config::schema::DelegationMode::trio(),
-        ..Default::default()
-    };
-    td.apply_mode();
-
-    let router_model = router.get_default_model().to_string();
-    let specialist_model = specialist.get_default_model().to_string();
-    let trio_config = TrioConfig {
-        enabled: true,
-        router_model: router_model.clone(),
-        specialist_model: specialist_model.clone(),
-        ..Default::default()
-    };
-
-    let core = build_swappable_core(SwappableCoreConfig {
-        provider: main,
-        workspace: workspace.clone(),
-        model: "offline-main".to_string(),
-        max_iterations: 5,
-        max_continuations: 2,
-        max_tokens: 512,
-        temperature: 0.3,
-        max_context_tokens: 4096,
-        brave_api_key: None,
-        search_provider: "searxng".to_string(),
-        searxng_url: "http://localhost:8888".to_string(),
-        crw_url: String::new(),
-        search_max_results: 5,
-        exec_timeout: 30,
-        restrict_to_workspace: true,
-        memory_config: MemoryConfig::default(),
-        is_local: true,
-        lane: Lane::default(),
-        tool_delegation: td,
-        provenance: ProvenanceConfig::default(),
-        max_tool_result_chars: 2000,
-        delegation_provider: Some(router.clone()),
-        specialist_provider: Some(specialist),
-        trio_config,
-        model_capabilities_overrides: std::collections::HashMap::new(),
-        reasoning_config: crate::config::schema::ReasoningConfig::default(),
-        tool_heartbeat_secs: 2,
-        health_check_timeout_secs: 2,
-        code_execution: CodeExecutionConfig::default(),
-        python_kernel: PythonKernelConfig::default(),
-        cua: CuaToolConfig::default(),
-        adaptive_tokens: AdaptiveTokenConfig::default(),
-        sessions_db_path: Some(
-            std::env::temp_dir().join(format!("nanobot-test-{}.sqlite", uuid::Uuid::new_v4())),
-        ),
-    });
-
-    let counters = test_runtime_counters(4096);
-    let core_handle = AgentHandle::new(core, counters);
-
-    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
-    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
-
-    let agent_loop = AgentLoop::new(
-        core_handle,
-        inbound_rx,
-        outbound_tx,
-        inbound_tx,
-        None,
-        1,
-        None,
-        None,
-        None,
-        ProprioceptionConfig::default(),
-        LcmSchemaConfig::default(),
-        Some(health_registry), // health registry is wired in here
-    );
-
-    let resp = agent_loop
-        .process_direct("Hello", "trio-offline-health-gate", "test", "offline")
-        .await;
-
-    eprintln!(
-        "test_trio_offline_e2e_health_gate: response ({} chars): {}",
-        resp.len(),
-        &resp[..resp.len().min(200)]
-    );
-
-    // When the health gate fires, router_preflight returns Passthrough and sets Degraded.
-    let state = agent_loop.shared.core_handle.counters.get_trio_state();
-    eprintln!("trio_state after health gate: {:?}", state);
-    assert_eq!(
-        state,
-        crate::agent::agent_core::TrioState::Degraded,
-        "trio_state should be Degraded when health gate fires"
-    );
-
-    // Response must come from main (non-empty).
-    assert!(
-        !resp.is_empty(),
-        "response should come from main, not be empty"
-    );
-
-    // router_preflight_fired should be true (we entered preflight but returned Passthrough).
-    let metrics = &agent_loop.shared.core_handle.counters.trio_metrics;
-    assert!(
-        metrics
-            .router_preflight_fired
-            .load(std::sync::atomic::Ordering::Relaxed),
-        "router_preflight_fired should be true (preflight was entered)"
-    );
-
-    // Specialist must not have been dispatched.
-    assert!(
-        !metrics
-            .specialist_dispatched
-            .load(std::sync::atomic::Ordering::Relaxed),
-        "specialist should not be dispatched when health gate is active"
-    );
-
-    // Router's chat() should never have been called — health gate fired before it.
-    assert_eq!(
-        router_seq.call_count(),
-        0,
-        "router provider's chat() call count should be 0 (health gate bypassed it)"
-    );
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-// -----------------------------------------------------------------------
-// Test 5: lenient parse fallback
-//
-// Router returns FunctionGemma comma-separated format:
-//   "specialist,coding,{}"
-// `parse_lenient_router_decision` handles this format.
-// -----------------------------------------------------------------------
-
-/// Strict-trio strip path is active (healthy registry) and the turn spans
-/// two iterations (specialist dispatch → respond). The orchestration-mode
-/// block must appear EXACTLY ONCE in the system head on every wire: a
-/// re-append per iteration rewrites sent system bytes and busts the prefix
-/// cache.
-#[tokio::test]
-async fn test_trio_orchestration_block_not_reappended_across_iterations() {
-    use crate::heartbeat::health::HealthRegistry;
-
-    let router: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(
-        "offline-router",
-        vec![
-            r#"{"action":"specialist","target":"coding","args":{"task":"explain loops"},"confidence":0.85}"#,
-            r#"{"action":"specialist","target":"coding","args":{"task":"explain loops"},"confidence":0.85}"#,
-            r#"{"action":"specialist","target":"coding","args":{"task":"explain loops again"},"confidence":0.85}"#,
-            r#"{"action":"respond","target":"main","args":{},"confidence":0.95}"#,
-        ],
-    ));
-    let main_recorder = Arc::new(WireRecordingProvider::new(
-        "offline-main",
-        vec![WireRecordingProvider::text_response("final answer")],
-    ));
-    let main: Arc<dyn LLMProvider> = main_recorder.clone();
-    let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
-        "offline-specialist",
-        "specialist answer",
-    ));
-
-    let (agent_loop, workspace) = build_trio_offline_harness_with_registry(
-        main,
-        router,
-        specialist,
-        Some(Arc::new(HealthRegistry::new())),
-    );
-
-    let resp = agent_loop
-        .process_direct("Explain for loops", "trio-dedup", "test", "offline")
-        .await;
-    assert!(!resp.is_empty(), "response should be non-empty");
-
-    // The strip path must actually have been armed, or the test is vacuous.
-    assert_eq!(
-        agent_loop.shared.core_handle.counters.get_trio_state(),
-        crate::agent::agent_core::TrioState::Active,
-        "trio must be Active (tools stripped) for this test to exercise the block"
-    );
-
-    let calls = main_recorder.calls();
-    assert!(
-        calls.len() >= 1,
-        "main model must have been called at least once"
-    );
-    for (i, wire) in calls.iter().enumerate() {
-        let system = wire[0]["content"].as_str().unwrap_or("");
-        assert_eq!(
-            system.matches("## Orchestration Mode (Active)").count(),
-            1,
-            "wire {i}: orchestration block must appear exactly once in the system head"
-        );
-    }
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-async fn test_trio_offline_e2e_parse_fallback_lenient() {
-    // Lenient format: "action,target,{args}" — no JSON wrapper.
-    // This exercises the comma-separated branch in parse_lenient_router_decision.
-    let router_resp = "specialist,coding,{}";
-
-    let router: Arc<dyn LLMProvider> = Arc::new(SequenceProvider::new(
-        "offline-router",
-        vec![router_resp, router_resp, router_resp],
-    ));
-    let main: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new("offline-main", "delegating"));
-    let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
-        "offline-specialist",
-        "lenient parse worked",
-    ));
-
-    // Verify that parse_lenient_router_decision handles this format before
-    // wiring it into the full agent loop.
-    let lenient_decision = parse_lenient_router_decision(router_resp);
-    assert!(
-        lenient_decision.is_some(),
-        "parse_lenient_router_decision should accept 'specialist,coding,{{}}'"
-    );
-    let lenient_decision = lenient_decision.unwrap();
-    assert_eq!(
-        lenient_decision.action, "specialist",
-        "lenient decision action should be 'specialist'"
-    );
-
-    let (agent_loop, workspace) = build_trio_offline_harness(main, router, specialist);
-
-    let resp = agent_loop
-        .process_direct(
-            "Explain something complex",
-            "trio-offline-lenient",
-            "test",
-            "offline",
-        )
-        .await;
-
-    eprintln!(
-        "test_trio_offline_e2e_parse_fallback_lenient: response ({} chars): {}",
-        resp.len(),
-        &resp[..resp.len().min(200)]
-    );
-
-    let metrics = &agent_loop.shared.core_handle.counters.trio_metrics;
-
-    assert_eq!(
-        metrics.router_action.lock().as_deref(),
-        Some("specialist"),
-        "router_action should be 'specialist' after lenient parse"
-    );
-    assert!(
-        metrics
-            .specialist_dispatched
-            .load(std::sync::atomic::Ordering::Relaxed),
-        "specialist should have been dispatched after lenient parse"
-    );
-    assert!(!resp.is_empty(), "response should be non-empty");
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -11013,7 +8631,7 @@ mod runtime_mode_parity_tests {
     /// Cloud-fixture path: `is_local: false` → `mode == Cloud`, accessor returns Cloud.
     #[test]
     fn mode_accessor_cloud_matches_is_local_false() {
-        let core = build_test_core(false, None, None);
+        let core = build_test_core();
         assert!(!core.mode().is_local(), "fixture is is_local=false");
         assert!(
             matches!(core.mode(), RuntimeMode::Cloud),
@@ -11021,9 +8639,8 @@ mod runtime_mode_parity_tests {
         );
     }
 
-    /// Local-fixture path: build a local core via a minimal SwappableCoreConfig
-    /// (mirrors the pattern in `test_delegation_with_is_local_true`). Verifies
-    /// the accessor returns `Local { caps }`.
+    /// Local-fixture path: build a local core via a minimal SwappableCoreConfig.
+    /// Verifies the accessor returns `Local { caps }`.
     #[test]
     fn mode_accessor_local_matches_is_local_true() {
         let workspace = tempfile::tempdir().unwrap().keep();
@@ -11050,8 +8667,6 @@ mod runtime_mode_parity_tests {
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
-            delegation_provider: None,
-            specialist_provider: None,
             trio_config: TrioConfig::default(),
             model_capabilities_overrides: std::collections::HashMap::new(),
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -11077,7 +8692,7 @@ mod runtime_mode_parity_tests {
     #[test]
     fn build_core_reserve_cap_cloud_passthrough() {
         // Cloud fixture: max_tokens=4096, max_ctx=16384. Cloud reserve = max_tokens verbatim.
-        let core = build_test_core(false, None, None);
+        let core = build_test_core();
         // token_budget exposes reserve via the constructor; reconstruct the
         // expected value from what mode.reserve_cap returns on Cloud.
         let mode = core.mode();
@@ -11112,8 +8727,6 @@ mod runtime_mode_parity_tests {
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
-            delegation_provider: None,
-            specialist_provider: None,
             trio_config: TrioConfig::default(),
             model_capabilities_overrides: std::collections::HashMap::new(),
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -11140,7 +8753,7 @@ mod runtime_mode_parity_tests {
     /// (the tiny-model ≤4K branch keeps a leaner 50-token prefix).
     #[test]
     fn build_core_context_cap_cloud_uses_full_scaling() {
-        let core = build_test_core(false, None, None);
+        let core = build_test_core();
         // Cloud: scale_budgets sets system_prompt_cap = ctx * 2/5 = 16384 * 2/5 = 6553.
         assert!(!core.context.local_prompt_mode);
         assert_eq!(core.context.system_prompt_cap, 16_384 * 2 / 5);
@@ -11172,8 +8785,6 @@ mod runtime_mode_parity_tests {
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
-            delegation_provider: None,
-            specialist_provider: None,
             trio_config: TrioConfig::default(),
             model_capabilities_overrides: std::collections::HashMap::new(),
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -11198,17 +8809,16 @@ mod runtime_mode_parity_tests {
     /// MockLLM returns `get_api_base() == None` → triggers the "haiku" branch.
     #[test]
     fn build_core_memory_provider_cloud_defaults_to_haiku_when_no_api_base() {
-        let core = build_test_core(false, None, None);
+        let core = build_test_core();
         // provider.get_api_base() is None for MockLLM → "haiku" memory model.
         assert_eq!(core.memory_model, "haiku");
         assert_eq!(core.compactor.model(), "main-model");
     }
 
-    /// Task 2 / Branch 3: local memory provider falls through specialist → main.
-    /// With no explicit memory config and no specialist provider, the local
+    /// Task 2 / Branch 3: with no explicit memory config, the local
     /// reflection and compaction identities both resolve to the main model.
     #[test]
-    fn build_core_memory_provider_local_defaults_to_main_without_trio() {
+    fn build_core_memory_provider_local_defaults_to_main() {
         let workspace = tempfile::tempdir().unwrap().keep();
         let main = MockLLM::named("local-main");
         let core = build_swappable_core(SwappableCoreConfig {
@@ -11233,8 +8843,6 @@ mod runtime_mode_parity_tests {
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
-            delegation_provider: None,
-            specialist_provider: None,
             trio_config: TrioConfig::default(),
             model_capabilities_overrides: std::collections::HashMap::new(),
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -11281,8 +8889,6 @@ mod runtime_mode_parity_tests {
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
-            delegation_provider: None,
-            specialist_provider: None,
             trio_config: TrioConfig::default(),
             model_capabilities_overrides: std::collections::HashMap::new(),
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -11330,7 +8936,7 @@ mod runtime_mode_parity_tests {
     /// Post-Wave-3: `core.mode().grounding_role()`.
     #[test]
     fn wave3_grounding_role_cloud_matches_pre_migration() {
-        let core = build_test_core(false, None, None);
+        let core = build_test_core();
         assert_eq!(core.mode().grounding_role(), "system");
     }
 
@@ -11360,8 +8966,6 @@ mod runtime_mode_parity_tests {
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
-            delegation_provider: None,
-            specialist_provider: None,
             trio_config: TrioConfig::default(),
             model_capabilities_overrides: std::collections::HashMap::new(),
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -11384,7 +8988,7 @@ mod runtime_mode_parity_tests {
     #[test]
     fn wave3_protocol_selection_mlx_exception_preserved() {
         // Cloud always → CloudProtocol (mode.is_local() == false).
-        let cloud = build_test_core(false, None, None);
+        let cloud = build_test_core();
         assert!(!cloud.mode().is_local());
 
         // Local with mlx: prefix model would go to CloudProtocol
@@ -11415,8 +9019,6 @@ mod runtime_mode_parity_tests {
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
-            delegation_provider: None,
-            specialist_provider: None,
             trio_config: TrioConfig::default(),
             model_capabilities_overrides: std::collections::HashMap::new(),
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -11648,27 +9250,13 @@ mod runtime_mode_parity_tests {
     }
 
     #[tokio::test]
-    async fn terminal_no_tools_without_prior_contract_bypasses_strict_router() {
+    async fn terminal_no_tools_without_prior_contract_invents_none() {
         let main = Arc::new(TerminalNoToolsProvider::new(terminal_text(Some(
             "strict terminal summary",
         ))));
-        let router_body = r#"{"action":"respond","target":"main","args":{},"confidence":0.9}"#;
-        let router = Arc::new(SequenceProvider::new(
-            "offline-router",
-            vec![router_body, router_body, router_body, router_body],
-        ));
-        let specialist: Arc<dyn LLMProvider> = Arc::new(StaticResponseLLM::new(
-            "offline-specialist",
-            "specialist unused",
-        ));
-        let (agent_loop, workspace) = build_trio_offline_harness_with_iters(
-            main.clone() as Arc<dyn LLMProvider>,
-            router.clone() as Arc<dyn LLMProvider>,
-            specialist,
-            None,
-            0,
-        );
-        let session_key = format!("terminal-strict-trio-{}", uuid::Uuid::new_v4());
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(main.clone() as Arc<dyn LLMProvider>, 0);
+        let session_key = format!("terminal-no-contract-{}", uuid::Uuid::new_v4());
 
         let response = agent_loop
             .process_direct("What is 2+2?", &session_key, "test", "offline")
@@ -11676,11 +9264,6 @@ mod runtime_mode_parity_tests {
 
         assert!(!response.is_empty(), "{response:?}");
         assert_ne!(response, "strict terminal summary");
-        assert_eq!(
-            router.call_count(),
-            0,
-            "terminal mode reran router preflight"
-        );
         assert!(main.normal_tools.lock().is_empty());
         let terminal_calls = main.terminal_calls.lock();
         assert!(
@@ -12162,8 +9745,6 @@ mod runtime_mode_parity_tests {
             provider.clone() as Arc<dyn LLMProvider>,
             130,
             crate::config::schema::ReasoningConfig::default(),
-            ToolDelegationConfig::default(),
-            None,
             131_072,
         );
         let session_key = format!("compound-replay-{}", uuid::Uuid::new_v4());
@@ -13020,8 +10601,6 @@ async fn idle_turn_e2e_injects_journaled_quiet_turn() {
         tool_delegation: ToolDelegationConfig::default(),
         provenance: ProvenanceConfig::default(),
         max_tool_result_chars: 2000,
-        delegation_provider: None,
-        specialist_provider: None,
         trio_config: TrioConfig::default(),
         model_capabilities_overrides: std::collections::HashMap::new(),
         reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -13734,8 +11313,6 @@ mod capacity_preflight {
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
-            delegation_provider: None,
-            specialist_provider: None,
             trio_config: TrioConfig::default(),
             model_capabilities_overrides: std::collections::HashMap::new(),
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -14136,8 +11713,6 @@ mod capacity_exceeded {
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
-            delegation_provider: None,
-            specialist_provider: None,
             trio_config: TrioConfig::default(),
             model_capabilities_overrides: std::collections::HashMap::new(),
             reasoning_config: crate::config::schema::ReasoningConfig::default(),
@@ -14379,8 +11954,6 @@ mod interrupted {
             tool_delegation: ToolDelegationConfig::default(),
             provenance: ProvenanceConfig::default(),
             max_tool_result_chars: 2000,
-            delegation_provider: None,
-            specialist_provider: None,
             trio_config: TrioConfig::default(),
             model_capabilities_overrides: std::collections::HashMap::new(),
             reasoning_config: crate::config::schema::ReasoningConfig::default(),

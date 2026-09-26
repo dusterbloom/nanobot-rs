@@ -1,4 +1,4 @@
-//! Server lifecycle REPL commands: /provenance, /restart, /ctx, /model, /trio, /local.
+//! Server lifecycle REPL commands: /provenance, /restart, /ctx, /model, /local.
 
 // Interactive/app boundary (error-protocol layer 3 backlog): printing IS the
 // product here (REPL/TUI/CLI), and the thin glue code keeps pragmatic
@@ -105,8 +105,6 @@ impl ReplContext {
             &toggled_config,
             &self.srv.local_port,
             model_name,
-            None,
-            None,
             // migrated from swappable().is_local — phase 09-03
             self.core_handle.swappable().mode().is_local(),
         );
@@ -264,40 +262,6 @@ impl ReplContext {
                     Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
                 }
 
-                // Reload trio models if enabled
-                if self.config.trio.enabled {
-                    if !self.config.trio.router_model.is_empty() {
-                        print!("  Loading {}... ", self.config.trio.router_model);
-                        io::stdout().flush().ok();
-                        match crate::lms::load_model(
-                            "",
-                            lms_port,
-                            &self.config.trio.router_model,
-                            Some(self.config.trio.router_ctx_tokens),
-                        )
-                        .await
-                        {
-                            Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                            Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
-                        }
-                    }
-                    if !self.config.trio.specialist_model.is_empty() {
-                        print!("  Loading {}... ", self.config.trio.specialist_model);
-                        io::stdout().flush().ok();
-                        match crate::lms::load_model(
-                            "",
-                            lms_port,
-                            &self.config.trio.specialist_model,
-                            Some(self.config.trio.specialist_ctx_tokens),
-                        )
-                        .await
-                        {
-                            Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                            Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
-                        }
-                    }
-                }
-
                 // Update URL in case host/port changed (only if user has not set an explicit base)
                 if self.config.agents.defaults.local_api_base.is_empty() {
                     let lms_host = crate::lms::api_host();
@@ -342,13 +306,6 @@ impl ReplContext {
                     &self.core_handle.capacity,
                 ) {
                     println!("{line}");
-                }
-                if self.config.trio.enabled {
-                    let budget = self.compute_current_vram_budget();
-                    let total_gb = budget.total_vram_bytes as f64 / 1e9;
-                    let limit_gb = budget.effective_limit_bytes as f64 / 1e9;
-                    let status = if budget.fits { "OK" } else { "OVER" };
-                    println!("  VRAM: {:.1} / {:.1} GB [{}]", total_gb, limit_gb, status);
                 }
                 println!("\n  Usage: /ctx <size>  e.g. /ctx 32K or /ctx 32768\n");
                 return;
@@ -431,19 +388,6 @@ impl ReplContext {
                         }
                     }
                 }
-            }
-        }
-
-        // Warn if VRAM budget exceeded
-        if self.config.trio.enabled {
-            let budget = self.compute_current_vram_budget();
-            if !budget.fits {
-                println!(
-                    "  \x1b[33mWarning:\x1b[0m Total VRAM ({:.1} GB) exceeds limit ({:.1} GB).",
-                    budget.total_vram_bytes as f64 / 1e9,
-                    budget.effective_limit_bytes as f64 / 1e9,
-                );
-                println!("  Reduce context sizes or switch to smaller models.");
             }
         }
 
@@ -629,17 +573,6 @@ impl ReplContext {
             .counters
             .reset_session_prompt_state(&self.session_id);
 
-        if self.config.trio.enabled {
-            let budget = self.compute_current_vram_budget();
-            if !budget.fits {
-                report.note(format!(
-                    "warning: VRAM usage ({:.1} GB) exceeds limit ({:.1} GB); use /trio budget for details",
-                    budget.total_vram_bytes as f64 / 1e9,
-                    budget.effective_limit_bytes as f64 / 1e9,
-                ));
-            }
-        }
-
         Ok(report)
     }
 
@@ -798,441 +731,6 @@ impl ReplContext {
                 );
             }
         }
-    }
-
-    /// /trio — manage trio mode (router + specialist helpers).
-    ///
-    /// Subcommands:
-    ///   /trio                      — toggle trio on/off
-    ///   /trio status               — show current trio config
-    ///   /trio budget               — show VRAM budget breakdown
-    ///   /trio router               — pick router model from LM Studio
-    ///   /trio specialist           — pick specialist model from LM Studio
-    ///   /trio router temp 0.3      — set router temperature
-    ///   /trio specialist ctx 8K    — set specialist context size
-    ///   /trio router nothink       — toggle router no_think
-    ///   /trio main nothink         — toggle main no_think
-    ///   /trio cap 12               — set VRAM cap (GB)
-    pub(super) async fn cmd_trio(&mut self, arg: &str) {
-        let parts: Vec<&str> = arg.split_whitespace().collect();
-        match parts.as_slice() {
-            ["status" | "s"] => self.cmd_trio_status().await,
-            ["router" | "r"] => self.cmd_trio_pick_model("router").await,
-            ["specialist" | "spec"] => self.cmd_trio_pick_model("specialist").await,
-            ["budget" | "b"] => self.cmd_trio_budget().await,
-
-            // Parameter subcommands
-            ["router" | "r", "temp" | "temperature", val] => {
-                self.cmd_trio_set_param("router", "temperature", val)
-            }
-            ["specialist" | "spec", "temp" | "temperature", val] => {
-                self.cmd_trio_set_param("specialist", "temperature", val)
-            }
-            ["router" | "r", "ctx" | "context", val] => {
-                self.cmd_trio_set_param("router", "ctx", val)
-            }
-            ["specialist" | "spec", "ctx" | "context", val] => {
-                self.cmd_trio_set_param("specialist", "ctx", val)
-            }
-            ["router" | "r", "nothink" | "no_think"] => {
-                self.cmd_trio_set_param("router", "no_think", "toggle")
-            }
-            ["main", "nothink" | "no_think"] => {
-                self.cmd_trio_set_param("main", "no_think", "toggle")
-            }
-            ["cap" | "vram", val] => self.cmd_trio_set_param("trio", "vram_cap", val),
-
-            [] => self.cmd_trio_toggle().await,
-            _ => {
-                println!("\n  Usage: /trio [subcommand]");
-                println!("    /trio                      Toggle trio on/off");
-                println!("    /trio status               Show current trio config");
-                println!("    /trio budget               Show VRAM budget breakdown");
-                println!("    /trio router               Pick router model");
-                println!("    /trio specialist            Pick specialist model");
-                println!("    /trio router temp 0.3       Set router temperature");
-                println!("    /trio specialist temp 0.7   Set specialist temperature");
-                println!("    /trio router ctx 4K         Set router context");
-                println!("    /trio specialist ctx 8K     Set specialist context");
-                println!("    /trio router nothink        Toggle router no_think");
-                println!("    /trio main nothink          Toggle main no_think");
-                println!("    /trio cap 12                Set VRAM cap (GB)\n");
-            }
-        }
-    }
-
-    /// Set a trio parameter (temperature, context, no_think, vram_cap).
-    fn cmd_trio_set_param(&mut self, role: &str, param: &str, value: &str) {
-        match apply_trio_param(&mut self.config, role, param, value) {
-            Ok(desc) => {
-                self.persist_trio_config();
-                self.apply_and_rebuild();
-                println!("\n  Set {}.\n", desc);
-            }
-            Err(msg) => {
-                println!("\n  Error: {}\n", msg);
-            }
-        }
-    }
-
-    /// Show VRAM budget breakdown.
-    async fn cmd_trio_budget(&self) {
-        // migrated from swappable().is_local — phase 09-03
-        if !self.core_handle.swappable().mode().is_local() {
-            println!(
-                "\n  {}Not in local mode — use /local first{}\n",
-                tui::DIM,
-                tui::RESET
-            );
-            return;
-        }
-        let budget = self.compute_current_vram_budget();
-        println!("{}", format_vram_budget(&budget));
-    }
-
-    /// Toggle trio mode on/off.
-    async fn cmd_trio_toggle(&mut self) {
-        let was_enabled = self.config.trio.enabled;
-
-        if was_enabled {
-            trio_disable(&mut self.config);
-
-            // Unload router + specialist from LMS (keep main loaded)
-            if self.srv.lms_managed {
-                let lms_port = self.config.agents.defaults.lms_port;
-                if !self.config.trio.router_model.is_empty() {
-                    let _ = crate::lms::unload_model(
-                        "",
-                        lms_port,
-                        &self.config.trio.router_model,
-                        self.config.timeouts.lms_unload_secs,
-                    )
-                    .await;
-                }
-                if !self.config.trio.specialist_model.is_empty() {
-                    let _ = crate::lms::unload_model(
-                        "",
-                        lms_port,
-                        &self.config.trio.specialist_model,
-                        self.config.timeouts.lms_unload_secs,
-                    )
-                    .await;
-                }
-            }
-
-            self.persist_trio_config();
-            self.apply_and_rebuild();
-            println!("\n  Trio \x1b[33mdisabled\x1b[0m — single model (inline) mode.\n");
-        } else {
-            let needs_warning = trio_enable(&mut self.config);
-            if needs_warning {
-                println!("\n  \x1b[33mWarning:\x1b[0m Router or specialist model not configured.");
-                println!("  Use /trio router and /trio specialist to pick models first.");
-                println!("  Or set them in config.json under \"trio\".\n");
-            }
-
-            // Auto-compute optimal context sizes to fit VRAM budget
-            // migrated from swappable().is_local — phase 09-03
-            if self.core_handle.swappable().mode().is_local() {
-                let budget = self.compute_current_vram_budget();
-                if budget.fits {
-                    // Apply computed context sizes
-                    self.config.agents.defaults.local_max_context_tokens = budget.main_ctx;
-                    if budget.router_ctx > 0 {
-                        self.config.trio.router_ctx_tokens = budget.router_ctx;
-                    }
-                    if budget.specialist_ctx > 0 {
-                        self.config.trio.specialist_ctx_tokens = budget.specialist_ctx;
-                    }
-                    let total_gb = budget.total_vram_bytes as f64 / 1e9;
-                    let limit_gb = budget.effective_limit_bytes as f64 / 1e9;
-                    println!(
-                        "  Auto-computed contexts: main={}K router={}K specialist={}K ({:.1}/{:.1} GB)",
-                        budget.main_ctx / 1024,
-                        budget.router_ctx / 1024,
-                        budget.specialist_ctx / 1024,
-                        total_gb,
-                        limit_gb,
-                    );
-                } else {
-                    println!(
-                        "  \x1b[33mWarning:\x1b[0m Models may exceed VRAM ({:.1}/{:.1} GB).",
-                        budget.total_vram_bytes as f64 / 1e9,
-                        budget.effective_limit_bytes as f64 / 1e9,
-                    );
-                    println!("  Use /trio budget for details, /trio cap to adjust.");
-                }
-            }
-
-            // Load router + specialist on LMS if available
-            if self.srv.lms_managed {
-                let lms_port = self.config.agents.defaults.lms_port;
-                if !self.config.trio.router_model.is_empty() {
-                    print!("  Loading {}... ", self.config.trio.router_model);
-                    io::stdout().flush().ok();
-                    match crate::lms::load_model(
-                        "",
-                        lms_port,
-                        &self.config.trio.router_model,
-                        Some(self.config.trio.router_ctx_tokens),
-                    )
-                    .await
-                    {
-                        Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                        Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
-                    }
-                }
-                if !self.config.trio.specialist_model.is_empty() {
-                    print!("  Loading {}... ", self.config.trio.specialist_model);
-                    io::stdout().flush().ok();
-                    match crate::lms::load_model(
-                        "",
-                        lms_port,
-                        &self.config.trio.specialist_model,
-                        Some(self.config.trio.specialist_ctx_tokens),
-                    )
-                    .await
-                    {
-                        Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                        Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
-                    }
-                }
-            }
-
-            self.persist_trio_config();
-            self.apply_and_rebuild();
-            println!("\n  Trio \x1b[32menabled\x1b[0m — main + router + specialist.\n");
-        }
-    }
-
-    /// Show current trio configuration.
-    async fn cmd_trio_status(&self) {
-        let trio = &self.config.trio;
-        let td = &self.config.tool_delegation;
-        let enabled_label = if trio.enabled {
-            format!("{}enabled{}", tui::GREEN, tui::RESET)
-        } else {
-            format!("{}disabled{}", tui::YELLOW, tui::RESET)
-        };
-
-        println!();
-        println!("  {}TRIO{}       {}", tui::BOLD, tui::RESET, enabled_label);
-        println!("  {}MODE{}       {:?}", tui::BOLD, tui::RESET, td.mode);
-
-        // Main model
-        let main = if !self.config.agents.defaults.lms_main_model.is_empty() {
-            self.config.agents.defaults.lms_main_model.clone()
-        } else if !self.config.agents.defaults.local_model.is_empty() {
-            self.config.agents.defaults.local_model.clone()
-        } else {
-            "(default)".to_string()
-        };
-        println!(
-            "  {}MAIN{}       {}{}{}",
-            tui::BOLD,
-            tui::RESET,
-            tui::DIM,
-            main,
-            tui::RESET
-        );
-
-        // Router
-        let router = if trio.router_model.is_empty() {
-            "\x1b[33m(not set)\x1b[0m".to_string()
-        } else {
-            format!("{}{}{}", tui::DIM, trio.router_model, tui::RESET)
-        };
-        println!("  {}ROUTER{}     {}", tui::BOLD, tui::RESET, router);
-
-        // Specialist
-        let specialist = if trio.specialist_model.is_empty() {
-            "\x1b[33m(not set)\x1b[0m".to_string()
-        } else {
-            format!("{}{}{}", tui::DIM, trio.specialist_model, tui::RESET)
-        };
-        println!("  {}SPECIALIST{} {}", tui::BOLD, tui::RESET, specialist);
-
-        // Context sizes
-        println!(
-            "  {}CTX{}        main={}K  router={}K  specialist={}K",
-            tui::BOLD,
-            tui::RESET,
-            self.config.agents.defaults.local_max_context_tokens / 1024,
-            trio.router_ctx_tokens / 1024,
-            trio.specialist_ctx_tokens / 1024,
-        );
-
-        // Loaded models (if LMS managed)
-        if self.srv.lms_managed {
-            let lms_port = self.config.agents.defaults.lms_port;
-            let loaded = crate::lms::list_loaded("", lms_port).await;
-            if !loaded.is_empty() {
-                println!(
-                    "  {}LOADED{}     {}{}{}",
-                    tui::BOLD,
-                    tui::RESET,
-                    tui::DIM,
-                    loaded.join(", "),
-                    tui::RESET
-                );
-            }
-        }
-
-        // VRAM budget summary (local mode only)
-        // migrated from swappable().is_local — phase 09-03
-        if self.core_handle.swappable().mode().is_local() {
-            let budget = self.compute_current_vram_budget();
-            let total_gb = budget.total_vram_bytes as f64 / 1e9;
-            let limit_gb = budget.effective_limit_bytes as f64 / 1e9;
-            let status = if budget.fits {
-                format!("{}OK{}", tui::GREEN, tui::RESET)
-            } else {
-                format!("\x1b[31mOVER\x1b[0m")
-            };
-            println!(
-                "  {}VRAM{}       {:.1} / {:.1} GB  [{}]",
-                tui::BOLD,
-                tui::RESET,
-                total_gb,
-                limit_gb,
-                status,
-            );
-        }
-
-        println!();
-    }
-
-    /// Pick a model for a trio role (router or specialist) from LM Studio's available models.
-    async fn cmd_trio_pick_model(&mut self, role: &str) {
-        // Get available models from LMS
-        let models: Vec<String> = if self.srv.lms_managed {
-            let lms_port = self.config.agents.defaults.lms_port;
-            crate::lms::list_available("", lms_port)
-                .await
-                .into_iter()
-                .filter(|m| {
-                    // Filter out embedding models
-                    !m.to_lowercase().contains("embedding")
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        if models.is_empty() {
-            println!("\n  No LLM models found in LM Studio.");
-            println!("  Set manually in config.json: trio.{}Model\n", role);
-            // Allow manual entry
-            let manual_prompt = format!("  Enter {} model ID (or Enter to cancel): ", role);
-            let input = match self.rl.as_mut().unwrap().readline(&manual_prompt) {
-                Ok(line) => line.trim().to_string(),
-                Err(_) => return,
-            };
-            if input.is_empty() {
-                return;
-            }
-            self.set_trio_role_model(role, &input).await;
-            return;
-        }
-
-        let current = match role {
-            "router" => &self.config.trio.router_model,
-            "specialist" => &self.config.trio.specialist_model,
-            _ => unreachable!(),
-        };
-
-        println!("\n  Available models for {}:", role);
-        for (i, model) in models.iter().enumerate() {
-            let marker = if crate::lms::is_model_available(std::slice::from_ref(model), current) {
-                " (active)"
-            } else {
-                ""
-            };
-            println!("  [{}] {}{}", i + 1, model, marker);
-        }
-
-        let pick_prompt = format!(
-            "  Select {} model [1-{}] or Enter to cancel: ",
-            role,
-            models.len()
-        );
-        let choice = match self.rl.as_mut().unwrap().readline(&pick_prompt) {
-            Ok(line) => line,
-            Err(_) => return,
-        };
-        let choice = choice.trim();
-        if choice.is_empty() {
-            return;
-        }
-        let idx: usize = match choice.parse::<usize>() {
-            Ok(n) if n >= 1 && n <= models.len() => n - 1,
-            _ => {
-                println!("  Invalid selection.\n");
-                return;
-            }
-        };
-
-        let selected = &models[idx];
-        self.set_trio_role_model(role, selected).await;
-    }
-
-    /// Apply a model selection to a trio role and persist.
-    async fn set_trio_role_model(&mut self, role: &str, model: &str) {
-        set_trio_role_model_pure(&mut self.config, role, model);
-
-        // Load the model in LMS if trio is active
-        if self.config.trio.enabled && self.srv.lms_managed {
-            let lms_port = self.config.agents.defaults.lms_port;
-            let ctx = match role {
-                "router" => Some(self.config.trio.router_ctx_tokens),
-                "specialist" => Some(self.config.trio.specialist_ctx_tokens),
-                _ => Some(self.config.agents.defaults.local_max_context_tokens),
-            };
-            print!("  Loading {}... ", model);
-            io::stdout().flush().ok();
-            match crate::lms::load_model("", lms_port, model, ctx).await {
-                Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
-            }
-        }
-
-        self.persist_trio_config();
-        self.apply_and_rebuild();
-        println!(
-            "\n  {} {} set to {}{}{}.",
-            role.chars()
-                .next()
-                .unwrap()
-                .to_uppercase()
-                .collect::<String>()
-                + &role[1..],
-            tui::BOLD,
-            tui::RESET,
-            model,
-            ""
-        );
-
-        // Warn if VRAM budget exceeded after model change
-        // migrated from swappable().is_local — phase 09-03
-        if self.config.trio.enabled && self.core_handle.swappable().mode().is_local() {
-            let budget = self.compute_current_vram_budget();
-            if !budget.fits {
-                println!(
-                    "  \x1b[33mWarning:\x1b[0m VRAM usage ({:.1} GB) exceeds limit ({:.1} GB).",
-                    budget.total_vram_bytes as f64 / 1e9,
-                    budget.effective_limit_bytes as f64 / 1e9,
-                );
-                println!("  Use /trio budget for details.");
-            }
-        }
-        println!();
-    }
-
-    /// Persist trio + tool_delegation config to disk.
-    fn persist_trio_config(&self) {
-        let mut disk_cfg = load_config(None);
-        persist_trio_fields(&self.config, &mut disk_cfg);
-        save_config(&disk_cfg, None);
     }
 
     pub(super) fn persist_local_config(&self) {
@@ -1456,49 +954,6 @@ impl ReplContext {
                                         println!("{}FAILED: {}{}", tui::RED, e, tui::RESET)
                                     }
                                 }
-                                if self.config.trio.enabled {
-                                    if !self.config.trio.router_model.is_empty() {
-                                        print!("  Loading {}... ", self.config.trio.router_model);
-                                        io::stdout().flush().ok();
-                                        match crate::lms::load_model(
-                                            "",
-                                            lms_port,
-                                            &self.config.trio.router_model,
-                                            Some(self.config.trio.router_ctx_tokens),
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => {
-                                                println!("{}OK{}", tui::GREEN, tui::RESET)
-                                            }
-                                            Err(e) => {
-                                                println!("{}FAILED: {}{}", tui::RED, e, tui::RESET)
-                                            }
-                                        }
-                                    }
-                                    if !self.config.trio.specialist_model.is_empty() {
-                                        print!(
-                                            "  Loading {}... ",
-                                            self.config.trio.specialist_model
-                                        );
-                                        io::stdout().flush().ok();
-                                        match crate::lms::load_model(
-                                            "",
-                                            lms_port,
-                                            &self.config.trio.specialist_model,
-                                            Some(self.config.trio.specialist_ctx_tokens),
-                                        )
-                                        .await
-                                        {
-                                            Ok(()) => {
-                                                println!("{}OK{}", tui::GREEN, tui::RESET)
-                                            }
-                                            Err(e) => {
-                                                println!("{}FAILED: {}{}", tui::RED, e, tui::RESET)
-                                            }
-                                        }
-                                    }
-                                }
                                 self.srv.lms_managed = true;
                                 self.srv.lms_binary = Some(bin);
                                 self.srv.engine = super::super::InferenceEngine::Lms;
@@ -1534,23 +989,6 @@ impl ReplContext {
                         );
                         return;
                     }
-                }
-            }
-
-            // When trio strict mode is on but router model is unavailable,
-            // disable strict flags so the single model can handle tools directly.
-            if self.config.tool_delegation.strict_no_tools_main()
-                && self.config.tool_delegation.strict_router_schema()
-            {
-                let router_available = if self.srv.lms_managed {
-                    let lms_port = self.config.agents.defaults.lms_port;
-                    let available = crate::lms::list_available("", lms_port).await;
-                    crate::lms::is_model_available(&available, &self.config.trio.router_model)
-                } else {
-                    !self.config.trio.router_model.is_empty()
-                };
-                if !router_available {
-                    self.config.tool_delegation.clear_strict_router();
                 }
             }
 
@@ -1696,11 +1134,10 @@ mod capacity_status_tests {
 mod task1_catalog_tests {
     use super::*;
     use crate::agent::agent_core::{RuntimeCounters, ToolPresentationMode};
-    use crate::config::schema::CircuitBreakerConfig;
 
     #[test]
     fn runtime_switch_clears_same_mode_native_catalog_in_both_directions() {
-        let counters = RuntimeCounters::new_with_config(16_384, &CircuitBreakerConfig::default());
+        let counters = RuntimeCounters::new(16_384);
         let defs = vec![serde_json::json!({"function": {"name": "read_file"}})];
 
         for session in ["cloud-to-local", "local-to-cloud"] {

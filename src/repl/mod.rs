@@ -26,8 +26,6 @@
 pub(crate) mod commands;
 mod incremental;
 
-pub(crate) use commands::{should_auto_activate_trio, trio_enable};
-
 use std::collections::BTreeSet;
 use std::io::{self, IsTerminal, Write as _};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -431,23 +429,6 @@ async fn prewarm_remote_lms_models(config: &Config, main_model: &str) {
         ));
     }
 
-    let role_models_enabled = config.trio.enabled;
-
-    if role_models_enabled {
-        if !config.trio.router_model.trim().is_empty() {
-            models.push((
-                config.trio.router_model.trim().to_string(),
-                Some(config.trio.router_ctx_tokens),
-            ));
-        }
-        if !config.trio.specialist_model.trim().is_empty() {
-            models.push((
-                config.trio.specialist_model.trim().to_string(),
-                Some(config.trio.specialist_ctx_tokens),
-            ));
-        }
-    }
-
     // Query already-loaded models so we can skip redundant loads
     let models_url = format!("{}/api/v1/models", native);
     let client = reqwest::Client::new();
@@ -697,9 +678,6 @@ pub(crate) fn print_help() {
     println!("  /local, /l      - Toggle between local and cloud mode");
     println!("  /model, /m [q]  - Pick model from all sources (LMS, cluster, ~/models/)");
     println!("  /lane           - Toggle lane (answer/action) or /lane answer|action");
-    println!("  /trio           - Toggle trio mode (router + specialist)");
-    println!("  /trio budget    - Show VRAM budget breakdown");
-    println!("  /trio cap <GB>  - Set VRAM cap (e.g. /trio cap 12)");
     println!("  /ctx [size]     - Set context size (e.g. /ctx 32K) or auto-detect");
     println!("  /think, /t      - Toggle extended thinking (/thinking on|off|N)");
     println!("  /nothink, /nt   - Disable extended thinking");
@@ -1423,15 +1401,7 @@ pub(crate) fn apply_server_change(
     } else {
         model_path.file_name().and_then(|n| n.to_str())
     };
-    cli::rebuild_core(
-        core_handle,
-        config,
-        &state.local_port,
-        model_name,
-        None,
-        None,
-        is_local,
-    );
+    cli::rebuild_core(core_handle, config, &state.local_port, model_name, is_local);
 }
 
 // ============================================================================
@@ -1625,7 +1595,7 @@ pub(crate) fn cmd_agent(
             config.agents.defaults.local_backend = "lmstudio".to_string();
         }
         // Non-higgs local endpoints keep the LM Studio feature set (remote
-        // probe, prewarm, trio auto-activation, JIT warmup) whether spawned or
+        // probe, prewarm, JIT warmup) whether spawned or
         // discovered — only SPAWNING is gated by `localAutostart`.
         let lms_features = is_local
             && !crate::config::schema::is_higgs_backend(&config.agents.defaults.local_backend);
@@ -1720,9 +1690,8 @@ pub(crate) fn cmd_agent(
         }
 
         // In local mode with single-message (-m), just start main server.
-        // Trio is for interactive sessions - single messages use inline tools.
         // When localApiBase is set, skip all local server spawning — use remote server.
-        let mut trio_state: Option<ServerState> = None;
+        let mut single_message_srv: Option<ServerState> = None;
         // Recompute has_remote_local — discovery adoption or Higgs auto-start
         // may have filled local_api_base.
         let has_remote_local = !config.agents.defaults.local_api_base.is_empty();
@@ -1755,52 +1724,6 @@ pub(crate) fn cmd_agent(
                             }
                             config.agents.defaults.skip_jit_gate = true;
                         }
-
-                        // Trio model loading for single-message mode.
-                        let (auto_router, auto_specialist) =
-                            commands::pick_trio_models(&available, &local_model_name);
-                        if config.trio.router_model.is_empty() {
-                            if let Some(r) = auto_router {
-                                config.trio.router_model = r;
-                            }
-                        }
-                        if config.trio.specialist_model.is_empty() {
-                            if let Some(s) = auto_specialist {
-                                config.trio.specialist_model = s;
-                            }
-                        }
-                        if config.trio.enabled
-                            || commands::should_auto_activate_trio(
-                                is_local,
-                                &config.trio.router_model,
-                                &config.trio.specialist_model,
-                                config.trio.router_endpoint.is_some(),
-                                config.trio.specialist_endpoint.is_some(),
-                                &config.tool_delegation.mode,
-                            )
-                        {
-                            // Load router model if configured.
-                            if !config.trio.router_model.is_empty() {
-                                let _ = crate::lms::load_model(
-                                    "",
-                                    lms_port,
-                                    &config.trio.router_model,
-                                    Some(config.trio.router_ctx_tokens),
-                                )
-                                .await;
-                            }
-                            // Load specialist model if configured.
-                            if !config.trio.specialist_model.is_empty() {
-                                let _ = crate::lms::load_model(
-                                    "",
-                                    lms_port,
-                                    &config.trio.specialist_model,
-                                    Some(config.trio.specialist_ctx_tokens),
-                                )
-                                .await;
-                            }
-                            commands::trio_enable(&mut config);
-                        }
                     }
                     Err(e) => {
                         eprintln!("Warning: lms server start failed: {}", e);
@@ -1810,7 +1733,7 @@ pub(crate) fn cmd_agent(
                 eprintln!("Error: No local inference engine found. Install LM Studio (lms CLI) or Higgs (cargo install higgs).");
                 std::process::exit(1);
             }
-            trio_state = Some(srv);
+            single_message_srv = Some(srv);
         }
 
         // Interactive REPL: detect LMS and set config BEFORE building core,
@@ -1860,41 +1783,6 @@ pub(crate) fn cmd_agent(
                         match crate::lms::load_model("", lms_port, &main_model, main_ctx).await {
                             Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
                             Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
-                        }
-
-                        // Auto-detect trio roles from available models if not configured.
-                        let (auto_router, auto_specialist) =
-                            commands::pick_trio_models(&available, &main_model);
-                        if config.trio.router_model.is_empty() {
-                            if let Some(r) = auto_router {
-                                config.trio.router_model = r;
-                                info!(router = %config.trio.router_model, "trio_router_auto_detected");
-                            }
-                        }
-                        if config.trio.specialist_model.is_empty() {
-                            if let Some(s) = auto_specialist {
-                                config.trio.specialist_model = s;
-                                info!(specialist = %config.trio.specialist_model, "trio_specialist_auto_detected");
-                            }
-                        }
-
-                        if config.trio.enabled {
-                            if !config.trio.router_model.is_empty() {
-                                print!("  Loading {}... ", config.trio.router_model);
-                                io::stdout().flush().ok();
-                                match crate::lms::load_model("", lms_port, &config.trio.router_model, Some(config.trio.router_ctx_tokens)).await {
-                                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                                    Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
-                                }
-                            }
-                            if !config.trio.specialist_model.is_empty() {
-                                print!("  Loading {}... ", config.trio.specialist_model);
-                                io::stdout().flush().ok();
-                                match crate::lms::load_model("", lms_port, &config.trio.specialist_model, Some(config.trio.specialist_ctx_tokens)).await {
-                                    Ok(()) => println!("{}OK{}", tui::GREEN, tui::RESET),
-                                    Err(e) => println!("{}FAILED: {}{}", tui::RED, e, tui::RESET),
-                                }
-                            }
                         }
 
                         local_model_name = main_model;
@@ -1990,7 +1878,7 @@ pub(crate) fn cmd_agent(
             }
         }
 
-        // Remote LM Studio base: proactively prewarm main/router/specialist models
+        // Remote LM Studio base: proactively prewarm the main model
         // to avoid first-turn latency spikes from JIT loading.
         // Skip for oMLX — it uses LRU auto-eviction, not JIT loading.
         if lms_features && has_remote_local && !srv.lms_managed {
@@ -2004,81 +1892,9 @@ pub(crate) fn cmd_agent(
             });
         }
 
-        // Auto-activate trio mode for local sessions when both router and
-        // specialist models are configured.  The downgrade block below will
-        // revert strict flags if the router turns out to be unreachable.
-        // Skip for MLX/oMLX local — no LM Studio trio support.
-        if lms_features && commands::should_auto_activate_trio(
-            is_local,
-            &config.trio.router_model,
-            &config.trio.specialist_model,
-            config.trio.router_endpoint.is_some(),
-            config.trio.specialist_endpoint.is_some(),
-            &config.tool_delegation.mode,
-        ) {
-            commands::trio_enable(&mut config);
-            info!(
-                delegation_mode = ?config.tool_delegation.mode,
-                router_model = %config.trio.router_model,
-                specialist_model = %config.trio.specialist_model,
-                "trio_auto_activated"
-            );
-        }
-
-        // When no trio router is available, disable strict mode so the single model
-        // can handle tools directly. Must happen BEFORE build_core_handle so the core
-        // gets the updated tool_delegation_config.
-        if lms_features
-            && config.tool_delegation.strict_no_tools_main()
-            && config.tool_delegation.strict_router_schema()
-        {
-            let router_available = if srv.lms_managed || has_remote_local {
-                // For both managed (started by nanobot) and remote LM Studio,
-                // verify the model is actually loaded via list_available()
-                let (lms_host, lms_port) = if srv.lms_managed {
-                    (String::new(), config.agents.defaults.lms_port)
-                } else {
-                    // Extract host and port from local_api_base
-                    // (e.g. "http://192.168.1.22:18080/v1")
-                    let base = &config.agents.defaults.local_api_base;
-                    let port = base
-                        .split(':')
-                        .last()
-                        .and_then(|p| p.split('/').next())
-                        .and_then(|p| p.parse::<u16>().ok())
-                        .unwrap_or(18080);
-                    (extract_url_host(base), port)
-                };
-                let available = crate::lms::list_available(&lms_host, lms_port).await;
-                crate::lms::is_model_available(&available, &config.trio.router_model)
-            } else {
-                false
-            };
-
-            if !router_available {
-                info!("trio_downgrade: router not available, clearing strict flags");
-                config.tool_delegation.clear_strict_router();
-            }
-        }
-
-        info!(
-            delegation_mode = ?config.tool_delegation.mode,
-            strict_no_tools_main = config.tool_delegation.strict_no_tools_main(),
-            strict_router_schema = config.tool_delegation.strict_router_schema(),
-            is_local,
-            "delegation_config_at_core_build"
-        );
-
         log_startup_phase("endpoint_probe_done", startup_t0, &mut startup_last);
 
-        let core_handle = cli::build_core_handle(
-            &config,
-            &srv.local_port,
-            Some(&local_model_name),
-            None,
-            None,
-            is_local,
-        );
+        let core_handle = cli::build_core_handle(&config, &srv.local_port, Some(&local_model_name), is_local);
         // Resolve --resume / --continue to a real session key. Explicit resume
         // first touches the requested concrete ID, making it the latest row for
         // that reusable key before the normal turn path resolves the key.
@@ -2181,8 +1997,8 @@ pub(crate) fn cmd_agent(
 
         if let Some(msg) = message {
             // Single-message mode: process and exit.
-            // Keep trio servers alive during processing (they're dropped at end of scope).
-            let _servers = &trio_state;
+            // Keep the LMS server alive during processing (dropped at end of scope).
+            let _servers = &single_message_srv;
             let mut agent_loop = agent_loop;
             stream_and_render(
                 &mut agent_loop,
@@ -2255,13 +2071,12 @@ pub(crate) fn cmd_agent(
             // JIT warmup: pre-load models on the remote JIT server (e.g. LM Studio).
             // This forces each model to load sequentially before any real requests,
             // avoiding concurrent model-switch crashes and cold-start latency.
-            // Fires for any JIT server (localApiBase set), not just trio mode.
+            // Fires for any JIT server (localApiBase set).
             // Skip for MLX/oMLX local — no remote JIT server involved.
             if lms_features && has_remote_local && !ctx.srv.lms_managed {
                 use crate::providers::jit_gate::warmup_jit_models;
 
                 let base = ctx.config.agents.defaults.local_api_base.clone();
-                let mut models_to_warm: Vec<String> = Vec::new();
 
                 // Main model — always warm so first message is fast. Prefer the
                 // resolved/adopted id (lms_main_model) over the raw localModel,
@@ -2271,23 +2086,7 @@ pub(crate) fn cmd_agent(
                 } else {
                     &ctx.config.agents.defaults.local_model
                 };
-                models_to_warm.push(cli::strip_gguf_suffix(main_model_ref).to_string());
-
-                // Trio models (router + specialist) when enabled.
-                if ctx.config.trio.enabled {
-                    // Router: prefer explicit endpoint model, fall back to trio config.
-                    if let Some(ref ep) = ctx.config.trio.router_endpoint {
-                        models_to_warm.push(ep.model.clone());
-                    } else if !ctx.config.trio.router_model.is_empty() {
-                        models_to_warm.push(ctx.config.trio.router_model.clone());
-                    }
-                    // Specialist: prefer explicit endpoint model, fall back to trio config.
-                    if let Some(ref ep) = ctx.config.trio.specialist_endpoint {
-                        models_to_warm.push(ep.model.clone());
-                    } else if !ctx.config.trio.specialist_model.is_empty() {
-                        models_to_warm.push(ctx.config.trio.specialist_model.clone());
-                    }
-                }
+                let models_to_warm = vec![cli::strip_gguf_suffix(main_model_ref).to_string()];
 
                 // Background: warming can take 30s per model — if it hasn't
                 // finished by the first message, that request JIT-loads anyway.
@@ -2654,32 +2453,6 @@ pub(crate) fn cmd_agent(
                 h.abort();
             }
             let _ = ctx.rl.as_mut().unwrap().save_history(&history_path);
-
-            // Unload trio models so LM Studio returns to just the main model.
-            // Run when trio is enabled and we have any LMS connection (managed or
-            // user-started via localApiBase) — not only when nanobot started the server.
-            if ctx.config.trio.enabled && (ctx.srv.lms_managed || has_remote_local) {
-                let (lms_host, lms_port) = if ctx.srv.lms_managed {
-                    (String::new(), ctx.config.agents.defaults.lms_port)
-                } else {
-                    // Extract host and port from localApiBase
-                    // (e.g. "http://192.168.1.22:18080/v1")
-                    let base = &ctx.config.agents.defaults.local_api_base;
-                    let port = base
-                        .split(':')
-                        .last()
-                        .and_then(|p| p.split('/').next())
-                        .and_then(|p| p.parse::<u16>().ok())
-                        .unwrap_or(ctx.config.agents.defaults.lms_port);
-                    (extract_url_host(base), port)
-                };
-                if !ctx.config.trio.router_model.is_empty() {
-                    let _ = crate::lms::unload_model(&lms_host, lms_port, &ctx.config.trio.router_model, ctx.config.timeouts.lms_unload_secs).await;
-                }
-                if !ctx.config.trio.specialist_model.is_empty() {
-                    let _ = crate::lms::unload_model(&lms_host, lms_port, &ctx.config.trio.specialist_model, ctx.config.timeouts.lms_unload_secs).await;
-                }
-            }
 
             ctx.srv.shutdown();
 

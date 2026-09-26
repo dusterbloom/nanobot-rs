@@ -58,7 +58,7 @@ pub(crate) use response::RetryState;
 pub(crate) use shared::*;
 // Re-export remaining heuristic functions at module-private level for use
 // within this module and its submodules (shared uses them via super::).
-use heuristics::{last_user_message, render_via_protocol, should_strip_tools_for_trio};
+use heuristics::{last_user_message, render_via_protocol};
 
 // ---------------------------------------------------------------------------
 // Tool proxy wrappers
@@ -145,14 +145,12 @@ impl AgentLoop {
             subagent_mgr = subagent_mgr.with_providers_config(pc);
         }
         // Wire up the cheap default model for subagents from config.
-        // Resolve "local" to the delegation model name so it's a real model
-        // name that oMLX/servers recognise, not a literal "local" string.
+        // Resolve "local" to the main model name so it's a real model name
+        // that oMLX/servers recognise, not a literal "local" string.
         let subagent_model = {
             let raw = &core.tool_delegation_config.default_subagent_model;
             if raw.eq_ignore_ascii_case("local") {
-                core.tool_runner_model
-                    .clone()
-                    .unwrap_or_else(|| core.model.clone())
+                core.model.clone()
             } else {
                 raw.clone()
             }
