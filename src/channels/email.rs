@@ -434,10 +434,20 @@ async fn mark_message_read(
 }
 
 /// Extract email address from "Name <email@domain>" or plain "email@domain".
+///
+/// Tolerates RFC 5322 quoted display names that contain `>` before the
+/// angle-bracketed address (e.g. `"SALE > 70%" <deals@example.com>`): we only
+/// slice between the first `<` and a `>` that strictly follows it, falling
+/// back to the raw input rather than panicking on a reversed range.
 pub fn extract_email_address(raw: &str) -> String {
     if let Some(start) = raw.find('<') {
-        if let Some(end) = raw.find('>') {
-            return raw[start + 1..end].to_string();
+        if let Some(end) = raw.rfind('>') {
+            if end > start {
+                let inner = &raw[start + 1..end];
+                if !inner.is_empty() {
+                    return inner.to_string();
+                }
+            }
         }
     }
     raw.to_string()
@@ -1401,6 +1411,52 @@ mod tests {
     #[test]
     fn test_extract_email_empty_string() {
         assert_eq!(extract_email_address(""), "");
+    }
+
+    #[test]
+    fn test_extract_email_gt_before_lt_in_quoted_display_name() {
+        // RFC 5322 quoted display name containing '>' before the '<addr>'.
+        // Previously panicked: `byte range starts at 25 but ends at 13`.
+        assert_eq!(
+            extract_email_address("\"SALE > 70%\" <deals@example.com>"),
+            "deals@example.com"
+        );
+    }
+
+    #[test]
+    fn test_extract_email_multiple_gt_in_display_name() {
+        // Multiple '>' characters before the address; the closing '>' must be
+        // the one after '<' (rfind, not find), or the address is wrong.
+        assert_eq!(
+            extract_email_address("\"Deals > 50% > 70% off\" <promo@shop.com>"),
+            "promo@shop.com"
+        );
+    }
+
+    #[test]
+    fn test_extract_email_close_before_open_no_other_close() {
+        // '>' occurs before '<' with no trailing '>': end <= start, so the
+        // ordering guard must fall back to the raw string rather than panic.
+        assert_eq!(
+            extract_email_address("\">bad\" <no-close@example.com"),
+            "\">bad\" <no-close@example.com"
+        );
+    }
+
+    #[test]
+    fn test_extract_email_unmatched_open_bracket() {
+        // '<' with no closing '>': fall back to the raw string rather than
+        // panicking.
+        assert_eq!(
+            extract_email_address("John Doe <john@example.com"),
+            "John Doe <john@example.com"
+        );
+    }
+
+    #[test]
+    fn test_extract_email_empty_angle_brackets() {
+        // `<>` pair with nothing inside: fall back to the raw string.
+        assert_eq!(extract_email_address("<>"), "<>");
     }
 
     #[test]
