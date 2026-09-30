@@ -4586,6 +4586,37 @@ async fn test_local_wire_prompt_prefix_stable_when_second_turn_is_rich_artifact(
     );
 }
 
+/// Installs a retained-byte V2 capacity contract directly on the shared
+/// capacity runtime, mirroring what `resolve_live_capacity` installs from a
+/// real Higgs `/v1/capacity` fetch. The higgs session id is only attached to
+/// the wire when a contract is present (`RetentionAttachment::Retained`, see
+/// `attach_retained_session_control` in budget.rs) — `WireRecordingProvider`
+/// has no `get_api_base()`, so discovery never runs and `ctx.capacity` stays
+/// empty unless a contract is installed up front. The limits below are
+/// generous enough that every test prompt fits under the seed target, so
+/// discovery mechanics stay out of the way of the rotation behavior under
+/// test.
+fn install_retained_contract(agent_loop: &AgentLoop, model: &str) {
+    let profile = serde_json::from_value(json!({
+        "schemaVersion": 2,
+        "contractRevision": "boot-1:1:sha256:abc",
+        "model": model,
+        "maxContextTokens": 65_536,
+        "maxOutputTokens": 4_096,
+        "retainedBudgetBytes": 4_294_967_296_u64,
+        "guaranteedFastPromptTokens": 60_000,
+        "softCompactionPromptTokens": 50_000,
+        "targetAfterCompactionTokens": 40_000,
+        "guaranteedSessions": 1
+    }))
+    .expect("valid v2 contract");
+    agent_loop
+        .shared
+        .core_handle
+        .capacity
+        .install_profile("http://127.0.0.1:9000", model, profile);
+}
+
 /// THE prompt-cache invariant: when a turn's prompt is not an append-only
 /// extension of the previous call (unsanctioned divergence), the request must
 /// ship under a FRESH higgs session id with the poisoned id queued for drop —
@@ -4603,6 +4634,7 @@ async fn test_diverged_prompt_ships_under_rotated_higgs_session() {
     ));
     let (agent_loop, _ws) = build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
     let session_key = format!("diverge-rotate-{}", uuid::Uuid::new_v4());
+    install_retained_contract(&agent_loop, "local-qwen-test");
 
     agent_loop
         .process_direct("first message", &session_key, "test", "offline")
@@ -4674,6 +4706,7 @@ async fn test_tool_block_change_rotates_higgs_session() {
     ));
     let (agent_loop, _ws) = build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
     let session_key = format!("tool-drift-{}", uuid::Uuid::new_v4());
+    install_retained_contract(&agent_loop, "local-qwen-test");
 
     agent_loop
         .process_direct("first message", &session_key, "test", "offline")
