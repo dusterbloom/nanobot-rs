@@ -1323,12 +1323,21 @@ fn retained_contract_action(
     }
 }
 
+/// `retained_exact` is the exact-prompt decision (`retained_contract_action`)
+/// gated to `Some` only for sessions with an installed retained-byte
+/// contract — for those sessions `conversation` is forced to `None` (see the
+/// `ctx.capacity.retained_contract()` guards above) so `exact` alone carries
+/// the real signal. An ordinary (unretained) session must keep triggering
+/// async compaction from `conversation` only, exactly as it did before the
+/// exact-prompt decision existed.
 fn should_schedule_async_compaction(
     conversation: CompactionAction,
-    exact: CompactionAction,
+    retained_exact: Option<CompactionAction>,
     has_pending: bool,
 ) -> bool {
-    !has_pending && (conversation == CompactionAction::Async || exact == CompactionAction::Async)
+    !has_pending
+        && (conversation == CompactionAction::Async
+            || retained_exact == Some(CompactionAction::Async))
 }
 
 fn compaction_budget_for_target(effective: &TokenBudget, target: Option<usize>) -> TokenBudget {
@@ -1374,13 +1383,32 @@ mod retained_contract_threshold_tests {
     fn retained_soft_wall_schedules_from_the_exact_prompt_decision() {
         assert!(should_schedule_async_compaction(
             CompactionAction::None,
-            CompactionAction::Async,
+            Some(CompactionAction::Async),
             false
         ));
         assert!(!should_schedule_async_compaction(
             CompactionAction::None,
-            CompactionAction::Async,
+            Some(CompactionAction::Async),
             true
+        ));
+    }
+
+    /// Break caught: an unretained session's exact-prompt decision must never
+    /// trigger async compaction on its own — only `conversation` does, exactly
+    /// as before the exact-prompt decision existed (02a92d5c regressed this by
+    /// ORing in `exact == Async` unconditionally). Callers signal "unretained"
+    /// with `None`, never by passing the computed `exact` action through.
+    #[test]
+    fn unretained_sessions_ignore_the_exact_prompt_decision() {
+        assert!(!should_schedule_async_compaction(
+            CompactionAction::None,
+            None,
+            false
+        ));
+        assert!(should_schedule_async_compaction(
+            CompactionAction::Async,
+            None,
+            false
         ));
     }
 
@@ -3088,7 +3116,7 @@ impl AgentLoopShared {
                 Some(started)
             } else if should_schedule_async_compaction(
                 conversation_action,
-                exact_action,
+                ctx.capacity.retained_contract().map(|_| exact_action),
                 has_pending,
             ) {
                 tracing::info!(
