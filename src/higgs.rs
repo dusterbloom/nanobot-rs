@@ -24,8 +24,9 @@ use std::path::{Path, PathBuf};
 ///
 /// Search order:
 /// 1. `HIGGS_BIN` env var (explicit override, e.g. for development builds)
-/// 2. `~/.cargo/bin/higgs` (cargo install location)
-/// 3. `higgs` on PATH (via `which`)
+/// 2. `higgs` on PATH (via `which`) — the same binary the user's shell runs.
+///    No hardcoded `~/.cargo/bin` probe: it is on PATH anyway, and probing it
+///    first silently shadowed a newer install earlier on PATH.
 pub(crate) fn find_binary() -> Option<PathBuf> {
     // 1. HIGGS_BIN env var (highest priority — dev builds and CI overrides)
     if let Ok(bin) = std::env::var("HIGGS_BIN") {
@@ -35,15 +36,7 @@ pub(crate) fn find_binary() -> Option<PathBuf> {
         }
     }
 
-    // 2. ~/.cargo/bin/higgs (most common for Rust tools installed via cargo install)
-    if let Some(home) = dirs::home_dir() {
-        let cargo_bin = home.join(".cargo/bin/higgs");
-        if cargo_bin.exists() {
-            return Some(cargo_bin);
-        }
-    }
-
-    // 3. Check PATH
+    // 2. Check PATH
     if let Ok(output) = std::process::Command::new("which").arg("higgs").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
