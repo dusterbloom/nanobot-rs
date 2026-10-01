@@ -447,12 +447,7 @@ pub(super) async fn execute_lcm_compaction(
         hydrated,
         "LCM hydrated exact durable source rows"
     );
-    // Stamp the session turn so the new summary node records its creation
-    // turn. auto_expand's fresh-summary cooldown uses this to prevent the
-    // just-compacted originals from being reinjected on the very next turn
-    // (live failure 2026-07-27 12:13:06).
     let mut mutation = LcmCompactionMutation::new(&mut engine);
-    mutation.engine_mut().set_current_turn(session_turn);
     if failure_mode == CompactionFailureMode::PreserveContext {
         mutation.engine_mut().request_async_compaction();
     }

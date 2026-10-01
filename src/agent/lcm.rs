@@ -254,15 +254,6 @@ pub struct SummaryNode {
     pub tokens: usize,
     /// Escalation level that produced this summary (1, 2, or 3).
     pub level: u8,
-    /// Session turn when this node was created, stamped by `LcmEngine` from
-    /// its `current_turn` counter. Used by `auto_expand`'s fresh-summary
-    /// cooldown to prevent the just-compacted detail from being reinjected
-    /// the very next turn (live failure 2026-07-27 12:13:06 saw +12463
-    /// tokens reinjected 24 seconds after compaction). Persisted with
-    /// `#[serde(default)]` so older SQLite rows restore as 0 — those are
-    /// treated as ancient history by the cooldown check.
-    #[serde(default)]
-    pub created_at_turn: u64,
 }
 
 /// Compress sorted message IDs into a compact range string: `5-8,12,14-20`.
@@ -385,21 +376,10 @@ impl SummaryDag {
             manifest,
             tokens,
             level,
-            created_at_turn: 0,
         });
         &self.nodes[self.nodes.len() - 1]
     }
 
-    /// Stamp the session turn when a node was created. Called by
-    /// `LcmEngine::compact` right after `create_node` so the cooldown check
-    /// in `auto_expand` can tell fresh nodes from established ones. Only
-    /// mutates the in-memory DAG; persistence stores the field via
-    /// `save_compaction_checkpoint`.
-    pub(crate) fn stamp_node_creation_turn(&mut self, node_id: usize, turn: u64) {
-        if let Some(node) = self.nodes.iter_mut().find(|n| n.id == node_id) {
-            node.created_at_turn = turn;
-        }
-    }
 
     /// Get a summary node by ID.
     pub fn get(&self, id: usize) -> Option<&SummaryNode> {
@@ -550,16 +530,13 @@ fn protect_tokens_for_budget(available_tokens: usize) -> usize {
     (available_tokens / 20).clamp(512, 2048)
 }
 
-/// A freshly created summary node is ineligible for `auto_expand` while its
-/// age in turns is `<=` this value. Age is `current_turn - created_at_turn`.
-/// Cooldown of 1 means a node created during turn N's compaction cannot be
-/// re-expanded until turn N+2 — the very next turn (N+1, age=1) is still
-/// blocked, which is the live failure window (session 20260727_094539_eeab48,
-/// 2026-07-27 12:12:42 compact → 12:13:06 +12463 token reinject).
-///
-/// Nodes with `created_at_turn == 0` (back-compat rows, or test scaffolding
-/// that never set the turn) are always eligible.
-const FRESH_SUMMARY_COOLDOWN_TURNS: u64 = 1;
+/// A summary is ineligible for `auto_expand` until more than this many user
+/// turns were stored after the newest message it covers: a fold made during
+/// turn N stays folded through turn N+1. Age is derived from the transcript
+/// (`LcmEngine::is_fresh_fold`), never from a caller-fed counter — the
+/// 2026-10-01 regression fed the session's message count, which advances
+/// several per tool round, so the fresh fold was "old" one tool call later.
+const FRESH_SUMMARY_COOLDOWN_TURNS: usize = 1;
 
 /// One relevant summary selected for lossless auto-expansion. Planning is
 /// intentionally inert: callers decide how to represent the candidate on the
@@ -590,10 +567,11 @@ pub struct LcmEngine {
     /// Summary node IDs already auto-expanded into the tail this session, so the
     /// per-turn auto_expand pass doesn't append the same detail repeatedly.
     auto_expanded: std::collections::HashSet<usize>,
-    /// Session turn counter, bumped by the caller at turn start via
-    /// `set_current_turn`. Stamped onto every freshly-created summary node
-    /// so `auto_expand` can apply `FRESH_SUMMARY_COOLDOWN_TURNS`.
-    current_turn: u64,
+    /// Newest stored message id when each summary was folded. Same unit as
+    /// `store`, so a fold's age (`user_turns_since`) cannot drift from a
+    /// separately-fed counter. Not persisted: a rebuild stamps every node
+    /// with the newest restored row, i.e. treats it as freshly folded.
+    fold_watermarks: std::collections::HashMap<usize, MessageId>,
     /// Entries at the head of `active` pinned verbatim by the first
     /// prefix-preserving cut. While history fits the live budget, compaction
     /// spans start after this byte-identical head. Capacity recovery may
@@ -622,24 +600,10 @@ impl LcmEngine {
             store: std::collections::BTreeMap::new(),
             async_compaction_pending: false,
             auto_expanded: std::collections::HashSet::new(),
-            current_turn: 0,
+            fold_watermarks: std::collections::HashMap::new(),
             pinned_prefix_entries: 0,
             pending_pinned_prefix: None,
         }
-    }
-
-    /// Record the session's current turn. Called by `agent_loop` at turn
-    /// start so subsequent `compact()` calls stamp the new node's
-    /// `created_at_turn`, and `auto_expand`'s cooldown check knows the
-    /// present turn. Tests that never call this default to 0, which
-    /// disables the cooldown (back-compat with summaries created without a
-    /// turn stamp).
-    pub fn set_current_turn(&mut self, turn: u64) {
-        self.current_turn = turn;
-    }
-
-    pub fn current_turn(&self) -> u64 {
-        self.current_turn
     }
 
     pub(crate) fn compaction_state(&self) -> LcmCompactionState {
@@ -1085,11 +1049,8 @@ impl LcmEngine {
         let summary_source_ids = node.source_ids.clone();
         let summary_text_clone = node.text.clone();
         let summary_manifest = node.manifest.clone();
-        // Stamp the creation turn so `auto_expand`'s cooldown can tell this
-        // fresh node apart from established summaries on the next turn.
-        self.dag
-            .stamp_node_creation_turn(node_id, self.current_turn);
-
+        let watermark = self.store.keys().next_back().copied().unwrap_or(0);
+        self.fold_watermarks.insert(node_id, watermark);
         // Build the summary message with lossless pointers (compact ranges).
         let summary_message = summary_wire_message(
             &summary_source_ids,
@@ -1459,6 +1420,25 @@ impl LcmEngine {
     /// Relevance uses semantic embeddings when available, else keyword overlap.
     ///
     /// Returns bounded candidates (empty if nothing is eligible).
+    /// Whether `node_id` was folded within the last
+    /// `FRESH_SUMMARY_COOLDOWN_TURNS` user turns. Every node made by
+    /// `compact` or a rebuild carries a watermark; a node without one was not
+    /// folded by this engine (test scaffolding) and is never fresh.
+    fn is_fresh_fold(&self, node_id: usize) -> bool {
+        let Some(&watermark) = self.fold_watermarks.get(&node_id) else {
+            return false;
+        };
+        let user_turns = self
+            .store
+            .range(watermark + 1..)
+            .filter(|(_, m)| {
+                m.get("role").and_then(Value::as_str) == Some("user")
+                    && m.get("_synthetic").is_none()
+            })
+            .count();
+        user_turns <= FRESH_SUMMARY_COOLDOWN_TURNS
+    }
+
     pub(crate) fn plan_auto_expansion(
         &self,
         budget: &TokenBudget,
@@ -1490,19 +1470,21 @@ impl LcmEngine {
         // the model is unavailable, in which case we fall back to keyword overlap.
         let user_embedding = crate::agent::embedder::embed_one(&user_text).ok();
 
-        // Budget: never let expansion push the *wire* past τ_hard. Because we
-        // APPEND originals (the summary stays in place, keeping the frozen prefix
-        // byte-stable and the prompt cache warm), the cost is the full expansion,
-        // not summary→original net. Counting the wire (not internal active) is
-        // what prevents the feedback loop where reinjection exceeds headroom
-        // because the engine's view misses the previously-appended wire tail.
+        // Budget: never let expansion push the *wire* past τ_soft — the level
+        // that schedules the next compaction. Up to τ_hard, an expansion could
+        // refill the window right back into a fold (expand→compact
+        // oscillation). Because we APPEND originals (the summary stays in
+        // place, keeping the frozen prefix byte-stable and the prompt cache
+        // warm), the cost is the full expansion, not summary→original net.
+        // Counting the wire (not internal active) keeps previously-appended
+        // tail in the bill.
         let available = budget.available_budget(tool_def_tokens);
-        let hard_limit = (available as f64 * self.config.tau_hard) as usize;
-        let mut headroom = hard_limit.saturating_sub(wire_tokens);
+        let soft_limit = (available as f64 * self.config.tau_soft) as usize;
+        let mut headroom = soft_limit.saturating_sub(wire_tokens);
         if headroom < 100 {
             debug!(
                 wire_tokens,
-                hard_limit, "LCM auto_expand: no wire headroom, skipping"
+                soft_limit, "LCM auto_expand: no wire headroom, skipping"
             );
             return Vec::new();
         }
@@ -1520,26 +1502,11 @@ impl LcmEngine {
                 _ => None,
             })
             .filter(|(node_id, _)| {
-                // Fresh-summary cooldown: a node created within the last
-                // FRESH_SUMMARY_COOLDOWN_TURNS turns is ineligible. Without
-                // this, auto_expand on turn N+1 reinjects the originals of
-                // a summary created on turn N — undoing the compaction
-                // (live 2026-07-27 12:13:06 saw +12463 tokens reinjected 24
-                // seconds after a successful 12463→1398 compaction).
-                //
-                // Nodes with `created_at_turn == 0` (back-compat rows from
-                // older persisted sessions, or test scaffolding that never
-                // set the turn) are always eligible — we have no creation
-                // signal for them, and treating them as ancient history
-                // preserves pre-cooldown behaviour.
-                let Some(node) = self.dag.get(*node_id) else {
-                    return true;
-                };
-                if node.created_at_turn == 0 {
-                    return true;
-                }
-                let age = self.current_turn.saturating_sub(node.created_at_turn);
-                age > FRESH_SUMMARY_COOLDOWN_TURNS
+                // Fresh-summary cooldown: without it, auto_expand on the
+                // turn after a compaction reinjects the originals it just
+                // folded, undoing it (2026-07-27: +12463 tokens 24 s after a
+                // 12463->1398 fold; 2026-10-01: +38K after a 41K->3K fold).
+                !self.is_fresh_fold(*node_id)
             })
             .collect();
 
@@ -1811,16 +1778,17 @@ impl LcmEngine {
                 manifest: manifest.clone(),
                 tokens: *tokens,
                 level: *level,
-                // Persisted rows restore with their original creation turn
-                // where available; older rows without the column deserialize
-                // as 0 and are treated as ancient history by the cooldown.
-                created_at_turn: 0,
             });
             for &sid in source_ids {
                 summarized_ids.insert(sid);
             }
         }
         engine.dag.nodes.sort_by_key(|node| node.id);
+        // Fold ages are not persisted; the safe restart default is "fresh".
+        let newest_row = engine.store.keys().next_back().copied().unwrap_or(0);
+        for node in &engine.dag.nodes {
+            engine.fold_watermarks.insert(node.id, newest_row);
+        }
 
         let unsummarized: Vec<(MessageId, Value)> = engine
             .store
@@ -2900,6 +2868,30 @@ mod tests {
             engine.ingest(json!({"role": "tool", "name": "exec", "tool_call_id": call_id, "content": content, "_db_id": base + 2})),
             Some(base + 2)
         );
+    }
+
+    /// Rebuild through the same path a process restart takes
+    /// (`prepare_context` → `rebuild_from_db_nodes`): raw rows + summary rows.
+    fn rebuild_like_restart(engine: &LcmEngine) -> LcmEngine {
+        let raws: Vec<Value> = engine.store.values().cloned().collect();
+        let nodes: Vec<_> = engine
+            .dag()
+            .nodes
+            .iter()
+            .map(|n| {
+                (
+                    n.id,
+                    n.source_ids.clone(),
+                    n.child_summaries.clone(),
+                    n.text.clone(),
+                    n.tokens,
+                    n.level,
+                    n.manifest.clone(),
+                    "db_id".to_string(),
+                )
+            })
+            .collect();
+        LcmEngine::rebuild_from_db_nodes(&raws, &nodes, engine.config.clone())
     }
 
     fn plan_and_commit_auto_expansion(
@@ -6327,8 +6319,6 @@ mod tests {
             );
         }
 
-        // Turn 5: compact — new node stamps created_at_turn=5.
-        engine.set_current_turn(5);
         let compacted = engine
             .compact(
                 Some(&compactor),
@@ -6338,33 +6328,32 @@ mod tests {
             )
             .await;
         assert!(compacted.is_some(), "compaction must succeed first");
-        let node_id = engine.dag().newest().unwrap().id;
-        assert_eq!(
-            engine.dag().get(node_id).unwrap().created_at_turn,
-            5,
-            "compact must stamp the new node's creation turn"
-        );
 
-        // Turn 6 (age=1): ingest a highly-relevant user message and give
-        // auto_expand huge wire headroom so ONLY the cooldown can block it.
-        engine.set_current_turn(6);
+        // Turn N+1: a highly-relevant user message, then a tool round (the
+        // 2026-10-01 shape: several new rows, one user turn). Huge wire
+        // headroom, so ONLY the cooldown can block expansion.
         ingest(&mut engine, 100, "user", topic);
-        let appended = plan_and_commit_auto_expansion(&mut engine, &budget, 0, 0);
+        ingest_tool_pair(&mut engine, 100, "call_1", "ls output".to_string());
         assert!(
-            appended.is_empty(),
-            "freshly-created summary (age=1, cooldown=1) must NOT be \
-             auto-expanded; this is the exact live failure pattern that \
-             undid the 12463→1398 compaction 24 seconds later"
+            plan_and_commit_auto_expansion(&mut engine, &budget, 0, 0).is_empty(),
+            "a fold is still fresh one user turn later, however many tool \
+             rows that turn added; expanding it undoes the compaction"
+        );
+        // Age is derived from the transcript, so a restart cannot reset it.
+        let mut rebuilt = rebuild_like_restart(&engine);
+        assert!(
+            plan_and_commit_auto_expansion(&mut rebuilt, &budget, 0, 0).is_empty(),
+            "a rebuilt engine must see the same fresh fold"
         );
 
-        // Sanity: at turn 8 (age=3, past cooldown), the same user message
-        // CAN trigger expansion — the cooldown is not a permanent block.
-        engine.set_current_turn(8);
+        // Two user turns later the cooldown has passed: not a permanent block.
+        ingest(&mut engine, 110, "user", "unrelated");
+        ingest(&mut engine, 111, "user", topic);
         let appended_later = plan_and_commit_auto_expansion(&mut engine, &budget, 0, 0);
         assert!(
             !appended_later.is_empty(),
-            "at age=3 (past FRESH_SUMMARY_COOLDOWN_TURNS=1) the summary must \
-             be eligible again; cooldown must not be permanent"
+            "past FRESH_SUMMARY_COOLDOWN_TURNS the summary must be eligible \
+             again; the cooldown must not be permanent"
         );
     }
 
@@ -6373,6 +6362,55 @@ mod tests {
     /// the wire (not `self.active`). Counting the wire is what prevents
     /// auto_expand from pushing the prompt past τ_hard and blowing the Higgs
     /// retained-session cap.
+    /// An expansion may never push the wire past τ_soft: that is the level
+    /// that schedules the next compaction, so crossing it means
+    /// expand→compact oscillation (2026-10-01: a 38K reinjection right after
+    /// a 41K→3K fold). Property over wire levels on both sides of the fit.
+    #[tokio::test]
+    async fn auto_expand_never_plans_past_the_soft_threshold() {
+        let mut engine = LcmEngine::new(LcmConfig {
+            tau_soft: 0.3,
+            tau_hard: 0.6,
+            deterministic_target: 64,
+            keep_prefix_fraction: 0.35,
+            checkpoint: CheckpointWriter::Model,
+        });
+        let budget = TokenBudget::new(100_000, 1_024);
+        let compactor = ContextCompactor::new(
+            Arc::new(EchoSummarizerMock) as Arc<dyn LLMProvider>,
+            "mock".to_string(),
+            100_000,
+        );
+        let body = "serramanna weather forecast desert bakery recipes ".repeat(20);
+        ingest(&mut engine, 1, "system", "System");
+        for i in 0..12 {
+            ingest(&mut engine, 2 + 2 * i, "user", &format!("{i}: {body}"));
+            ingest(&mut engine, 3 + 2 * i, "assistant", &format!("reply {i}: {body}"));
+        }
+        assert!(engine
+            .compact(Some(&compactor), &budget, 0, CompactionFailureMode::PreserveContext)
+            .await
+            .is_some());
+        ingest(&mut engine, 199, "user", "unrelated");
+        ingest(&mut engine, 200, "user", &body);
+
+        let soft_limit = (budget.available_budget(0) as f64 * engine.tau_soft()) as usize;
+        let mut planned_somewhere = false;
+        for wire in (0..=soft_limit).step_by(soft_limit / 40) {
+            let planned: usize = engine
+                .plan_auto_expansion(&budget, 0, wire)
+                .iter()
+                .map(|c| c.estimated_tokens)
+                .sum();
+            planned_somewhere |= planned > 0;
+            assert!(
+                wire + planned <= soft_limit,
+                "wire {wire} + expansion {planned} crosses τ_soft {soft_limit}"
+            );
+        }
+        assert!(planned_somewhere, "property must not hold vacuously");
+    }
+
     #[tokio::test]
     async fn auto_expand_budget_uses_wire_tokens_not_active() {
         let mut engine = LcmEngine::new(LcmConfig {
@@ -6400,8 +6438,6 @@ mod tests {
             );
         }
 
-        // Turn 1: compact — node stamps created_at_turn=1.
-        engine.set_current_turn(1);
         engine
             .compact(
                 Some(&compactor),
@@ -6411,8 +6447,8 @@ mod tests {
             )
             .await;
 
-        // Turn 100: way past the cooldown, so wire_tokens is the only barrier.
-        engine.set_current_turn(100);
+        // Past the cooldown, so wire_tokens is the only barrier.
+        ingest(&mut engine, 199, "user", "unrelated");
         ingest(&mut engine, 200, "user", &body); // highly relevant
         let available = budget.available_budget(0);
         let hard_limit = (available as f64 * engine.tau_hard()) as usize;
@@ -6466,7 +6502,6 @@ mod tests {
         }
 
         let pre_compact_tokens = engine.active_tokens();
-        engine.set_current_turn(1);
         let compacted = engine
             .compact(
                 Some(&compactor),
@@ -6484,9 +6519,8 @@ mod tests {
             post_compact_tokens
         );
 
-        // Turn 2 (age=1): same-topic user msg, wire at post-compact active
-        // size. This is the 12:13:06 pattern. Reinjection must be blocked.
-        engine.set_current_turn(2);
+        // Next turn: same-topic user msg, wire at post-compact active size.
+        // This is the 12:13:06 pattern. Reinjection must be blocked.
         ingest(&mut engine, 200, "user", topic);
         let appended = plan_and_commit_auto_expansion(&mut engine, &budget, 0, post_compact_tokens);
         assert!(

@@ -3037,7 +3037,7 @@ async fn cancelling_hard_compaction_restores_engine_without_publishing_checkpoin
     assert!(!compaction.has_job().await);
     assert!(!compaction.has_pending().await);
 
-    let engine = await_compaction_sync("restored LCM engine lock", engine.lock()).await;
+    let mut engine = await_compaction_sync("restored LCM engine lock", engine.lock()).await;
     assert_eq!(serde_json::to_value(engine.dag()).unwrap(), dag_before);
     let active_after = engine.active_context();
     assert!(
@@ -3050,15 +3050,11 @@ async fn cancelling_hard_compaction_restores_engine_without_publishing_checkpoin
         "only the eagerly persisted current user turn may extend active context"
     );
     assert_eq!(engine.store_len(), store_before + 1);
-    let expanded = engine.plan_auto_expansion(&core.token_budget, 0, 0);
+    // Eligibility is the node not being consumed; probe it directly, since
+    // planning also applies the post-rebuild fresh-fold cooldown.
+    let prior_node = engine.dag().newest().expect("prior summary").id;
     assert!(
-        expanded.iter().any(|message| {
-            message
-                .flattened_fallback
-                .get("content")
-                .and_then(Value::as_str)
-                .is_some_and(|content| content.contains("persistent project detail"))
-        }),
+        engine.commit_auto_expansion(prior_node),
         "hard cancellation consumed prior-summary auto-expand eligibility"
     );
     drop(engine);

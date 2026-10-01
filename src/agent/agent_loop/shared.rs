@@ -3180,23 +3180,18 @@ impl AgentLoopShared {
         let Some(lcm_engine) = self.lcm_engines.lock().await.get(&ctx.session_id).cloned() else {
             return;
         };
-        let current_turn = ctx
-            .core
-            .sessions
-            .get_session(&ctx.session_id)
-            .await
-            .map_or(0, |session| session.message_count as u64);
         let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs);
         let wire_tokens = TokenBudget::estimate_tokens(&ctx.rendered_messages);
         let expand_t0 = std::time::Instant::now();
         let (candidates, prompt_token_limit, summary_count) = {
-            let mut engine = lcm_engine.lock().await;
+            let engine = lcm_engine.lock().await;
             if engine.dag().is_empty() {
                 return;
             }
-            engine.set_current_turn(current_turn);
             let available = ctx.effective_budget.available_budget(tool_def_tokens);
-            let hard_message_limit = (available as f64 * engine.tau_hard()) as usize;
+            // Same τ_soft ceiling the planner uses: an expansion may never
+            // schedule the next compaction.
+            let soft_message_limit = (available as f64 * engine.tau_soft()) as usize;
             let provider_prompt_limit = ctx
                 .core
                 .token_budget
@@ -3204,7 +3199,7 @@ impl AgentLoopShared {
                 .saturating_sub(max_tokens as usize);
             (
                 engine.plan_auto_expansion(&ctx.effective_budget, tool_def_tokens, wire_tokens),
-                hard_message_limit
+                soft_message_limit
                     .saturating_add(tool_def_tokens)
                     .min(provider_prompt_limit),
                 engine.dag().len(),
