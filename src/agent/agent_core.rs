@@ -580,6 +580,12 @@ impl RuntimeCounters {
         state.active_id = Some(session_id);
     }
 
+    /// Drop in-process Higgs route state, as a nanobot restart does.
+    #[cfg(test)]
+    pub fn forget_higgs_session(&self, session_key: &str) {
+        self.higgs_sessions.lock().remove(session_key);
+    }
+
     fn activate_higgs_session_state(
         state: &mut HiggsSessionState,
         durable_session_id: &str,

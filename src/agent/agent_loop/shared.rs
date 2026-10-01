@@ -2258,6 +2258,26 @@ impl AgentLoopShared {
         effective_max_tokens: u32,
         tool_def_tokens: usize,
     ) -> bool {
+        // A staged auto-expansion is the optional part of the failed prompt:
+        // shed it before anything else and retire its nodes, so neither the
+        // retry nor any later turn re-plans the same rejected expansion
+        // (2026-10-01: a 38K reinjection re-planned on every turn after higgs
+        // rejected it, wedging the session).
+        if let Some(staged) = ctx.staged_auto_expansion.take() {
+            let node_ids = staged.node_ids.clone();
+            let retired =
+                commit_staged_auto_expansion(staged, &self.lcm_engines, &ctx.session_id)
+                    .await
+                    .is_some();
+            warn!(
+                session = %ctx.session_key,
+                ?node_ids,
+                retired,
+                error = %error,
+                "LCM auto-expand: provider rejected the expanded prompt; retrying without it"
+            );
+            return retired;
+        }
         if matches!(
             error.downcast_ref::<crate::errors::ProviderError>(),
             Some(crate::errors::ProviderError::HiggsRetentionCompactionRequired { .. })
@@ -2310,7 +2330,12 @@ impl AgentLoopShared {
                 }
                 after = rendered_prompt_tokens(ctx, tool_def_tokens);
             }
-            if after > target || after >= before {
+            // Rotate and seed whenever the prompt fits the seed target — also
+            // when compaction had nothing to shrink: a session the server
+            // simply lacks (Higgs restarted, evicted it, or a resumed process
+            // claimed a stale epoch) needs a seed, not a smaller prompt.
+            // `overflow_trim_recoveries` bounds this to one attempt.
+            if after > target {
                 return false;
             }
             ctx.counters.invalidate_prompt_cache(&ctx.session_key, true);

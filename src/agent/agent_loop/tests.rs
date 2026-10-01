@@ -3065,6 +3065,258 @@ async fn cancelling_hard_compaction_restores_engine_without_publishing_checkpoin
     );
 }
 
+/// Rejects any request whose prompt carries an LCM auto-expansion (the
+/// synthetic `[Auto-expanded originals ...]` user message), answering every
+/// other request normally. Records every request's messages.
+struct AutoExpansionRejectingProvider {
+    calls: std::sync::Mutex<Vec<Vec<Value>>>,
+    rejections: std::sync::atomic::AtomicUsize,
+}
+
+impl AutoExpansionRejectingProvider {
+    fn new() -> Self {
+        Self {
+            calls: std::sync::Mutex::new(Vec::new()),
+            rejections: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn calls(&self) -> Vec<Vec<Value>> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn rejections(&self) -> usize {
+        self.rejections.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+fn carries_auto_expansion(messages: &[Value]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains("[Auto-expanded originals"))
+    })
+}
+
+#[async_trait]
+impl LLMProvider for AutoExpansionRejectingProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        self.calls.lock().unwrap().push(messages.to_vec());
+        if carries_auto_expansion(messages) {
+            self.rejections
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(crate::errors::ProviderError::HiggsRetainedSessionUnavailable {
+                session_id: 1,
+                epoch: 0,
+            }
+            .into());
+        }
+        Ok(WireRecordingProvider::text_response("ok"))
+    }
+
+    fn get_default_model(&self) -> &str {
+        "auto-expand-retire-test"
+    }
+}
+
+/// A provider rejection of a prompt carrying a staged LCM auto-expansion must
+/// retire the expanded node instead of re-planning the same rejected
+/// expansion on retry and on every later turn (2026-10-01: a 38K reinjection
+/// re-planned on every turn after Higgs rejected it, wedging the session).
+#[tokio::test]
+async fn rejected_auto_expansion_is_retired_not_replanned() {
+    const RELEVANT_PROMPT_1: &str = "What were the persistent project detail decisions constraints?";
+    const RELEVANT_PROMPT_2: &str =
+        "Remind me again about the persistent project detail decisions constraints";
+
+    let provider = Arc::new(AutoExpansionRejectingProvider::new());
+    let (agent_loop, _workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "auto-expand-retire-test",
+        32_768,
+        LcmSchemaConfig::default(),
+    );
+    let session_key = format!("auto-expand-retire-{}", uuid::Uuid::new_v4());
+    let core = agent_loop.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+
+    // Seed a block of source messages and persist a summary checkpoint
+    // covering them — reuses the same fixture as the hard-compaction-
+    // cancellation test above, whose summary text ("persistent project
+    // detail...decisions...constraints...acknowledged...retained") is
+    // keyword-relevant to the prompts below.
+    seed_compaction_history(&core, &session.id, 2, 4).await;
+    persist_prior_summary(&core, &session.id).await;
+
+    // A dry-run `prepare_context` call creates the session's LCM engine and
+    // rebuilds its DAG from the persisted checkpoint, without persisting this
+    // probe's own content (prepare_context alone never writes to the DB).
+    let mut probe = InboundMessage::new("test", "user", "offline", "setup probe");
+    probe
+        .metadata
+        .insert("session_key".to_string(), json!(session_key.clone()));
+    agent_loop
+        .shared
+        .prepare_context(&probe, None, None, None, None)
+        .await;
+
+    // A rebuilt summary node is marked fresh (cooldown = 1 user turn) so a
+    // session restart cannot immediately re-expand it. One unrelated warm-up
+    // turn ages it past the cooldown before the two instrumented turns below.
+    agent_loop
+        .process_direct("hello", &session_key, "test", "offline")
+        .await;
+
+    // Turn 1: a relevant message stages the auto-expansion; the provider
+    // rejects the prompt that carries it, and the turn must still complete.
+    let reply = agent_loop
+        .process_direct(RELEVANT_PROMPT_1, &session_key, "test", "offline")
+        .await;
+    assert!(
+        reply.contains("ok") && !reply.contains("I encountered an error"),
+        "a rejected auto-expansion must not fail the turn: {reply:?}"
+    );
+    assert!(
+        provider.rejections() >= 1,
+        "turn 1 must have staged and sent the auto-expansion at least once"
+    );
+
+    let calls_after_turn1 = provider.calls();
+    assert!(
+        !carries_auto_expansion(calls_after_turn1.last().unwrap()),
+        "the final successful request of turn 1 must not carry the rejected expansion"
+    );
+
+    // Turn 2: another relevant message must not re-stage the retired node.
+    let reply2 = agent_loop
+        .process_direct(RELEVANT_PROMPT_2, &session_key, "test", "offline")
+        .await;
+    assert!(
+        reply2.contains("ok") && !reply2.contains("I encountered an error"),
+        "turn 2 must also complete normally: {reply2:?}"
+    );
+
+    let calls_after_turn2 = provider.calls();
+    let turn2_calls = &calls_after_turn2[calls_after_turn1.len()..];
+    assert!(
+        !turn2_calls.is_empty(),
+        "turn 2 must have made at least one provider request"
+    );
+    assert!(
+        turn2_calls
+            .iter()
+            .all(|messages| !carries_auto_expansion(messages)),
+        "a retired auto-expansion must not be re-planned on a later turn: {turn2_calls:?}"
+    );
+    assert_eq!(
+        provider.rejections(),
+        1,
+        "only turn 1's single staged attempt should ever be rejected"
+    );
+}
+
+/// Serves seeds; rejects every `require_continuation` request with
+/// `HiggsRetainedSessionUnavailable`, as a restarted Higgs does for a session
+/// it no longer holds. Records `(policy, session_id)` per request.
+struct ForgetfulHiggsProvider {
+    requests: std::sync::Mutex<Vec<(String, u64)>>,
+}
+
+#[async_trait]
+impl LLMProvider for ForgetfulHiggsProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        use crate::providers::openai_compat::{
+            NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD, NANOBOT_HIGGS_SESSION_ID_FIELD,
+        };
+        let first = &messages[0];
+        let policy = first[NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD]
+            .as_str()
+            .unwrap_or("none")
+            .to_string();
+        let session_id = first[NANOBOT_HIGGS_SESSION_ID_FIELD].as_u64().unwrap_or(0);
+        self.requests.lock().unwrap().push((policy.clone(), session_id));
+        if policy == "require_continuation" {
+            return Err(crate::errors::ProviderError::HiggsRetainedSessionUnavailable {
+                session_id,
+                epoch: 0,
+            }
+            .into());
+        }
+        Ok(WireRecordingProvider::text_response("ok"))
+    }
+
+    fn get_default_model(&self) -> &str {
+        "local-qwen-test"
+    }
+
+    fn supports_higgs_session_cache(&self) -> bool {
+        true
+    }
+}
+
+/// A resumed process claims its old retained session (epoch 0). When Higgs
+/// no longer holds it — restarted, evicted, or rotated to a later epoch —
+/// the turn must rotate and seed once, not fail (2026-10-01: every request
+/// after a nanobot+Higgs restart failed "retained session … epoch 0 is
+/// unavailable", because recovery only rotated after compaction shrank the
+/// prompt).
+#[tokio::test]
+async fn resumed_claim_on_forgetful_higgs_rotates_and_seeds() {
+    let provider = Arc::new(ForgetfulHiggsProvider {
+        requests: std::sync::Mutex::new(Vec::new()),
+    });
+    let (agent_loop, _ws) = build_local_inline_harness(provider.clone() as Arc<dyn LLMProvider>);
+    install_retained_contract(&agent_loop, "local-qwen-test");
+    let session_key = format!("forgetful-higgs-{}", uuid::Uuid::new_v4());
+
+    agent_loop
+        .process_direct("first message", &session_key, "test", "offline")
+        .await;
+    agent_loop
+        .shared
+        .core_handle
+        .counters
+        .forget_higgs_session(&session_key);
+
+    let reply = agent_loop
+        .process_direct("second message", &session_key, "test", "offline")
+        .await;
+
+    let requests = provider.requests.lock().unwrap().clone();
+    let resumed = &requests[1..];
+    assert_eq!(
+        resumed.first().map(|(policy, _)| policy.as_str()),
+        Some("require_continuation"),
+        "the resumed process must first claim its old session: {requests:?}"
+    );
+    assert!(
+        reply.contains("ok") && !reply.contains("I encountered an error"),
+        "an unavailable resumed session must rotate and seed: {reply:?} {requests:?}"
+    );
+    let (policy, seeded_id) = resumed.last().unwrap();
+    assert_eq!(policy, "seed", "{requests:?}");
+    assert_ne!(*seeded_id, resumed[0].1, "the seed must use a rotated session id");
+}
+
 const COMPACTION_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const COMPACTION_BLOCKED_OBSERVATION: std::time::Duration = std::time::Duration::from_millis(250);
 
