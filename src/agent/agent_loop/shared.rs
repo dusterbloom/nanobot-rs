@@ -1305,8 +1305,37 @@ pub(crate) async fn resolve_live_capacity(
 }
 
 fn rendered_prompt_tokens(ctx: &TurnContext, tool_def_tokens: usize) -> usize {
-    TokenBudget::estimate_tokens(&render_via_protocol(&*ctx.protocol, &ctx.messages))
-        .saturating_add(tool_def_tokens)
+    anchored_prompt_tokens_for(
+        ctx,
+        &render_via_protocol(&*ctx.protocol, &ctx.messages),
+        tool_def_tokens,
+    )
+}
+
+/// The one prompt-size number every admission decision reads (retained
+/// walls, exact thresholds, preflight gate, recovery): the server's own count
+/// for the shipped prefix plus the scaled new suffix, or the full client
+/// estimate when no measured prefix matches. The client estimate alone ran
+/// 13% under the server on 2026-10-02 and let a 45,301-token prompt reach a
+/// 45,056 wall while every threshold still read ~39k.
+fn anchored_prompt_tokens_for(
+    ctx: &TurnContext,
+    rendered: &[Value],
+    tool_def_tokens: usize,
+) -> usize {
+    // Clone out of the lock: the estimate below runs the BPE over the suffix
+    // (or the whole prompt on fallback) and must not hold cache state.
+    let shipped = ctx
+        .counters
+        .prompt_fingerprints
+        .lock()
+        .get(&ctx.session_key)
+        .cloned();
+    crate::agent::prompt_fingerprint::anchored_prompt_tokens(
+        shipped.as_ref(),
+        rendered,
+        tool_def_tokens,
+    )
 }
 
 fn retained_contract_action(
@@ -2527,7 +2556,7 @@ impl AgentLoopShared {
         let trim_threshold = overflow_trim_threshold(prompt_cap);
         let gate_tool_def_tokens = TokenBudget::estimate_tool_def_tokens(&tool_defs);
         let mut estimated =
-            TokenBudget::estimate_tokens(&ctx.rendered_messages) + gate_tool_def_tokens;
+            anchored_prompt_tokens_for(ctx, &ctx.rendered_messages, gate_tool_def_tokens);
         if trim_threshold > 0 && estimated > trim_threshold {
             warn!(
                 estimated_tokens = estimated,
@@ -2539,8 +2568,8 @@ impl AgentLoopShared {
             let installed = self.install_pending_compaction(ctx, true).await;
             if installed {
                 ctx.rendered_messages = render_via_protocol(&*ctx.protocol, &ctx.messages);
-                estimated = TokenBudget::estimate_tokens(&ctx.rendered_messages)
-                    .saturating_add(gate_tool_def_tokens);
+                estimated =
+                    anchored_prompt_tokens_for(ctx, &ctx.rendered_messages, gate_tool_def_tokens);
             }
             // Immutable-prefix check: system + tool definitions alone against
             // the exact prompt cap.
@@ -3071,9 +3100,21 @@ impl AgentLoopShared {
             }
 
             let has_pending = ctx.compaction.has_pending().await;
+            // Under a retained contract the soft wall is an absolute server
+            // token count, and the contract's reading of it is "fold before
+            // the next request": one tool loop crossed it and then overran the
+            // hard wall inside a single user turn (36.8k -> 44.9k over nine
+            // rounds on 2026-10-02) while the post-turn soft spawn was never
+            // reached. Fold the live snapshot now, between tool rounds — on
+            // local runtimes the checkpoint is mechanical, so this costs
+            // milliseconds, not a model call. Unretained sessions keep the
+            // post-turn async spawn (ed6513d).
+            let retained_soft_wall = ctx.capacity.retained_contract().is_some()
+                && exact_action == CompactionAction::Async;
             let must_block = raw_hard
                 || conversation_action == CompactionAction::Blocking
                 || exact_action == CompactionAction::Blocking
+                || retained_soft_wall
                 || window_near
                 || (force && !checkpoint_installed);
             if must_block {
@@ -4495,6 +4536,19 @@ impl AgentLoopShared {
             {
                 reservation.publish_exact();
             }
+            // The bytes just shipped now have a server-side size. Carry it on
+            // the fingerprint so the next request's admission decisions start
+            // from the server's count instead of the client's estimate
+            // (`anchored_prompt_tokens_for`).
+            let shipped_fp = prompt_fp.with_server_measurement(
+                response
+                    .usage
+                    .get("prompt_tokens")
+                    .copied()
+                    .and_then(|tokens| usize::try_from(tokens).ok())
+                    .unwrap_or(0),
+                prompt_total_estimate,
+            );
             if let Some(staged) = ctx.staged_auto_expansion.take() {
                 if let Some(committed) =
                     commit_staged_auto_expansion(staged, &self.lcm_engines, &ctx.session_id).await
@@ -4504,7 +4558,7 @@ impl AgentLoopShared {
                         &mut ctx.rendered_messages,
                         counters,
                         &ctx.session_key,
-                        prompt_fp,
+                        shipped_fp,
                     );
                 }
             } else {
@@ -4512,7 +4566,7 @@ impl AgentLoopShared {
                 counters
                     .prompt_fingerprints
                     .lock()
-                    .insert(ctx.session_key.clone(), prompt_fp);
+                    .insert(ctx.session_key.clone(), shipped_fp);
                 counters
                     .prompt_cache_watermark
                     .lock()
