@@ -632,10 +632,6 @@ fn make_agent_configured(
         health_check_timeout_secs: 2,
         adaptive_tokens,
         sessions_db_path: Some(dir.join("sessions.db")),
-        code_execution: CodeExecutionConfig {
-            enabled: false,
-            ..Default::default()
-        },
         python_kernel: PythonKernelConfig::default(),
         cua: CuaToolConfig::default(),
     });

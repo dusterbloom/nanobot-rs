@@ -130,7 +130,7 @@ impl CuaTool {
 
     /// Run `cua-driver call`, racing the timeout against cooperative
     /// cancellation. `kill_on_drop` aborts the child on the timeout/cancel
-    /// path (same pattern as `code_execution.rs`). `None` means cancelled.
+    /// path. `None` means cancelled.
     async fn run_call(&self, args: &[&str], ctx: &ToolContext) -> Option<(String, String, bool)> {
         let child = match Command::new(&self.binary)
             .args(args)

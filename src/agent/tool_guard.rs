@@ -6,16 +6,8 @@ use serde_json::Value;
 
 /// Read-only tools that benefit from higher repeat limits.
 const READ_TOOL_LIMIT: u32 = 2;
-const READ_TOOLS: &[&str] = &[
-    "read_file",
-    "list_dir",
-    "find_files",
-    "search_files",
-    "recall",
-    "get_skills",
-];
-const READ_CACHE_INVALIDATORS: &[&str] =
-    &["exec", "write_file", "edit_file", "apply_patch", "remember"];
+const READ_TOOLS: &[&str] = &["read_file", "list_dir", "search_files", "recall", "get_skills"];
+const READ_CACHE_INVALIDATORS: &[&str] = &["exec", "write_file", "edit_file", "remember"];
 
 /// Web tools need even higher limits — agents frequently search/fetch many
 /// different URLs or refine queries within one turn.
@@ -505,21 +497,21 @@ mod tests {
     #[test]
     fn test_tool_guard_write_invalidates_cached_file_searches() {
         let mut g = ToolGuard::new(1);
-        let find_args = args(&[("path", "/tmp"), ("pattern", "*.rs")]);
+        let list_args = args(&[("path", "/tmp")]);
         let search_args = args(&[("path", "/tmp"), ("query", "needle")]);
-        g.record_result("find_files", &find_args, "old names".to_string());
+        g.record_result("list_dir", &list_args, "old names".to_string());
         g.record_result("search_files", &search_args, "old matches".to_string());
 
         let write_args = args(&[("path", "/tmp/a.rs"), ("content", "needle")]);
         g.record_result("write_file", &write_args, "written".to_string());
 
-        let find_key = ToolGuard::key("find_files", &find_args);
+        let list_key = ToolGuard::key("list_dir", &list_args);
         let search_key = ToolGuard::key("search_files", &search_args);
-        assert_eq!(g.get_cached_result(&find_key), None);
+        assert_eq!(g.get_cached_result(&list_key), None);
         assert_eq!(g.get_cached_result(&search_key), None);
         assert!(
-            g.allow("find_files", &find_args).is_ok(),
-            "find_files after a write should execute fresh"
+            g.allow("list_dir", &list_args).is_ok(),
+            "list_dir after a write should execute fresh"
         );
         assert!(
             g.allow("search_files", &search_args).is_ok(),

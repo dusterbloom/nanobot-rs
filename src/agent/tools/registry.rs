@@ -16,12 +16,9 @@ use tracing::warn;
 use super::base::{PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolExecutionResult};
 use super::filesystem::MAX_WRITE_FILE_PIECE_CHARS;
 use super::{
-    ApplyPatchTool, BrowserTool, CodeExecutionTool, CreateSkillTool, CuaTool, EditFileTool,
-    ExecTool, FileInfoTool, FilePreviewTool, FindFilesTool, ListDirTool, ReadFileTool,
-    ReadSkillTool, RecallTool, RememberTool, SearchFilesTool, SystemInfoTool, ToolStatusTool,
-    WebFetchTool, WebSearchTool, WorkspaceDiffTool, WriteFileTool,
+    BrowserTool, CuaTool, EditFileTool, ExecTool, ListDirTool, ReadFileTool, ReadSkillTool,
+    RecallTool, RememberTool, SearchFilesTool, WebFetchTool, WebSearchTool, WriteFileTool,
 };
-use crate::config::schema::CodeExecutionConfig;
 #[cfg(feature = "python-kernel")]
 use crate::config::schema::PythonKernelConfig;
 
@@ -52,8 +49,6 @@ pub struct ToolConfig {
     /// Path to the SQLite sessions database for session_search tool.
     /// When `None`, the session_search tool is not registered.
     pub db_path: Option<PathBuf>,
-    /// Code execution tool config. Disabled by default.
-    pub code_execution: CodeExecutionConfig,
     /// Stateful Python kernel tool config. Feature: `python-kernel`.
     #[cfg(feature = "python-kernel")]
     pub python_kernel: PythonKernelConfig,
@@ -64,9 +59,9 @@ pub struct ToolConfig {
     /// "degraded, restart the container" message instead of silent zero results.
     pub health_registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
     /// Idle-turn write allowlist. `Some(..)` only on self-directed idle
-    /// turns: write_file / edit_file / apply_patch deny any path outside
-    /// these entries (workspace-relative "skills/**" subtree, exact file,
-    /// or absolute path). `None` on normal turns — a human is watching.
+    /// turns: write_file / edit_file deny any path outside these entries
+    /// (workspace-relative "skills/**" subtree, exact file, or absolute
+    /// path). `None` on normal turns — a human is watching.
     pub idle_write_paths: Option<Vec<String>>,
 }
 
@@ -87,7 +82,6 @@ impl ToolConfig {
             crw_url: String::new(),
             search_max_results: 5,
             db_path: None,
-            code_execution: CodeExecutionConfig::default(),
             #[cfg(feature = "python-kernel")]
             python_kernel: PythonKernelConfig::default(),
             cua: crate::config::schema::CuaToolConfig::default(),
@@ -229,13 +223,11 @@ impl ToolRegistry {
         let dir_aliases: &[&str] = &["dir_path", "directory", "dir"];
 
         match canonical_name {
-            "read_file" | "write_file" | "edit_file" | "file_info" | "workspace_diff" => {
+            "read_file" | "write_file" | "edit_file" => {
                 Self::normalize_param_aliases(&mut params, "path", file_aliases);
-                if canonical_name != "workspace_diff" {
-                    Self::require_non_empty_string(&params, "path", canonical_name)?;
-                }
+                Self::require_non_empty_string(&params, "path", canonical_name)?;
             }
-            "list_dir" | "find_files" | "search_files" => {
+            "list_dir" | "search_files" => {
                 Self::normalize_param_aliases(&mut params, "path", dir_aliases);
             }
             _ => {}
@@ -313,7 +305,7 @@ impl ToolRegistry {
     /// after this.
     pub fn register_standard_tools(&mut self, config: &ToolConfig) {
         let should_include = |name: &str| -> bool {
-            if config.read_only && matches!(name, "write_file" | "edit_file" | "apply_patch") {
+            if config.read_only && matches!(name, "write_file" | "edit_file") {
                 return false;
             }
             if let Some(ref filter) = config.tools_filter {
@@ -325,9 +317,6 @@ impl ToolRegistry {
         if should_include("read_file") {
             self.register(Box::new(ReadFileTool::new(config.max_tool_result_chars)));
         }
-        if should_include("file_preview") {
-            self.register(Box::new(FilePreviewTool));
-        }
         if should_include("write_file") {
             self.register(Box::new(WriteFileTool::new(
                 config.idle_write_paths.clone(),
@@ -336,31 +325,11 @@ impl ToolRegistry {
         if should_include("edit_file") {
             self.register(Box::new(EditFileTool::new(config.idle_write_paths.clone())));
         }
-        if should_include("apply_patch") {
-            self.register(Box::new(ApplyPatchTool::new(
-                config.idle_write_paths.clone(),
-            )));
-        }
         if should_include("list_dir") {
             self.register(Box::new(ListDirTool));
         }
-        if should_include("find_files") {
-            self.register(Box::new(FindFilesTool));
-        }
         if should_include("search_files") {
             self.register(Box::new(SearchFilesTool));
-        }
-        if should_include("file_info") {
-            self.register(Box::new(FileInfoTool));
-        }
-        if should_include("workspace_diff") {
-            self.register(Box::new(WorkspaceDiffTool));
-        }
-        if should_include("system_info") {
-            self.register(Box::new(SystemInfoTool));
-        }
-        if should_include("tool_status") {
-            self.register(Box::new(ToolStatusTool::new(config.workspace.clone())));
         }
         if should_include("exec") {
             let exec_cwd = config.exec_working_dir.clone().unwrap_or_else(|| {
@@ -417,25 +386,6 @@ impl ToolRegistry {
         }
         if should_include("get_skills") {
             self.register(Box::new(ReadSkillTool::new(&config.workspace)));
-        }
-        if should_include("create_skill") {
-            self.register(Box::new(CreateSkillTool::new(&config.workspace)));
-        }
-        if config.code_execution.enabled && should_include("execute_code") {
-            // Collect tool names for the Python stub (excluding execute_code itself).
-            let available_tools: Vec<String> = self
-                .tools
-                .keys()
-                .filter(|n| n.as_str() != "execute_code")
-                .cloned()
-                .collect();
-            self.register(Box::new(CodeExecutionTool::new(
-                true,
-                config.code_execution.timeout,
-                config.code_execution.max_tool_calls,
-                available_tools,
-                None, // No nested tool_config — scripts get a stub-only registry.
-            )));
         }
         #[cfg(feature = "python-kernel")]
         if config.python_kernel.enabled && should_include("python") {
@@ -813,14 +763,7 @@ impl ToolRegistry {
     /// Result inspection is native because `TOOL_RESULT_HANDLE v1` receipts
     /// point directly at it; a local model should never need a proxy round-trip
     /// to recover a narrow slice of prior evidence.
-    const RARELY_ADVERTISED_TOOLS: &'static [&'static str] = &[
-        "file_preview",
-        "file_info",
-        "workspace_diff",
-        "system_info",
-        "tool_status",
-        "browser",
-    ];
+    const RARELY_ADVERTISED_TOOLS: &'static [&'static str] = &["browser"];
 
     /// Lean production surface: a SINGLE meta-tool (`tool`) advertised at turn 1.
     ///
@@ -962,10 +905,10 @@ impl ToolRegistry {
         }
 
         match tool_name {
-            "read_file" | "write_file" | "edit_file" | "file_info" | "workspace_diff" => {
+            "read_file" | "write_file" | "edit_file" => {
                 matches!(key, "file_path" | "filepath" | "file")
             }
-            "list_dir" | "find_files" | "search_files" => {
+            "list_dir" | "search_files" => {
                 matches!(key, "dir_path" | "directory" | "dir")
             }
             "web_search" => matches!(key, "q" | "search_query"),
@@ -1268,6 +1211,9 @@ impl ToolRegistry {
                         )
                     }
                     _ => {
+                        if let Some(skill) = self.skill_name_fallback(&tool_name, ctx).await {
+                            return skill;
+                        }
                         let names = self.available_tool_names();
                         ToolExecutionResult::failure(format!(
                             "Tool '{}' not found. Available: {}",
@@ -1283,6 +1229,11 @@ impl ToolRegistry {
             } => {
                 // Dispatch mode: extract args and call the real tool.
                 // Call execute_inner directly to avoid recursion through execute().
+                if !self.tools.contains_key(&tool_name) {
+                    if let Some(skill) = self.skill_name_fallback(&tool_name, ctx).await {
+                        return skill;
+                    }
+                }
                 if tool_name == "write_file"
                     && inner_params
                         .get("state")
@@ -1301,6 +1252,28 @@ impl ToolRegistry {
                 self.execute_inner(&tool_name, inner_params, ctx).await
             }
         }
+    }
+
+    /// When the model calls the `tool` proxy with a name that isn't a
+    /// registered tool, check whether it's actually an installed skill
+    /// (observed misuse: `newsreader`, `weather`, `webradio` called as tools
+    /// instead of loaded via `get_skills`). Reuses `get_skills`'s own execute
+    /// path — no duplicated skill-loading logic — so the returned content is
+    /// byte-identical to `get_skills(name)`. Returns `None` when `get_skills`
+    /// isn't registered or the name doesn't match a skill either, leaving the
+    /// caller's existing "tool not found" error unchanged.
+    async fn skill_name_fallback(
+        &self,
+        tool_name: &str,
+        ctx: Option<&ToolContext>,
+    ) -> Option<ToolExecutionResult> {
+        if !self.tools.contains_key("get_skills") {
+            return None;
+        }
+        let mut params = HashMap::new();
+        params.insert("name".to_string(), Value::String(tool_name.to_string()));
+        let result = self.execute_inner("get_skills", params, ctx).await;
+        result.ok().then_some(result)
     }
 
     /// Get list of registered tool names.
@@ -2346,55 +2319,6 @@ mod tests {
         assert!(!allowed_tools.contains(&"spawn".to_string()));
     }
 
-    /// Test 5: CodeExecutionTool availability gating via is_available().
-    ///
-    /// Verifies that the Tool::is_available() contract works for CodeExecutionTool:
-    /// disabled -> excluded from definitions, enabled -> included in definitions.
-    #[test]
-    fn test_integration_code_execution_availability() {
-        use crate::agent::tools::CodeExecutionTool;
-
-        // Disabled tool should not be available.
-        let disabled = CodeExecutionTool::new(false, 30, 20, vec![], None);
-        assert!(!disabled.is_available());
-
-        // Enabled tool should be available.
-        let enabled = CodeExecutionTool::new(true, 30, 20, vec![], None);
-        assert!(enabled.is_available());
-
-        // Registry gating: disabled execute_code must not appear in definitions.
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(MockTool::new("read_file")));
-        registry.register(Box::new(CodeExecutionTool::new(
-            false,
-            30,
-            20,
-            vec![],
-            None,
-        )));
-
-        let defs = registry.get_definitions();
-        let def_names: Vec<String> = defs
-            .iter()
-            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
-            .collect();
-
-        assert!(def_names.contains(&"read_file".to_string()));
-        assert!(!def_names.contains(&"execute_code".to_string()));
-
-        // Registry gating: enabled execute_code must appear in definitions.
-        let mut registry2 = ToolRegistry::new();
-        registry2.register(Box::new(CodeExecutionTool::new(true, 30, 20, vec![], None)));
-
-        let defs2 = registry2.get_definitions();
-        let def_names2: Vec<String> = defs2
-            .iter()
-            .filter_map(|d| d["function"]["name"].as_str().map(String::from))
-            .collect();
-
-        assert!(def_names2.contains(&"execute_code".to_string()));
-    }
-
     #[test]
     fn test_definitions_for_filters_by_name() {
         let mut registry = ToolRegistry::new();
@@ -2616,14 +2540,14 @@ mod tests {
     fn proxy_exclusion_matches_exact_tool_name() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(MockTool::new("exec")));
-        registry.register(Box::new(MockTool::new("execute_code")));
+        registry.register(Box::new(MockTool::new("exec_helper")));
 
         let defs = registry.get_proxy_definition_excluding(&["exec"]);
         let desc = defs[0]["function"]["description"].as_str().unwrap();
 
         assert!(!desc.contains("exec("), "exact exclusion leaked: {desc}");
         assert!(
-            desc.contains("execute_code("),
+            desc.contains("exec_helper("),
             "prefix-sharing tool must remain advertised: {desc}"
         );
     }
@@ -2663,6 +2587,54 @@ mod tests {
         assert!(
             result.data().contains("read_file"),
             "Error should list available tools: {}",
+            result.data()
+        );
+    }
+
+    /// Observed misuse: models call an installed skill's name as if it were
+    /// a tool (`newsreader`, `weather`, `webradio`...) instead of loading it
+    /// via `get_skills`. The proxy now falls back to `get_skills(name)` for
+    /// any `tool_name` that isn't a registered tool, returning the skill body
+    /// unchanged. A name that is neither a tool nor a skill still errors.
+    #[tokio::test]
+    async fn test_proxy_unknown_name_falls_back_to_skill_body() {
+        let ws = tempfile::tempdir().unwrap();
+        let skill_dir = ws.path().join("skills").join("newsreader");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "# Newsreader\nFetch and summarize RSS feeds.",
+        )
+        .unwrap();
+
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(ReadSkillTool::new(ws.path())));
+        registry.register(Box::new(MockTool::new("read_file")));
+
+        // Inspect-style call (no tool_args): tool_name alone names the skill.
+        let mut params = HashMap::new();
+        params.insert("tool_name".to_string(), serde_json::json!("newsreader"));
+        let result = registry.execute("get_tools", params).await;
+        assert!(
+            result.ok(),
+            "skill-name fallback should succeed: {:?}",
+            result.error()
+        );
+        assert!(
+            result.data().contains("Fetch and summarize RSS feeds."),
+            "expected the skill body, got: {}",
+            result.data()
+        );
+
+        // A name that is neither a registered tool nor an installed skill
+        // keeps the existing "not found" error.
+        let mut params = HashMap::new();
+        params.insert("tool_name".to_string(), serde_json::json!("nonexistent"));
+        let result = registry.execute("get_tools", params).await;
+        assert!(!result.ok(), "unknown name must still error");
+        assert!(
+            result.data().contains("not found"),
+            "expected a not-found error, got: {}",
             result.data()
         );
     }
@@ -3134,7 +3106,7 @@ mod tests {
         // Genuinely no-arg tool → None (no augmentation possible).
         let no_args = serde_json::json!({"type": "object", "properties": {}});
         assert_eq!(
-            ToolRegistry::worked_example_call("system_info", &no_args),
+            ToolRegistry::worked_example_call("recall", &no_args),
             None
         );
     }

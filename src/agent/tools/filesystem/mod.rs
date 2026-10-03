@@ -23,13 +23,10 @@ pub(crate) use write::MAX_WRITE_FILE_PIECE_CHARS;
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use regex::RegexBuilder;
 use sha2::{Digest, Sha256};
-use tokio::process::Command;
 
 use super::base::{PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolResult};
 use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
@@ -365,7 +362,7 @@ impl Tool for EditFileTool {
     }
 
     fn description(&self) -> &str {
-        "Edit a file by replacing old_text with new_text, or apply a unified diff in patch. Use patch for multi-line edits when exact old_text matching would be brittle. Optional expected_sha256 prevents overwriting a file that changed since file_info/read_file."
+        "Edit a file by replacing old_text with new_text, or apply a unified diff in patch. Use patch for multi-line edits when exact old_text matching would be brittle. Optional expected_sha256 prevents overwriting a file that changed since it was last read."
     }
 
     fn permission(&self) -> PermissionLevel {
@@ -434,7 +431,7 @@ impl Tool for EditFileTool {
             if !is_sha256_hex(expected) {
                 return Err(ToolError::InvalidArgs {
                     message: format!(
-                        "invalid expected_sha256 '{}'. Omit expected_sha256 unless you copied the 64-character sha256 value from read_file or file_info.",
+                        "invalid expected_sha256 '{}'. Omit expected_sha256 unless you copied the 64-character sha256 value from read_file.",
                         expected.trim()
                     ),
                 });
@@ -443,7 +440,7 @@ impl Tool for EditFileTool {
             if !expected.trim().eq_ignore_ascii_case(&actual) {
                 return Err(ToolError::InvalidArgs {
                     message: format!(
-                        "File changed before edit. expected_sha256={}, actual_sha256={}. Re-read the file or inspect workspace_diff before retrying; omit expected_sha256 if you did not copy it from read_file or file_info.",
+                        "File changed before edit. expected_sha256={}, actual_sha256={}. Re-read the file before retrying; omit expected_sha256 if you did not copy it from read_file.",
                         expected.trim(),
                         actual
                     ),
@@ -683,204 +680,6 @@ impl Tool for ListDirTool {
             }
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// FindFilesTool
-// ---------------------------------------------------------------------------
-
-/// Tool to recursively find files/directories without requiring shell `find`.
-pub struct FindFilesTool;
-
-#[async_trait]
-impl Tool for FindFilesTool {
-    fn name(&self) -> &str {
-        "find_files"
-    }
-
-    fn description(&self) -> &str {
-        "Recursively find files or directories under a path. Supports simple glob patterns with * and ?, depth/limit bounds, and an optional tree view."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Directory to search. Defaults to the current working directory."
-                },
-                "pattern": {
-                    "type": "string",
-                    "description": "File name or relative-path pattern. Supports * and ?. Plain text matches as a case-insensitive substring. Default: *"
-                },
-                "kind": {
-                    "type": "string",
-                    "enum": ["file", "dir", "all"],
-                    "description": "Return files, directories, or both. Default: file"
-                },
-                "max_depth": {
-                    "type": "integer",
-                    "description": "Maximum recursive depth below path. Direct children are depth 1. Default: 5, max: 20"
-                },
-                "limit": {
-                    "type": "integer",
-                    "description": "Maximum matches to return. Default: 200, max: 1000"
-                },
-                "include_hidden": {
-                    "type": "boolean",
-                    "description": "Include dotfiles and hidden directories. Default: false"
-                },
-                "tree": {
-                    "type": "boolean",
-                    "description": "Render matches as an indented tree. Default: false"
-                }
-            }
-        })
-    }
-
-    async fn execute(
-        &self,
-        params: HashMap<String, serde_json::Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
-        let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let pattern = params
-            .get("pattern")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or("*");
-        let kind = params
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("file");
-        if !matches!(kind, "file" | "dir" | "all") {
-            return Err(ToolError::InvalidArgs {
-                message: "'kind' must be one of: file, dir, all".to_string(),
-            });
-        }
-
-        let max_depth = bounded_usize_param(&params, "max_depth", 5, 20);
-        let limit = bounded_usize_param(&params, "limit", 200, 1000);
-        let include_hidden = bool_param(&params, "include_hidden", false);
-        let tree = bool_param(&params, "tree", false);
-
-        let root = expand_path(path);
-        if !root.exists() {
-            return Err(ToolError::NotFound(format!(
-                "Directory not found: {}. Hint: verify the path or use list_dir on its parent.",
-                path
-            )));
-        }
-        if !root.is_dir() {
-            return Err(ToolError::InvalidArgs {
-                message: format!(
-                    "Not a directory: {}. Hint: use file_info or read_file for file paths.",
-                    path
-                ),
-            });
-        }
-
-        let root_canon = root.canonicalize().unwrap_or(root.clone());
-        let mut stack = vec![(root.clone(), 0usize)];
-        let mut matches = Vec::new();
-
-        while let Some((dir, depth)) = stack.pop() {
-            if depth >= max_depth {
-                continue;
-            }
-
-            let mut children = match std::fs::read_dir(&dir) {
-                Ok(rd) => rd
-                    .filter_map(Result::ok)
-                    .collect::<Vec<std::fs::DirEntry>>(),
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => continue,
-                // Legacy quirk preserved: no "Error:" prefix → success channel.
-                Err(e) => {
-                    return Ok(format!("Error reading directory {}: {}", dir.display(), e).into())
-                }
-            };
-            children.sort_by_key(|e| e.file_name());
-
-            for entry in children {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if !include_hidden && name.starts_with('.') {
-                    continue;
-                }
-                let entry_path = entry.path();
-                let file_type = match entry.file_type() {
-                    Ok(ft) => ft,
-                    Err(_) => continue,
-                };
-                let is_dir = file_type.is_dir();
-                let child_depth = depth + 1;
-
-                let rel = entry_path
-                    .strip_prefix(&root_canon)
-                    .or_else(|_| entry_path.strip_prefix(&root))
-                    .unwrap_or(&entry_path)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-
-                let kind_matches = match kind {
-                    "file" => file_type.is_file(),
-                    "dir" => is_dir,
-                    "all" => true,
-                    _ => false,
-                };
-                if kind_matches && pattern_matches(pattern, &name, &rel) {
-                    let size = entry.metadata().ok().map(|m| m.len()).unwrap_or(0);
-                    matches.push(FindMatch {
-                        rel,
-                        depth: child_depth,
-                        is_dir,
-                        size,
-                    });
-                }
-
-                if is_dir && child_depth < max_depth {
-                    stack.push((entry_path, child_depth));
-                }
-            }
-        }
-
-        matches.sort_by(|a, b| a.rel.cmp(&b.rel));
-        let total = matches.len();
-        let shown = total.min(limit);
-        if total == 0 {
-            return Ok(format!("No matches under {} for pattern=\"{}\".", path, pattern).into());
-        }
-        let mut out = format!("{} matches (showing {}):", total, shown);
-        for item in matches.iter().take(limit) {
-            out.push('\n');
-            if tree {
-                let indent = "  ".repeat(item.depth.saturating_sub(1));
-                out.push_str(&format!(
-                    "{}{}{}",
-                    indent,
-                    item.rel,
-                    if item.is_dir { "/" } else { "" }
-                ));
-            } else if item.is_dir {
-                out.push_str(&format!("[dir]  {}", item.rel));
-            } else {
-                out.push_str(&format!("[file] {} ({} bytes)", item.rel, item.size));
-            }
-        }
-        if shown < total {
-            out.push_str(&format!("\n[{} more matches not shown]", total - shown));
-        }
-        Ok(out.into())
-    }
-}
-
-#[derive(Debug)]
-struct FindMatch {
-    rel: String,
-    depth: usize,
-    is_dir: bool,
-    size: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1216,278 +1015,6 @@ fn append_search_hit(out: &mut Vec<String>, rel: &str, lines: &[&str], idx: usiz
 }
 
 // ---------------------------------------------------------------------------
-// FileInfoTool
-// ---------------------------------------------------------------------------
-
-/// Tool to inspect file metadata and optional content hash.
-pub struct FileInfoTool;
-
-#[async_trait]
-impl Tool for FileInfoTool {
-    fn name(&self) -> &str {
-        "file_info"
-    }
-
-    fn description(&self) -> &str {
-        "Return metadata for a file or directory: type, size, permissions, timestamps, and SHA-256 for files. Use expected_sha256 with edit_file to catch concurrent edits."
-    }
-
-    fn concurrency(&self) -> ToolConcurrency {
-        ToolConcurrency::ParallelSafe
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "File or directory path to inspect"
-                },
-                "hash": {
-                    "type": "boolean",
-                    "description": "Compute SHA-256 for regular files. Default: true"
-                }
-            },
-            "required": ["path"]
-        })
-    }
-
-    async fn execute(
-        &self,
-        params: HashMap<String, serde_json::Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
-        let path = require_param(&params, "path")?;
-        let include_hash = bool_param(&params, "hash", true);
-        let file_path = expand_path(path);
-
-        let metadata = match tokio::fs::symlink_metadata(&file_path).await {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(ToolError::NotFound(format!(
-                    "Path not found: {}. Hint: use find_files to locate it.",
-                    path
-                )))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                return Err(ToolError::PermissionDenied(format!(
-                    "Permission denied: {}. Hint: check file permissions.",
-                    path
-                )))
-            }
-            // Legacy quirk preserved: no "Error:" prefix → success channel.
-            Err(e) => return Ok(format!("Error reading metadata: {}", e).into()),
-        };
-
-        let kind = if metadata.file_type().is_symlink() {
-            "symlink"
-        } else if metadata.is_file() {
-            "file"
-        } else if metadata.is_dir() {
-            "directory"
-        } else {
-            "other"
-        };
-
-        let mut out = format!(
-            "Path: {}\nResolved: {}\nType: {}\nSize: {} bytes\nReadonly: {}",
-            path,
-            file_path.display(),
-            kind,
-            metadata.len(),
-            metadata.permissions().readonly()
-        );
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            out.push_str(&format!(
-                "\nMode: {:o}",
-                metadata.permissions().mode() & 0o7777
-            ));
-        }
-
-        if let Ok(modified) = metadata.modified() {
-            out.push_str(&format!("\nModified: {}", format_system_time(modified)));
-            out.push_str(&format!(
-                "\nModified_unix: {}",
-                unix_timestamp_secs(modified).unwrap_or(0)
-            ));
-        }
-        if let Ok(created) = metadata.created() {
-            out.push_str(&format!("\nCreated: {}", format_system_time(created)));
-        }
-        if let Ok(accessed) = metadata.accessed() {
-            out.push_str(&format!("\nAccessed: {}", format_system_time(accessed)));
-        }
-
-        if include_hash && metadata.is_file() {
-            match tokio::fs::read(&file_path).await {
-                Ok(bytes) => out.push_str(&format!("\nSHA-256: {}", sha256_hex(&bytes))),
-                Err(e) => out.push_str(&format!("\nSHA-256: Error reading file: {}", e)),
-            }
-        }
-
-        Ok(out.into())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WorkspaceDiffTool
-// ---------------------------------------------------------------------------
-
-/// Tool to summarize git status/diff without making the model parse shell output.
-pub struct WorkspaceDiffTool;
-
-#[async_trait]
-impl Tool for WorkspaceDiffTool {
-    fn name(&self) -> &str {
-        "workspace_diff"
-    }
-
-    fn description(&self) -> &str {
-        "Show what changed in the current git workspace: status, staged/unstaged diff stats, and optionally the patch. Use after edits or before reporting completion."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Git repo, subdirectory, or file to inspect. Defaults to current directory."
-                },
-                "include_diff": {
-                    "type": "boolean",
-                    "description": "Include full staged and unstaged patches, truncated by max_chars. Default: false"
-                },
-                "max_chars": {
-                    "type": "integer",
-                    "description": "Maximum characters when include_diff=true. Default: 12000, max: 50000"
-                }
-            }
-        })
-    }
-
-    async fn execute(
-        &self,
-        params: HashMap<String, serde_json::Value>,
-        _ctx: &ToolContext,
-    ) -> ToolResult {
-        let path = params.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-        let include_diff = bool_param(&params, "include_diff", false);
-        let max_chars = bounded_usize_param(&params, "max_chars", 12_000, 50_000);
-
-        let requested = expand_path(path);
-        let probe = if requested.is_file() {
-            requested
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(|| PathBuf::from("."))
-        } else {
-            requested.clone()
-        };
-        if !probe.exists() {
-            return Err(ToolError::NotFound(format!(
-                "Path not found: {}. Hint: use find_files or list_dir first.",
-                path
-            )));
-        }
-
-        let root_text =
-            match run_git_command(&probe, vec!["rev-parse".into(), "--show-toplevel".into()]).await
-            {
-                Ok(out) => out.trim().to_string(),
-                Err(e) => {
-                    return Err(ToolError::Execution {
-                        message: format!("Not a git workspace or git unavailable: {}", e),
-                    })
-                }
-            };
-        let root = PathBuf::from(root_text);
-        let pathspec = git_pathspec(&root, &requested);
-
-        let mut out = format!("Git root: {}", root.display());
-        if let Some(ref spec) = pathspec {
-            out.push_str(&format!("\nPath filter: {}", spec));
-        }
-
-        let status = run_git_with_optional_pathspec(
-            &root,
-            vec!["status".into(), "--short".into()],
-            pathspec.as_deref(),
-        )
-        .await
-        .unwrap_or_else(|e| format!("Error: {}", e));
-        out.push_str("\n\n## Status\n");
-        out.push_str(if status.trim().is_empty() {
-            "clean"
-        } else {
-            status.trim_end()
-        });
-
-        let unstaged_stat = run_git_with_optional_pathspec(
-            &root,
-            vec!["diff".into(), "--stat".into()],
-            pathspec.as_deref(),
-        )
-        .await
-        .unwrap_or_else(|e| format!("Error: {}", e));
-        out.push_str("\n\n## Unstaged Diff Stat\n");
-        out.push_str(if unstaged_stat.trim().is_empty() {
-            "none"
-        } else {
-            unstaged_stat.trim_end()
-        });
-
-        let staged_stat = run_git_with_optional_pathspec(
-            &root,
-            vec!["diff".into(), "--cached".into(), "--stat".into()],
-            pathspec.as_deref(),
-        )
-        .await
-        .unwrap_or_else(|e| format!("Error: {}", e));
-        out.push_str("\n\n## Staged Diff Stat\n");
-        out.push_str(if staged_stat.trim().is_empty() {
-            "none"
-        } else {
-            staged_stat.trim_end()
-        });
-
-        if include_diff {
-            let unstaged =
-                run_git_with_optional_pathspec(&root, vec!["diff".into()], pathspec.as_deref())
-                    .await
-                    .unwrap_or_else(|e| format!("Error: {}", e));
-            let staged = run_git_with_optional_pathspec(
-                &root,
-                vec!["diff".into(), "--cached".into()],
-                pathspec.as_deref(),
-            )
-            .await
-            .unwrap_or_else(|e| format!("Error: {}", e));
-            let patches = format!(
-                "\n\n## Unstaged Diff\n{}\n\n## Staged Diff\n{}",
-                if unstaged.trim().is_empty() {
-                    "none"
-                } else {
-                    unstaged.trim_end()
-                },
-                if staged.trim().is_empty() {
-                    "none"
-                } else {
-                    staged.trim_end()
-                }
-            );
-            out.push_str(&truncate_chars_with_notice(&patches, max_chars));
-        }
-
-        Ok(out.into())
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -1525,15 +1052,6 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
-}
-
-fn unix_timestamp_secs(time: SystemTime) -> Option<u64> {
-    time.duration_since(UNIX_EPOCH).ok().map(|d| d.as_secs())
-}
-
-fn format_system_time(time: SystemTime) -> String {
-    let datetime: chrono::DateTime<chrono::Utc> = time.into();
-    datetime.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 fn pattern_matches(pattern: &str, name: &str, rel: &str) -> bool {
@@ -1596,75 +1114,6 @@ fn glob_match(pattern: &str, text: &str) -> bool {
         }
     }
     inner(pattern.as_bytes(), text.as_bytes())
-}
-
-fn git_pathspec(root: &Path, requested: &Path) -> Option<String> {
-    let absolute = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(requested))
-            .unwrap_or_else(|_| requested.to_path_buf())
-    };
-    let absolute = absolute.canonicalize().unwrap_or(absolute);
-    if absolute == root {
-        return None;
-    }
-    absolute
-        .strip_prefix(root)
-        .ok()
-        .map(|p| p.to_string_lossy().replace('\\', "/"))
-        .filter(|s| !s.is_empty())
-}
-
-async fn run_git_with_optional_pathspec(
-    cwd: &Path,
-    mut args: Vec<String>,
-    pathspec: Option<&str>,
-) -> Result<String, String> {
-    if let Some(spec) = pathspec {
-        args.push("--".to_string());
-        args.push(spec.to_string());
-    }
-    run_git_command(cwd, args).await
-}
-
-async fn run_git_command(cwd: &Path, args: Vec<String>) -> Result<String, String> {
-    let output = tokio::time::timeout(
-        Duration::from_secs(10),
-        Command::new("git")
-            .args(&args)
-            .current_dir(cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| "git command timed out".to_string())?
-    .map_err(|e| e.to_string())?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if output.status.success() {
-        Ok(stdout)
-    } else {
-        Err(if stderr.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            stderr.trim().to_string()
-        })
-    }
-}
-
-fn truncate_chars_with_notice(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(max_chars).collect();
-    out.push_str("\n...[truncated]");
-    out
 }
 
 /// Extract a line range from content.
@@ -2857,52 +2306,6 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FindFilesTool tests
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_find_files_recursive_pattern() {
-        let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join("src").join("nested")).unwrap();
-        std::fs::write(dir.path().join("src").join("main.rs"), "fn main() {}").unwrap();
-        std::fs::write(dir.path().join("src").join("nested").join("lib.rs"), "").unwrap();
-        std::fs::write(dir.path().join("README.md"), "").unwrap();
-
-        let tool = FindFilesTool;
-        let mut params =
-            make_params(&[("path", dir.path().to_str().unwrap()), ("pattern", "*.rs")]);
-        params.insert("max_depth".to_string(), serde_json::json!(3));
-        let result = crate::agent::tools::base::render_result(
-            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
-                .await,
-        );
-
-        assert!(result.contains("src/main.rs"), "{result}");
-        assert!(result.contains("src/nested/lib.rs"), "{result}");
-        assert!(!result.contains("README.md"), "{result}");
-    }
-
-    #[tokio::test]
-    async fn test_find_files_skips_hidden_by_default() {
-        let dir = TempDir::new().unwrap();
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
-        std::fs::write(dir.path().join(".git").join("config"), "").unwrap();
-
-        let tool = FindFilesTool;
-        let result = crate::agent::tools::base::render_result(
-            tool.execute(
-                make_params(&[
-                    ("path", dir.path().to_str().unwrap()),
-                    ("pattern", "config"),
-                ]),
-                &crate::agent::tools::base::ToolContext::sandbox(),
-            )
-            .await,
-        );
-        assert!(result.starts_with("No matches"), "{result}");
-    }
-
-    // -----------------------------------------------------------------------
     // SearchFilesTool tests
     // -----------------------------------------------------------------------
 
@@ -2957,33 +2360,6 @@ mod tests {
         assert!(result.contains("a.txt:2: item 2"), "{result}");
         assert!(!result.contains("a.txt:3: item 3"), "{result}");
         assert!(result.contains("limit reached"), "{result}");
-    }
-
-    // -----------------------------------------------------------------------
-    // FileInfoTool tests
-    // -----------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn test_file_info_includes_sha256() {
-        let dir = TempDir::new().unwrap();
-        let file_path = dir.path().join("hash.txt");
-        std::fs::write(&file_path, "hash me").unwrap();
-
-        let tool = FileInfoTool;
-        let result = crate::agent::tools::base::render_result(
-            tool.execute(
-                make_params(&[("path", file_path.to_str().unwrap())]),
-                &crate::agent::tools::base::ToolContext::sandbox(),
-            )
-            .await,
-        );
-
-        assert!(result.contains("Type: file"), "{result}");
-        assert!(result.contains("Size: 7 bytes"), "{result}");
-        assert!(
-            result.contains(&format!("SHA-256: {}", sha256_hex(b"hash me"))),
-            "{result}"
-        );
     }
 
     #[test]

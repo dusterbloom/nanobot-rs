@@ -14,7 +14,6 @@ pub enum Capability {
     Skills,
     Cron,
     Message,
-    Code,
 }
 
 impl Capability {
@@ -33,7 +32,6 @@ impl Capability {
             Capability::Skills => &["get_skills"],
             Capability::Cron => &["cron_schedule"],
             Capability::Message => &["message"],
-            Capability::Code => &["execute_code"],
         }
     }
 }
@@ -98,11 +96,10 @@ mod tests {
             Capability::Skills,
             Capability::Cron,
             Capability::Message,
-            Capability::Code,
         ];
         let tools = resolve_capabilities(&all);
         // Should have all unique tool names
-        assert!(tools.len() >= 10); // at least 10 unique tools
+        assert!(tools.len() >= 9); // at least 9 unique tools
     }
 
     #[test]

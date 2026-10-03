@@ -798,39 +798,6 @@ impl Default for CuaToolConfig {
     }
 }
 
-/// Code execution tool configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CodeExecutionConfig {
-    /// When false (default), the execute_code tool is not registered.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Timeout in seconds for each script execution (default: 30).
-    #[serde(default = "default_code_timeout")]
-    pub timeout: u64,
-    /// Maximum number of tool RPC calls a single script may make (default: 20).
-    #[serde(default = "default_max_tool_calls")]
-    pub max_tool_calls: usize,
-}
-
-fn default_code_timeout() -> u64 {
-    30
-}
-
-fn default_max_tool_calls() -> usize {
-    20
-}
-
-impl Default for CodeExecutionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            timeout: default_code_timeout(),
-            max_tool_calls: default_max_tool_calls(),
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Python kernel config
 // ---------------------------------------------------------------------------
@@ -875,9 +842,6 @@ pub struct ToolsConfig {
     pub web: WebToolsConfig,
     #[serde(default, rename = "exec")]
     pub exec_: ExecToolConfig,
-    /// Code execution (Python RPC) tool settings.
-    #[serde(default)]
-    pub code_execution: CodeExecutionConfig,
     /// Cua driver (local desktop computer-use) tool settings.
     #[serde(default)]
     pub cua: CuaToolConfig,

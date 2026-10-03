@@ -1699,7 +1699,6 @@ mod tests {
                 health_check_timeout_secs: 2,
                 adaptive_tokens: crate::config::schema::AdaptiveTokenConfig::default(),
                 sessions_db_path: Some(workspace.join("sessions.sqlite")),
-                code_execution: crate::config::schema::CodeExecutionConfig::default(),
                 python_kernel: crate::config::schema::PythonKernelConfig::default(),
                 cua: crate::config::schema::CuaToolConfig::default(),
             },

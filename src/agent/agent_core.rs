@@ -98,8 +98,6 @@ pub struct SwappableCore {
     /// `hygiene_keep_last_messages` fields.
     pub retention: crate::agent::retention::RetentionPolicy,
     pub reasoning_config: crate::config::schema::ReasoningConfig,
-    /// Code execution tool config.
-    pub code_execution: crate::config::schema::CodeExecutionConfig,
     /// Python kernel tool config (feature: python-kernel).
     pub python_kernel: crate::config::schema::PythonKernelConfig,
     /// Cua driver (local desktop computer-use) tool settings.
@@ -1001,8 +999,6 @@ pub struct SwappableCoreConfig {
     /// `Some(workspace.join("sessions.db"))` so parallel tests don't contend
     /// on the user's real session DB.
     pub sessions_db_path: Option<PathBuf>,
-    /// Code execution (Python RPC) tool settings.
-    pub code_execution: crate::config::schema::CodeExecutionConfig,
     /// Python kernel tool (PyO3, feature: python-kernel).
     pub python_kernel: crate::config::schema::PythonKernelConfig,
     /// Cua driver (local desktop computer-use) tool settings.
@@ -1044,7 +1040,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         health_check_timeout_secs,
         adaptive_tokens,
         sessions_db_path,
-        code_execution,
         python_kernel,
         cua,
     } = cfg;
@@ -1145,7 +1140,6 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         search_max_results,
         exec_timeout,
         restrict_to_workspace,
-        code_execution,
         python_kernel,
         cua,
         memory_enabled: memory_config.enabled,

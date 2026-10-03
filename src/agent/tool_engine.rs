@@ -50,9 +50,9 @@ const TOOL_RESULT_INSPECTION_MAX_CHARS: usize = 8_192;
 #[cfg(test)]
 fn summary_threshold_tokens(tool_name: &str) -> usize {
     match tool_name {
-        "exec" | "list_dir" | "find_files" | "search_files" | "search_context" | "file_info"
-        | "file_preview" | "workspace_diff" | "system_info" | "tool_status" | "web_search"
-        | "read_file" => 4000,
+        "exec" | "list_dir" | "search_files" | "search_context" | "web_search" | "read_file" => {
+            4000
+        }
         _ => LARGE_TOOL_RESULT_TOKEN_THRESHOLD,
     }
 }
@@ -451,7 +451,7 @@ fn digest_tool_result(
 
 /// Tools that receive a reasoning checkpoint before execution when configured.
 pub(crate) fn is_side_effect_tool(name: &str) -> bool {
-    matches!(name, "exec" | "write_file" | "edit_file" | "apply_patch")
+    matches!(name, "exec" | "write_file" | "edit_file")
 }
 
 /// True when an `exec` command is a pure read: it starts with a
@@ -514,10 +514,7 @@ pub(crate) fn is_read_only_tool(name: &str) -> bool {
         name,
         "read_file"
             | "list_dir"
-            | "find_files"
             | "search_files"
-            | "file_info"
-            | "file_preview"
             | "get_skills"
             | "inspect_tool_result"
             | "get_tools"
@@ -1824,16 +1821,14 @@ mod tests {
             ToolRegistry::with_standard_tools(&ToolConfig::new(std::path::Path::new(".")));
         for name in [
             "read_file",
-            "file_preview",
             "list_dir",
-            "file_info",
             "web_fetch",
             "web_search",
             "get_skills",
         ] {
             assert_eq!(registry.concurrency(name), ToolConcurrency::ParallelSafe);
         }
-        for name in ["exec", "write_file", "find_files", "unknown_tool"] {
+        for name in ["exec", "write_file", "edit_file", "unknown_tool"] {
             assert_eq!(registry.concurrency(name), ToolConcurrency::Sequential);
         }
     }
@@ -2527,10 +2522,7 @@ mod tests {
         for name in [
             "read_file",
             "list_dir",
-            "find_files",
             "search_files",
-            "file_info",
-            "file_preview",
             "get_skills",
             "inspect_tool_result",
             "get_tools",

@@ -105,7 +105,6 @@ const RAW_JSON_TOOL_NAMES: &[&str] = &[
     "cron",
     "edit_file",
     "exec",
-    "execute_code",
     "list_dir",
     "message",
     "plan",

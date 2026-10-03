@@ -1,8 +1,8 @@
 //! Persistent stateful Python kernel via embedded CPython (PyO3).
 //!
-//! Unlike `execute_code` which spawns a fresh python3 process per call,
-//! this tool holds a persistent CPython interpreter in-process.
-//! Variables, imports, and function definitions survive across calls.
+//! Unlike spawning a fresh python3 process per call, this tool holds a
+//! persistent CPython interpreter in-process. Variables, imports, and
+//! function definitions survive across calls.
 
 use std::collections::HashMap;
 use std::ffi::CString;

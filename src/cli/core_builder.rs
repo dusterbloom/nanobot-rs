@@ -370,7 +370,6 @@ fn core_config_from(
         health_check_timeout_secs: config.monitoring.health_check_timeout_secs,
         adaptive_tokens: AdaptiveTokenConfig::from_defaults(&config.agents.defaults),
         sessions_db_path: None,
-        code_execution: config.tools.code_execution.clone(),
         python_kernel: config.tools.python_kernel.clone(),
         cua: config.tools.cua.clone(),
     }

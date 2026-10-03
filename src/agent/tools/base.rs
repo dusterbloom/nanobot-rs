@@ -42,14 +42,14 @@ pub(crate) use require_param;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PermissionLevel {
-    /// Read-only tools: read_file, list_dir, find_files, file_info,
-    /// workspace_diff, system_info, recall, get_skills, session_search
+    /// Read-only tools: read_file, list_dir, search_files, recall,
+    /// get_skills, session_search
     ReadOnly,
     /// Network access: web_search, web_fetch, browser
     Network,
     /// Write tools: write_file, edit_file, remember
     Write,
-    /// Code execution: exec, execute_code
+    /// Code execution: exec
     Execute,
     /// System-level: spawn, message, cron_schedule, send_email
     System,

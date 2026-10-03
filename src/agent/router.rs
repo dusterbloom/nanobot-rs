@@ -313,7 +313,7 @@ mod tests {
     use crate::agent::reasoning::ReasoningEngine;
     use crate::agent::tools::reasoning_tools::SharedEngine;
     use crate::config::schema::{
-        AdaptiveTokenConfig, CodeExecutionConfig, CuaToolConfig, MemoryConfig, ProvenanceConfig,
+        AdaptiveTokenConfig, CuaToolConfig, MemoryConfig, ProvenanceConfig,
         PythonKernelConfig, ReasoningConfig, ToolDelegationConfig, TrioConfig,
     };
     use crate::providers::base::{FinishReason, LLMProvider, LLMResponse};
@@ -376,7 +376,6 @@ mod tests {
             reasoning_config: ReasoningConfig::default(),
             tool_heartbeat_secs: 2,
             health_check_timeout_secs: 2,
-            code_execution: CodeExecutionConfig::default(),
             python_kernel: PythonKernelConfig::default(),
             cua: CuaToolConfig::default(),
             adaptive_tokens: AdaptiveTokenConfig::default(),
