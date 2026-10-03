@@ -5491,6 +5491,304 @@ async fn test_local_wire_prompt_prefix_stable_when_second_turn_is_rich_artifact(
     );
 }
 
+/// Builds an `AgentLoop` whose session DB and workspace are the caller's, not
+/// a fresh tempdir per call — the shared-state knob a resume test needs: core
+/// A runs turn 1 against them, core B is a brand-new process-equivalent core
+/// built over the SAME two paths for turn 2.
+fn build_shared_db_harness(
+    provider: Arc<dyn LLMProvider>,
+    workspace: std::path::PathBuf,
+    sessions_db_path: std::path::PathBuf,
+) -> AgentLoop {
+    let core = build_swappable_core(SwappableCoreConfig {
+        provider,
+        workspace,
+        model: "local-fab-history-test".to_string(),
+        max_iterations: 4,
+        max_continuations: 2,
+        max_tokens: 512,
+        temperature: 0.0,
+        max_context_tokens: 8192,
+        brave_api_key: None,
+        search_provider: "searxng".to_string(),
+        searxng_url: "http://localhost:8888".to_string(),
+        crw_url: String::new(),
+        search_max_results: 5,
+        exec_timeout: 30,
+        restrict_to_workspace: true,
+        memory_config: MemoryConfig::default(),
+        is_local: true,
+        lane: Lane::default(),
+        tool_delegation: ToolDelegationConfig::default(),
+        provenance: ProvenanceConfig::default(),
+        max_tool_result_chars: 2000,
+        trio_config: TrioConfig::default(),
+        model_capabilities_overrides: std::collections::HashMap::new(),
+        reasoning_config: crate::config::schema::ReasoningConfig::default(),
+        tool_heartbeat_secs: 2,
+        health_check_timeout_secs: 2,
+        python_kernel: PythonKernelConfig::default(),
+        cua: CuaToolConfig::default(),
+        adaptive_tokens: AdaptiveTokenConfig::default(),
+        sessions_db_path: Some(sessions_db_path),
+    });
+    let counters = test_runtime_counters(8192);
+    let core_handle = AgentHandle::new(core, counters);
+    let (inbound_tx, inbound_rx) = tokio::sync::mpsc::unbounded_channel::<InboundMessage>();
+    let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::unbounded_channel::<OutboundMessage>();
+    AgentLoop::new(
+        core_handle,
+        inbound_rx,
+        outbound_tx,
+        inbound_tx,
+        None,
+        1,
+        None,
+        None,
+        None,
+        ProprioceptionConfig::default(),
+        LcmSchemaConfig::default(),
+        None,
+    )
+}
+
+/// Pins the "never mutate committed history" contract: strict-mode
+/// redaction and the fabrication NOTICE must only ever touch the OUTBOUND
+/// (display) text, never what gets persisted. Before the fix,
+/// `finalize_response` overwrote `ctx.final_content` with the redacted text
+/// BEFORE pushing it into history, and inserted a `NOTICE: ... removed.`
+/// scaffold ahead of it — so a reload replayed `tool → user NOTICE →
+/// assistant("...[unverified claim removed]")` instead of what the model
+/// actually generated (`tool → assistant("...30615...")`), busting the KV
+/// prefix cache on the very next turn and rewriting the historical record of
+/// what the model said.
+#[tokio::test]
+async fn resumed_core_replays_generated_history_not_the_redacted_display_text() {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let sessions_db_path = workspace.join("sessions.db");
+    let session_key = format!("fab-history-{}", uuid::Uuid::new_v4());
+
+    // Turn 1, core A: one tool round (whose result never contains "30615")
+    // followed by a final answer that CLAIMS a number the tool never
+    // produced — exactly what strict-mode redaction exists to catch.
+    let mut tool_call_args = std::collections::HashMap::new();
+    tool_call_args.insert("path".to_string(), json!("."));
+    let tool_call_response = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![crate::providers::base::ToolCallRequest {
+            id: "tc_fab_history".to_string(),
+            name: "list_dir".to_string(),
+            arguments: tool_call_args,
+        }],
+        finish_reason: FinishReason::ToolCalls,
+        usage: std::collections::HashMap::new(),
+    };
+    let generated_text = "Total: 30615 lines, all accounted for.";
+    let fabricated_response = crate::providers::base::LLMResponse {
+        content: Some(generated_text.to_string()),
+        tool_calls: vec![],
+        finish_reason: FinishReason::Stop,
+        usage: std::collections::HashMap::new(),
+    };
+    let provider_a = Arc::new(WireRecordingProvider::new(
+        "local-fab-history-test",
+        vec![tool_call_response, fabricated_response],
+    ));
+    let core_a = build_shared_db_harness(
+        provider_a.clone() as Arc<dyn LLMProvider>,
+        workspace.clone(),
+        sessions_db_path.clone(),
+    );
+
+    let outbound_turn1 = core_a
+        .process_direct("count the lines", &session_key, "test", "offline")
+        .await;
+
+    assert!(
+        outbound_turn1.contains("[unverified claim removed]"),
+        "strict mode must still redact the OUTBOUND text for display: {outbound_turn1}"
+    );
+    assert!(
+        !outbound_turn1.contains("30615"),
+        "outbound text must not leak the unverified number: {outbound_turn1}"
+    );
+
+    let core_handle_a = core_a.shared.core_handle.swappable();
+    let session = core_handle_a
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .unwrap();
+    let persisted = core_handle_a.sessions.get_all_messages(&session.id).await;
+    let persisted_assistant_texts: Vec<&str> = persisted
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .filter_map(|m| m.get("content").and_then(Value::as_str))
+        .collect();
+    assert!(
+        persisted_assistant_texts.contains(&generated_text),
+        "history must carry the EXACT generated text byte-for-byte, got: {persisted_assistant_texts:?}"
+    );
+    assert!(
+        !persisted.iter().any(|m| m
+            .get("content")
+            .and_then(Value::as_str)
+            .map(|c| c.contains("NOTICE:"))
+            .unwrap_or(false)),
+        "no NOTICE scaffold must ever be persisted into history"
+    );
+    assert!(
+        !persisted.iter().any(|m| m
+            .get("content")
+            .and_then(Value::as_str)
+            .map(|c| c.contains("[unverified claim removed]"))
+            .unwrap_or(false)),
+        "history must never carry the redacted display text"
+    );
+
+    // Turn 2, core B: a brand-new process-equivalent core built over the
+    // SAME sessions db + workspace resumes the session. Its first wire must
+    // be a byte-extension of core A's last wire — the KV prefix-cache
+    // contract — which only holds if what was persisted matches what was
+    // generated.
+    let provider_b = Arc::new(WireRecordingProvider::new(
+        "local-fab-history-test",
+        vec![WireRecordingProvider::text_response("turn two reply")],
+    ));
+    let core_b = build_shared_db_harness(
+        provider_b.clone() as Arc<dyn LLMProvider>,
+        workspace.clone(),
+        sessions_db_path.clone(),
+    );
+    core_b
+        .process_direct("and now?", &session_key, "test", "offline")
+        .await;
+
+    let a_calls = provider_a.calls();
+    let b_calls = provider_b.calls();
+    assert!(!a_calls.is_empty() && !b_calls.is_empty());
+    assert_wire_prefix(&a_calls[a_calls.len() - 1], &b_calls[0]);
+    let b_wire_text = serde_json::to_string(&b_calls[0]).unwrap();
+    assert!(
+        b_wire_text.contains(generated_text),
+        "resumed wire must replay the exact generated text: {b_wire_text}"
+    );
+    assert!(
+        !b_wire_text.contains("NOTICE:"),
+        "resumed wire must not carry the removed NOTICE scaffold"
+    );
+    assert!(
+        !b_wire_text.contains("[unverified claim removed]"),
+        "resumed wire must not carry the redacted display text"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// Same contract as the fabrication-redaction test above, for the
+/// phantom-tool-claim branch: a `scaffold_user(detection.system_warning)`
+/// used to be pushed into history right after a turn with no tool calls
+/// but tool-claiming language in the final text. That scaffold was never
+/// sent to the model live in the turn that generated it (finalize_response
+/// is the terminal phase -- there is no later model call to see it), so it
+/// landed in persisted history ahead of the assistant message the model
+/// actually generated, busting the KV prefix cache on resume exactly like
+/// the removed fabrication NOTICE.
+#[tokio::test]
+async fn resumed_core_replays_generated_history_not_the_phantom_notice() {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let sessions_db_path = workspace.join("sessions.db");
+    let session_key = format!("phantom-history-{}", uuid::Uuid::new_v4());
+
+    // Turn 1, core A: no tool calls at all, but the final text uses
+    // tool-claiming language -- exactly what phantom detection exists to
+    // catch.
+    let generated_text = "Let me check the file. The file contains the config.";
+    let phantom_response = crate::providers::base::LLMResponse {
+        content: Some(generated_text.to_string()),
+        tool_calls: vec![],
+        finish_reason: FinishReason::Stop,
+        usage: std::collections::HashMap::new(),
+    };
+    let provider_a = Arc::new(WireRecordingProvider::new(
+        "local-fab-history-test",
+        vec![phantom_response],
+    ));
+    let core_a = build_shared_db_harness(
+        provider_a.clone() as Arc<dyn LLMProvider>,
+        workspace.clone(),
+        sessions_db_path.clone(),
+    );
+
+    let outbound_turn1 = core_a
+        .process_direct("what's in the config?", &session_key, "test", "offline")
+        .await;
+
+    assert!(
+        outbound_turn1.contains("PHANTOM WARNING"),
+        "strict mode must still annotate the OUTBOUND text for display: {outbound_turn1}"
+    );
+
+    let core_handle_a = core_a.shared.core_handle.swappable();
+    let session = core_handle_a
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .unwrap();
+    let persisted = core_handle_a.sessions.get_all_messages(&session.id).await;
+    let persisted_assistant_texts: Vec<&str> = persisted
+        .iter()
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("assistant"))
+        .filter_map(|m| m.get("content").and_then(Value::as_str))
+        .collect();
+    assert!(
+        persisted_assistant_texts.contains(&generated_text),
+        "history must carry the EXACT generated text byte-for-byte, got: {persisted_assistant_texts:?}"
+    );
+    assert!(
+        !persisted.iter().any(|m| m
+            .get("content")
+            .and_then(Value::as_str)
+            .map(|c| c.contains("PHANTOM") || c.contains("CRITICAL: You did not call"))
+            .unwrap_or(false)),
+        "no phantom NOTICE must ever be persisted into history"
+    );
+
+    // Turn 2, core B: a brand-new process-equivalent core built over the
+    // SAME sessions db + workspace resumes the session. Its first wire must
+    // be a byte-extension of core A's last wire -- the KV prefix-cache
+    // contract -- which only holds if what was persisted matches what was
+    // generated.
+    let provider_b = Arc::new(WireRecordingProvider::new(
+        "local-fab-history-test",
+        vec![WireRecordingProvider::text_response("turn two reply")],
+    ));
+    let core_b = build_shared_db_harness(
+        provider_b.clone() as Arc<dyn LLMProvider>,
+        workspace.clone(),
+        sessions_db_path.clone(),
+    );
+    core_b
+        .process_direct("and now?", &session_key, "test", "offline")
+        .await;
+
+    let a_calls = provider_a.calls();
+    let b_calls = provider_b.calls();
+    assert!(!a_calls.is_empty() && !b_calls.is_empty());
+    assert_wire_prefix(&a_calls[a_calls.len() - 1], &b_calls[0]);
+    let b_wire_text = serde_json::to_string(&b_calls[0]).unwrap();
+    assert!(
+        b_wire_text.contains(generated_text),
+        "resumed wire must replay the exact generated text: {b_wire_text}"
+    );
+    assert!(
+        !b_wire_text.contains("PHANTOM") && !b_wire_text.contains("CRITICAL: You did not call"),
+        "resumed wire must not carry the removed phantom NOTICE scaffold"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
 /// Installs a retained-byte V2 capacity contract directly on the shared
 /// capacity runtime, mirroring what `resolve_live_capacity` installs from a
 /// real Higgs `/v1/capacity` fetch. The higgs session id is only attached to

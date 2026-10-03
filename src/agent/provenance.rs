@@ -669,8 +669,6 @@ pub fn redact_fabrications(text: &str, claims: &[AnnotatedClaim]) -> (String, us
 
 /// Result of phantom detection.
 pub struct PhantomDetection {
-    /// Warning text for the system message (next turn).
-    pub system_warning: String,
     /// Matched phantom patterns.
     pub matched_patterns: Vec<String>,
 }
@@ -735,17 +733,7 @@ pub fn detect_phantom_claims(response: &str, tools_called: &[String]) -> Option<
         return None;
     }
 
-    let system_warning = format!(
-        "CRITICAL: You did not call any tools this turn, but your response contains \
-         {} phantom claim(s): [{}]. You MUST use tool calls to perform actions. \
-         Do not fabricate tool outputs. If you need to read a file, call read_file. \
-         If you need to run a command, call exec. Never generate fake results.",
-        matches.len(),
-        matches.join(", ")
-    );
-
     Some(PhantomDetection {
-        system_warning,
         matched_patterns: matches,
     })
 }
@@ -1441,7 +1429,6 @@ mod tests {
     #[test]
     fn test_phantom_annotation() {
         let detection = PhantomDetection {
-            system_warning: "test warning".to_string(),
             matched_patterns: vec!["I read the file".to_string()],
         };
         let annotated = annotate_phantom_response("I read the file and it says hello.", &detection);

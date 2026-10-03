@@ -90,6 +90,18 @@ impl AgentLoopShared {
             }
         }
 
+        // Snapshot the exact text the model generated (or the rescue above
+        // synthesized) before redaction/annotation below mutate
+        // `ctx.final_content` for display. Committed history must replay
+        // byte-identical to what the model actually generated — redaction is
+        // a display-only concern for the OUTBOUND message. Persisting the
+        // redacted text instead desynced history from generation (tool →
+        // assistant became tool → user NOTICE → assistant on replay),
+        // busting the KV prefix cache on the next turn (higgs
+        // `token_mismatch`) and rewriting what the model is on record as
+        // having said.
+        let history_content = ctx.final_content.clone();
+
         // Phase 3+4: Claim verification and context hygiene.
         if !ctx.final_content.is_empty()
             && !rescued_incomplete_assistant
@@ -102,24 +114,18 @@ impl AgentLoopShared {
                     crate::agent::provenance::verify_turn_claims(&ctx.final_content, &entries);
 
                 if has_fabrication && ctx.core.provenance_config.strict_mode {
-                    let (redacted, redaction_count) =
+                    // Display-only: redact the OUTBOUND text the user sees.
+                    // `history_content` above already snapshotted the
+                    // unredacted generated text, so committed history is
+                    // unaffected by this. The REPL surfaces the same warning
+                    // to the user from the "[unverified claim removed]"
+                    // marker in the outbound text (see repl/mod.rs) — no
+                    // separate NOTICE message belongs in history, where it
+                    // would reorder the replayed conversation relative to
+                    // what the model actually generated.
+                    let (redacted, _redaction_count) =
                         crate::agent::provenance::redact_fabrications(&ctx.final_content, &claims);
                     ctx.final_content = redacted;
-                    if redaction_count > 0 {
-                        // Cache-replay tagged: a warning the model saw live must
-                        // replay byte-identical on reload or the warm prompt
-                        // prefix diverges. Force `user` role (matches the
-                        // response-boundary nudge convention at shared.rs:1193)
-                        // — Anthropic's OpenAI-compat layer strips mid-thread
-                        // system messages anyway.
-                        let warning_content = format!(
-                            "NOTICE: {} claim(s) in the previous response could not be \
-                             verified against tool outputs and were removed.",
-                            redaction_count
-                        );
-                        ctx.messages
-                            .push_draft(crate::agent::markers::scaffold_user(warning_content));
-                    }
                 }
             }
         }
@@ -140,21 +146,22 @@ impl AgentLoopShared {
                     detection.matched_patterns
                 );
 
-                // Hard block: annotate the response so the user sees the warning.
+                // Display-only: annotate the OUTBOUND text the user sees.
+                // `history_content` above already snapshotted the generated
+                // text before this mutation, so committed history is
+                // unaffected. A separate scaffold_user(detection.system_warning)
+                // used to be injected here for "the next turn", but nothing
+                // sends it to the model live in this turn -- it would land
+                // in persisted history ahead of the assistant message the
+                // model actually generated, busting the KV prefix-cache
+                // contract on resume (higgs token_mismatch), same failure
+                // mode as the fabrication NOTICE removed above.
                 if ctx.core.provenance_config.strict_mode {
                     ctx.final_content = crate::agent::provenance::annotate_phantom_response(
                         &ctx.final_content,
                         &detection,
                     );
                 }
-
-                // Inject warning for the next turn. Cache-replay tagged;
-                // user role for the same reason as the fabrication warning
-                // above.
-                ctx.messages
-                    .push_draft(crate::agent::markers::scaffold_user(
-                        detection.system_warning,
-                    ));
             }
         }
 
@@ -163,7 +170,7 @@ impl AgentLoopShared {
         // Bug 1 fix: if strip_dangling_tool_calls already converted a tool-call
         // assistant message into a plain text assistant message, merging here
         // prevents two consecutive assistant messages from being persisted.
-        if !ctx.final_content.is_empty() {
+        if !history_content.is_empty() {
             let last_can_absorb_final_text = ctx
                 .messages
                 .last()
@@ -189,15 +196,15 @@ impl AgentLoopShared {
                             .unwrap_or("")
                             .to_string();
                         last["content"] = if existing.trim().is_empty() {
-                            json!(ctx.final_content.clone())
+                            json!(history_content.clone())
                         } else {
-                            json!(format!("{}\n\n{}", existing, ctx.final_content))
+                            json!(format!("{}\n\n{}", existing, history_content))
                         };
                     }
                 });
             } else {
                 ctx.messages
-                    .push_draft(json!({"role": "assistant", "content": ctx.final_content.clone()}));
+                    .push_draft(json!({"role": "assistant", "content": history_content.clone()}));
             }
         }
 
