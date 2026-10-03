@@ -2400,7 +2400,19 @@ impl AgentLoopShared {
             ),
         };
         let before_messages = ctx.messages.len();
-        if !self.apply_emergency_trim(ctx, message_budget).await {
+        // Fold through the same LCM checkpoint the blocking compaction path
+        // installs, instead of the mechanical trim's much larger remainder:
+        // a fold lands at the configured deterministic target (~1-4k) and
+        // can seed a retained session, where a mechanical trim to
+        // `message_budget` (2026-10-02: 45.3k -> 19.4k) was still too big to
+        // seed and left the session cold every later turn. No provider
+        // request: `Deterministic` installs the lossless index immediately.
+        self.manage_compaction(ctx, tool_def_tokens, CompactionFailureMode::Deterministic, true)
+            .await;
+        let after_est =
+            TokenBudget::estimate_tokens(&render_via_protocol(&*ctx.protocol, &ctx.messages));
+        let folded = after_est < est_rendered;
+        if !folded && !self.apply_emergency_trim(ctx, message_budget).await {
             return false;
         }
         ctx.flow.retries.overflow_trim_recoveries += 1;
@@ -2409,6 +2421,7 @@ impl AgentLoopShared {
             error = %error,
             before_messages,
             after_messages = ctx.messages.len(),
+            folded,
             "context_overflow_recovery_trim"
         );
         true
