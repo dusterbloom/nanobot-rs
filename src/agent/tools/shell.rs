@@ -108,9 +108,18 @@ fn default_deny_patterns() -> Vec<String> {
 pub struct ExecTool {
     timeout: u64,
     working_dir: Option<String>,
-    deny_patterns: Vec<String>,
-    allow_patterns: Vec<String>,
+    deny_patterns: Vec<Regex>,
+    allow_patterns: Vec<Regex>,
     restrict_to_workspace: bool,
+}
+
+/// Compile guard patterns once at construction; `guard_command` runs on every
+/// exec call and must not pay a regex compile per pattern per segment.
+fn compile_patterns(patterns: &[String]) -> Vec<Regex> {
+    patterns
+        .iter()
+        .filter_map(|pattern| Regex::new(pattern).ok())
+        .collect()
 }
 
 impl ExecTool {
@@ -125,8 +134,8 @@ impl ExecTool {
         Self {
             timeout,
             working_dir,
-            deny_patterns: deny_patterns.unwrap_or_else(default_deny_patterns),
-            allow_patterns: allow_patterns.unwrap_or_default(),
+            deny_patterns: compile_patterns(&deny_patterns.unwrap_or_else(default_deny_patterns)),
+            allow_patterns: compile_patterns(&allow_patterns.unwrap_or_default()),
             restrict_to_workspace,
         }
     }
@@ -234,14 +243,12 @@ impl ExecTool {
         // First, check deny patterns against the full normalized command.
         // This catches patterns that span pipes/semicolons (e.g. `curl ... | sh`).
         let full_normalized = Self::normalize_command(cmd);
-        for pattern in &self.deny_patterns {
-            if let Ok(re) = Regex::new(pattern) {
-                if re.is_match(&full_normalized) {
-                    return Some(
-                        "Error: Command blocked by safety guard (dangerous pattern detected)"
-                            .to_string(),
-                    );
-                }
+        for re in &self.deny_patterns {
+            if re.is_match(&full_normalized) {
+                return Some(
+                    "Error: Command blocked by safety guard (dangerous pattern detected)"
+                        .to_string(),
+                );
             }
         }
 
@@ -253,24 +260,21 @@ impl ExecTool {
             let normalized = Self::normalize_command(segment);
 
             // Check deny patterns against the normalized segment.
-            for pattern in &self.deny_patterns {
-                if let Ok(re) = Regex::new(pattern) {
-                    if re.is_match(&normalized) {
-                        return Some(
-                            "Error: Command blocked by safety guard (dangerous pattern detected)"
-                                .to_string(),
-                        );
-                    }
+            for re in &self.deny_patterns {
+                if re.is_match(&normalized) {
+                    return Some(
+                        "Error: Command blocked by safety guard (dangerous pattern detected)"
+                            .to_string(),
+                    );
                 }
             }
 
             // Check allow patterns (if any are configured, segment must match at least one).
             if !self.allow_patterns.is_empty() {
-                let allowed = self.allow_patterns.iter().any(|pattern| {
-                    Regex::new(pattern)
-                        .map(|re| re.is_match(&normalized))
-                        .unwrap_or(false)
-                });
+                let allowed = self
+                    .allow_patterns
+                    .iter()
+                    .any(|re| re.is_match(&normalized));
                 if !allowed {
                     return Some(
                         "Error: Command blocked by safety guard (not in allowlist)".to_string(),
