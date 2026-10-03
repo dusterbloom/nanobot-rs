@@ -220,6 +220,28 @@ impl AgentLoop {
                 }
             }));
 
+        // Durable backstop for the in-memory Higgs retained-session epoch:
+        // right after a rotation bumps it, persist it against the durable
+        // session id so a process that restarts mid-session (new
+        // RuntimeCounters, same sessions.db row) resumes from the correct
+        // epoch instead of re-deriving an already-retained id. Best-effort,
+        // same fire-and-forget shape as the drop flusher above.
+        let epoch_persist_handle = core_handle.clone();
+        core_handle
+            .counters
+            .set_higgs_epoch_persist(std::sync::Arc::new(move |durable_session_id, epoch| {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    let persist_handle = epoch_persist_handle.clone();
+                    handle.spawn(async move {
+                        let swappable = persist_handle.swappable();
+                        swappable
+                            .sessions
+                            .set_higgs_epoch(&durable_session_id, epoch)
+                            .await;
+                    });
+                }
+            }));
+
         Self {
             shared,
             bus_inbound_rx,

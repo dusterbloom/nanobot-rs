@@ -1361,6 +1361,16 @@ impl LLMProvider for WireRecordingProvider {
 struct RetentionRefusingHiggs {
     calls: std::sync::Mutex<Vec<Vec<Value>>>,
     refusals: std::sync::atomic::AtomicUsize,
+    /// Which refusal to simulate: compaction-required (the original
+    /// scenario) or a seed conflict (one retained session at a time —
+    /// `ProviderError::HiggsRetentionSeedConflict`). Both must be answered
+    /// unretained by `attempt_overflow_recovery`'s shared arm.
+    seed_conflict: bool,
+    /// When set, the first successful (unretained) call after a refusal
+    /// responds with one tool call instead of finishing the turn, so a
+    /// further request follows within the same turn and can exercise
+    /// whether suspension is per-request rather than turn-wide.
+    extra_tool_round: bool,
 }
 
 impl RetentionRefusingHiggs {
@@ -1368,7 +1378,23 @@ impl RetentionRefusingHiggs {
         Self {
             calls: std::sync::Mutex::new(Vec::new()),
             refusals: std::sync::atomic::AtomicUsize::new(refusals),
+            seed_conflict: false,
+            extra_tool_round: false,
         }
+    }
+
+    fn new_seed_conflict(refusals: usize) -> Self {
+        Self {
+            calls: std::sync::Mutex::new(Vec::new()),
+            refusals: std::sync::atomic::AtomicUsize::new(refusals),
+            seed_conflict: true,
+            extra_tool_round: false,
+        }
+    }
+
+    fn with_extra_tool_round(mut self) -> Self {
+        self.extra_tool_round = true;
+        self
     }
 
     /// The retention policy each request opted into (`None` = ordinary request).
@@ -1404,7 +1430,11 @@ impl LLMProvider for RetentionRefusingHiggs {
         _thinking_budget: Option<u32>,
         _top_p: Option<f64>,
     ) -> anyhow::Result<crate::providers::base::LLMResponse> {
-        self.calls.lock().unwrap().push(messages.to_vec());
+        let call_index = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(messages.to_vec());
+            calls.len()
+        };
         let retained = messages.first().is_some_and(|first| {
             first
                 .get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD)
@@ -1420,12 +1450,28 @@ impl LLMProvider for RetentionRefusingHiggs {
                 )
                 .is_ok();
         if refuse {
-            return Err(
+            return Err(if self.seed_conflict {
+                crate::errors::ProviderError::HiggsRetentionSeedConflict.into()
+            } else {
                 crate::errors::ProviderError::HiggsRetentionCompactionRequired {
                     contract_revision: "boot-1:1:sha256:abc".to_owned(),
                 }
-                .into(),
-            );
+                .into()
+            });
+        }
+        if self.extra_tool_round && call_index == 2 {
+            let mut arguments = std::collections::HashMap::new();
+            arguments.insert("path".to_string(), json!("."));
+            return Ok(crate::providers::base::LLMResponse {
+                content: Some(String::new()),
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc_retention_round".to_string(),
+                    name: "list_dir".to_string(),
+                    arguments,
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: std::collections::HashMap::new(),
+            });
         }
         Ok(WireRecordingProvider::text_response("ok"))
     }
@@ -1517,6 +1563,617 @@ async fn refused_retained_request_is_answered_unretained() {
         higgs.policies().last().cloned().flatten().as_deref(),
         Some("seed"),
         "an unretained answer must not publish the session for continuation"
+    );
+}
+
+/// A retention seed conflict (one retained session at a time; see
+/// `ProviderError::HiggsRetentionSeedConflict`, raised when a resuming
+/// process's seed collides with a still-live retained session id) must be
+/// handled by the same unretained-continuation arm as a compaction-required
+/// refusal, not surfaced as a generic error to the user.
+#[tokio::test]
+async fn refused_seed_conflict_request_is_answered_unretained() {
+    let higgs = Arc::new(RetentionRefusingHiggs::new_seed_conflict(1));
+    let (agent, _workspace) = build_local_inline_harness_with_lcm(
+        higgs.clone(),
+        "escha",
+        32_768,
+        LcmSchemaConfig::default(),
+    );
+
+    let reply = agent
+        .process_direct("hello", "cli:seed-conflict", "test", "chat")
+        .await;
+    assert!(
+        reply.contains("ok") && !reply.contains("I encountered an error"),
+        "a seed conflict must not become the answer: {reply:?}"
+    );
+    assert_eq!(
+        higgs.policies(),
+        vec![Some("seed".to_owned()), None],
+        "one refused seed, then one ordinary request"
+    );
+}
+
+/// A seed conflict suspends retention for exactly the request it forced
+/// unretained, not for the rest of the turn: the next request in the same
+/// multi-tool-round turn must carry retention controls again. Before this
+/// fix, `SuspendedForTurn` stuck every remaining request of the turn to a
+/// cold, stateless prefill even though Higgs's slot can free up moments
+/// later (idle eviction) — see the live `e2e3-T` incident (2026-10-03).
+#[tokio::test]
+async fn retention_suspension_is_per_request_not_per_turn() {
+    let higgs = Arc::new(RetentionRefusingHiggs::new_seed_conflict(1).with_extra_tool_round());
+    let (agent, _workspace) = build_local_inline_harness_with_lcm(
+        higgs.clone(),
+        "escha",
+        32_768,
+        LcmSchemaConfig::default(),
+    );
+
+    let reply = agent
+        .process_direct("list the directory", "cli:seed-conflict-tool-round", "test", "chat")
+        .await;
+    assert!(
+        !reply.contains("I encountered an error"),
+        "a seed conflict must not become the answer: {reply:?}"
+    );
+    assert_eq!(
+        higgs.policies(),
+        vec![Some("seed".to_owned()), None, Some("seed".to_owned())],
+        "request 1 refused retained, request 2 unretained, request 3 attempts retention again"
+    );
+}
+
+/// Higgs stand-in whose tokenizer counts 17% more than the client's cl100k
+/// estimate — the skew measured on 2026-10-02 — and which enforces the
+/// contract's guaranteed prompt wall exactly like higgs's
+/// `validate_prompt_limit`. Each call answers with two `read_file` calls for
+/// `tool_rounds` rounds, then a plain reply. `usage.prompt_tokens` is its own
+/// count: the number the loop anchors the next request on.
+struct SkewedTokenizerHiggs {
+    calls: std::sync::Mutex<Vec<Vec<Value>>>,
+    server_counts: std::sync::Mutex<Vec<usize>>,
+    rejections: std::sync::atomic::AtomicUsize,
+    /// Harness workspace, known only after the loop is built; `read_file`
+    /// resolves relative paths elsewhere, so the growth files are absolute.
+    workspace: std::sync::OnceLock<std::path::PathBuf>,
+    tool_rounds: usize,
+    /// `read_file` calls per round; each body is capped by the harness's
+    /// `max_tool_result_chars` (~600 tokens), so this sets the growth per round.
+    reads_per_round: usize,
+    guaranteed: usize,
+    soft: usize,
+    target: usize,
+}
+
+impl SkewedTokenizerHiggs {
+    const SKEW_PCT: usize = 117;
+    const SIDES: &'static str = "abc";
+
+    fn new(
+        tool_rounds: usize,
+        reads_per_round: usize,
+        guaranteed: usize,
+        soft: usize,
+        target: usize,
+    ) -> Self {
+        Self {
+            calls: std::sync::Mutex::new(Vec::new()),
+            server_counts: std::sync::Mutex::new(Vec::new()),
+            rejections: std::sync::atomic::AtomicUsize::new(0),
+            workspace: std::sync::OnceLock::new(),
+            tool_rounds,
+            reads_per_round,
+            guaranteed,
+            soft,
+            target,
+        }
+    }
+
+    fn sides(&self) -> impl Iterator<Item = char> {
+        Self::SIDES.chars().take(self.reads_per_round)
+    }
+
+    /// The retention policy each shipped request opted into (`None` =
+    /// ordinary, unretained request).
+    fn policies(&self) -> Vec<Option<String>> {
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|messages| {
+                messages
+                    .first()
+                    .and_then(|first| {
+                        first.get(
+                            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD,
+                        )
+                    })
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    fn server_count(messages: &[Value], tools: Option<&[Value]>) -> usize {
+        use crate::agent::token_budget::TokenBudget;
+        (TokenBudget::estimate_tokens(messages)
+            + tools.map_or(0, TokenBudget::estimate_tool_def_tokens))
+        .saturating_mul(Self::SKEW_PCT)
+        .div_ceil(100)
+    }
+
+    fn growth_file(&self, round: usize, side: char) -> std::path::PathBuf {
+        self.workspace
+            .get()
+            .expect("workspace set after the harness is built")
+            .join(format!("growth_{round}{side}.txt"))
+    }
+
+    /// One tool round: read fresh files. Distinct paths keep the duplicate-call
+    /// guard out of the way, and the bodies are the growth the fold can
+    /// reclaim (tool results over 500 chars retire behind `lcm_expand`).
+    fn read_fresh_files(&self, round: usize) -> crate::providers::base::LLMResponse {
+        let call = |side: char| {
+            let mut arguments = std::collections::HashMap::new();
+            arguments.insert("path".to_string(), json!(self.growth_file(round, side)));
+            crate::providers::base::ToolCallRequest {
+                id: format!("tc_growth_{round}{side}"),
+                name: "read_file".to_string(),
+                arguments,
+            }
+        };
+        crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: self.sides().map(call).collect(),
+            finish_reason: FinishReason::ToolCalls,
+            usage: std::collections::HashMap::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl LLMProvider for SkewedTokenizerHiggs {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        let server_tokens = Self::server_count(messages, tools);
+        self.server_counts.lock().unwrap().push(server_tokens);
+        let round = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(messages.to_vec());
+            calls.len()
+        };
+        if server_tokens > self.guaranteed {
+            self.rejections
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            anyhow::bail!(
+                "HTTP 400: {{\"error\":{{\"message\":\"Rendered prompt has {server_tokens} tokens, exceeding max_prompt_tokens={}\",\"code\":\"context_length_exceeded\"}}}}",
+                self.guaranteed
+            );
+        }
+        let mut response = if round <= self.tool_rounds {
+            self.read_fresh_files(round)
+        } else {
+            WireRecordingProvider::text_response("done reading")
+        };
+        response.usage.insert(
+            "prompt_tokens".to_string(),
+            i64::try_from(server_tokens).unwrap_or(i64::MAX),
+        );
+        response.usage.insert("completion_tokens".to_string(), 8);
+        Ok(response)
+    }
+
+    fn get_default_model(&self) -> &str {
+        "escha"
+    }
+
+    fn get_api_base(&self) -> Option<&str> {
+        Some("http://127.0.0.1:9000")
+    }
+
+    fn supports_higgs_session_cache(&self) -> bool {
+        true
+    }
+
+    fn fetch_higgs_capacity<'a>(
+        &'a self,
+        _model: &'a str,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        Option<crate::agent::capacity::HiggsCapacityFetch>,
+                        crate::errors::ProviderError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        let profile = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 2,
+            "contractRevision": "boot-1:1:sha256:skew",
+            "model": "escha",
+            "maxContextTokens": 16_384,
+            "maxOutputTokens": 512,
+            "retainedBudgetBytes": 4_294_967_296_u64,
+            "guaranteedFastPromptTokens": self.guaranteed,
+            "softCompactionPromptTokens": self.soft,
+            "targetAfterCompactionTokens": self.target,
+            "guaranteedSessions": 1
+        }))
+        .expect("valid v2 contract");
+        Box::pin(async move {
+            Ok(Some(crate::agent::capacity::HiggsCapacityFetch::Profile(
+                profile,
+            )))
+        })
+    }
+}
+
+/// Drive one user turn through the skewed higgs stand-in: build the harness,
+/// lay down the growth files, run the tool loop. Returns the reply, the
+/// shipped wires, the server's own count per wire, and whether a checkpoint
+/// was persisted. A fold replaces retired rounds with one checkpoint whose
+/// text carries the lossless `lcm_expand(` pointer, so the first wire that
+/// carries it is the first request after a fold.
+async fn drive_skewed_tool_loop(
+    higgs: &Arc<SkewedTokenizerHiggs>,
+) -> (String, Vec<Vec<Value>>, Vec<usize>, bool) {
+    let (agent, workspace) = build_local_inline_harness_with_lcm(
+        higgs.clone() as Arc<dyn LLMProvider>,
+        "escha",
+        16_384,
+        LcmSchemaConfig::default(),
+    );
+    higgs.workspace.set(workspace.clone()).unwrap();
+    for round in 1..=higgs.tool_rounds {
+        for side in higgs.sides() {
+            std::fs::write(
+                higgs.growth_file(round, side),
+                format!("growth {round}{side}: the quick brown fox jumps over the lazy dog\n")
+                    .repeat(36),
+            )
+            .unwrap();
+        }
+    }
+    let session_key = format!("retained-skew-{}", uuid::Uuid::new_v4());
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        agent.process_direct(
+            "keep reading the growth files",
+            &session_key,
+            "test",
+            "offline",
+        ),
+    )
+    .await
+    .expect("turn must terminate");
+    let core = agent.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    let checkpoint_persisted = !core
+        .sessions
+        .load_summary_nodes(&session.id)
+        .await
+        .is_empty();
+    let _ = std::fs::remove_dir_all(&workspace);
+    (
+        reply,
+        higgs.calls.lock().unwrap().clone(),
+        higgs.server_counts.lock().unwrap().clone(),
+        checkpoint_persisted,
+    )
+}
+
+fn first_wire_after_fold(calls: &[Vec<Value>]) -> Option<usize> {
+    calls.iter().position(|call| {
+        call.iter().any(|m| {
+            m["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("lcm_expand("))
+        })
+    })
+}
+
+/// Mid-turn fold under a retained contract, against a server that counts 17%
+/// more than the client estimates: one user turn whose tool loop grows the
+/// prompt past the contract's soft wall must fold between its own tool rounds,
+/// so the server never receives a prompt at the soft wall — let alone the
+/// guaranteed wall it would reject. The raw client estimate at the folding
+/// round sits under the soft wall; only the server-anchored count sees it.
+#[tokio::test]
+async fn retained_soft_wall_folds_between_tool_rounds_before_server_wall() {
+    let higgs = Arc::new(SkewedTokenizerHiggs::new(3, 2, 5_500, 4_800, 2_000));
+    let (reply, calls, server_counts, checkpoint_persisted) = drive_skewed_tool_loop(&higgs).await;
+
+    assert!(
+        server_counts
+            .first()
+            .is_some_and(|&first| first + 1_300 < higgs.soft),
+        "harness base prompt must leave at least one tool round under the soft wall: {server_counts:?}"
+    );
+    assert_eq!(
+        higgs.rejections.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the server must never see a prompt above its guaranteed wall: {server_counts:?}"
+    );
+    assert!(
+        server_counts.iter().all(|&seen| seen < higgs.soft),
+        "every shipped prompt must stay under the soft wall: {server_counts:?}"
+    );
+    assert!(
+        first_wire_after_fold(&calls).is_some_and(|index| index > 0),
+        "the soft wall must fold the prompt between tool rounds of ONE turn: message counts {:?}, server counts {server_counts:?}",
+        calls.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+    assert!(
+        checkpoint_persisted,
+        "the mid-turn fold must persist its checkpoint"
+    );
+    assert!(
+        reply.contains("done reading"),
+        "the turn must finish normally: {reply:?}"
+    );
+}
+
+/// A contract-driven fold must land where the retained session can be
+/// re-seeded: the first request after the fold is admitted as a `seed`, for
+/// any contract geometry whose seed ceiling leaves room beside the immutable
+/// prefix. Otherwise the fold stops at the walls, the seed check refuses the
+/// prompt, and the session runs unretained (cold prefill every request).
+#[tokio::test]
+async fn contract_driven_fold_lands_under_the_seed_ceiling() {
+    // (guaranteed, soft, target): soft = guaranteed minus a quarter, as higgs
+    // publishes it; the target leaves room under its seed ceiling for the
+    // immutable prefix plus the newest tool round, which stays raw. Three
+    // capped reads add ~2.3k server tokens per round, so the first geometry
+    // folds at the third request and the second at the fourth.
+    for (guaranteed, soft, target) in [(8_000, 6_000, 5_500), (11_000, 8_250, 6_000)] {
+        let higgs = Arc::new(SkewedTokenizerHiggs::new(4, 3, guaranteed, soft, target));
+        let (reply, calls, server_counts, checkpoint_persisted) =
+            drive_skewed_tool_loop(&higgs).await;
+        let policies = higgs.policies();
+        let geometry = format!("contract ({guaranteed}, {soft}, {target}) server counts {server_counts:?} policies {policies:?}");
+        let shape: Vec<String> = first_wire_after_fold(&calls)
+            .and_then(|index| calls.get(index))
+            .into_iter()
+            .flatten()
+            .map(|m| {
+                format!(
+                    "{}:{}",
+                    m["role"].as_str().unwrap_or("?"),
+                    crate::agent::token_budget::TokenBudget::estimate_message_tokens(m)
+                )
+            })
+            .collect();
+        let geometry = format!("{geometry} post-fold wire {shape:?}");
+
+        assert_eq!(
+            higgs.rejections.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no request may exceed the guaranteed wall: {geometry}"
+        );
+        let after_fold = first_wire_after_fold(&calls).unwrap_or_else(|| {
+            panic!("the tool loop must cross the soft wall and fold: {geometry}")
+        });
+        assert!(checkpoint_persisted, "the fold must persist: {geometry}");
+        assert_eq!(
+            policies.get(after_fold).cloned().flatten().as_deref(),
+            Some("seed"),
+            "the first request after the fold must be admitted as a retained seed: {geometry}"
+        );
+        assert!(
+            reply.contains("done reading"),
+            "the turn must finish normally: {reply:?} ({geometry})"
+        );
+    }
+}
+
+/// Stand-in provider for `attempt_overflow_recovery`'s generic
+/// context-overflow branch: grows several rounds of large, never-compacted
+/// tool-result history (read_file calls against on-disk growth files, same
+/// shape as [`SkewedTokenizerHiggs::read_fresh_files`]), then rejects the
+/// very next call with `context_length_exceeded` exactly once — regardless
+/// of the call's real size. This is deliberate: `max_context_tokens` is set
+/// far above the real growth in [`drive_once_overflow_growth`] so no
+/// proactive soft-wall fold can ever run first; the only way the rejection
+/// happens is this forced bail, standing in for a true server-side
+/// rejection the client could not have predicted.
+struct OnceOverflowGrowthProvider {
+    calls: std::sync::Mutex<Vec<Vec<Value>>>,
+    rejected_once: std::sync::atomic::AtomicBool,
+    workspace: std::sync::OnceLock<std::path::PathBuf>,
+    tool_rounds: usize,
+    reads_per_round: usize,
+}
+
+impl OnceOverflowGrowthProvider {
+    fn new(tool_rounds: usize, reads_per_round: usize) -> Self {
+        Self {
+            calls: std::sync::Mutex::new(Vec::new()),
+            rejected_once: std::sync::atomic::AtomicBool::new(false),
+            workspace: std::sync::OnceLock::new(),
+            tool_rounds,
+            reads_per_round,
+        }
+    }
+
+    fn sides(&self) -> impl Iterator<Item = char> {
+        "abcdefgh".chars().take(self.reads_per_round)
+    }
+
+    fn growth_file(&self, round: usize, side: char) -> std::path::PathBuf {
+        self.workspace
+            .get()
+            .expect("workspace set after the harness is built")
+            .join(format!("overflow_growth_{round}{side}.txt"))
+    }
+
+    fn read_fresh_files(&self, round: usize) -> crate::providers::base::LLMResponse {
+        let call = |side: char| {
+            let mut arguments = std::collections::HashMap::new();
+            arguments.insert("path".to_string(), json!(self.growth_file(round, side)));
+            crate::providers::base::ToolCallRequest {
+                id: format!("tc_overflow_{round}{side}"),
+                name: "read_file".to_string(),
+                arguments,
+            }
+        };
+        crate::providers::base::LLMResponse {
+            content: Some(String::new()),
+            tool_calls: self.sides().map(call).collect(),
+            finish_reason: FinishReason::ToolCalls,
+            usage: std::collections::HashMap::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl LLMProvider for OnceOverflowGrowthProvider {
+    async fn chat(
+        &self,
+        messages: &[Value],
+        _tools: Option<&[Value]>,
+        _model: Option<&str>,
+        _max_tokens: u32,
+        _temperature: f64,
+        _thinking_budget: Option<u32>,
+        _top_p: Option<f64>,
+    ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+        let round = {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(messages.to_vec());
+            calls.len()
+        };
+        // The call right after every growth round has shipped is the turn
+        // trying to wrap up. Reject it exactly once, no matter how small or
+        // large it actually is.
+        if round == self.tool_rounds + 1
+            && !self
+                .rejected_once
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let tokens = crate::agent::token_budget::TokenBudget::estimate_tokens(messages);
+            anyhow::bail!(
+                "HTTP 400: {{\"error\":{{\"message\":\"Rendered prompt has {tokens} tokens, exceeding max_prompt_tokens={}\",\"code\":\"context_length_exceeded\"}}}}",
+                tokens.saturating_sub(1)
+            );
+        }
+        let response = if round <= self.tool_rounds {
+            self.read_fresh_files(round)
+        } else {
+            WireRecordingProvider::text_response("done reading")
+        };
+        Ok(response)
+    }
+
+    fn get_default_model(&self) -> &str {
+        "overflow-growth"
+    }
+}
+
+/// Drive one user turn through [`OnceOverflowGrowthProvider`]: build the
+/// harness with a `max_context_tokens` far above the real growth (so no
+/// proactive compaction can run), lay down the growth files, run the tool
+/// loop. Returns the reply, the shipped wires, and whether a checkpoint was
+/// persisted.
+async fn drive_once_overflow_growth(
+    provider: &Arc<OnceOverflowGrowthProvider>,
+) -> (String, Vec<Vec<Value>>, bool) {
+    let (agent, workspace) = build_local_inline_harness_with_lcm(
+        provider.clone() as Arc<dyn LLMProvider>,
+        "overflow-growth",
+        200_000,
+        LcmSchemaConfig::default(),
+    );
+    provider.workspace.set(workspace.clone()).unwrap();
+    for round in 1..=provider.tool_rounds {
+        for side in provider.sides() {
+            std::fs::write(
+                provider.growth_file(round, side),
+                format!("growth {round}{side}: the quick brown fox jumps over the lazy dog\n")
+                    .repeat(60),
+            )
+            .unwrap();
+        }
+    }
+    let session_key = format!("overflow-growth-{}", uuid::Uuid::new_v4());
+    let reply = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        agent.process_direct(
+            "keep reading the growth files",
+            &session_key,
+            "test",
+            "offline",
+        ),
+    )
+    .await
+    .expect("turn must terminate");
+    let core = agent.shared.core_handle.swappable();
+    let session = core.sessions.get_or_resume(&session_key).await;
+    let checkpoint_persisted = !core
+        .sessions
+        .load_summary_nodes(&session.id)
+        .await
+        .is_empty();
+    let calls = provider.calls.lock().unwrap().clone();
+    let _ = std::fs::remove_dir_all(&workspace);
+    (reply, calls, checkpoint_persisted)
+}
+
+/// A hard server rejection (`context_length_exceeded`) mid-turn must recover
+/// through `attempt_overflow_recovery`'s generic branch, which folds through
+/// the same LCM checkpoint the blocking compaction path installs
+/// (`manage_compaction(..., Deterministic, true)`) before ever falling back
+/// to `apply_emergency_trim`. Proves the FOLD branch ran, not the trim: the
+/// retried wire carries the lossless `lcm_expand(` pointer (only a fold
+/// installs it — a mechanical trim does not), a checkpoint is durably
+/// persisted, and the retried prompt is far smaller than the rejected one.
+#[tokio::test]
+async fn attempt_overflow_recovery_folds_before_trimming() {
+    let provider = Arc::new(OnceOverflowGrowthProvider::new(3, 5));
+    let (reply, calls, checkpoint_persisted) = drive_once_overflow_growth(&provider).await;
+
+    assert!(
+        provider
+            .rejected_once
+            .load(std::sync::atomic::Ordering::SeqCst),
+        "the harness must exercise its single forced rejection"
+    );
+    assert!(
+        checkpoint_persisted,
+        "the fold-first recovery must persist a checkpoint"
+    );
+
+    let rejected = calls
+        .get(calls.len().saturating_sub(2))
+        .expect("a rejected attempt precedes the retry");
+    let retried = calls.last().expect("the retry must ship a request");
+    let rejected_tokens = crate::agent::token_budget::TokenBudget::estimate_tokens(rejected);
+    let retried_tokens = crate::agent::token_budget::TokenBudget::estimate_tokens(retried);
+    assert!(
+        retried_tokens < rejected_tokens,
+        "the recovered retry must shrink the prompt well below the rejected one: \
+         rejected={rejected_tokens} retried={retried_tokens}"
+    );
+    assert!(
+        retried.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("lcm_expand("))),
+        "the retried wire must carry the fold's lossless pointer, not a mechanical trim: {retried:?}"
+    );
+    assert!(
+        reply.contains("done reading"),
+        "the turn must finish normally despite the forced rejection: {reply:?}"
     );
 }
 
@@ -6176,7 +6833,7 @@ async fn cached_duplicate_rounds_use_one_terminal_none_without_scaffold_or_stati
     assert_eq!(response, "terminal duplicate summary");
     assert_eq!(
         provider.terminal_choices.lock().as_slice(),
-        &[crate::providers::base::ToolChoice::None],
+        &[crate::providers::base::ToolChoice::Auto],
         "one shared terminal authority must own duplicate-loop convergence"
     );
 
@@ -6195,7 +6852,7 @@ async fn cached_duplicate_rounds_use_one_terminal_none_without_scaffold_or_stati
     assert_eq!(terminal_calls.len(), 1);
     let terminal_request: crate::session::db::RecordedProviderRequest =
         serde_json::from_slice(&terminal_calls[0].request).unwrap();
-    assert_eq!(terminal_request.tool_choice, "none");
+    assert_eq!(terminal_request.tool_choice, "auto");
     let persisted_text = core
         .sessions
         .get_all_messages(&session.id)
@@ -9413,7 +10070,7 @@ mod runtime_mode_parity_tests {
         assert_eq!(terminal_calls.len(), 1);
         assert_eq!(
             terminal_calls[0].0,
-            crate::providers::base::ToolChoice::None
+            crate::providers::base::ToolChoice::Auto
         );
         assert_eq!(provider.normal_tools.lock()[0], terminal_calls[0].1);
         drop(terminal_calls);
@@ -9436,7 +10093,7 @@ mod runtime_mode_parity_tests {
             .expect("terminal request must be recorded as a continuation");
         let request: crate::session::db::RecordedProviderRequest =
             serde_json::from_slice(&terminal.request).unwrap();
-        assert_eq!(request.tool_choice, "none");
+        assert_eq!(request.tool_choice, "auto");
         assert!(!request.streaming);
         assert_eq!(
             persisted_turn_outcome(&core.sessions, &session.id).await,
@@ -9617,7 +10274,7 @@ mod runtime_mode_parity_tests {
         assert_eq!(stored_ok, Some(false));
         assert_eq!(
             stored_receipt,
-            "terminal tool_choice=none: tool call was rejected and not executed"
+            "terminal answer request: tool call was rejected and not executed"
         );
         assert_eq!(
             persisted_turn_outcome(&core.sessions, &session.id).await,
@@ -9766,7 +10423,7 @@ mod runtime_mode_parity_tests {
         assert_eq!(stored_ok, Some(false));
         assert_eq!(
             stored_receipt,
-            "terminal tool_choice=none: tool call was rejected and not executed"
+            "terminal answer request: tool call was rejected and not executed"
         );
         let replay = core
             .sessions
@@ -9814,6 +10471,397 @@ mod runtime_mode_parity_tests {
             );
             let _ = std::fs::remove_dir_all(&workspace);
         }
+    }
+
+    /// Higgs-capable provider for the terminal-retention regression below:
+    /// records the full wire `messages` array of both the normal
+    /// (tool-calling) request and the terminal (`tool_choice=none`) request,
+    /// so the test can compare the retained-session control fields the two
+    /// carried.
+    struct TerminalHiggsRetentionProvider {
+        normal: crate::providers::base::LLMResponse,
+        terminal: crate::providers::base::LLMResponse,
+        calls: parking_lot::Mutex<Vec<Vec<Value>>>,
+        /// When set, the FIRST terminal (`chat_with_tool_choice`) call fails
+        /// with the 409-class `HiggsRetainedSessionUnavailable` error instead
+        /// of answering — simulating Higgs refusing the retained continuation
+        /// — and every later terminal call answers normally. Exercises the
+        /// `attempt_overflow_recovery` retry arm from the terminal path.
+        fail_first_terminal: std::sync::atomic::AtomicBool,
+    }
+
+    impl TerminalHiggsRetentionProvider {
+        fn new() -> Self {
+            let mut arguments = std::collections::HashMap::new();
+            arguments.insert("path".to_string(), json!("."));
+            Self {
+                normal: crate::providers::base::LLMResponse {
+                    content: Some(String::new()),
+                    tool_calls: vec![crate::providers::base::ToolCallRequest {
+                        id: "tc_retain_normal".to_string(),
+                        name: "list_dir".to_string(),
+                        arguments,
+                    }],
+                    finish_reason: FinishReason::ToolCalls,
+                    usage: std::collections::HashMap::new(),
+                },
+                terminal: crate::providers::base::LLMResponse {
+                    content: Some("terminal retained summary".to_string()),
+                    tool_calls: vec![],
+                    finish_reason: FinishReason::Stop,
+                    usage: std::collections::HashMap::new(),
+                },
+                calls: parking_lot::Mutex::new(Vec::new()),
+                fail_first_terminal: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        /// The terminal request's first attempt is refused by Higgs as an
+        /// unavailable retained session; the retry (unretained or reseeded by
+        /// `attempt_overflow_recovery`) must still land the model's answer.
+        fn new_failing_first_terminal() -> Self {
+            let provider = Self::new();
+            provider
+                .fail_first_terminal
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            provider
+        }
+
+        /// The terminal request answers the nudge with a tool call instead of
+        /// text — it must be rejected, never executed.
+        fn new_terminal_tool_call() -> Self {
+            let mut provider = Self::new();
+            let mut arguments = std::collections::HashMap::new();
+            arguments.insert("command".to_string(), json!("printf should-not-run"));
+            provider.terminal = crate::providers::base::LLMResponse {
+                content: None,
+                tool_calls: vec![crate::providers::base::ToolCallRequest {
+                    id: "tc_terminal_retained_ignored".to_string(),
+                    name: "exec".to_string(),
+                    arguments,
+                }],
+                finish_reason: FinishReason::ToolCalls,
+                usage: std::collections::HashMap::new(),
+            };
+            provider
+        }
+
+        fn calls(&self) -> Vec<Vec<Value>> {
+            self.calls.lock().clone()
+        }
+    }
+
+    #[async_trait]
+    impl LLMProvider for TerminalHiggsRetentionProvider {
+        async fn chat(
+            &self,
+            messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            self.calls.lock().push(messages.to_vec());
+            Ok(self.normal.clone())
+        }
+
+        async fn chat_with_tool_choice(
+            &self,
+            messages: &[Value],
+            _tools: Option<&[Value]>,
+            _model: Option<&str>,
+            _max_tokens: u32,
+            _temperature: f64,
+            _thinking_budget: Option<u32>,
+            _top_p: Option<f64>,
+            _tool_choice: crate::providers::base::ToolChoice,
+        ) -> anyhow::Result<crate::providers::base::LLMResponse> {
+            self.calls.lock().push(messages.to_vec());
+            if self
+                .fail_first_terminal
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                let session_id = messages
+                    .first()
+                    .and_then(|first| {
+                        first.get(crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD)
+                    })
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                return Err(crate::errors::ProviderError::HiggsRetainedSessionUnavailable {
+                    session_id,
+                    epoch: 0,
+                }
+                .into());
+            }
+            Ok(self.terminal.clone())
+        }
+
+        fn get_default_model(&self) -> &str {
+            "local-qwen-test"
+        }
+
+        fn supports_higgs_session_cache(&self) -> bool {
+            true
+        }
+    }
+
+    /// Regression for the terminal-no-tools cold-reprefill bug: after
+    /// exhausting `maxToolIterations`, the loop falls back to
+    /// `step_call_terminal_no_tools`, which used to build its request
+    /// without ever attaching retained-session control (no call to
+    /// `attach_retained_session_control`, the sole caller being the normal
+    /// `step_call_llm` path). Reaching Higgs with no `_nanobot_higgs_*`
+    /// fields forces a stateless, full cold re-prefill instead of a warm
+    /// continuation of the session the normal call just opened. The terminal
+    /// request must carry the SAME retained session id as the normal call
+    /// and its wire must extend that call's, byte for byte.
+    #[tokio::test]
+    async fn terminal_no_tools_carries_retained_session_control() {
+        let provider = Arc::new(TerminalHiggsRetentionProvider::new());
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 1);
+        install_retained_contract(&agent_loop, "local-qwen-test");
+        let session_key = format!("terminal-retained-{}", uuid::Uuid::new_v4());
+
+        let response = agent_loop
+            .process_direct("inspect once then finish", &session_key, "test", "offline")
+            .await;
+
+        assert_eq!(response, "terminal retained summary");
+        let calls = provider.calls();
+        assert_eq!(
+            calls.len(),
+            2,
+            "expected one normal (tool-calling) call then one terminal call"
+        );
+
+        let session_field = crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD;
+        let policy_field =
+            crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD;
+        let normal_session_id = calls[0][0][session_field].as_u64();
+        assert!(
+            normal_session_id.is_some(),
+            "normal call must carry a higgs session id"
+        );
+        assert_eq!(
+            calls[1][0][session_field].as_u64(),
+            normal_session_id,
+            "terminal call must ride the SAME retained session as the normal call, not ship stateless"
+        );
+        assert!(
+            calls[1][0][policy_field].is_string(),
+            "terminal call must carry a retained-session cache policy"
+        );
+        // The cache policy legitimately differs between the two calls (the
+        // first seeds a fresh session; by the terminal call a continuation
+        // is already published, so it must demand an exact continuation
+        // instead) — that one field is deliberately excluded from the
+        // byte-prefix check. Every other wire message, including the rest of
+        // message[0] (session id, epoch, contract revision, system prompt
+        // text), must still extend byte-for-byte: the terminal request must
+        // be indistinguishable from an ordinary continuation of the same
+        // session as far as Higgs's KV cache is concerned.
+        let strip_policy = |messages: &[Value]| -> Vec<Value> {
+            let mut messages = messages.to_vec();
+            if let Some(first) = messages.first_mut().and_then(Value::as_object_mut) {
+                first.remove(policy_field);
+            }
+            messages
+        };
+        assert_wire_prefix(&strip_policy(&calls[0]), &strip_policy(&calls[1]));
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// The terminal request is an ordinary continuation plus exactly one tail
+    /// addition: the `TERMINAL_NUDGE` user message. It must carry tools and a
+    /// non-`"none"` tool_choice (the old tool-choice=none design is gone),
+    /// its wire must byte-extend the prior call, its last message must be
+    /// the nudge, and the nudge must be durably persisted so a reload replays
+    /// the same prefix (never hand-appended only to the live wire array).
+    #[tokio::test]
+    async fn terminal_request_wire_extends_with_persisted_tail_nudge() {
+        let provider = Arc::new(TerminalHiggsRetentionProvider::new());
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 1);
+        install_retained_contract(&agent_loop, "local-qwen-test");
+        let session_key = format!("terminal-nudge-tail-{}", uuid::Uuid::new_v4());
+
+        let response = agent_loop
+            .process_direct("inspect once then finish", &session_key, "test", "offline")
+            .await;
+        assert_eq!(response, "terminal retained summary");
+
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2, "one normal call, one terminal call");
+        // The retained-session cache policy legitimately differs between the
+        // two calls (seed vs. require_continuation — see
+        // `terminal_no_tools_carries_retained_session_control`); strip it
+        // before the byte-prefix check.
+        let policy_field = crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_CACHE_POLICY_FIELD;
+        let strip_policy = |messages: &[Value]| -> Vec<Value> {
+            let mut messages = messages.to_vec();
+            if let Some(first) = messages.first_mut().and_then(Value::as_object_mut) {
+                first.remove(policy_field);
+            }
+            messages
+        };
+        assert_wire_prefix(&strip_policy(&calls[0]), &strip_policy(&calls[1]));
+
+        let last = calls[1].last().expect("terminal wire must not be empty");
+        assert_eq!(last.get("role").and_then(Value::as_str), Some("user"));
+        assert_eq!(
+            last.get("content").and_then(Value::as_str),
+            Some(crate::agent::agent_loop::shared::TERMINAL_NUDGE),
+            "the terminal request's tail message must be the exact nudge text"
+        );
+
+        let core = agent_loop.shared.core_handle.swappable();
+        let session = core
+            .sessions
+            .get_latest_session(&session_key)
+            .await
+            .unwrap();
+        let replay = core
+            .sessions
+            .load_session_replay(&session.id)
+            .await
+            .unwrap();
+        let terminal_call = replay
+            .model_calls
+            .iter()
+            .find(|call| call.purpose == crate::session::db::ModelCallPurpose::Continuation)
+            .expect("terminal request must be recorded as a continuation");
+        let request: crate::session::db::RecordedProviderRequest =
+            serde_json::from_slice(&terminal_call.request).unwrap();
+        assert_ne!(
+            request.tool_choice, "none",
+            "the terminal request must no longer force tool_choice=none"
+        );
+        assert!(
+            request.tools.as_ref().is_some_and(|tools| !tools.is_empty()),
+            "the terminal request must keep the tool catalog"
+        );
+
+        let persisted = core.sessions.get_all_messages(&session.id).await;
+        assert!(
+            persisted.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("user")
+                    && message.get("content").and_then(Value::as_str)
+                        == Some(crate::agent::agent_loop::shared::TERMINAL_NUDGE)
+            }),
+            "the nudge must be durably persisted, not only sent live: {persisted:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// A 409 `HiggsRetainedSessionUnavailable` on the terminal request itself
+    /// — Higgs refusing the retained continuation for the exact same reason
+    /// it can refuse any other request — must not strand the user with the
+    /// generic "ran out of tool iterations" fallback. It is routed through
+    /// the same `attempt_overflow_recovery` arm `step_call_llm` uses and
+    /// retried once; the retry must land the model's real text answer.
+    #[tokio::test]
+    async fn terminal_request_retries_unretained_after_409_and_answers() {
+        let provider = Arc::new(TerminalHiggsRetentionProvider::new_failing_first_terminal());
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 1);
+        install_retained_contract(&agent_loop, "local-qwen-test");
+        let session_key = format!("terminal-409-retry-{}", uuid::Uuid::new_v4());
+
+        let response = agent_loop
+            .process_direct("inspect once then finish", &session_key, "test", "offline")
+            .await;
+
+        assert_eq!(
+            response, "terminal retained summary",
+            "a refused terminal retained session must still end in the model's text answer"
+        );
+
+        let calls = provider.calls();
+        assert_eq!(
+            calls.len(),
+            3,
+            "normal call, refused terminal attempt, retried terminal attempt: {calls:?}"
+        );
+        let session_field = crate::providers::openai_compat::NANOBOT_HIGGS_SESSION_ID_FIELD;
+        let refused_session_id = calls[1][0][session_field].as_u64();
+        let retried_session_id = calls[2][0][session_field].as_u64();
+        assert!(
+            refused_session_id.is_some() && retried_session_id.is_some(),
+            "both terminal attempts must carry a higgs session id: {calls:?}"
+        );
+        assert_ne!(
+            refused_session_id, retried_session_id,
+            "the retry must rotate to a fresh session rather than repeat the refused one"
+        );
+
+        let core = agent_loop.shared.core_handle.swappable();
+        let session = core
+            .sessions
+            .get_latest_session(&session_key)
+            .await
+            .unwrap();
+        assert_eq!(
+            persisted_turn_outcome(&core.sessions, &session.id).await,
+            "finished",
+            "recovery must reach a finished turn, not limit_exhausted"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    /// If the model answers the terminal nudge with a tool call instead of
+    /// text, it must never execute — no `ToolExecute` event, no side effect
+    /// — and the turn ends with the generic limit-exhausted fallback, exactly
+    /// as it did when the terminal request forced `tool_choice=none`.
+    #[tokio::test]
+    async fn terminal_request_tool_call_is_rejected_not_executed_with_retained_session() {
+        let provider = Arc::new(TerminalHiggsRetentionProvider::new_terminal_tool_call());
+        let (agent_loop, workspace) =
+            build_local_inline_harness_with_iters(provider.clone() as Arc<dyn LLMProvider>, 1);
+        install_retained_contract(&agent_loop, "local-qwen-test");
+        let session_key = format!("terminal-tool-ignored-{}", uuid::Uuid::new_v4());
+
+        agent_loop
+            .process_direct("inspect once then finish", &session_key, "test", "offline")
+            .await;
+
+        assert_eq!(
+            provider.calls().len(),
+            2,
+            "one normal call, one terminal attempt — a rejected tool call must not retry"
+        );
+
+        let core = agent_loop.shared.core_handle.swappable();
+        let session = core
+            .sessions
+            .get_latest_session(&session_key)
+            .await
+            .unwrap();
+        let replay = core
+            .sessions
+            .load_session_replay(&session.id)
+            .await
+            .unwrap();
+        assert!(
+            !replay.events.iter().any(|event| matches!(
+                &event.payload,
+                crate::session::db::SessionEventPayload::ToolExecute { tool_call_id, .. }
+                    if tool_call_id == "tc_terminal_retained_ignored"
+            )),
+            "the terminal tool call must never execute"
+        );
+        assert_eq!(
+            persisted_turn_outcome(&core.sessions, &session.id).await,
+            "limit_exhausted"
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     /// One deterministic replay of the failure cluster recovered from the
@@ -10049,7 +11097,7 @@ mod runtime_mode_parity_tests {
         assert_eq!(terminal_calls.len(), 1);
         assert_eq!(
             terminal_calls[0].0,
-            crate::providers::base::ToolChoice::None
+            crate::providers::base::ToolChoice::Auto
         );
         drop(terminal_calls);
 
@@ -10084,7 +11132,7 @@ mod runtime_mode_parity_tests {
             .expect("prior main call");
         let prior_main_request: crate::session::db::RecordedProviderRequest =
             serde_json::from_slice(&prior_main_call.request).unwrap();
-        assert_eq!(terminal_request.tool_choice, "none");
+        assert_eq!(terminal_request.tool_choice, "auto");
         assert!(!terminal_request.streaming);
         assert!(prior_main_request.streaming);
         assert_eq!(
@@ -10543,7 +11591,7 @@ mod runtime_mode_parity_tests {
         );
         assert_eq!(
             provider.terminal_choices.lock().as_slice(),
-            &[crate::providers::base::ToolChoice::None],
+            &[crate::providers::base::ToolChoice::Auto],
             "the repeated loop must share the one terminal no-tools authority"
         );
 

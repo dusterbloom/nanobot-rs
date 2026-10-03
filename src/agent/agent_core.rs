@@ -189,6 +189,10 @@ struct HiggsSessionState {
     /// One-shot exception for the intentional LCM session rotation: the next
     /// request may reuse the stable prefix anchor instead of looking cold.
     preserved_prefix_epoch: Option<u64>,
+    /// Durable session id last seen through [`RuntimeCounters::activate_higgs_session_state`].
+    /// Captured so a rotation can persist the new epoch against the correct
+    /// durable row without threading the id through every rotation call site.
+    durable_session_id: Option<String>,
 }
 
 pub(crate) struct HiggsSessionRequestReservation {
@@ -313,6 +317,12 @@ pub struct RuntimeCounters {
     /// rotation queues one, so the retired session's resident KV frees
     /// before the next prompt prefills instead of riding that request.
     higgs_drop_flusher: parking_lot::Mutex<Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>>,
+    /// Durable backstop for the in-memory epoch, wired by the embedding loop:
+    /// fires right after a rotation bumps the epoch, persisting it against the
+    /// durable session id so a resuming process (after restart) does not
+    /// re-derive a stale, already-retained id. Best-effort — see
+    /// `SessionDb::set_higgs_epoch`.
+    higgs_epoch_persist: parking_lot::Mutex<Option<std::sync::Arc<dyn Fn(String, u64) + Send + Sync>>>,
     /// Per-session local artifact intent for short follow-up edit turns
     /// ("make it red", "also add a score") after an explicit local artifact
     /// request. Bounded by turn count, not persisted.
@@ -376,6 +386,7 @@ impl RuntimeCounters {
             prompt_cache_transition: parking_lot::Mutex::new(()),
             higgs_sessions: parking_lot::Mutex::new(std::collections::HashMap::new()),
             higgs_drop_flusher: parking_lot::Mutex::new(None),
+            higgs_epoch_persist: parking_lot::Mutex::new(None),
             local_artifact_intent: parking_lot::Mutex::new(std::collections::HashMap::new()),
             lcm_compaction_count: AtomicU64::new(0),
             lcm_tokens_before: AtomicU64::new(0),
@@ -592,6 +603,7 @@ impl RuntimeCounters {
     ) -> u64 {
         let active_id = stable_higgs_session_id(durable_session_id, state.epoch);
         state.active_id = Some(active_id);
+        state.durable_session_id = Some(durable_session_id.to_string());
         active_id
     }
 
@@ -602,22 +614,28 @@ impl RuntimeCounters {
     /// safe: if Higgs restarted or evicted it, the typed unavailable path rotates
     /// and seeds once. Never overwrite live in-process state, especially after a
     /// deliberate compaction rotation.
+    /// `epoch` is the last epoch persisted for `durable_session_id` (see
+    /// `SessionDb::get_higgs_epoch`), or `0` for a session with no persisted
+    /// epoch (matches the prior hardcoded cold-start behavior).
     pub(crate) fn restore_higgs_publication_hint(
         &self,
         session_key: &str,
         durable_session_id: &str,
+        epoch: u64,
     ) -> bool {
         let _transition = self.prompt_cache_transition.lock();
         let mut sessions = self.higgs_sessions.lock();
         if sessions.contains_key(session_key) {
             return false;
         }
-        let active_id = stable_higgs_session_id(durable_session_id, 0);
+        let active_id = stable_higgs_session_id(durable_session_id, epoch);
         sessions.insert(
             session_key.to_string(),
             HiggsSessionState {
+                epoch,
                 active_id: Some(active_id),
                 published_active_id: Some(active_id),
+                durable_session_id: Some(durable_session_id.to_string()),
                 ..HiggsSessionState::default()
             },
         );
@@ -695,6 +713,14 @@ impl RuntimeCounters {
         *self.higgs_drop_flusher.lock() = Some(flusher);
     }
 
+    /// Wire the durable epoch-persist callback (see `higgs_epoch_persist`).
+    pub(crate) fn set_higgs_epoch_persist(
+        &self,
+        persist: std::sync::Arc<dyn Fn(String, u64) + Send + Sync>,
+    ) {
+        *self.higgs_epoch_persist.lock() = Some(persist);
+    }
+
     pub(crate) fn retire_higgs_session(&self, session_key: &str) -> u64 {
         self.retire_higgs_session_inner(session_key, PromptCacheBookkeeping::Clear)
     }
@@ -755,7 +781,18 @@ impl RuntimeCounters {
             PromptCacheBookkeeping::Clear => None,
             PromptCacheBookkeeping::Preserve(_) => Some(state.epoch),
         };
-        state.epoch
+        let new_epoch = state.epoch;
+        // Persist the bumped epoch against the durable session id so a
+        // resuming process (new RuntimeCounters, same sessions.db row) does
+        // not restart at epoch 0 and collide with this still-live retained
+        // id. Best-effort — see `higgs_epoch_persist`.
+        if let Some(durable_session_id) = state.durable_session_id.clone() {
+            let maybe_persist = self.higgs_epoch_persist.lock().clone();
+            if let Some(persist_fn) = maybe_persist {
+                persist_fn(durable_session_id, new_epoch);
+            }
+        }
+        new_epoch
     }
 
     #[cfg(test)]
@@ -1338,7 +1375,7 @@ mod tests {
     #[test]
     fn resumed_process_restores_required_continuation_hint_once() {
         let counters = Arc::new(RuntimeCounters::new(32_768));
-        assert!(counters.restore_higgs_publication_hint("cli:resume", "sqlite:resume",));
+        assert!(counters.restore_higgs_publication_hint("cli:resume", "sqlite:resume", 0));
 
         let resumed = counters.reserve_higgs_session_request("cli:resume", "sqlite:resume", 24_576);
         assert_eq!(
@@ -1347,11 +1384,67 @@ mod tests {
         );
 
         counters.invalidate_prompt_cache("cli:resume", true);
-        assert!(!counters.restore_higgs_publication_hint("cli:resume", "sqlite:resume",));
+        assert!(!counters.restore_higgs_publication_hint("cli:resume", "sqlite:resume", 0));
         let rotated = counters.reserve_higgs_session_request("cli:resume", "sqlite:resume", 24_576);
         assert_eq!(
             rotated.control().reuse_policy,
             HiggsSessionReusePolicy::Seed
+        );
+    }
+
+    /// Cross-process epoch loss: a rotation persists its new epoch (via the
+    /// `higgs_epoch_persist` callback, here captured directly instead of
+    /// going through the fire-and-forget tokio::spawn wiring in
+    /// `agent_loop::mod`), and a brand-new `RuntimeCounters` resuming the
+    /// same durable session reads it back instead of cold-starting at 0 and
+    /// colliding with the still-live retained id.
+    #[tokio::test]
+    async fn resumed_process_reads_persisted_epoch_and_requires_continuation() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let db = Arc::new(SessionDb::new(&temp.path().join("sessions.db")));
+        let meta = db.create_session("cli:restart").await;
+        let durable_id = meta.id.clone();
+
+        let counters = Arc::new(RuntimeCounters::new(32_768));
+        let (persist_tx, persist_rx) = std::sync::mpsc::channel::<(String, u64)>();
+        counters.set_higgs_epoch_persist(Arc::new(move |session_id, epoch| {
+            let _ = persist_tx.send((session_id, epoch));
+        }));
+
+        // Activate once, then rotate — mirrors a real LCM/compaction rotation.
+        counters.reserve_higgs_session_request("cli:restart", &durable_id, 0);
+        let epoch = counters.retire_higgs_session("cli:restart");
+        assert_eq!(epoch, 1);
+
+        let (persisted_id, persisted_epoch) = persist_rx
+            .try_recv()
+            .expect("rotation must invoke the epoch-persist callback");
+        assert_eq!(persisted_id, durable_id);
+        assert_eq!(persisted_epoch, 1);
+        db.set_higgs_epoch(&durable_id, persisted_epoch).await;
+
+        // Simulate a process restart: a fresh RuntimeCounters with no
+        // in-memory higgs state, reading the same durable sessions.db row.
+        let resumed_counters = Arc::new(RuntimeCounters::new(32_768));
+        let read_epoch = db.get_higgs_epoch(&durable_id).await;
+        assert_eq!(read_epoch, 1);
+        assert!(resumed_counters.restore_higgs_publication_hint(
+            "cli:restart",
+            &durable_id,
+            read_epoch,
+        ));
+
+        let expected_active_id = stable_higgs_session_id(&durable_id, 1);
+        assert_eq!(
+            resumed_counters.active_higgs_session_id("cli:restart"),
+            Some(expected_active_id)
+        );
+        let reservation =
+            resumed_counters.reserve_higgs_session_request("cli:restart", &durable_id, 24_576);
+        assert_eq!(reservation.active_id(), expected_active_id);
+        assert_eq!(
+            reservation.control().reuse_policy,
+            HiggsSessionReusePolicy::RequireContinuation
         );
     }
 

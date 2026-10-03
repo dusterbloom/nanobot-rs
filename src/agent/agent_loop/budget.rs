@@ -13,8 +13,11 @@ use std::collections::HashSet;
 
 use serde_json::{json, Value};
 
-use crate::agent::agent_core::{HiggsSessionControl, HiggsSessionReusePolicy};
+use crate::agent::agent_core::{
+    HiggsSessionControl, HiggsSessionRequestReservation, HiggsSessionReusePolicy,
+};
 use crate::agent::system_state;
+use crate::agent::token_budget::TokenBudget;
 use crate::turn_stream::{CacheResetReason, CacheStatus, ControlMarker};
 
 use super::shared::{RetentionEligibility, TurnContext};
@@ -151,7 +154,7 @@ pub(super) fn retention_attachment(
     };
     let seed_fits = prompt_tokens as f64 <= seed_target as f64 * OVERFLOW_RECOVERY_MARGIN;
     match (eligibility, policy) {
-        (RetentionEligibility::SuspendedForTurn, _) => RetentionAttachment::Unretained,
+        (RetentionEligibility::SuspendedForNextRequest, _) => RetentionAttachment::Unretained,
         (RetentionEligibility::Contracted, HiggsSessionReusePolicy::Seed) if !seed_fits => {
             RetentionAttachment::Unretained
         }
@@ -222,6 +225,129 @@ pub(super) fn attach_higgs_session_control(messages: &mut [Value], control: &Hig
     }
 }
 
+/// One provider request's share of the Higgs retained-session contract:
+/// the reservation to settle once the call finishes, and the drop ids a
+/// request that never attaches retention must leave pending for the next
+/// request to carry.
+///
+/// Shared by the normal tool-calling request (`step_call_llm`) and the
+/// terminal no-tools request (`step_call_terminal_no_tools`) so both opt
+/// into retention identically. Before this type existed, the terminal
+/// request never reserved or attached anything, so after exhausting the
+/// tool budget it shipped stateless — a cold, un-retained prefill of the
+/// whole prompt — even though a warm retained session was sitting right
+/// there from the normal calls earlier in the same turn.
+pub(super) struct HiggsReservationState {
+    pub(super) pending_drop: Vec<u64>,
+    pub(super) reservation: Option<HiggsSessionRequestReservation>,
+}
+
+/// Pre-call half of the Higgs retained-session contract, run BEFORE the
+/// provider-request admission hash so that hash is computed over the raw
+/// prompt (admission must be blind to session bookkeeping). Restores the
+/// publication hint for a reloaded history, then reserves a session slot.
+/// A non-Higgs provider gets an empty, no-op state.
+pub(super) async fn reserve_higgs_session(
+    ctx: &TurnContext,
+    messages_for_llm: &[Value],
+    max_tokens: u32,
+) -> HiggsReservationState {
+    if !ctx.core.provider.supports_higgs_session_cache() {
+        return HiggsReservationState {
+            pending_drop: Vec::new(),
+            reservation: None,
+        };
+    }
+    let counters = &ctx.counters;
+    if messages_for_llm
+        .iter()
+        .any(|message| message.get("role").and_then(|role| role.as_str()) == Some("assistant"))
+    {
+        let persisted_epoch = ctx.core.sessions.get_higgs_epoch(&ctx.session_id).await;
+        counters.restore_higgs_publication_hint(&ctx.session_key, &ctx.session_id, persisted_epoch);
+    }
+    let max_prompt_tokens = ctx
+        .effective_budget
+        .max_context()
+        .saturating_sub(max_tokens as usize)
+        .min(ctx.effective_budget.available_budget(0))
+        .min(u32::MAX as usize) as u32;
+    let reservation =
+        counters.reserve_higgs_session_request(&ctx.session_key, &ctx.session_id, max_prompt_tokens);
+    let pending_drop = reservation.drop_ids().to_vec();
+    HiggsReservationState {
+        pending_drop,
+        reservation: Some(reservation),
+    }
+}
+
+/// Post-admission half: decide whether this request's token estimate fits
+/// the installed retained contract and, if so, stamp the retained-session
+/// control fields onto `messages_for_llm`'s head message. Run AFTER the
+/// admission hash so retained bookkeeping never perturbs it, and before the
+/// request is durably recorded so the persisted request matches the wire
+/// exactly.
+pub(super) fn attach_higgs_retention(
+    ctx: &mut TurnContext,
+    state: &mut HiggsReservationState,
+    messages_for_llm: &mut [Value],
+    tool_def_tokens: usize,
+) -> Option<RetentionAttachment> {
+    let control = state.reservation.as_ref()?.control().clone();
+    let eligibility = ctx.flow.retention;
+    let retention = retention_attachment(
+        ctx.capacity.retained_contract(),
+        control.reuse_policy,
+        TokenBudget::estimate_tokens(messages_for_llm).saturating_add(tool_def_tokens),
+        eligibility,
+    );
+    // The suspension covers exactly the request it forced unretained; restore
+    // eligibility now so the NEXT request attempts retention again instead of
+    // staying unretained for the rest of the turn.
+    if eligibility == RetentionEligibility::SuspendedForNextRequest {
+        ctx.flow.retention = RetentionEligibility::Contracted;
+    }
+    match &retention {
+        RetentionAttachment::Retained { contract_revision } => {
+            attach_retained_session_control(
+                messages_for_llm,
+                &control,
+                ctx.counters.session_prompt_epoch(&ctx.session_key),
+                contract_revision,
+            );
+        }
+        RetentionAttachment::Unretained => state.pending_drop.clear(),
+        RetentionAttachment::NoContract => {}
+    }
+    Some(retention)
+}
+
+/// Release any drop ids this request queued but never shipped (no contract,
+/// or the request did not opt into retention) — they stay pending for the
+/// next request that does.
+pub(super) fn clear_pending_higgs_drop(ctx: &TurnContext, pending_drop: &[u64]) {
+    if !pending_drop.is_empty() {
+        ctx.counters
+            .clear_pending_higgs_session_drop_ids(&ctx.session_key, pending_drop);
+    }
+}
+
+/// Mark the reserved session id as actually published, but only when the
+/// request shipped retained — an unretained response (contract declined to
+/// admit this request) publishes nothing, so the next request must seed
+/// rather than demand an exact continuation.
+pub(super) fn publish_higgs_reservation(
+    reservation: &Option<HiggsSessionRequestReservation>,
+    retention: Option<&RetentionAttachment>,
+) {
+    if let Some(reservation) = reservation
+        .as_ref()
+        .filter(|_| retention != Some(&RetentionAttachment::Unretained))
+    {
+        reservation.publish_exact();
+    }
+}
+
 #[cfg(test)]
 pub(super) fn attach_higgs_session_marker(
     messages: &mut [Value],
@@ -250,7 +376,7 @@ mod retention_attachment_tests {
     #[test]
     fn requests_opt_into_retention_only_when_the_contract_admits_them() {
         use HiggsSessionReusePolicy::{RequireContinuation, Seed};
-        use RetentionEligibility::{Contracted, SuspendedForTurn};
+        use RetentionEligibility::{Contracted, SuspendedForNextRequest};
         let retained = RetentionAttachment::Retained {
             contract_revision: "rev".to_owned(),
         };
@@ -274,19 +400,19 @@ mod retention_attachment_tests {
                 Contracted,
                 retained.clone(),
             ),
-            // After a refusal the turn stays unretained even when it would fit.
+            // While suspended, the next request stays unretained even when it would fit.
             (
                 contract(4_096),
                 Seed,
                 100,
-                SuspendedForTurn,
+                SuspendedForNextRequest,
                 RetentionAttachment::Unretained,
             ),
             (
                 contract(4_096),
                 RequireContinuation,
                 100,
-                SuspendedForTurn,
+                SuspendedForNextRequest,
                 RetentionAttachment::Unretained,
             ),
         ];

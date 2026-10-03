@@ -66,12 +66,13 @@ use super::response::RetryState;
 use crate::turn_stream::{BackendActivity, CacheResetReason, CacheStatus, ControlMarker};
 
 use super::budget::{
-    advertised_tool_names, attach_retained_session_control, clear_prompt_cache_state,
-    divergent_message_digest, history_window_near, invalidate_prompt_cache_for_rewrite,
-    overflow_recovery_fallback_budget, overflow_trim_threshold,
-    proactive_grounding_preserves_prefix_cache, retention_attachment, send_cache_reset_marker,
+    advertised_tool_names, attach_higgs_retention, clear_pending_higgs_drop,
+    clear_prompt_cache_state, divergent_message_digest, history_window_near,
+    invalidate_prompt_cache_for_rewrite, overflow_recovery_fallback_budget,
+    overflow_trim_threshold, proactive_grounding_preserves_prefix_cache,
+    publish_higgs_reservation, reserve_higgs_session, send_cache_reset_marker,
     send_compaction_marker, send_retract_reply_marker, should_allow_checkpoint,
-    should_inject_heartbeat_grounding, RetentionAttachment, MAX_OVERFLOW_RECOVERIES,
+    should_inject_heartbeat_grounding, MAX_OVERFLOW_RECOVERIES,
     OVERFLOW_RECOVERY_HEADROOM,
 };
 use super::compaction::execute_lcm_compaction;
@@ -748,19 +749,28 @@ pub(crate) const NO_PROGRESS_HARD_STOP: u32 = 4;
 const LIMIT_EXHAUSTED_REPLY: &str =
     "I ran out of tool iterations before producing a final answer. The actions above may be incomplete.";
 
+/// Appended to the conversation (via `ctx.messages`, never hand-appended to
+/// the rendered wire array) before the terminal no-more-tool-iterations
+/// request. The model sees this live; its text answers the nudge.
+pub(crate) const TERMINAL_NUDGE: &str = "User needs your answer now. Do not call any more tools. Look at the results from the past tool calls and answer truthfully if possible; otherwise say what has gone wrong.";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProviderCallMode {
     Normal,
     TerminalNoTools,
 }
 
-/// Whether this turn's requests may opt into Higgs's retained-session
-/// contract. Once Higgs refuses to retain a request, the turn continues as
-/// ordinary prompts instead of cutting live context to fit a cache.
+/// Whether the NEXT request may opt into Higgs's retained-session contract.
+/// Once Higgs refuses to retain a request, only that one refused request's
+/// successor goes unretained; `attach_higgs_retention` consumes the
+/// suspension and restores `Contracted` so the request after that attempts
+/// retention again. The seed slot Higgs refused can free up (idle eviction)
+/// within a few requests, so staying unretained for the rest of the turn
+/// would pay full stateless prefill long after the conflict resolved itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RetentionEligibility {
     Contracted,
-    SuspendedForTurn,
+    SuspendedForNextRequest,
 }
 
 /// Per-turn flow control flags.
@@ -832,7 +842,8 @@ pub(crate) struct FlowControl {
     /// Provider mode for the next call. Terminal mode is entered only after a
     /// convergence limit and never returns to the normal loop.
     pub(crate) provider_call_mode: ProviderCallMode,
-    /// Whether requests in this turn may opt into retained-session reuse.
+    /// Whether the next request may opt into retained-session reuse. See
+    /// `RetentionEligibility`.
     pub(crate) retention: RetentionEligibility,
     /// Shared at-most-once authority for every convergence trigger.
     pub(crate) terminal_attempted: bool,
@@ -2255,14 +2266,18 @@ impl AgentLoopShared {
     /// Higgs refused to retain a request whose prompt fits the model: a seed
     /// above the contract's post-compaction target (the client estimate
     /// under-counted), or a continuation past its guarantee. Retention only
-    /// saves prefill, so answer the rest of the turn with ordinary requests
-    /// instead of folding or trimming live context to fit the cache. A refusal
-    /// after suspension is not a retention problem and surfaces.
+    /// saves prefill, so answer with one ordinary request instead of folding
+    /// or trimming live context to fit the cache. The suspension covers only
+    /// that one next request — `attach_higgs_retention` restores
+    /// `Contracted` once it is consumed, so the request after that attempts
+    /// retention again (the slot Higgs refused frees up via idle eviction).
+    /// A refusal while already suspended is not a retention problem and
+    /// surfaces.
     fn suspend_retention_for_turn(ctx: &mut TurnContext, error: &anyhow::Error) -> bool {
-        if ctx.flow.retention == RetentionEligibility::SuspendedForTurn {
+        if ctx.flow.retention == RetentionEligibility::SuspendedForNextRequest {
             return false;
         }
-        ctx.flow.retention = RetentionEligibility::SuspendedForTurn;
+        ctx.flow.retention = RetentionEligibility::SuspendedForNextRequest;
         warn!(
             session = %ctx.session_key,
             error = %error,
@@ -2309,7 +2324,10 @@ impl AgentLoopShared {
         }
         if matches!(
             error.downcast_ref::<crate::errors::ProviderError>(),
-            Some(crate::errors::ProviderError::HiggsRetentionCompactionRequired { .. })
+            Some(
+                crate::errors::ProviderError::HiggsRetentionCompactionRequired { .. }
+                    | crate::errors::ProviderError::HiggsRetentionSeedConflict
+            )
         ) {
             return Self::suspend_retention_for_turn(ctx, error);
         }
@@ -3444,7 +3462,21 @@ impl AgentLoopShared {
         );
         let tool_def_tokens = TokenBudget::estimate_tool_def_tokens(tool_defs);
 
-        let messages_for_llm = render_via_protocol(&*ctx.protocol, &ctx.messages);
+        // The terminal call is an ordinary request plus one tail nudge: same
+        // tools, same tool_choice, same retained-session controls as a normal
+        // `step_call_llm` call would carry. The nudge goes through
+        // `ctx.messages` (never hand-appended to the rendered wire array) so
+        // it is persisted and replays byte-identically; the model sees it
+        // live and answers it.
+        ctx.messages
+            .push_draft(crate::agent::markers::scaffold_user(TERMINAL_NUDGE));
+        if let Err(error) = ctx.persist_pending_protocol_messages().await {
+            return IterationOutcome::Error(format!(
+                "terminal nudge could not be recorded: {error}"
+            ));
+        }
+
+        let mut messages_for_llm = render_via_protocol(&*ctx.protocol, &ctx.messages);
         let prompt_cap = ctx
             .effective_budget
             .max_context()
@@ -3460,149 +3492,182 @@ impl AgentLoopShared {
         }
 
         let tool_defs_opt = (!tool_defs.is_empty()).then_some(tool_defs);
-        let request = RecordedProviderRequest {
-            messages: messages_for_llm.clone(),
-            tools: tool_defs_opt.map(<[Value]>::to_vec),
-            model: ctx.core.model.clone(),
-            max_tokens,
-            temperature: ctx.core.temperature,
-            thinking_budget: None,
-            top_p: None,
-            tool_choice: "none".to_string(),
-            streaming: false,
-        };
-        let call_id = match ctx
-            .core
-            .sessions
-            .record_model_request(
-                &ctx.session_id,
-                &ctx.request_id,
-                ctx.turn_count,
-                ModelCallPurpose::Continuation,
-                &request,
-            )
-            .await
-        {
-            Ok(call_id) => call_id,
-            Err(error) => {
+
+        loop {
+            // Opt this terminal request into the same retained-session contract a
+            // normal `step_call_llm` call would carry. Without this the request
+            // reaches Higgs with no `_nanobot_higgs_*` controls and ships
+            // stateless — a full cold re-prefill of the whole prompt instead of
+            // a warm continuation.
+            let mut higgs = reserve_higgs_session(ctx, &messages_for_llm, max_tokens).await;
+            let retention =
+                attach_higgs_retention(ctx, &mut higgs, &mut messages_for_llm, tool_def_tokens);
+
+            let request = RecordedProviderRequest {
+                messages: messages_for_llm.clone(),
+                tools: tool_defs_opt.map(<[Value]>::to_vec),
+                model: ctx.core.model.clone(),
+                max_tokens,
+                temperature: ctx.core.temperature,
+                thinking_budget: None,
+                top_p: None,
+                tool_choice: "auto".to_string(),
+                streaming: false,
+            };
+            let call_id = match ctx
+                .core
+                .sessions
+                .record_model_request(
+                    &ctx.session_id,
+                    &ctx.request_id,
+                    ctx.turn_count,
+                    ModelCallPurpose::Continuation,
+                    &request,
+                )
+                .await
+            {
+                Ok(call_id) => call_id,
+                Err(error) => {
+                    return IterationOutcome::Error(format!(
+                        "terminal request was not sent because replay persistence failed: {error}"
+                    ));
+                }
+            };
+
+            self.core_handle.counters.mark_inference_started();
+            let response = ctx
+                .core
+                .provider
+                .chat_with_tool_choice(
+                    &messages_for_llm,
+                    tool_defs_opt,
+                    Some(&ctx.core.model),
+                    max_tokens,
+                    ctx.core.temperature,
+                    None,
+                    None,
+                    ToolChoice::Auto,
+                )
+                .await;
+            self.core_handle.counters.mark_inference_finished();
+            let response = match response {
+                Ok(response) => response,
+                Err(error) => {
+                    // A retained-session refusal on the terminal request must
+                    // not strand the user without an answer: retry once
+                    // through the same recovery `step_call_llm` uses (DRY) —
+                    // it rotates/suspends retention as needed so the retried
+                    // request succeeds, cold at worst.
+                    if self
+                        .attempt_overflow_recovery(ctx, &error, max_tokens, tool_def_tokens)
+                        .await
+                    {
+                        messages_for_llm = render_via_protocol(&*ctx.protocol, &ctx.messages);
+                        continue;
+                    }
+                    if let Err(record_error) =
+                        Self::persist_model_failure(ctx, &call_id, &error.to_string()).await
+                    {
+                        return IterationOutcome::Error(record_error.to_string());
+                    }
+                    return IterationOutcome::Complete {
+                        content: LIMIT_EXHAUSTED_REPLY.to_string(),
+                        outcome: TurnOutcome::LimitExhausted,
+                    };
+                }
+            };
+            if let Err(error) = ctx
+                .core
+                .sessions
+                .record_model_response(
+                    &ctx.session_id,
+                    &ctx.request_id,
+                    ctx.turn_count,
+                    &call_id,
+                    &RecordedProviderResponse::from(&response),
+                )
+                .await
+            {
                 return IterationOutcome::Error(format!(
-                    "terminal request was not sent because replay persistence failed: {error}"
+                    "terminal response could not be recorded: {error}"
                 ));
             }
-        };
 
-        self.core_handle.counters.mark_inference_started();
-        let response = ctx
-            .core
-            .provider
-            .chat_with_tool_choice(
-                &messages_for_llm,
-                tool_defs_opt,
-                Some(&ctx.core.model),
-                max_tokens,
-                ctx.core.temperature,
-                None,
-                None,
-                ToolChoice::None,
-            )
-            .await;
-        self.core_handle.counters.mark_inference_finished();
-        let response = match response {
-            Ok(response) => response,
-            Err(error) => {
-                if let Err(record_error) =
-                    Self::persist_model_failure(ctx, &call_id, &error.to_string()).await
-                {
-                    return IterationOutcome::Error(record_error.to_string());
+            // Mirror step_call_llm's receipt/publication bookkeeping so the next
+            // turn's request is a byte-extension of this one instead of starting
+            // a fresh, un-retained session.
+            clear_pending_higgs_drop(ctx, &higgs.pending_drop);
+            if Self::response_status(&response) == "ok" {
+                publish_higgs_reservation(&higgs.reservation, retention.as_ref());
+            }
+            drop(higgs);
+
+            if response.has_tool_calls() {
+                crate::agent::tool_engine::append_tool_call_carrier(
+                    ctx,
+                    &response.tool_calls,
+                    &response,
+                );
+                for tool_call in &response.tool_calls {
+                    ctx.messages.with_draft(|draft| {
+                        ContextBuilder::add_tool_result_immutable_with_status(
+                            draft,
+                            &tool_call.id,
+                            &tool_call.name,
+                            "terminal answer request: tool call was rejected and not executed",
+                            false,
+                        )
+                    });
+                }
+                if let Err(error) = ctx.persist_pending_rejected_tool_messages().await {
+                    return IterationOutcome::Error(format!(
+                        "terminal tool rejection receipts could not be recorded: {error}"
+                    ));
+                }
+                for tool_call in &response.tool_calls {
+                    if let Err(error) = ctx
+                        .core
+                        .sessions
+                        .record_tool_pre_execute(
+                            &ctx.session_id,
+                            &ctx.request_id,
+                            ctx.turn_count,
+                            &tool_call.id,
+                            &tool_call.name,
+                            &tool_call.arguments,
+                            crate::session::db::ToolPreExecuteDecision::Rejected {
+                                reason: "terminal_no_tools".to_string(),
+                            },
+                        )
+                        .await
+                    {
+                        return IterationOutcome::Error(format!(
+                            "terminal tool rejection could not be recorded: {error}"
+                        ));
+                    }
                 }
                 return IterationOutcome::Complete {
                     content: LIMIT_EXHAUSTED_REPLY.to_string(),
                     outcome: TurnOutcome::LimitExhausted,
                 };
             }
-        };
-        if let Err(error) = ctx
-            .core
-            .sessions
-            .record_model_response(
-                &ctx.session_id,
-                &ctx.request_id,
-                ctx.turn_count,
-                &call_id,
-                &RecordedProviderResponse::from(&response),
-            )
-            .await
-        {
-            return IterationOutcome::Error(format!(
-                "terminal response could not be recorded: {error}"
-            ));
-        }
 
-        if response.has_tool_calls() {
-            crate::agent::tool_engine::append_tool_call_carrier(
-                ctx,
-                &response.tool_calls,
-                &response,
-            );
-            for tool_call in &response.tool_calls {
-                ctx.messages.with_draft(|draft| {
-                    ContextBuilder::add_tool_result_immutable_with_status(
-                        draft,
-                        &tool_call.id,
-                        &tool_call.name,
-                        "terminal tool_choice=none: tool call was rejected and not executed",
-                        false,
-                    )
-                });
+            let response_failed = response.outcome().is_err();
+            let content = response.content.unwrap_or_default();
+            if response_failed || content.trim().is_empty() {
+                return IterationOutcome::Complete {
+                    content: LIMIT_EXHAUSTED_REPLY.to_string(),
+                    outcome: TurnOutcome::LimitExhausted,
+                };
             }
-            if let Err(error) = ctx.persist_pending_rejected_tool_messages().await {
-                return IterationOutcome::Error(format!(
-                    "terminal tool rejection receipts could not be recorded: {error}"
-                ));
-            }
-            for tool_call in &response.tool_calls {
-                if let Err(error) = ctx
-                    .core
-                    .sessions
-                    .record_tool_pre_execute(
-                        &ctx.session_id,
-                        &ctx.request_id,
-                        ctx.turn_count,
-                        &tool_call.id,
-                        &tool_call.name,
-                        &tool_call.arguments,
-                        crate::session::db::ToolPreExecuteDecision::Rejected {
-                            reason: "terminal_no_tools".to_string(),
-                        },
-                    )
-                    .await
-                {
-                    return IterationOutcome::Error(format!(
-                        "terminal tool rejection could not be recorded: {error}"
-                    ));
-                }
+            if let Some(delta_tx) = &ctx.text_delta_tx {
+                let _ = delta_tx.send(content.clone());
+                ctx.flow.content_was_streamed = true;
             }
             return IterationOutcome::Complete {
-                content: LIMIT_EXHAUSTED_REPLY.to_string(),
-                outcome: TurnOutcome::LimitExhausted,
+                content,
+                outcome: TurnOutcome::Finished,
             };
-        }
-
-        let response_failed = response.outcome().is_err();
-        let content = response.content.unwrap_or_default();
-        if response_failed || content.trim().is_empty() {
-            return IterationOutcome::Complete {
-                content: LIMIT_EXHAUSTED_REPLY.to_string(),
-                outcome: TurnOutcome::LimitExhausted,
-            };
-        }
-        if let Some(delta_tx) = &ctx.text_delta_tx {
-            let _ = delta_tx.send(content.clone());
-            ctx.flow.content_was_streamed = true;
-        }
-        IterationOutcome::Complete {
-            content,
-            outcome: TurnOutcome::Finished,
         }
     }
 
@@ -3986,30 +4051,7 @@ impl AgentLoopShared {
 
         // The higgs reservation runs AFTER the divergence rotation above so
         // the rotated epoch folds into a fresh session id for THIS request.
-        let mut pending_higgs_drop = Vec::new();
-        let mut higgs_control = None;
-        let mut higgs_request_reservation = None;
-        if ctx.core.provider.supports_higgs_session_cache() {
-            if messages_for_llm.iter().any(|message| {
-                message.get("role").and_then(|role| role.as_str()) == Some("assistant")
-            }) {
-                counters.restore_higgs_publication_hint(&ctx.session_key, &ctx.session_id);
-            }
-            let max_prompt_tokens = ctx
-                .effective_budget
-                .max_context()
-                .saturating_sub(max_tokens as usize)
-                .min(ctx.effective_budget.available_budget(0))
-                .min(u32::MAX as usize) as u32;
-            let reservation = counters.reserve_higgs_session_request(
-                &ctx.session_key,
-                &ctx.session_id,
-                max_prompt_tokens,
-            );
-            pending_higgs_drop = reservation.drop_ids().to_vec();
-            higgs_control = Some(reservation.control().clone());
-            higgs_request_reservation = Some(reservation);
-        }
+        let mut higgs = reserve_higgs_session(ctx, &messages_for_llm, max_tokens).await;
 
         let request_hash = crate::agent::prompt_fingerprint::hash_provider_request(
             &messages_for_llm,
@@ -4043,28 +4085,8 @@ impl AgentLoopShared {
         ctx.flow.llm_call_start = Some(std::time::Instant::now());
         ctx.flow.ttft_ms = None;
 
-        let retention = higgs_control.as_ref().map(|control| {
-            retention_attachment(
-                ctx.capacity.retained_contract(),
-                control.reuse_policy,
-                TokenBudget::estimate_tokens(&messages_for_llm).saturating_add(tool_def_tokens),
-                ctx.flow.retention,
-            )
-        });
-        match (&higgs_control, &retention) {
-            (Some(control), Some(RetentionAttachment::Retained { contract_revision })) => {
-                attach_retained_session_control(
-                    &mut messages_for_llm,
-                    control,
-                    ctx.counters.session_prompt_epoch(&ctx.session_key),
-                    contract_revision,
-                );
-            }
-            // Nothing offered for retention: the queued drops stay pending for
-            // a retained request to carry.
-            (_, Some(RetentionAttachment::Unretained)) => pending_higgs_drop.clear(),
-            _ => {}
-        }
+        let retention =
+            attach_higgs_retention(ctx, &mut higgs, &mut messages_for_llm, tool_def_tokens);
 
         // The provider boundary is the exact model-visible contract: protocol
         // rendering, tool presentation, retained-session controls, and sampling
@@ -4499,9 +4521,7 @@ impl AgentLoopShared {
             ));
         }
 
-        if !pending_higgs_drop.is_empty() {
-            counters.clear_pending_higgs_session_drop_ids(&ctx.session_key, &pending_higgs_drop);
-        }
+        clear_pending_higgs_drop(ctx, &higgs.pending_drop);
 
         // Inference complete — allow watchdog health checks again.
         counters.mark_inference_finished();
@@ -4543,12 +4563,7 @@ impl AgentLoopShared {
         if response_ok {
             // Higgs retained nothing for an unretained request, so the next
             // one must seed rather than demand an exact continuation.
-            if let Some(reservation) = higgs_request_reservation
-                .as_ref()
-                .filter(|_| retention != Some(RetentionAttachment::Unretained))
-            {
-                reservation.publish_exact();
-            }
+            publish_higgs_reservation(&higgs.reservation, retention.as_ref());
             // The bytes just shipped now have a server-side size. Carry it on
             // the fingerprint so the next request's admission decisions start
             // from the server's count instead of the client's estimate
@@ -4593,7 +4608,7 @@ impl AgentLoopShared {
             ctx.staged_auto_expansion = None;
         }
 
-        drop(higgs_request_reservation);
+        drop(higgs);
         StepResult::Next(IterationPhase::Processing { response })
     }
 

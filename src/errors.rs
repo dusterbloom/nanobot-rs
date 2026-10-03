@@ -95,6 +95,15 @@ pub enum ProviderError {
     #[error("Higgs retention contract is stale ({contract_revision})")]
     HiggsStaleRetentionContract { contract_revision: String },
 
+    /// The retained-session seed this client sent collides with a session
+    /// identity Higgs already considers live — one retained session at a
+    /// time is the server's intended design. The correct client response is
+    /// not to retry the seed, but to continue the turn unretained (see
+    /// `attempt_overflow_recovery`'s shared arm with
+    /// `HiggsRetentionCompactionRequired`).
+    #[error("Higgs retention seed conflicts with an existing session identity")]
+    HiggsRetentionSeedConflict,
+
     #[error(
         "Higgs capacity interrupted generation (boot {boot_id}, generation {generation}, partial output {partial_output_tokens} tokens)"
     )]
@@ -134,6 +143,7 @@ impl ProviderError {
             | Self::HiggsRetentionCompactionRequired { .. }
             | Self::HiggsRetainedSessionUnavailable { .. }
             | Self::HiggsStaleRetentionContract { .. }
+            | Self::HiggsRetentionSeedConflict
             | Self::HiggsCapacityInterrupted { .. }
             | Self::Cancelled
             | Self::EmptyStream(_) => false,

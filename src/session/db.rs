@@ -2193,6 +2193,62 @@ impl SessionDb {
         .ok()
     }
 
+    /// Read the persisted Higgs retained-session epoch for `session_id`.
+    ///
+    /// The epoch tracks retained-session rotations (see `agent_core`'s
+    /// `HiggsSessionState`). It is in-memory only there, so a process restart
+    /// loses it; this is the durable backstop a resuming process reads from.
+    /// Missing session, missing field, or unparseable metadata all default to
+    /// `0` — the pre-existing cold-start behavior.
+    pub async fn get_higgs_epoch(&self, session_id: &str) -> u64 {
+        let conn = self.conn.lock().await;
+        let metadata_json: Option<String> = conn
+            .query_row(
+                "SELECT metadata FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .ok();
+        metadata_json
+            .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+            .and_then(|value| value.get("higgs_epoch").and_then(Value::as_u64))
+            .unwrap_or(0)
+    }
+
+    /// Persist the Higgs retained-session epoch for `session_id`, merging it
+    /// into the existing `metadata` JSON so other fields survive. Best-effort:
+    /// a missing session or write failure is logged and otherwise ignored —
+    /// the in-memory epoch (this call's source of truth) stays correct for
+    /// the rest of the process lifetime regardless.
+    pub async fn set_higgs_epoch(&self, session_id: &str, epoch: u64) {
+        let conn = self.conn.lock().await;
+        let metadata_json: Option<String> = conn
+            .query_row(
+                "SELECT metadata FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .ok();
+        let Some(metadata_json) = metadata_json else {
+            return;
+        };
+        let mut metadata = serde_json::from_str::<Value>(&metadata_json)
+            .ok()
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+        metadata.insert("higgs_epoch".to_string(), json!(epoch));
+        let updated = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
+        if let Err(e) = conn.execute(
+            "UPDATE sessions SET metadata = ?1 WHERE id = ?2",
+            params![updated, session_id],
+        ) {
+            warn!(
+                "Failed to persist higgs_epoch for session {}: {}",
+                session_id, e
+            );
+        }
+    }
+
     /// Return the most recent session for `key` by `updated_at`, or `None`.
     pub async fn get_latest_session(&self, key: &str) -> Option<SessionMeta> {
         let conn = self.conn.lock().await;

@@ -978,7 +978,20 @@ fn parse_higgs_capacity_error(
     let value: serde_json::Value = serde_json::from_str(response_text).ok()?;
     let error = value.get("error")?.as_object()?;
     let error_type = error.get("type")?.as_str()?;
-    let code = error.get("code")?.as_str()?;
+    // `code` may be missing or JSON `null` — do not short-circuit on that
+    // (a seed conflict currently ships uncoded; see below). All other
+    // variants still require a string code, which the `code?` a few lines
+    // down restores unchanged.
+    let code_opt = error.get("code").and_then(serde_json::Value::as_str);
+    if status_code == 409 && error_type == "conflict" {
+        let is_seed_conflict = code_opt == Some("retention_seed_conflict")
+            || error.get("message").and_then(serde_json::Value::as_str)
+                == Some("retention seed conflicts with an existing session identity");
+        if is_seed_conflict {
+            return Some(ProviderError::HiggsRetentionSeedConflict);
+        }
+    }
+    let code = code_opt?;
     match (status_code, code) {
         (409, "retention_compaction_required")
             if matches!(error_type, "conflict" | "retention_compaction_required") =>
@@ -5110,6 +5123,27 @@ mod tests {
             assert_eq!(
                 format!("{:?}", parse_higgs_capacity_error(status, body)),
                 format!("{:?}", Some(expected))
+            );
+        }
+    }
+
+    /// A seed conflict (one retained session at a time) currently ships with
+    /// `code: null` on the wire — `error.get("code")?.as_str()?` used to
+    /// short-circuit on that and surface the error generically instead of
+    /// classifying it. Both the uncoded wire shape and the coded variant
+    /// being added to higgs in parallel must classify identically.
+    #[test]
+    fn retention_seed_conflict_classifies_with_or_without_a_code() {
+        let uncoded = r#"{"error":{"type":"conflict","code":null,"message":"retention seed conflicts with an existing session identity"}}"#;
+        let coded = r#"{"error":{"type":"conflict","code":"retention_seed_conflict","message":"retention seed conflicts with an existing session identity"}}"#;
+
+        for body in [uncoded, coded] {
+            assert!(
+                matches!(
+                    parse_higgs_capacity_error(409, body),
+                    Some(crate::errors::ProviderError::HiggsRetentionSeedConflict)
+                ),
+                "{body}"
             );
         }
     }
