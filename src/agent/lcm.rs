@@ -1000,9 +1000,13 @@ impl LcmEngine {
         let (summary_text, manifest, level) = if let Some(summary) = model_summary {
             summary
         } else {
-            let Some((end, _tokens, ids, _merged, index)) =
-                self.deterministic_compaction_fallback(block_start, candidate_end, target)
-            else {
+            let soft_limit = (available as f64 * self.config.tau_soft) as usize;
+            let Some((end, _tokens, ids, _merged, index)) = self.deterministic_compaction_fallback(
+                block_start,
+                candidate_end,
+                target,
+                soft_limit,
+            ) else {
                 self.async_compaction_pending = false;
                 return None;
             };
@@ -1208,7 +1212,9 @@ impl LcmEngine {
         block_start: usize,
         candidate_end: usize,
         target: usize,
+        soft_limit: usize,
     ) -> Option<(usize, usize, Vec<MessageId>, Vec<usize>, String)> {
+        let conversation_now = self.conversation_tokens();
         for len in self
             .complete_compaction_boundaries(block_start, candidate_end)
             .into_iter()
@@ -1245,9 +1251,19 @@ impl LcmEngine {
                 .iter()
                 .map(|entry| TokenBudget::estimate_message_tokens(entry.message()))
                 .sum();
-            if let Some(index) =
-                deterministic_recovery_index(&ids, &recovery, retired_wire_tokens, target)
-            {
+            // The fold must land the conversation back under the soft wall,
+            // or the next round re-arms compaction against the same span
+            // (139170f: a 4k window re-folded every tool round). Only the
+            // orientation is bounded by that room; the pointer always ships.
+            let kept_tokens = conversation_now.saturating_sub(retired_wire_tokens);
+            let orientation_budget = soft_limit.saturating_sub(kept_tokens);
+            if let Some(index) = deterministic_recovery_index(
+                &ids,
+                &recovery,
+                retired_wire_tokens,
+                target,
+                orientation_budget,
+            ) {
                 return Some((end, tokens, ids, merged, index));
             }
         }
@@ -1980,6 +1996,7 @@ fn deterministic_recovery_index(
     messages: &[(MessageId, Value)],
     retired_wire_tokens: usize,
     configured_target: usize,
+    orientation_budget: usize,
 ) -> Option<String> {
     if source_ids.is_empty() || messages.is_empty() {
         return None;
@@ -2009,7 +2026,11 @@ fn deterministic_recovery_index(
         return None;
     }
 
-    Some(append_mechanical_orientation(text, messages, wire_budget))
+    Some(append_mechanical_orientation(
+        text,
+        messages,
+        wire_budget.min(orientation_budget),
+    ))
 }
 
 /// Largest tool result copied verbatim into a mechanical checkpoint
@@ -4427,8 +4448,9 @@ mod tests {
             ),
         ];
 
-        let text = deterministic_recovery_index(&[2, 3, 4, 5, 6], &messages, 10_000, 2_048)
-            .expect("checkpoint fits");
+        let text =
+            deterministic_recovery_index(&[2, 3, 4, 5, 6], &messages, 10_000, 2_048, usize::MAX)
+                .expect("checkpoint fits");
 
         assert!(text.starts_with("version=1 ranges=2-6"), "{text}");
         assert!(
@@ -4484,7 +4506,8 @@ mod tests {
             .collect();
         let ids: Vec<MessageId> = (1..=40).collect();
 
-        let text = deterministic_recovery_index(&ids, &messages, 100_000, 400).expect("fits");
+        let text =
+            deterministic_recovery_index(&ids, &messages, 100_000, 400, usize::MAX).expect("fits");
 
         assert!(recovery_wire_tokens(&text) <= 400);
         assert!(text.contains("[msg 40] user: turn 40"), "{text}");
@@ -4541,7 +4564,7 @@ mod tests {
     #[test]
     fn deterministic_target_is_a_hard_wire_limit() {
         let messages = vec![(2, msg(2, "user", &"evidence ".repeat(200)))];
-        let text = deterministic_recovery_index(&[2], &messages, 500, 128)
+        let text = deterministic_recovery_index(&[2], &messages, 500, 128, usize::MAX)
             .expect("mandatory recovery record should fit 128 tokens");
         let required = recovery_wire_tokens(
             text.lines()
@@ -4550,11 +4573,13 @@ mod tests {
         );
 
         assert!(required < 128);
-        assert!(deterministic_recovery_index(&[2], &messages, 500, required).is_some());
-        assert!(deterministic_recovery_index(&[2], &messages, 500, required - 1).is_none());
+        assert!(deterministic_recovery_index(&[2], &messages, 500, required, usize::MAX).is_some());
+        assert!(
+            deterministic_recovery_index(&[2], &messages, 500, required - 1, usize::MAX).is_none()
+        );
         assert!(recovery_wire_tokens(&text) < 500);
-        assert!(deterministic_recovery_index(&[2], &messages, 500, 64).is_none());
-        assert!(deterministic_recovery_index(&[2], &messages, 500, 16).is_none());
+        assert!(deterministic_recovery_index(&[2], &messages, 500, 64, usize::MAX).is_none());
+        assert!(deterministic_recovery_index(&[2], &messages, 500, 16, usize::MAX).is_none());
     }
 
     #[test]
