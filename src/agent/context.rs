@@ -1118,14 +1118,16 @@ impl ContextBuilder {
     /// identically across turns (prefix-cache hits; see
     /// `_collect_local_sections` and `session_date_stamp`).
     fn _get_identity(&self, local: bool) -> String {
-        let workspace_path = Self::display_path(
-            &self
-                .workspace
-                .canonicalize()
-                .unwrap_or_else(|_| self.workspace.clone()),
-        );
+        // Absolute paths only: the model copies these into tool args, and
+        // small local models expand `~` to a guessed home (e.g. /home/user).
+        let workspace_path = self
+            .workspace
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace.clone())
+            .display()
+            .to_string();
         let cwd = std::env::current_dir()
-            .map(|p| Self::display_path(&p))
+            .map(|p| p.display().to_string())
             .unwrap_or_else(|_| ".".to_string());
 
         let memory_path = format!("{workspace_path}/memory/MEMORY.md");
@@ -1162,7 +1164,7 @@ impl ContextBuilder {
             )
         } else {
             let home_dir = dirs::home_dir()
-                .map(|p| Self::display_path(&p))
+                .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "~".to_string());
 
             let model_section = if self.model_name.is_empty() {
@@ -1227,20 +1229,6 @@ Workspace: {workspace_path} — your internal state (memory, skills, config). NO
 - ALWAYS use tools. NEVER guess file contents, command output, or system state — if you don't know, use a tool to find out.
 - Be concise (1-5 sentences) unless asked for detail.{extra_rules}{tail}"#
         )
-    }
-
-    fn display_path(path: &Path) -> String {
-        let rendered = path.to_string_lossy().to_string();
-        if let Some(home) = dirs::home_dir() {
-            let home = home.to_string_lossy().to_string();
-            if rendered == home {
-                return "~".to_string();
-            }
-            if let Some(stripped) = rendered.strip_prefix(&(home.clone() + "/")) {
-                return format!("~/{}", stripped);
-            }
-        }
-        rendered
     }
 
     fn build_local_static_blocks(
@@ -1573,6 +1561,23 @@ mod tests {
         (tmp, cb)
     }
 
+    #[test]
+    fn test_local_prompt_uses_absolute_paths_not_tilde() {
+        // Small local models expand `~` to a guessed home (/home/user) and then
+        // can't find workspace files. Workspace sits under $HOME so a `~`
+        // shortening would show up here.
+        let home = dirs::home_dir().expect("home dir available in test env");
+        let tmp = tempfile::Builder::new()
+            .prefix(".nanobot-test-")
+            .tempdir_in(&home)
+            .unwrap();
+        let cb = ContextBuilder::new(tmp.path());
+        let prompt = cb.build_local_system_prompt(None, None, None, false, None, &[]);
+        let workspace = tmp.path().canonicalize().unwrap().display().to_string();
+        assert!(prompt.contains(&workspace), "{prompt}");
+        assert!(!prompt.contains("~/"), "{prompt}");
+    }
+
     // ----- TTFT: system prefix stable within a day (date-only timestamp) -----
 
     #[test]
@@ -1750,11 +1755,12 @@ mod tests {
         // reserved for the long tail and still teaches list / inspect / invoke.
         let (_tmp, cb) = make_context();
         let identity = cb._get_identity(true);
-        let workspace_str = ContextBuilder::display_path(
-            &cb.workspace
-                .canonicalize()
-                .unwrap_or_else(|_| cb.workspace.clone()),
-        );
+        let workspace_str = cb
+            .workspace
+            .canonicalize()
+            .unwrap_or_else(|_| cb.workspace.clone())
+            .display()
+            .to_string();
 
         // (a) identity + where
         assert!(identity.contains("nanobot"), "{identity}");
@@ -1871,8 +1877,8 @@ mod tests {
         let tokens = TokenBudget::estimate_str_tokens(&prompt);
 
         assert!(
-            tokens <= 260,
-            "local system prompt must stay <= 260 tokens with realistic model name (got {tokens}):\n{prompt}"
+            tokens <= 280,
+            "local system prompt must stay <= 280 tokens with realistic model name (got {tokens}):\n{prompt}"
         );
 
         // Bootstrap catalog content must NOT be inlined — model fetches on demand.
