@@ -191,6 +191,7 @@ pub struct SubagentManager {
     /// Prevents the expensive main model from being used as a worker.
     default_subagent_model: Option<String>,
     brave_api_key: Option<String>,
+    exa_api_key: Option<String>,
     search_provider: String,
     searxng_url: String,
     search_max_results: u32,
@@ -269,6 +270,7 @@ impl SubagentManager {
             model,
             default_subagent_model: None,
             brave_api_key,
+            exa_api_key: None,
             search_provider: "searxng".to_string(),
             searxng_url: "http://localhost:8888".to_string(),
             search_max_results: 5,
@@ -332,6 +334,12 @@ impl SubagentManager {
         self.search_provider = provider;
         self.searxng_url = searxng_url;
         self.search_max_results = max_results;
+        self
+    }
+
+    /// Set the Exa fallback credential for all subagent search tools.
+    pub fn with_exa_api_key(mut self, api_key: Option<String>) -> Self {
+        self.exa_api_key = api_key;
         self
     }
 
@@ -471,6 +479,7 @@ impl SubagentManager {
         let exec_working_dir = working_dir;
         let bus_tx = self.bus_tx.clone();
         let brave_api_key = self.brave_api_key.clone();
+        let exa_api_key = self.exa_api_key.clone();
         let search_provider = self.search_provider.clone();
         let searxng_url = self.searxng_url.clone();
         let search_max_results = self.search_max_results;
@@ -502,6 +511,7 @@ impl SubagentManager {
                 &workspace,
                 &config,
                 brave_api_key.as_deref(),
+                exa_api_key.as_deref(),
                 &search_provider,
                 &searxng_url,
                 search_max_results,
@@ -766,6 +776,7 @@ impl SubagentManager {
                 &self.workspace,
                 &config,
                 self.brave_api_key.as_deref(),
+                self.exa_api_key.as_deref(),
                 &self.search_provider,
                 &self.searxng_url,
                 self.search_max_results,
@@ -919,6 +930,7 @@ impl SubagentManager {
         workspace: &PathBuf,
         config: &SubagentConfig,
         brave_api_key: Option<&str>,
+        exa_api_key: Option<&str>,
         search_provider: &str,
         searxng_url: &str,
         search_max_results: u32,
@@ -946,6 +958,7 @@ impl SubagentManager {
             restrict_to_workspace,
             max_tool_result_chars: config.max_tool_result_chars,
             brave_api_key: brave_api_key.map(|s| s.to_string()),
+            exa_api_key: exa_api_key.map(|s| s.to_string()),
             search_provider: search_provider.to_string(),
             searxng_url: searxng_url.to_string(),
             search_max_results,
@@ -1035,12 +1048,7 @@ impl SubagentManager {
                     let after = TokenBudget::estimate_tokens(&trimmed);
                     warn!(
                         "Subagent {} context guard trimmed prompt ({} -> {} tokens, limit={}, reserve={}, tool_defs={})",
-                        task_id,
-                        before,
-                        after,
-                        ctx_limit,
-                        max_response_tokens,
-                        tool_def_tokens,
+                        task_id, before, after, ctx_limit, max_response_tokens, tool_def_tokens,
                     );
                     messages = trimmed;
                 }
@@ -1079,12 +1087,7 @@ impl SubagentManager {
                     let after_retry = TokenBudget::estimate_tokens(&messages);
                     warn!(
                         "Subagent {} hit context overflow; retrying once after hard trim ({} -> {} tokens, retry_limit={}, retry_reserve={}): {}",
-                        task_id,
-                        before_retry,
-                        after_retry,
-                        retry_ctx,
-                        retry_max_tokens,
-                        e,
+                        task_id, before_retry, after_retry, retry_ctx, retry_max_tokens, e,
                     );
                     let wire_retry = crate::agent::protocol::render_to_wire(&*protocol, &messages);
                     provider
@@ -1117,7 +1120,9 @@ impl SubagentManager {
                     if let Some(_spans) = taint_state.check_sensitive(&tc.name) {
                         warn!(
                             "TAINT WARNING [subagent {}]: Sensitive tool '{}' called with tainted context from: {}",
-                            label, tc.name, taint_state.taint_summary()
+                            label,
+                            tc.name,
+                            taint_state.taint_summary()
                         );
                     }
                     let detail = tc
@@ -1540,12 +1545,14 @@ mod tests {
     /// call, then a text-only response on second call.
     struct SubagentCapturingProvider {
         captured: tokio::sync::Mutex<Vec<Vec<Value>>>,
+        captured_tools: tokio::sync::Mutex<Vec<Vec<Value>>>,
     }
 
     impl SubagentCapturingProvider {
         fn new() -> Self {
             Self {
                 captured: tokio::sync::Mutex::new(Vec::new()),
+                captured_tools: tokio::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -1555,7 +1562,7 @@ mod tests {
         async fn chat(
             &self,
             messages: &[Value],
-            _tools: Option<&[Value]>,
+            tools: Option<&[Value]>,
             _model: Option<&str>,
             _max_tokens: u32,
             _temperature: f64,
@@ -1565,6 +1572,10 @@ mod tests {
             let mut captured = self.captured.lock().await;
             let call_num = captured.len();
             captured.push(messages.to_vec());
+            self.captured_tools
+                .lock()
+                .await
+                .push(tools.unwrap_or_default().to_vec());
 
             if call_num == 0 {
                 // First call: return a tool call (list_dir)
@@ -1624,6 +1635,7 @@ mod tests {
             &workspace,
             &config,
             None,
+            None,
             "searxng",
             "http://localhost:8888",
             5,
@@ -1660,6 +1672,48 @@ mod tests {
             .collect();
         // Expected: system, user, assistant, tool
         assert_eq!(roles.last(), Some(&"tool"));
+    }
+
+    #[tokio::test]
+    async fn test_subagent_search_registry_receives_exa_key() {
+        let provider = Arc::new(SubagentCapturingProvider::new());
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().to_path_buf();
+        let config = default_test_config("mock-model");
+
+        SubagentManager::_run_subagent(
+            "exa-test-id",
+            "Inspect the available tools",
+            "exa-test-label",
+            provider.as_ref(),
+            &workspace_path,
+            &config,
+            None,
+            Some("unit-test-exa-key"),
+            "exa",
+            "http://localhost:8888",
+            5,
+            5,
+            false,
+            false,
+            None,
+            None,
+            &SubagentTuning::default(),
+        )
+        .await
+        .unwrap();
+
+        let tool_calls = provider.captured_tools.lock().await;
+        assert!(
+            tool_calls[0].iter().any(|tool| {
+                tool.pointer("/function/name").and_then(Value::as_str) == Some("get_tools")
+                    && tool
+                        .pointer("/function/description")
+                        .and_then(Value::as_str)
+                        .is_some_and(|description| description.contains("web_search"))
+            }),
+            "configured Exa search tool should be available to subagents"
+        );
     }
 
     #[tokio::test]
@@ -1700,6 +1754,7 @@ mod tests {
             &ImmediateProvider,
             &workspace,
             &config,
+            None,
             None,
             "searxng",
             "http://localhost:8888",

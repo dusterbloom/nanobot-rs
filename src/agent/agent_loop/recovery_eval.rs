@@ -607,6 +607,7 @@ fn make_agent_configured(
         temperature: 0.0,
         max_context_tokens: ceiling,
         brave_api_key: None,
+        exa_api_key: None,
         search_provider: "searxng".into(),
         searxng_url: String::new(),
         crw_url: String::new(),

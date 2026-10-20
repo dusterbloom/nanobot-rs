@@ -66,6 +66,162 @@ pub fn extract_web_content(raw: &str) -> String {
     raw.to_string()
 }
 
+const WEB_FETCH_EVIDENCE_MARKER: &str = "WEB_FETCH_EVIDENCE v1";
+
+/// Extract a successful `web_fetch` envelope while retaining the provenance
+/// needed to interpret its extracted text. Generic extraction stays in
+/// [`extract_web_content`] for search and legacy callers.
+pub(crate) fn extract_web_fetch_evidence(raw: &str) -> String {
+    let Ok(envelope) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return extract_web_content(raw);
+    };
+    let Some(object) = envelope.as_object() else {
+        return extract_web_content(raw);
+    };
+    if object.contains_key("error")
+        || object.get("success").and_then(|v| v.as_bool()) == Some(false)
+    {
+        return extract_web_content(raw);
+    }
+    let Some(text) = object.get("text").and_then(serde_json::Value::as_str) else {
+        return extract_web_content(raw);
+    };
+    let Some(requested_url) = object.get("url").and_then(serde_json::Value::as_str) else {
+        return extract_web_content(raw);
+    };
+    if !is_http_url(requested_url) {
+        return extract_web_content(raw);
+    }
+
+    // Require three fetch-specific fields. This avoids treating arbitrary JSON
+    // with only a `text` or `url` property as web-fetch evidence.
+    if ["finalUrl", "status", "extractor", "truncated", "length"]
+        .iter()
+        .filter(|key| object.contains_key(**key))
+        .count()
+        < 3
+    {
+        return extract_web_content(raw);
+    }
+
+    let final_url = match object.get("finalUrl") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) if is_http_url(value) => Some(value.as_str()),
+        _ => return extract_web_content(raw),
+    };
+    let http_status = match object.get("status") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value)
+            if value
+                .as_u64()
+                .is_some_and(|status| (100..=599).contains(&status)) =>
+        {
+            value.as_u64()
+        }
+        _ => return extract_web_content(raw),
+    };
+    let extractor = match object.get("extractor") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value)) if !value.trim().is_empty() => Some(value.as_str()),
+        _ => return extract_web_content(raw),
+    };
+    let extracted_text_truncated = match object.get("truncated") {
+        None | Some(serde_json::Value::Null) => "unknown",
+        Some(serde_json::Value::Bool(true)) => "true",
+        Some(serde_json::Value::Bool(false)) => "false",
+        _ => return extract_web_content(raw),
+    };
+
+    let completeness_note = completeness_note_for(extracted_text_truncated);
+    let metadata = serde_json::json!({
+        "requested_url": requested_url,
+        "final_url": final_url,
+        "http_status": http_status,
+        "extractor": extractor,
+        "extracted_text_truncated": extracted_text_truncated,
+        "scope": "extracted_text_only",
+        "completeness_note": completeness_note
+    });
+    let Ok(metadata) = serde_json::to_string(&metadata) else {
+        return extract_web_content(raw);
+    };
+    format!("{WEB_FETCH_EVIDENCE_MARKER}\n{metadata}\n\n{text}")
+}
+
+/// Strictly recognize only evidence produced by [`extract_web_fetch_evidence`].
+/// Legacy text-only results, malformed markers, and error envelopes retain
+/// their existing rendering path.
+pub(crate) fn is_web_fetch_evidence(body: &str) -> bool {
+    let Some(rest) = body.strip_prefix(&format!("{WEB_FETCH_EVIDENCE_MARKER}\n")) else {
+        return false;
+    };
+    let Some((metadata, _text)) = rest.split_once("\n\n") else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(metadata) else {
+        return false;
+    };
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    let requested_url = object
+        .get("requested_url")
+        .and_then(serde_json::Value::as_str);
+    let final_url = object.get("final_url");
+    let status = object.get("http_status");
+    let extractor = object.get("extractor");
+    let truncated = object
+        .get("extracted_text_truncated")
+        .and_then(serde_json::Value::as_str);
+    let completeness_note = object
+        .get("completeness_note")
+        .and_then(serde_json::Value::as_str);
+    let status_is_valid = match status {
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::Number(status)) => status
+            .as_u64()
+            .is_some_and(|status| (100..=599).contains(&status)),
+        _ => false,
+    };
+    let extractor_is_valid = match extractor {
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(value)) => !value.trim().is_empty(),
+        _ => false,
+    };
+    requested_url.is_some_and(is_http_url)
+        && matches!(
+            final_url,
+            Some(serde_json::Value::Null) | Some(serde_json::Value::String(_))
+        )
+        && final_url
+            .and_then(serde_json::Value::as_str)
+            .map_or(true, is_http_url)
+        && status_is_valid
+        && extractor_is_valid
+        && truncated.is_some_and(|value| matches!(value, "true" | "false" | "unknown"))
+        && object.get("scope").and_then(serde_json::Value::as_str) == Some("extracted_text_only")
+        && completeness_note == truncated.map(completeness_note_for)
+}
+
+fn completeness_note_for(truncated: &str) -> &'static str {
+    match truncated {
+        "true" => {
+            "The extracted text was clipped at maxChars; refetch with a larger maxChars to request more extracted text. The original page may still contain content omitted by extraction."
+        }
+        "false" => {
+            "The extracted text was not clipped at maxChars. This does not establish that extraction represented the complete original page."
+        }
+        _ => {
+            "Whether maxChars clipped the extracted text is unknown. This does not establish that extraction represented the complete original page."
+        }
+    }
+}
+
+fn is_http_url(value: &str) -> bool {
+    Url::parse(value)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+}
+
 /// Replace fenced code blocks with a short placeholder.
 ///
 /// web_fetch is for reading pages, not scraping source: code blocks dominate
@@ -140,6 +296,9 @@ fn validate_url(url_str: &str) -> Result<(), String> {
 /// Search the web using SearXNG (default) or Brave Search API.
 pub struct WebSearchTool {
     api_key: String,
+    brave_search_url: String,
+    exa_api_key: Option<String>,
+    exa_search_url: String,
     max_results: u32,
     provider: String,
     searxng_url: String,
@@ -209,6 +368,9 @@ impl WebSearchTool {
 
         Self {
             api_key: resolved_key,
+            brave_search_url: "https://api.search.brave.com/res/v1/web/search".to_string(),
+            exa_api_key: None,
+            exa_search_url: "https://api.exa.ai/search".to_string(),
             max_results,
             provider,
             searxng_url,
@@ -226,6 +388,12 @@ impl WebSearchTool {
         registry: Option<Arc<crate::heartbeat::health::HealthRegistry>>,
     ) -> Self {
         self.health_registry = registry;
+        self
+    }
+
+    /// Attach an Exa credential for fallback after SearXNG fails.
+    pub fn with_exa_api_key(mut self, api_key: Option<String>) -> Self {
+        self.exa_api_key = api_key.filter(|key| !key.trim().is_empty());
         self
     }
 }
@@ -271,10 +439,18 @@ impl Tool for WebSearchTool {
     ///
     /// - SearXNG: available when `provider == "searxng"` and a non-empty
     ///   SearXNG URL is present (the default `"http://localhost:8888"` counts).
-    /// - Brave: available when an API key is present (either passed at
-    ///   construction time or read from `$BRAVE_API_KEY`).
+    /// - Brave and Exa: available when their API keys are configured.
     fn is_available(&self) -> bool {
-        (self.provider == "searxng" && !self.searxng_url.is_empty()) || !self.api_key.is_empty()
+        match self.provider.as_str() {
+            "searxng" => {
+                !self.searxng_url.is_empty()
+                    || !self.api_key.is_empty()
+                    || self.exa_api_key.is_some()
+            }
+            "brave" => !self.api_key.is_empty(),
+            "exa" => self.exa_api_key.is_some(),
+            _ => false,
+        }
     }
 
     async fn execute(
@@ -295,27 +471,42 @@ impl Tool for WebSearchTool {
             .get("count")
             .and_then(|v| v.as_u64())
             .map(|n| n.min(10).max(1) as u32)
-            .unwrap_or(self.max_results);
+            .unwrap_or(self.max_results.clamp(1, 10));
 
-        let out = match self.provider.as_str() {
-            "searxng" => self.execute_searxng(query, count).await,
-            "brave" => self.execute_brave(query, count).await,
-            other => {
-                return Err(ToolError::InvalidArgs {
-                    message: format!(
-                        "unknown search provider '{}'. Use 'searxng' or 'brave'.",
-                        other
-                    ),
-                })
-            }
-        };
-        // One boundary: backend executors are String-shaped; strip the
-        // legacy prefix so render() re-prefixes exactly once.
-        match out.strip_prefix("Error:").map(str::trim) {
-            Some(err) => Err(ToolError::Execution {
-                message: err.to_string(),
+        match self.provider.as_str() {
+            "searxng" => match self.execute_searxng(query, count).await {
+                Ok(result) => Ok(result.into()),
+                Err(primary_error) => {
+                    if let Some(api_key) = self.exa_api_key.as_deref() {
+                        self.execute_exa(query, count, api_key)
+                            .await
+                            .map(|result| format!("{result}\n(Fell back to Exa)").into())
+                    } else if !self.api_key.is_empty() {
+                        self.execute_brave(query, count)
+                            .await
+                            .map(|result| format!("{result}\n(Fell back to Brave Search)").into())
+                    } else {
+                        Err(primary_error)
+                    }
+                }
+            },
+            "brave" => self.execute_brave(query, count).await.map(Into::into),
+            "exa" => match self.exa_api_key.as_deref() {
+                Some(api_key) => self
+                    .execute_exa(query, count, api_key)
+                    .await
+                    .map(Into::into),
+                None => Err(ToolError::Execution {
+                    message: "Exa API key not configured. Set exaApiKey or EXA_API_KEY."
+                        .to_string(),
+                }),
+            },
+            other => Err(ToolError::InvalidArgs {
+                message: format!(
+                    "unknown search provider '{}'. Use 'searxng', 'brave', or 'exa'.",
+                    other
+                ),
             }),
-            None => Ok(out.into()),
         }
     }
 }
@@ -402,183 +593,297 @@ fn trigger_searxng_heal(searxng_url: &str) {
 }
 
 impl WebSearchTool {
-    /// Execute a search via SearXNG. Falls back to Brave if SearXNG is unreachable
-    /// and a Brave API key is configured.
-    async fn execute_searxng(&self, query: &str, count: u32) -> String {
-        // Pre-flight: if the heartbeat probe has marked SearXNG Degraded
-        // (3+ consecutive /health failures), short-circuit with a clear
-        // message. Otherwise we'd hang for the full HTTP timeout and either
-        // return an opaque connection error or, worse, silently return zero
-        // results — the failure mode that motivated this check.
+    /// Execute the primary local search. The caller owns the one fallback decision.
+    async fn execute_searxng(&self, query: &str, count: u32) -> Result<String, ToolError> {
         if let Some(reg) = &self.health_registry {
             if !reg.is_healthy("searxng") {
                 trigger_searxng_heal(&self.searxng_url);
-                return format!(
-                    "Error: SearXNG backend is degraded (health probe failing). \
-                     An automatic restart was just triggered — retry this \
-                     search in ~30-60 seconds. Query was: {:?}",
-                    query
-                );
+                return Err(ToolError::ServiceUnavailable(
+                    "SearXNG backend is degraded (health probe failing). An automatic restart was triggered.".to_string(),
+                ));
             }
         }
 
-        let result = self
+        let response = self
             .client
             .get(format!("{}/search", self.searxng_url))
             .query(&[("q", query), ("format", "json"), ("categories", "general")])
             .timeout(std::time::Duration::from_secs(10))
             .send()
-            .await;
-
-        match result {
-            Ok(response) => {
-                if !response.status().is_success() {
-                    let status = response.status();
-                    // SearXNG returned an error — try Brave fallback if available.
-                    if !self.api_key.is_empty() {
-                        tracing::warn!(
-                            "SearXNG returned HTTP {}, falling back to Brave Search",
-                            status
-                        );
-                        let mut result = self.execute_brave(query, count).await;
-                        result.push_str("\n(Fell back to Brave Search)");
-                        return result;
-                    }
-                    // No Brave key - return error
-                    return format!(
-                        "Error: SearXNG returned HTTP {} and no Brave API key configured. \
-                         Set 'braveApiKey' in config.json or fix SearXNG URL.",
-                        status
-                    );
-                }
-
-                match response.json::<serde_json::Value>().await {
-                    Ok(data) => {
-                        let results = data
-                            .get("results")
-                            .and_then(|r| r.as_array())
-                            .cloned()
-                            .unwrap_or_default();
-
-                        // Empty results is ambiguous: either genuinely
-                        // nothing matched, OR the upstream engines are
-                        // throttling/blocking this IP (SearXNG still
-                        // returns HTTP 200 with an empty `results` array
-                        // and a populated `unresponsive_engines` list).
-                        // The latter is rate-limiting, not "nothing
-                        // found" — telling the model "No results" makes
-                        // it loop the same doomed query. Surface it as a
-                        // distinct, retry-later Error so the agent stops.
-                        if results.is_empty() {
-                            if let Some(msg) =
-                                searxng_throttled_message(&data, query, &self.searxng_url)
-                            {
-                                return msg;
-                            }
-                            return format!("No results for: {}", query);
-                        }
-
-                        let mut lines = vec![format!("Results for: {}\n", query)];
-                        for (i, item) in results.iter().take(count as usize).enumerate() {
-                            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                            let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                            lines.push(format!("{}. {}\n   {}", i + 1, title, url));
-
-                            if let Some(desc) = item.get("content").and_then(|v| v.as_str()) {
-                                lines.push(format!("   {}", desc));
-                            }
-                        }
-                        lines.join("\n")
-                    }
-                    Err(e) => format!("Error parsing SearXNG results: {}", e),
-                }
-            }
-            Err(e) => {
-                // Connection error — usually Docker (and thus the SearXNG
-                // container) is not running. Kick the self-heal chain so a
-                // retry succeeds, then fall back to Brave if configured.
+            .await
+            .map_err(|_| {
                 trigger_searxng_heal(&self.searxng_url);
-                if !self.api_key.is_empty() {
-                    tracing::warn!("SearXNG unavailable ({}), falling back to Brave Search", e);
-                    let mut result = self.execute_brave(query, count).await;
-                    result.push_str("\n(Fell back to Brave Search)");
-                    return result;
-                }
-                // No Brave key - return error
-                format!(
-                    "Error: SearXNG unavailable ({}). An automatic restart was \
-                     just triggered — retry this search in ~30-60 seconds.",
-                    e
+                ToolError::Network(
+                    "SearXNG connection failed; an automatic restart was triggered".to_string(),
                 )
-            }
+            })?;
+
+        if !response.status().is_success() {
+            return Err(ToolError::ServiceUnavailable(format!(
+                "SearXNG returned HTTP {}",
+                response.status()
+            )));
         }
+
+        let data =
+            response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|_| ToolError::Execution {
+                    message: "SearXNG returned invalid JSON".to_string(),
+                })?;
+        let Some(results) = data.get("results").and_then(|results| results.as_array()) else {
+            return Err(ToolError::Execution {
+                message: "SearXNG response is missing a valid results array".to_string(),
+            });
+        };
+
+        if results.is_empty() {
+            if let Some(msg) = searxng_throttled_message(&data, query, &self.searxng_url) {
+                return Err(ToolError::Execution {
+                    message: msg
+                        .strip_prefix("Error:")
+                        .unwrap_or(&msg)
+                        .trim()
+                        .to_string(),
+                });
+            }
+            return Ok(format!("No results for: {query}"));
+        }
+
+        let mut entries = Vec::new();
+        let max_entries = count.clamp(1, 10) as usize;
+        for item in results {
+            if entries.len() >= max_entries {
+                break;
+            }
+            let Some(url) = item
+                .get("url")
+                .and_then(|v| v.as_str())
+                .filter(|url| !url.trim().is_empty())
+            else {
+                continue;
+            };
+            let title = item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or(url);
+            let snippet = item
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            entries.push((title.to_string(), url.to_string(), snippet));
+        }
+        if entries.is_empty() {
+            return Err(ToolError::Execution {
+                message: "SearXNG response contains no usable results".to_string(),
+            });
+        }
+        Ok(format_search_results(query, entries))
     }
 
     /// Execute a search via the Brave Search API.
-    async fn execute_brave(&self, query: &str, count: u32) -> String {
+    async fn execute_brave(&self, query: &str, count: u32) -> Result<String, ToolError> {
         if self.api_key.is_empty() {
-            return "Error: BRAVE_API_KEY not configured. Set it in config.json under 'braveApiKey'.".to_string();
+            return Err(ToolError::Execution {
+                message: "BRAVE_API_KEY not configured. Set it in config.json under 'braveApiKey'."
+                    .to_string(),
+            });
         }
+        let mut api_key = reqwest::header::HeaderValue::from_str(&self.api_key).map_err(|_| {
+            ToolError::Execution {
+                message: "Brave API key is malformed".to_string(),
+            }
+        })?;
+        api_key.set_sensitive(true);
 
-        match self
+        let response = self
             .client
-            .get("https://api.search.brave.com/res/v1/web/search")
-            .query(&[("q", query), ("count", &count.to_string())])
-            .header("Accept", "application/json")
-            .header("X-Subscription-Token", &self.api_key)
+            .get(&self.brave_search_url)
+            .query(&[("q", query), ("count", &count.clamp(1, 10).to_string())])
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .header("X-Subscription-Token", api_key)
             .timeout(std::time::Duration::from_secs(10))
             .send()
             .await
-        {
-            Ok(response) => {
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let code = status.as_u16();
-                    let body = response.text().await.unwrap_or_default();
-                    let hint = match code {
-                        401 | 403 => ". Hint: API key may be invalid or expired. Check your Brave API subscription.",
-                        422 => ". Hint: query may be malformed or API subscription may be inactive.",
-                        429 => ". Hint: rate limited. Wait a moment and try again.",
-                        500..=599 => ". Hint: Brave Search service error. Try again shortly.",
-                        _ => ". Hint: check API key and query format.",
-                    };
-                    return format!(
-                        "Error: Brave Search returned HTTP {}: {}{}",
-                        status, body, hint
-                    );
+            .map_err(|_| {
+                ToolError::Network(
+                    "Brave Search request failed; check network connectivity".to_string(),
+                )
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let hint = match status.as_u16() {
+                401 | 403 => {
+                    ". Hint: API key may be invalid or expired. Check your Brave API subscription."
                 }
+                422 => ". Hint: query may be malformed or API subscription may be inactive.",
+                429 => ". Hint: rate limited. Wait a moment and try again.",
+                500..=599 => ". Hint: Brave Search service error. Try again shortly.",
+                _ => ". Hint: check API key and query format.",
+            };
+            return Err(ToolError::ServiceUnavailable(format!(
+                "Brave Search returned HTTP {status}{hint}"
+            )));
+        }
 
-                match response.json::<serde_json::Value>().await {
-                    Ok(data) => {
-                        let results = data
-                            .get("web")
-                            .and_then(|w| w.get("results"))
-                            .and_then(|r| r.as_array())
-                            .cloned()
-                            .unwrap_or_default();
+        let data =
+            response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|_| ToolError::Execution {
+                    message: "Brave Search returned invalid JSON".to_string(),
+                })?;
+        let Some(results) = data
+            .get("web")
+            .and_then(|web| web.get("results"))
+            .and_then(|results| results.as_array())
+        else {
+            return Err(ToolError::Execution {
+                message: "Brave Search response is missing a valid results array".to_string(),
+            });
+        };
+        if results.is_empty() {
+            return Ok(format!("No results for: {query}"));
+        }
 
-                        if results.is_empty() {
-                            return format!("No results for: {}", query);
-                        }
-
-                        let mut lines = vec![format!("Results for: {}\n", query)];
-                        for (i, item) in results.iter().take(count as usize).enumerate() {
-                            let title = item.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                            let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                            lines.push(format!("{}. {}\n   {}", i + 1, title, url));
-
-                            if let Some(desc) = item.get("description").and_then(|v| v.as_str()) {
-                                lines.push(format!("   {}", desc));
-                            }
-                        }
-                        lines.join("\n")
-                    }
-                    Err(e) => format!("Error parsing search results: {}", e),
-                }
+        let mut entries = Vec::new();
+        let max_entries = count.clamp(1, 10) as usize;
+        for item in results {
+            if entries.len() >= max_entries {
+                break;
             }
-            Err(e) => format!("Error: {}. Hint: check network connectivity.", e),
+            let Some(url) = item
+                .get("url")
+                .and_then(|v| v.as_str())
+                .filter(|url| !url.trim().is_empty())
+            else {
+                continue;
+            };
+            let title = item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or(url);
+            let snippet = item
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            entries.push((title.to_string(), url.to_string(), snippet));
+        }
+        if entries.is_empty() {
+            return Err(ToolError::Execution {
+                message: "Brave Search response contains no usable results".to_string(),
+            });
+        }
+        Ok(format_search_results(query, entries))
+    }
+
+    /// Execute a search via Exa Search.
+    async fn execute_exa(
+        &self,
+        query: &str,
+        count: u32,
+        api_key: &str,
+    ) -> Result<String, ToolError> {
+        let mut api_key =
+            reqwest::header::HeaderValue::from_str(api_key).map_err(|_| ToolError::Execution {
+                message: "Exa API key is malformed".to_string(),
+            })?;
+        api_key.set_sensitive(true);
+
+        let response = self
+            .client
+            .post(&self.exa_search_url)
+            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::ACCEPT_ENCODING, "identity")
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header("x-api-key", api_key)
+            .json(&serde_json::json!({
+                "query": query,
+                "numResults": count.clamp(1, 10),
+                "type": "auto",
+                "contents": { "highlights": true }
+            }))
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|_| ToolError::Network("Exa Search request failed".to_string()))?;
+
+        if !response.status().is_success() {
+            return Err(ToolError::ServiceUnavailable(format!(
+                "Exa Search returned HTTP {}",
+                response.status()
+            )));
+        }
+        let data =
+            response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|_| ToolError::Execution {
+                    message: "Exa Search returned invalid JSON".to_string(),
+                })?;
+        let Some(results) = data.get("results").and_then(|results| results.as_array()) else {
+            return Err(ToolError::Execution {
+                message: "Exa Search response is missing a valid results array".to_string(),
+            });
+        };
+        if results.is_empty() {
+            return Ok(format!("No results for: {query}"));
+        }
+
+        let mut entries = Vec::new();
+        let max_entries = count.clamp(1, 10) as usize;
+        for item in results {
+            if entries.len() >= max_entries {
+                break;
+            }
+            let Some(url) = item
+                .get("url")
+                .and_then(|v| v.as_str())
+                .filter(|url| !url.trim().is_empty())
+            else {
+                continue;
+            };
+            let title = item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or(url);
+            let snippet = item
+                .get("highlights")
+                .and_then(|v| v.as_array())
+                .and_then(|items| items.first())
+                .and_then(|v| v.as_str())
+                .or_else(|| item.get("summary").and_then(|v| v.as_str()))
+                .or_else(|| item.get("text").and_then(|v| v.as_str()))
+                .map(|text| truncate_at_boundary(text.to_string(), 400).0);
+            entries.push((title.to_string(), url.to_string(), snippet));
+        }
+        if entries.is_empty() {
+            return Err(ToolError::Execution {
+                message: "Exa Search response contains no usable results".to_string(),
+            });
+        }
+        Ok(format_search_results(query, entries))
+    }
+}
+
+fn format_search_results(query: &str, entries: Vec<(String, String, Option<String>)>) -> String {
+    if entries.is_empty() {
+        return format!("No results for: {query}");
+    }
+    let mut lines = vec![format!("Results for: {query}\n")];
+    for (index, (title, url, snippet)) in entries.into_iter().enumerate() {
+        lines.push(format!("{}. {}\n   {}", index + 1, title, url));
+        if let Some(snippet) = snippet.filter(|text| !text.is_empty()) {
+            lines.push(format!("   {snippet}"));
         }
     }
+    lines.join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,6 +1310,142 @@ fn fallback_extract(html: &str, mode: &str) -> String {
 mod tests {
     use super::*;
 
+    fn suppress_searxng_heal_for_test() {
+        LAST_SEARXNG_HEAL_S.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    async fn serve_web_search_response(status: u16, body: impl Into<String>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // These loopback fixtures may intentionally return failed SearXNG
+        // responses. Keep their repair callback offline and side-effect free.
+        suppress_searxng_heal_for_test();
+        let body = body.into();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
+    async fn serve_exa_response(
+        status: u16,
+        body: String,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let request_text = String::from_utf8_lossy(&request).into_owned();
+            let _ = request_tx.send(request_text);
+            let response = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}"), request_rx)
+    }
+
+    fn web_search_with_exa(searxng_url: String, exa_url: String) -> WebSearchTool {
+        let mut tool = WebSearchTool::new(Some(String::new()), 5, "searxng".into(), searxng_url)
+            .with_exa_api_key(Some("unit-test-exa-key".to_string()));
+        tool.exa_search_url = exa_url;
+        tool
+    }
+
+    async fn execute_search_for_test(
+        tool: &WebSearchTool,
+        count: Option<u64>,
+    ) -> crate::agent::tools::base::ToolResult {
+        let mut params = HashMap::new();
+        params.insert("query".to_string(), serde_json::json!("regression query"));
+        if let Some(count) = count {
+            params.insert("count".to_string(), serde_json::json!(count));
+        }
+        tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_web_search_malformed_searxng_json_is_a_typed_failure() {
+        let searxng_url = serve_web_search_response(200, "{not-json").await;
+        let tool = WebSearchTool::new(Some(String::new()), 5, "searxng".into(), searxng_url);
+
+        let result = execute_search_for_test(&tool, None).await;
+
+        let error = result.expect_err("malformed SearXNG JSON must be a tool failure");
+        assert!(
+            format!("{error:?}").contains("SearXNG"),
+            "failure should identify the primary backend: {}",
+            error
+        );
+    }
+
+    #[tokio::test]
+    async fn test_web_search_missing_searxng_results_is_a_typed_failure() {
+        let searxng_url = serve_web_search_response(200, r#"{"query":"regression query"}"#).await;
+        let tool = WebSearchTool::new(Some(String::new()), 5, "searxng".into(), searxng_url);
+
+        let result = execute_search_for_test(&tool, None).await;
+
+        let error =
+            result.expect_err("missing results must not be reported as genuine empty search");
+        assert!(
+            format!("{error:?}").contains("SearXNG"),
+            "failure should identify the primary backend: {}",
+            error
+        );
+    }
+
     #[test]
     #[ignore = "scratch: needs /tmp/kimi.html + /tmp/hn.html downloaded"]
     fn live_readable_savings_check() {
@@ -1068,8 +1509,14 @@ mod tests {
         assert_eq!(v["extractor"], "crw");
         assert_eq!(v["truncated"], false);
         assert!(v["text"].as_str().unwrap().contains("Example Domain"));
-        // Same envelope keys as the plain path — extract_web_content works.
+        // Same envelope keys as the plain path — generic extraction is stable.
         assert_eq!(extract_web_content(&envelope), v["text"].as_str().unwrap());
+
+        let evidence = extract_web_fetch_evidence(&envelope);
+        assert!(evidence.starts_with("WEB_FETCH_EVIDENCE v1\n"));
+        assert!(evidence.contains("\"extractor\":\"crw\""));
+        assert!(evidence.contains("\"extracted_text_truncated\":\"false\""));
+        assert!(is_web_fetch_evidence(&evidence));
     }
 
     #[test]
@@ -1425,32 +1872,279 @@ mod tests {
         reg.register(Box::new(UnhealthyProbe));
         reg.run_due_probes().await;
         assert!(!reg.is_healthy("searxng"));
+        suppress_searxng_heal_for_test();
 
-        let tool = WebSearchTool::new(
-            None,
+        let (exa_url, exa_request) = serve_exa_response(
+            200,
+            r#"{"results":[{"title":"Rust","url":"https://www.rust-lang.org/","highlights":["The Rust programming language"]}]}"#.to_string(),
+        )
+        .await;
+        let mut tool = WebSearchTool::new(
+            Some(String::new()),
             5,
             "searxng".to_string(),
             // Point at a port nothing listens on; if the short-circuit fails
             // the test will hang for 10s then return a connection error.
             "http://127.0.0.1:1".to_string(),
         )
-        .with_health_registry(Some(Arc::new(reg)));
+        .with_health_registry(Some(Arc::new(reg)))
+        .with_exa_api_key(Some("unit-test-exa-key".to_string()));
+        tool.exa_search_url = exa_url;
 
         let mut params = HashMap::new();
         params.insert("query".to_string(), serde_json::json!("test"));
-        let result = crate::agent::tools::base::render_result(
-            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
-                .await,
-        );
+        let result = tool
+            .execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+            .await
+            .expect("healthy Exa fallback should succeed");
 
         assert!(
-            result.contains("SearXNG backend is degraded"),
-            "expected degraded short-circuit message, got: {result}"
+            result.text.contains("Fell back to Exa"),
+            "degraded SearXNG should fall back to Exa: {}",
+            result.text
         );
         assert!(
-            result.contains("automatic restart") && result.contains("retry"),
-            "expected self-heal notice with retry hint, got: {result}"
+            result.text.contains("Rust") && result.text.contains("https://www.rust-lang.org/"),
+            "fallback should expose a usable result: {}",
+            result.text
         );
+        assert!(exa_request
+            .await
+            .unwrap()
+            .contains("x-api-key: unit-test-exa-key"));
+    }
+
+    #[tokio::test]
+    async fn test_web_search_exa_fallback_covers_transport_http_parse_and_schema_errors() {
+        let malformed = serve_web_search_response(200, "{not-json").await;
+        let missing_results =
+            serve_web_search_response(200, r#"{"query":"regression query"}"#).await;
+        let unusable_rows =
+            serve_web_search_response(200, r#"{"results":[{"title":"missing URL"}]}"#).await;
+        let non_success = serve_web_search_response(503, r#"{"error":"unavailable"}"#).await;
+        let cases = [
+            ("transport", "http://127.0.0.1:1".to_string()),
+            ("http", non_success),
+            ("parse", malformed),
+            ("schema", missing_results),
+            ("unusable rows", unusable_rows),
+        ];
+
+        for (case, searxng_url) in cases {
+            let (exa_url, exa_request) = serve_exa_response(
+                200,
+                r#"{"results":[{"title":"Rust docs","url":"https://doc.rust-lang.org/","highlights":["Rust documentation"]}]}"#.to_string(),
+            )
+            .await;
+            let tool = web_search_with_exa(searxng_url, exa_url);
+
+            let result = execute_search_for_test(&tool, None)
+                .await
+                .expect("configured Exa should recover backend failures");
+
+            assert!(
+                result.text.contains("Fell back to Exa")
+                    && result.text.contains("https://doc.rust-lang.org/"),
+                "{case} failure did not return an Exa result: {}",
+                result.text
+            );
+            let request = exa_request.await.unwrap();
+            assert!(request.contains("x-api-key: unit-test-exa-key"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_web_search_genuine_empty_searxng_results_do_not_call_exa() {
+        let searxng_url =
+            serve_web_search_response(200, r#"{"results":[],"unresponsive_engines":[]}"#).await;
+        let tool = web_search_with_exa(searxng_url, "http://127.0.0.1:1".to_string());
+
+        let result = execute_search_for_test(&tool, None)
+            .await
+            .expect("a genuine empty result is successful");
+
+        assert_eq!(result.text, "No results for: regression query");
+    }
+
+    #[tokio::test]
+    async fn test_web_search_healthy_local_results_do_not_call_exa() {
+        let searxng_url = serve_web_search_response(
+            200,
+            r#"{"results":[{"title":"Local result","url":"https://local.example/","content":"local snippet"}],"unresponsive_engines":[]}"#,
+        )
+        .await;
+        let tool = web_search_with_exa(searxng_url, "http://127.0.0.1:1".to_string());
+
+        let result = execute_search_for_test(&tool, None)
+            .await
+            .expect("successful local SearXNG results must not invoke Exa");
+
+        assert!(result.text.contains("Local result"));
+        assert!(!result.text.contains("Fell back to Exa"));
+    }
+
+    #[tokio::test]
+    async fn test_web_search_keeps_usable_local_rows_when_title_is_null() {
+        let searxng_url = serve_web_search_response(
+            200,
+            r#"{"results":[null,{"title":null,"url":"https://usable.example/","content":"local snippet"}],"unresponsive_engines":[]}"#,
+        )
+        .await;
+        let tool = web_search_with_exa(searxng_url, "http://127.0.0.1:1".to_string());
+
+        let result = execute_search_for_test(&tool, Some(1))
+            .await
+            .expect("a usable URL with a null title remains a local result");
+
+        assert!(result.text.contains("https://usable.example/"));
+        assert!(result.text.contains("local snippet"));
+        assert!(!result.text.contains("Fell back to Exa"));
+    }
+
+    #[tokio::test]
+    async fn test_web_search_exa_errors_are_typed_and_do_not_expose_response_body_or_key() {
+        let searxng_url = serve_web_search_response(
+            200,
+            r#"{"results":[],"unresponsive_engines":[["brave","HTTP 429"]]}"#,
+        )
+        .await;
+        let (exa_url, _) = serve_exa_response(
+            402,
+            r#"{"error":"SENSITIVE_REMOTE_BODY unit-test-exa-key"}"#.to_string(),
+        )
+        .await;
+        let tool = web_search_with_exa(searxng_url, exa_url);
+
+        let error = execute_search_for_test(&tool, None)
+            .await
+            .expect_err("an Exa quota error must remain a tool error");
+        let message = format!("{error:?}");
+
+        assert!(
+            message.contains("402"),
+            "HTTP status should be surfaced: {message}"
+        );
+        assert!(
+            !message.contains("SENSITIVE_REMOTE_BODY"),
+            "raw response leaked: {message}"
+        );
+        assert!(
+            !message.contains("unit-test-exa-key"),
+            "API key leaked: {message}"
+        );
+        assert!(
+            !message.contains("Fell back to Exa"),
+            "failed fallback must not sound successful"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_web_search_exa_highlights_are_bounded_and_count_is_clamped() {
+        let searxng_url = serve_web_search_response(
+            200,
+            r#"{"results":[],"unresponsive_engines":[["brave","HTTP 429"]]}"#,
+        )
+        .await;
+        let exa_response = serde_json::json!({
+            "results": (1..=5)
+                .map(|n| serde_json::json!({
+                    "title": format!("Rust result {n}"),
+                    "url": format!("https://example.com/{n}"),
+                    "highlights": ["é".repeat(600)],
+                }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string();
+        let (exa_url, exa_request) = serve_exa_response(200, exa_response).await;
+        let tool = web_search_with_exa(searxng_url, exa_url);
+
+        let result = execute_search_for_test(&tool, Some(99))
+            .await
+            .expect("Exa result should render");
+        let request = exa_request.await.unwrap();
+        let request_headers = request
+            .split_once("\r\n\r\n")
+            .map(|(headers, _)| headers.to_ascii_lowercase())
+            .expect("Exa request should contain HTTP headers");
+        assert!(request_headers.contains("accept: application/json"));
+        assert!(request_headers.contains("accept-encoding: identity"));
+        let body = request
+            .split_once("\r\n\r\n")
+            .and_then(|(_, body)| serde_json::from_str::<serde_json::Value>(body).ok())
+            .expect("Exa POST body should be JSON");
+
+        assert_eq!(body["query"], "regression query");
+        assert_eq!(body["numResults"], 10);
+        assert_eq!(body["type"], "auto");
+        assert_eq!(body["contents"]["highlights"], true);
+        let snippets = result
+            .text
+            .lines()
+            .filter(|line| line.starts_with("   ") && line.contains('é'))
+            .collect::<Vec<_>>();
+        assert_eq!(snippets.len(), 5);
+        assert!(snippets.iter().all(|line| line.trim().len() <= 400));
+        assert!(
+            result.text.len() < 4096,
+            "result too large: {} bytes",
+            result.text.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_web_search_brave_request_disables_compression() {
+        let body = r#"{"web":{"results":[{"title":"Rust","url":"https://www.rust-lang.org/","description":"Rust language"}]}}"#;
+        let (brave_url, request_rx) = serve_exa_response(200, body.to_string()).await;
+        let mut tool = WebSearchTool::new(
+            Some("unit-test-brave-key".to_string()),
+            5,
+            "brave".to_string(),
+            "http://localhost:8888".to_string(),
+        );
+        tool.brave_search_url = brave_url;
+
+        let result = execute_search_for_test(&tool, None)
+            .await
+            .expect("mock Brave response should parse");
+        let request = request_rx.await.unwrap();
+        let request_headers = request
+            .split_once("\r\n\r\n")
+            .map(|(headers, _)| headers.to_ascii_lowercase())
+            .expect("Brave request should contain HTTP headers");
+
+        assert!(result.text.contains("https://www.rust-lang.org/"));
+        assert!(request_headers.contains("accept: application/json"));
+        assert!(request_headers.contains("accept-encoding: identity"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires EXA_API_KEY and a local SearXNG service on localhost:8080"]
+    async fn test_web_search_exa_live_with_local_searxng() {
+        let key = std::env::var("EXA_API_KEY").expect("parent supplies EXA_API_KEY privately");
+        let tool = WebSearchTool::new(
+            Some(String::new()),
+            5,
+            "searxng".to_string(),
+            "http://localhost:8080".to_string(),
+        )
+        .with_exa_api_key(Some(key));
+        let mut params = HashMap::new();
+        params.insert(
+            "query".to_string(),
+            serde_json::json!("Rust async runtime official documentation"),
+        );
+
+        let result = tool
+            .execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+            .await
+            .expect("local SearXNG or Exa should return usable results");
+
+        assert!(
+            result.text.contains("https://"),
+            "search should include usable URLs: {}",
+            result.text
+        );
+        eprintln!("web_search live receipt:\n{}", result.text);
     }
 
     #[tokio::test]
@@ -1462,6 +2156,7 @@ mod tests {
 
         let reg = HealthRegistry::new();
         // No probes registered -> is_healthy returns true (optimistic default).
+        suppress_searxng_heal_for_test();
 
         let tool = WebSearchTool::new(
             None,
@@ -1484,7 +2179,9 @@ mod tests {
             "healthy probe must not short-circuit, got: {result}"
         );
         assert!(
-            result.contains("Error:") || result.contains("No results"),
+            result.contains("Network error:")
+                || result.contains("Error:")
+                || result.contains("No results"),
             "expected network error or empty-results path, got: {result}"
         );
     }
@@ -1500,6 +2197,13 @@ mod tests {
         let params = tool.parameters();
         assert_eq!(params["type"], "object");
         assert!(params["properties"]["query"].is_object());
+    }
+
+    #[test]
+    fn test_web_search_searxng_remains_available_with_only_exa_fallback() {
+        let tool = WebSearchTool::new(Some(String::new()), 5, "searxng".to_string(), String::new())
+            .with_exa_api_key(Some("unit-test-exa-key".to_string()));
+        assert!(tool.is_available());
     }
 
     #[test]
@@ -1587,6 +2291,7 @@ mod tests {
     #[tokio::test]
     async fn test_web_search_searxng_unavailable_no_brave_key() {
         // SearXNG provider with no Brave key and unreachable URL should return error.
+        suppress_searxng_heal_for_test();
         let tool = WebSearchTool::new(
             Some(String::new()),
             5,
@@ -1603,7 +2308,7 @@ mod tests {
                 .await,
         );
         assert!(
-            result.contains("Error: SearXNG unavailable") && result.contains("automatic restart"),
+            result.contains("SearXNG connection failed") && result.contains("automatic restart"),
             "Expected unavailable error with self-heal notice, got: {}",
             result
         );
@@ -1796,6 +2501,84 @@ The next GDP release, covering Q2, is scheduled for August 14th."#;
 
         let no_text_json = r#"{"status": 200, "url": "https://example.com"}"#;
         assert_eq!(extract_web_content(no_text_json), no_text_json);
+    }
+
+    #[test]
+    fn test_web_fetch_versioned_evidence_is_strict_and_scopes_truncation() {
+        let raw = bbc_web_fetch_fixture();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let text = parsed["text"].as_str().unwrap();
+        let legacy = extract_web_content(&raw);
+        assert_eq!(legacy, text, "generic extraction keeps its legacy contract");
+
+        let evidence = extract_web_fetch_evidence(&raw);
+        assert!(evidence.starts_with("WEB_FETCH_EVIDENCE v1\n"));
+        let (metadata, stored_text) = evidence
+            .strip_prefix("WEB_FETCH_EVIDENCE v1\n")
+            .unwrap()
+            .split_once("\n\n")
+            .unwrap();
+        assert_eq!(
+            stored_text, text,
+            "the exact extracted text remains retained"
+        );
+        let metadata: serde_json::Value = serde_json::from_str(metadata).unwrap();
+        assert_eq!(metadata["requested_url"], parsed["url"]);
+        assert_eq!(metadata["final_url"], parsed["finalUrl"]);
+        assert_eq!(metadata["http_status"], parsed["status"]);
+        assert_eq!(metadata["extractor"], parsed["extractor"]);
+        assert_eq!(metadata["extracted_text_truncated"], "false");
+        assert_eq!(metadata["scope"], "extracted_text_only");
+        assert!(metadata["completeness_note"]
+            .as_str()
+            .unwrap()
+            .contains("does not establish"));
+        assert!(is_web_fetch_evidence(&evidence));
+        assert!(!is_web_fetch_evidence(&raw));
+
+        let missing_truncation = serde_json::json!({
+            "url": "https://example.test/start",
+            "finalUrl": "https://example.test/article",
+            "status": 200,
+            "extractor": "crw",
+            "text": "CRW article text"
+        })
+        .to_string();
+        let unknown = extract_web_fetch_evidence(&missing_truncation);
+        assert!(unknown.contains("\"extracted_text_truncated\":\"unknown\""));
+
+        // Numeric HTTP failures are still fetched page bodies; retain their
+        // status metadata without changing the existing tool error protocol.
+        for status in [404, 500] {
+            let response = serde_json::json!({
+                "url": "https://example.test/missing",
+                "finalUrl": "https://example.test/missing",
+                "status": status,
+                "extractor": "raw",
+                "truncated": false,
+                "text": "HTTP error page"
+            })
+            .to_string();
+            let evidence = extract_web_fetch_evidence(&response);
+            assert!(evidence.contains(&format!("\"http_status\":{status}")));
+            assert!(evidence.contains("HTTP error page"));
+        }
+
+        let unrelated_json = r#"{"text":"legacy text extraction"}"#;
+        assert_eq!(
+            extract_web_fetch_evidence(unrelated_json),
+            "legacy text extraction"
+        );
+        assert!(!is_web_fetch_evidence(unrelated_json));
+        for untrusted in [
+            r#"{"error":"blocked","url":"https://example.test"}"#,
+            r#"{"url":"https://example.test","status":"200","text":"bad"}"#,
+            r#"{"url":"ftp://example.test","status":200,"text":"bad"}"#,
+            "{not json",
+        ] {
+            let evidence = extract_web_fetch_evidence(untrusted);
+            assert!(!is_web_fetch_evidence(&evidence), "{untrusted}");
+        }
     }
 
     // -----------------------------------------------------------------------

@@ -182,6 +182,7 @@ mod tests {
         // Verify content of one file
         let agents_content = std::fs::read_to_string(workspace.join("AGENTS.md")).unwrap();
         assert!(agents_content.contains("Agent Instructions"));
+        assert!(agents_content.contains("active tool schemas"));
         assert!(agents_content.contains("sessions.db"));
         assert!(agents_content.contains("LCM"));
 
@@ -192,6 +193,27 @@ mod tests {
             std::fs::read_to_string(workspace.join("memory").join("MEMORY.md")).unwrap();
         assert!(memory_content.contains("curated cross-session facts"));
         assert!(memory_content.contains("sessions.db"));
+    }
+
+    #[test]
+    fn test_create_workspace_templates_preserves_existing_custom_files() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path();
+        let custom_agents = "# Keep my workflow\nUse the team's review checklist.\n";
+        let custom_tools = "# Team tool rules\nCall the release helper before tagging.\n";
+        std::fs::write(workspace.join("AGENTS.md"), custom_agents).unwrap();
+        std::fs::write(workspace.join("TOOLS.md"), custom_tools).unwrap();
+
+        create_workspace_templates(workspace);
+
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("AGENTS.md")).unwrap(),
+            custom_agents
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("TOOLS.md")).unwrap(),
+            custom_tools
+        );
     }
 
     // -- inference engine detection tests --
@@ -577,7 +599,7 @@ pub(crate) fn cmd_onboard() {
 
 pub(crate) fn create_workspace_templates(workspace: &Path) {
     let templates: Vec<(&str, &str)> = vec![
-        ("AGENTS.md", "# Agent Instructions\n\nYou are a helpful AI assistant. Be concise, accurate, and friendly.\n\n## Guidelines\n\n- Always explain what you're doing before taking actions\n- Ask for clarification when the request is ambiguous\n- Use tools to help accomplish tasks\n- Raw session history lives in ~/.nanobot/sessions.db, and LCM maintains session-scoped working summaries there\n- Store only curated cross-session facts in workspace/memory/MEMORY.md\n"),
+        ("AGENTS.md", "# Agent Instructions\n\nYou are a helpful AI assistant. Be concise, accurate, and friendly.\n\n## Guidelines\n\n- Always explain what you're doing before taking actions\n- Ask for clarification when the request is ambiguous\n- Use tools to help accomplish tasks\n- Follow the active tool schemas for tool names, arguments, and invocation syntax\n- Raw session history lives in ~/.nanobot/sessions.db, and LCM maintains session-scoped working summaries there\n- Store only curated cross-session facts in workspace/memory/MEMORY.md\n"),
         ("SOUL.md", "# Soul\n\nI am nanobot, a lightweight AI assistant.\n\n## Personality\n\n- Helpful and friendly\n- Concise and to the point\n- Curious and eager to learn\n\n## Values\n\n- Accuracy over speed\n- User privacy and safety\n- Transparency in actions\n"),
         ("USER.md", "# User\n\nInformation about the user goes here.\n\n## Preferences\n\n- Communication style: (casual/formal)\n- Timezone: (your timezone)\n- Language: (your preferred language)\n"),
         ("TOOLS.md", "# Tool Usage\n\nGuidelines for using tools effectively.\n\n## Principles\n\n- Run independent tools in parallel; keep dependent tool calls ordered\n- Prefer read operations before write operations\n- Always confirm destructive actions with the user\n- Check tool output for errors before continuing\n"),

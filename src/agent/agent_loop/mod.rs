@@ -136,6 +136,7 @@ impl AgentLoop {
             core.mode().is_local(),
             core.max_tool_result_chars,
         )
+        .with_exa_api_key(core.exa_api_key.clone())
         .with_search_config(
             core.search_provider.clone(),
             core.searxng_url.clone(),

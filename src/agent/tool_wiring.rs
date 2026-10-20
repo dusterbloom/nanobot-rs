@@ -334,6 +334,7 @@ impl AgentLoopShared {
             restrict_to_workspace: core.restrict_to_workspace,
             max_tool_result_chars: core.max_tool_result_chars,
             brave_api_key: core.brave_api_key.clone(),
+            exa_api_key: core.exa_api_key.clone(),
             search_provider: core.search_provider.clone(),
             searxng_url: core.searxng_url.clone(),
             crw_url: core.crw_url.clone(),

@@ -338,6 +338,81 @@ fn render_char_page_with_budget(
     format!("{}{text}{footer}", header(end_char))
 }
 
+/// Render the first contiguous character page of versioned web evidence under
+/// a UTF-8 byte budget. The cursor remains a character offset so the existing
+/// `inspect_tool_result` path can continue through the exact stored body.
+pub(crate) fn render_web_fetch_first_page(
+    body: &str,
+    artifact_tool_call_id: &str,
+    max_bytes: usize,
+) -> Option<String> {
+    let total = body.chars().count();
+    if body.is_empty() || max_bytes == 0 {
+        return None;
+    }
+    let evidence_prefix = "WEB_FETCH_EVIDENCE v1\n";
+    let metadata_body = body.strip_prefix(evidence_prefix)?;
+    let (metadata, text) = metadata_body.split_once("\n\n")?;
+    if text.is_empty() {
+        return None;
+    }
+    let text_start_byte = evidence_prefix.len() + metadata.len() + 2;
+    let first_text_char_end = text_start_byte + text.chars().next()?.len_utf8();
+    let first_text_char_end = body[..first_text_char_end].chars().count();
+    let call_id_json = serde_json::to_string(artifact_tool_call_id).ok()?;
+    let header_prefix = format!("[source={artifact_tool_call_id} chars 0..");
+    let header_next_suffix = format!("/{total} next_char=");
+    let header_end_suffix = format!("/{total} end]\n");
+    let footer = |end_char: usize| {
+        if end_char < total {
+            format!(
+                "\n[MORE CONTENT AHEAD — this page stops mid-stored-result. Continue with inspect_tool_result {{\"tool_call_id\":{call_id_json},\"start_char\":{end_char}}}. Read the source truncation metadata above.]"
+            )
+        } else {
+            "\n[END OF STORED RESULT — the retained extracted text ends here. This does not imply the original page was fully represented.]".to_string()
+        }
+    };
+    let more_footer_prefix = format!(
+        "\n[MORE CONTENT AHEAD — this page stops mid-stored-result. Continue with inspect_tool_result {{\"tool_call_id\":{call_id_json},\"start_char\":"
+    );
+    let more_footer_suffix = "}. Read the source truncation metadata above.]";
+    let end_footer = "\n[END OF STORED RESULT — the retained extracted text ends here. This does not imply the original page was fully represented.]";
+
+    let mut best = None;
+    for (char_index, (byte_start, ch)) in body.char_indices().enumerate() {
+        let byte_end = byte_start + ch.len_utf8();
+        let end_char = char_index + 1;
+        let end_digits = end_char.to_string().len();
+        let header_bytes = if end_char < total {
+            header_prefix.len() + end_digits + header_next_suffix.len() + end_digits + 2
+        } else {
+            header_prefix.len() + end_digits + header_end_suffix.len()
+        };
+        let footer_bytes = if end_char < total {
+            more_footer_prefix.len() + end_digits + more_footer_suffix.len()
+        } else {
+            end_footer.len()
+        };
+        if header_bytes + byte_end + footer_bytes > max_bytes {
+            break;
+        }
+        if end_char >= first_text_char_end {
+            best = Some((byte_end, end_char));
+        }
+    }
+    let (byte_end, end_char) = best?;
+    let header = if end_char < total {
+        format!("{header_prefix}{end_char}{header_next_suffix}{end_char}]\n")
+    } else {
+        format!("{header_prefix}{end_char}{header_end_suffix}")
+    };
+    Some(format!(
+        "{header}{}{footer}",
+        &body[..byte_end],
+        footer = footer(end_char)
+    ))
+}
+
 /// Render one self-contained, line-aligned artifact page. The continuation is
 /// derived from the last COMPLETE source line that made it into the bounded
 /// page; applying [`bounded`] afterwards would advertise rows the model never
@@ -719,6 +794,173 @@ impl SearchToolResultTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn web_fetch_first_page_continues_and_reloads_byte_identically() {
+        let (_dir, db_path, session_id) = make_db().await;
+        let call_id = "call_web_fetch_paged";
+        let article = format!(
+            "First paragraph with the key fact.\n{}\nRequired fact near the end.",
+            "Evidence line with Unicode 界🦀.\n".repeat(700)
+        );
+        let evidence = format!(
+            "WEB_FETCH_EVIDENCE v1\n{{\"requested_url\":\"https://example.test/start\",\"final_url\":\"https://example.test/article\",\"http_status\":200,\"extractor\":\"crw\",\"extracted_text_truncated\":\"true\",\"scope\":\"extracted_text_only\",\"completeness_note\":\"The extracted text was clipped at maxChars; refetch with a larger maxChars to request more extracted text. The original page may still contain content omitted by extraction.\"}}\n\n{article}"
+        );
+        let db = SessionDb::new(&db_path);
+        let first_page = crate::agent::tool_engine::store_then_render_tool_result(
+            &db,
+            &session_id,
+            call_id,
+            "web_fetch",
+            &HashMap::new(),
+            &evidence,
+            true,
+            crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+        )
+        .await
+        .expect("versioned web evidence must be stored before rendering");
+
+        assert!(
+            first_page.len() <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+            "the first page must count headers, metadata, and footer in its byte limit"
+        );
+        assert!(
+            first_page.contains("https://example.test/article"),
+            "{first_page}"
+        );
+        assert!(
+            first_page.contains("\"extracted_text_truncated\":\"true\""),
+            "{first_page}"
+        );
+        assert!(
+            first_page.contains("\"scope\":\"extracted_text_only\""),
+            "{first_page}"
+        );
+        assert!(
+            first_page.contains("refetch with a larger maxChars"),
+            "{first_page}"
+        );
+        assert!(
+            first_page.contains("First paragraph with the key fact."),
+            "{first_page}"
+        );
+        assert!(
+            !first_page.contains("Required fact near the end."),
+            "{first_page}"
+        );
+
+        db.add_messages(
+            &session_id,
+            &[
+                serde_json::json!({"role":"user", "content":"Read this web page."}),
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "web_fetch", "arguments": "{}"}
+                    }]
+                }),
+                serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": "web_fetch",
+                    "ok": true,
+                    "content": first_page
+                }),
+            ],
+        )
+        .await;
+        drop(db);
+
+        let inspector = SearchToolResultTool::with_db(db_path.clone(), session_id.clone());
+        let mut cursor = 0usize;
+        let mut page = first_page.clone();
+        let mut reconstructed = String::new();
+        let mut saw_late_fact = false;
+        for _ in 0..8 {
+            let header = page.lines().next().expect("each page has a source header");
+            let header = header
+                .strip_prefix(&format!("[source={call_id} chars "))
+                .expect("the continuation must keep the original artifact id");
+            let (range, _) = header
+                .strip_suffix(']')
+                .expect("source header must close")
+                .split_once(' ')
+                .expect("source header must report page status");
+            let (start, tail) = range.split_once("..").expect("page range start");
+            let (end, total) = tail.split_once('/').expect("page range end");
+            let start = start.parse::<usize>().unwrap();
+            let end = end.parse::<usize>().unwrap();
+            let total = total.parse::<usize>().unwrap();
+            assert_eq!(
+                start, cursor,
+                "character pages must have no gaps or overlap"
+            );
+
+            let payload = page.split_once('\n').unwrap().1;
+            saw_late_fact |= payload.contains("Required fact near the end.");
+            let payload = payload
+                .split("\n[MORE CONTENT AHEAD")
+                .next()
+                .unwrap()
+                .split("\n[END OF STORED RESULT")
+                .next()
+                .unwrap();
+            let expected: String = evidence.chars().skip(start).take(end - start).collect();
+            assert_eq!(
+                payload, expected,
+                "cursor must refer to exact stored characters"
+            );
+            reconstructed.push_str(payload);
+
+            if end == total {
+                assert!(page.contains("END OF STORED RESULT"), "{page}");
+                assert!(!page.contains("original page is complete"), "{page}");
+                break;
+            }
+            assert!(page.contains(&format!("next_char={end}")), "{page}");
+            cursor = end;
+            let mut params = HashMap::new();
+            params.insert("tool_call_id".to_string(), serde_json::json!(call_id));
+            params.insert("start_char".to_string(), serde_json::json!(cursor));
+            page = crate::agent::tools::base::render_result(
+                inspector
+                    .execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                    .await,
+            );
+        }
+        assert_eq!(
+            reconstructed, evidence,
+            "inspection must recover retained evidence exactly"
+        );
+        assert!(
+            saw_late_fact,
+            "the post-page inspector must reveal the late fact"
+        );
+
+        let reopened = SessionDb::new(&db_path);
+        let history = reopened.get_history(&session_id, 100, 0).await;
+        let carrier = history
+            .iter()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+            .expect("tool-call carrier must survive reload");
+        assert_eq!(carrier["tool_calls"][0]["id"], call_id);
+        let replayed = history
+            .iter()
+            .find(|message| message.get("tool_call_id").and_then(Value::as_str) == Some(call_id))
+            .expect("paired tool result must survive reload");
+        assert_eq!(replayed["content"], first_page);
+        assert_eq!(
+            reopened
+                .load_tool_result(&session_id, call_id)
+                .await
+                .as_deref(),
+            Some(evidence.as_str()),
+            "reopening must retain the exact versioned artifact"
+        );
+    }
 
     async fn make_db() -> (tempfile::TempDir, PathBuf, String) {
         let dir = tempfile::tempdir().unwrap();

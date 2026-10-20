@@ -66,6 +66,7 @@ pub struct SwappableCore {
     pub working_memory: WorkingMemoryStore,
     pub working_memory_budget: usize,
     pub brave_api_key: Option<String>,
+    pub exa_api_key: Option<String>,
     pub search_provider: String,
     pub searxng_url: String,
     /// Base URL of a local crw-server for web_fetch; empty = disabled.
@@ -969,6 +970,7 @@ pub struct SwappableCoreConfig {
     pub temperature: f64,
     pub max_context_tokens: usize,
     pub brave_api_key: Option<String>,
+    pub exa_api_key: Option<String>,
     pub search_provider: String,
     pub searxng_url: String,
     /// Base URL of a local crw-server for web_fetch; empty = disabled.
@@ -1021,6 +1023,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
         temperature,
         max_context_tokens,
         brave_api_key,
+        exa_api_key,
         search_provider,
         searxng_url,
         crw_url,
@@ -1134,6 +1137,7 @@ pub fn build_swappable_core(cfg: SwappableCoreConfig) -> SwappableCore {
             memory_config.working_memory_budget
         },
         brave_api_key,
+        exa_api_key,
         search_provider,
         searxng_url,
         crw_url,

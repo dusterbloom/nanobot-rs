@@ -282,16 +282,47 @@ pub(crate) async fn store_then_render_tool_result(
 
     Ok(match tool_result_exposure(tool_name) {
         ToolResultExposure::Handle => {
-            // Hybrid exposure (prototype): small results go INLINE — their
-            // bytes are deterministic and immutable once stashed, so they are
-            // just as cache-stable as a handle, and inlining spares the model
-            // an inspect_tool_result round-trip per result. Only genuinely
-            // large results stay handles (context protection). The reload
-            // path in SessionDb::get_history applies the same threshold.
-            if exact_body.len() <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES {
-                exact_body.to_string()
+            if tool_name == "web_fetch"
+                && crate::agent::tools::web::is_web_fetch_evidence(exact_body)
+            {
+                let byte_budget =
+                    cap.min(crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES);
+                if exact_body.len() <= byte_budget {
+                    exact_body.to_string()
+                } else {
+                    crate::agent::tools::stash_search::render_web_fetch_first_page(
+                        exact_body,
+                        tool_call_id,
+                        byte_budget,
+                    )
+                    .unwrap_or_else(|| {
+                        render_tool_result_handle(
+                            tool_call_id,
+                            tool_name,
+                            ok,
+                            exact_body.as_bytes(),
+                            args,
+                        )
+                    })
+                }
             } else {
-                render_tool_result_handle(tool_call_id, tool_name, ok, exact_body.as_bytes(), args)
+                // Hybrid exposure (prototype): small results go INLINE — their
+                // bytes are deterministic and immutable once stashed, so they are
+                // just as cache-stable as a handle, and inlining spares the model
+                // an inspect_tool_result round-trip per result. Only genuinely
+                // large results stay handles (context protection). The reload
+                // path in SessionDb::get_history applies the same threshold.
+                if exact_body.len() <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES {
+                    exact_body.to_string()
+                } else {
+                    render_tool_result_handle(
+                        tool_call_id,
+                        tool_name,
+                        ok,
+                        exact_body.as_bytes(),
+                        args,
+                    )
+                }
             }
         }
         ToolResultExposure::ExplicitExcerpt => {
@@ -1012,12 +1043,12 @@ async fn inject_tool_result(ctx: &mut TurnContext, r: &SingleToolResult, prompt_
         return;
     }
 
-    // For web_fetch/web_search: unwrap the JSON envelope so the model
-    // sees clean article text rather than a JSON metadata summary.
-    let result_data = if r.tool_name == "web_fetch" || r.tool_name == "web_search" {
-        crate::agent::tools::web::extract_web_content(r.result.data())
-    } else {
-        r.result.data().to_string()
+    // Preserve the web_fetch envelope's provenance in versioned evidence;
+    // web_search keeps its legacy clean-text projection.
+    let result_data = match r.tool_name.as_str() {
+        "web_fetch" => crate::agent::tools::web::extract_web_fetch_evidence(r.result.data()),
+        "web_search" => crate::agent::tools::web::extract_web_content(r.result.data()),
+        _ => r.result.data().to_string(),
     };
 
     let cap = prompt_cap.max(1);
@@ -2305,6 +2336,359 @@ mod tests {
                 "size {size} must remain losslessly recoverable"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_large_evidence_shows_a_byte_bounded_first_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions.create_session("cli:web-fetch-first-page").await;
+        let text = format!(
+            "First paragraph with the lead fact.\n{}\nRequired fact at the end.",
+            "界🦀".repeat(4_000)
+        );
+        let evidence = format!(
+            "WEB_FETCH_EVIDENCE v1\n{{\"requested_url\":\"https://example.test/start\",\"final_url\":\"https://example.test/article\",\"http_status\":200,\"extractor\":\"readability\",\"extracted_text_truncated\":\"true\",\"scope\":\"extracted_text_only\",\"completeness_note\":\"The extracted text was clipped at maxChars; refetch with a larger maxChars to request more extracted text. The original page may still contain content omitted by extraction.\"}}\n\n{text}"
+        );
+
+        let rendered = store_then_render_tool_result(
+            &sessions,
+            &session.id,
+            "call_web_first_page",
+            "web_fetch",
+            &HashMap::new(),
+            &evidence,
+            true,
+            crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+        )
+        .await
+        .expect("web evidence must be stored before rendering");
+
+        assert!(rendered.len() <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES);
+        assert!(rendered.contains("WEB_FETCH_EVIDENCE v1"), "{rendered}");
+        assert!(
+            rendered.contains("https://example.test/article"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"http_status\":200"), "{rendered}");
+        assert!(
+            rendered.contains("\"extracted_text_truncated\":\"true\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("\"scope\":\"extracted_text_only\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("refetch with a larger maxChars"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("First paragraph with the lead fact."),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("Required fact at the end."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("source=call_web_first_page chars 0.."),
+            "{rendered}"
+        );
+        assert!(rendered.contains("next_char="), "{rendered}");
+        assert_eq!(
+            sessions
+                .load_tool_result(&session.id, "call_web_first_page")
+                .await
+                .as_deref(),
+            Some(evidence.as_str()),
+            "the original versioned evidence remains the immutable artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_small_evidence_stays_complete_inline() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions
+            .create_session("cli:web-fetch-small-evidence")
+            .await;
+        let evidence = "WEB_FETCH_EVIDENCE v1\n{\"requested_url\":\"https://example.test/start\",\"final_url\":\"https://example.test/article\",\"http_status\":200,\"extractor\":\"crw\",\"extracted_text_truncated\":\"false\",\"scope\":\"extracted_text_only\",\"completeness_note\":\"The extracted text was not clipped at maxChars. This does not establish that extraction represented the complete original page.\"}\n\nComplete small article.";
+
+        let rendered = store_then_render_tool_result(
+            &sessions,
+            &session.id,
+            "call_web_small",
+            "web_fetch",
+            &HashMap::new(),
+            &evidence,
+            true,
+            crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+        )
+        .await
+        .expect("small web evidence must be stored before rendering");
+
+        assert!(rendered.contains("WEB_FETCH_EVIDENCE v1"), "{rendered}");
+        assert!(rendered.contains("Complete small article."), "{rendered}");
+        assert_eq!(rendered, evidence);
+    }
+
+    #[tokio::test]
+    async fn web_fetch_empty_text_keeps_provenance_inline() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions.create_session("cli:web-fetch-empty-text").await;
+        let raw = json!({
+            "url": "https://example.test/empty",
+            "finalUrl": "https://example.test/empty",
+            "status": 200,
+            "extractor": "readability",
+            "truncated": false,
+            "length": 0,
+            "text": ""
+        })
+        .to_string();
+        let evidence = crate::agent::tools::web::extract_web_fetch_evidence(&raw);
+        assert!(crate::agent::tools::web::is_web_fetch_evidence(&evidence));
+
+        let rendered = store_then_render_tool_result(
+            &sessions,
+            &session.id,
+            "call_web_empty_text",
+            "web_fetch",
+            &HashMap::new(),
+            &evidence,
+            true,
+            crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+        )
+        .await
+        .expect("empty fetch evidence must be stored");
+
+        assert_eq!(rendered, evidence);
+        assert!(rendered.contains("https://example.test/empty"));
+        assert!(rendered.ends_with("\n\n"));
+    }
+
+    #[tokio::test]
+    async fn web_fetch_oversized_metadata_falls_back_to_handle() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions
+            .create_session("cli:web-fetch-large-metadata")
+            .await;
+        let long_url = format!("https://example.test/{}", "a".repeat(2_500));
+        let raw = json!({
+            "url": &long_url,
+            "finalUrl": &long_url,
+            "status": 200,
+            "extractor": "readability",
+            "truncated": false,
+            "length": 1,
+            "text": "x"
+        })
+        .to_string();
+        let evidence = crate::agent::tools::web::extract_web_fetch_evidence(&raw);
+        assert!(evidence.len() > crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES);
+        assert!(crate::agent::tools::web::is_web_fetch_evidence(&evidence));
+
+        let rendered = store_then_render_tool_result(
+            &sessions,
+            &session.id,
+            "call_web_large_metadata",
+            "web_fetch",
+            &HashMap::new(),
+            &evidence,
+            true,
+            crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+        )
+        .await
+        .expect("large metadata evidence must be stored");
+
+        assert!(
+            rendered.starts_with(TOOL_RESULT_HANDLE_MARKER),
+            "{rendered}"
+        );
+        assert!(rendered.len() < crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES);
+    }
+
+    #[tokio::test]
+    async fn web_fetch_evidence_uses_handle_when_prompt_cap_cannot_fit_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let sessions = crate::session::SessionDb::new(&temp.path().join("sessions.db"));
+        let session = sessions.create_session("cli:web-fetch-tiny-cap").await;
+        let evidence = format!(
+            "WEB_FETCH_EVIDENCE v1\n{{\"requested_url\":\"https://example.test/start\",\"final_url\":\"https://example.test/article\",\"http_status\":200,\"extractor\":\"readability\",\"extracted_text_truncated\":\"true\",\"scope\":\"extracted_text_only\",\"completeness_note\":\"The extracted text was clipped at maxChars; refetch with a larger maxChars to request more extracted text. The original page may still contain content omitted by extraction.\"}}\n\n{}",
+            "body text ".repeat(800)
+        );
+        assert!(crate::agent::tools::web::is_web_fetch_evidence(&evidence));
+
+        let rendered = store_then_render_tool_result(
+            &sessions,
+            &session.id,
+            "call_web_tiny_cap",
+            "web_fetch",
+            &HashMap::new(),
+            &evidence,
+            true,
+            64,
+        )
+        .await
+        .expect("web evidence must be stored before rendering");
+
+        assert!(
+            rendered.starts_with(TOOL_RESULT_HANDLE_MARKER),
+            "{rendered}"
+        );
+        assert!(rendered.contains("call_web_tiny_cap"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn read_file_result_is_persisted_and_reloaded_byte_identically() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("evidence.txt");
+        let contents = (1..=1_000)
+            .map(|line| format!("line {line}: a concrete fact from the source"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, contents).unwrap();
+
+        let result = crate::agent::tools::ReadFileTool::new(20_000)
+            .execute(
+                HashMap::from([(
+                    "path".to_string(),
+                    json!(file_path.to_string_lossy().as_ref()),
+                )]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await;
+        let exact_page = crate::agent::tools::base::render_result(result);
+        assert!(exact_page.len() <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES);
+        assert!(exact_page.contains("line 1: a concrete fact from the source"));
+        assert!(exact_page.contains("more lines; next: read_file lines="));
+
+        let db_path = temp.path().join("sessions.db");
+        let sessions = crate::session::SessionDb::new(&db_path);
+        let session = sessions.create_session("cli:file-result-reload").await;
+        let call_id = "call_read_file_paged";
+        let rendered = store_then_render_tool_result(
+            &sessions,
+            &session.id,
+            call_id,
+            "read_file",
+            &HashMap::new(),
+            &exact_page,
+            true,
+            crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+        )
+        .await
+        .expect("read_file page must be stored at ingestion");
+        assert_eq!(rendered, exact_page);
+        sessions
+            .add_messages(
+                &session.id,
+                &[
+                    json!({"role":"user", "content":"Read this file."}),
+                    json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"}
+                        }]
+                    }),
+                    json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "name": "read_file",
+                        "ok": true,
+                        "content": rendered
+                    }),
+                ],
+            )
+            .await;
+        drop(sessions);
+
+        let reopened = crate::session::SessionDb::new(&db_path);
+        let history = reopened.get_history(&session.id, 100, 0).await;
+        let tool_call = history
+            .iter()
+            .find(|message| message.get("tool_call_id").and_then(Value::as_str) == Some(call_id))
+            .expect("tool result must survive DB reload");
+        assert_eq!(tool_call["content"], exact_page);
+        let carrier = history
+            .iter()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+            .expect("tool-call carrier must survive DB reload");
+        assert_eq!(carrier["tool_calls"][0]["id"], call_id);
+        assert_eq!(
+            reopened
+                .load_tool_result(&session.id, call_id)
+                .await
+                .as_deref(),
+            Some(exact_page.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_explicit_excerpt_survives_history_reload_byte_identically() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("sessions.db");
+        let sessions = crate::session::SessionDb::new(&db_path);
+        let session = sessions.create_session("cli:legacy-excerpt-reload").await;
+        let call_id = "call_legacy_inspection";
+        let exact_body = "retained inspection evidence\n".repeat(2_000);
+        let rendered_excerpt = digest_tool_result(
+            "inspect_tool_result",
+            &HashMap::new(),
+            &exact_body,
+            6_000,
+            call_id,
+        );
+        assert!(
+            rendered_excerpt.len() > crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES
+        );
+        assert!(!rendered_excerpt.starts_with(TOOL_RESULT_EXCERPT_MARKER));
+
+        assert!(matches!(
+            sessions
+                .store_tool_result_immutable(
+                    &session.id,
+                    call_id,
+                    "inspect_tool_result",
+                    &exact_body
+                )
+                .await,
+            crate::session::db::StoredResult::Stored { .. }
+        ));
+        sessions
+            .add_messages(
+                &session.id,
+                &[
+                    json!({"role":"assistant", "content":"", "tool_calls":[{
+                        "id": call_id,
+                        "type":"function",
+                        "function":{"name":"inspect_tool_result", "arguments":"{}"}
+                    }]}),
+                    json!({
+                        "role":"tool",
+                        "tool_call_id": call_id,
+                        "name":"inspect_tool_result",
+                        "ok":true,
+                        "content": rendered_excerpt
+                    }),
+                ],
+            )
+            .await;
+        drop(sessions);
+
+        let reopened = crate::session::SessionDb::new(&db_path);
+        let history = reopened.get_history(&session.id, 100, 0).await;
+        let persisted = history
+            .iter()
+            .find(|message| message.get("tool_call_id").and_then(Value::as_str) == Some(call_id))
+            .expect("legacy excerpt must survive history reload");
+        assert_eq!(persisted["content"], rendered_excerpt);
     }
 
     #[tokio::test]

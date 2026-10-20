@@ -336,6 +336,10 @@ fn core_config_from(
     } else {
         Some(config.tools.web.search.api_key.clone())
     };
+    let exa_key = resolve_exa_api_key(
+        &config.tools.web.search.exa_api_key,
+        std::env::var("EXA_API_KEY").ok(),
+    );
     let max_iters = effective_max_iterations(
         config.agents.defaults.max_tool_iterations,
         max_context_tokens,
@@ -351,6 +355,7 @@ fn core_config_from(
         temperature: config.agents.defaults.temperature,
         max_context_tokens,
         brave_api_key: brave_key,
+        exa_api_key: exa_key,
         search_provider: config.tools.web.search.provider.clone(),
         searxng_url: config.tools.web.search.searxng_url.clone(),
         crw_url: config.tools.web.fetch.crw_url.clone(),
@@ -372,6 +377,14 @@ fn core_config_from(
         sessions_db_path: None,
         python_kernel: config.tools.python_kernel.clone(),
         cua: config.tools.cua.clone(),
+    }
+}
+
+fn resolve_exa_api_key(config_key: &str, env_key: Option<String>) -> Option<String> {
+    if !config_key.trim().is_empty() {
+        Some(config_key.to_string())
+    } else {
+        env_key.filter(|key| !key.trim().is_empty())
     }
 }
 
@@ -541,5 +554,19 @@ mod matching_tests {
             resolved_local_context_tokens("qwen36-35b", None, 32_768),
             32_768
         );
+    }
+
+    #[test]
+    fn test_exa_key_prefers_config_and_falls_back_to_environment() {
+        assert_eq!(
+            resolve_exa_api_key(" config-exa-key ", Some("environment-key".to_string())),
+            Some(" config-exa-key ".to_string())
+        );
+        assert_eq!(
+            resolve_exa_api_key("", Some("environment-key".to_string())),
+            Some("environment-key".to_string())
+        );
+        assert_eq!(resolve_exa_api_key("", None), None);
+        assert_eq!(resolve_exa_api_key("  ", Some("  ".to_string())), None);
     }
 }

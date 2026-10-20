@@ -647,6 +647,8 @@ impl ProvidersConfig {
 pub struct WebSearchConfig {
     #[serde(default)]
     pub api_key: String,
+    #[serde(default)]
+    pub exa_api_key: String,
     #[serde(default = "default_max_results")]
     pub max_results: u32,
     #[serde(default = "default_search_provider")]
@@ -674,6 +676,7 @@ impl fmt::Debug for WebSearchConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WebSearchConfig")
             .field("api_key", &crate::config::redact(&self.api_key))
+            .field("exa_api_key", &crate::config::redact(&self.exa_api_key))
             .field("max_results", &self.max_results)
             .field("provider", &self.provider)
             .field("searxng_url", &self.searxng_url)
@@ -686,6 +689,7 @@ impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
+            exa_api_key: String::new(),
             max_results: default_max_results(),
             provider: default_search_provider(),
             searxng_url: default_searxng_url(),
@@ -2500,6 +2504,28 @@ mod tests {
         assert!(
             debug_output.contains("[REDACTED"),
             "missing redaction markers"
+        );
+    }
+
+    #[test]
+    fn test_web_search_exa_key_roundtrips_and_is_redacted() {
+        let exa_key = "exa-private-test-key";
+        let config: WebSearchConfig = serde_json::from_value(serde_json::json!({
+            "apiKey": "brave-key-remains-distinct",
+            "exaApiKey": exa_key,
+        }))
+        .unwrap();
+
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert_eq!(serialized["apiKey"], "brave-key-remains-distinct");
+        assert_eq!(serialized["exaApiKey"], exa_key);
+        assert_eq!(
+            serde_json::to_value(WebSearchConfig::default()).unwrap()["exaApiKey"],
+            ""
+        );
+        assert!(
+            !format!("{config:?}").contains(exa_key),
+            "Exa key leaked through WebSearchConfig Debug"
         );
     }
 

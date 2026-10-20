@@ -1133,10 +1133,6 @@ impl ContextBuilder {
         let memory_path = format!("{workspace_path}/memory/MEMORY.md");
 
         // Genuinely divergent pieces: intro/model line, extra rules, tail sections.
-        // Local and cloud share one core-plus-proxy protocol: hot tools have
-        // native schemas, while the long tail is reached through `tool`.
-        // Keeping that distinction explicit prevents hybrid calls such as
-        // `exec({"args": {"command": ...}})`.
         let (intro, home_line, extra_rules, tail) = if local {
             let model_line = if self.model_name.is_empty() {
                 "local".to_string()
@@ -1147,14 +1143,10 @@ impl ContextBuilder {
                 format!(
                     "You are nanobot.\n\
                      Date: {today}. Model: {model_line}. Cwd: {cwd}. Workspace: {workspace_path}.\n\n\
-                     Native tools: read_file, edit_file, write_file, exec, get_skills, inspect_tool_result — call with schema args; never wrap. \
-                     Other tools via `get_tools` proxy: omit tool_name to list; \
-                     {{\"tool_name\":\"X\"}} inspect; {{\"tool_name\":\"X\",\"tool_args\":{{...}}}} invoke. \
-                      get_skills: omit name to list, name to read; recall (memory + files + past sessions). \
-                     TOOL_RESULT_HANDLE v1 receipt → inspect a bounded part with inspect_tool_result({{\"tool_call_id\":\"<id>\",\"query\":\"...\"}}), or use start_line/end_line. \
+                     Follow the supplied tool schemas for tool names, arguments, and invocation syntax; do not invent wrappers. \
+                     Use recall to search memory, files, and past sessions. \
+                     TOOL_RESULT_HANDLE v1 receipts can be inspected in bounded parts with inspect_tool_result when needed. \
                      Quote exact tool errors; never invent causes or tool results. \
-                     edit_file uses path, old_text, new_text—not content. \
-                     Never pass read_file line prefixes as args. \
                      Persona: AGENTS.md, SOUL.md, USER.md.",
                     today = Self::session_date_stamp(),
                 ),
@@ -1194,8 +1186,7 @@ impl ContextBuilder {
                 format!("Home: {home_dir}\n"),
                 "\n- Reply directly for conversation; use 'message' tool only for chat channels.\n\
                  - Use absolute paths or paths relative to the project directory.\n\
-                 - Tool results may arrive as TOOL_RESULT_HANDLE v1 receipts (body stashed to save context); \
-                 inspect only the needed part with inspect_tool_result({\"tool_call_id\":\"<id>\",\"query\":\"...\"}}) or start_line/end_line."
+                 - Tool results may arrive as TOOL_RESULT_HANDLE v1 receipts; inspect only needed parts with inspect_tool_result when relevant."
                     .to_string(),
                 format!(
                     "## Memory\n\
@@ -1750,9 +1741,7 @@ mod tests {
     }
 
     #[test]
-    fn test_local_identity_teaches_core_plus_proxy_contract() {
-        // Hot tools are native and take direct schema arguments. The proxy is
-        // reserved for the long tail and still teaches list / inspect / invoke.
+    fn test_local_identity_defers_tool_calls_to_supplied_schemas() {
         let (_tmp, cb) = make_context();
         let identity = cb._get_identity(true);
         let workspace_str = cb
@@ -1768,21 +1757,13 @@ mod tests {
         assert!(identity.contains("Workspace:"), "{identity}");
         assert!(identity.contains(&workspace_str), "{identity}");
 
-        // (b) one unambiguous native/proxy contract
-        assert!(identity.contains("Native tools:"), "{identity}");
-        assert!(identity.contains("never wrap"), "{identity}");
-        assert!(
-            identity.contains("Other tools via `get_tools` proxy"),
-            "{identity}"
-        );
-        assert!(identity.contains("`get_tools` proxy"), "{identity}");
-        assert!(identity.contains("omit tool_name to list"), "{identity}");
-        assert!(identity.contains(r#"{"tool_name":"X"}"#), "{identity}");
-        assert!(
-            identity.contains(r#"{"tool_name":"X","tool_args":{...}}"#),
-            "{identity}"
-        );
-        assert!(identity.contains("get_skills"), "{identity}");
+        // Tool definitions, rather than a second hand-maintained catalog,
+        // determine names, arguments, and call syntax.
+        assert!(!identity.contains("Native tools: read_file,"), "{identity}");
+        assert!(!identity.contains("Other tools via `tool`"), "{identity}");
+        assert!(!identity.contains(r#"{"tool_name":"X"}"#), "{identity}");
+        assert!(identity.contains("schemas"), "{identity}");
+        assert!(identity.contains("inspect_tool_result"), "{identity}");
         assert!(identity.contains("recall"), "{identity}");
         // session_search was dissolved into recall — must not appear.
         assert!(
@@ -1796,12 +1777,9 @@ mod tests {
             identity.contains("never invent causes or tool results"),
             "{identity}"
         );
+        assert!(!identity.contains("edit_file uses path,"), "{identity}");
         assert!(
-            identity.contains("edit_file uses path, old_text, new_text—not content"),
-            "{identity}"
-        );
-        assert!(
-            identity.contains("Never pass read_file line prefixes as args"),
+            !identity.contains("read_file line prefixes as args"),
             "{identity}"
         );
 
@@ -2513,10 +2491,8 @@ mod tests {
         let system_content = system_msg["content"].as_str().unwrap();
 
         // The cached prefix itself must stay within the 1000-token ceiling even
-        // with bootstrap/skills present. After the ratel-ai-style shrink, the
-        // identity advertises the catalog as fetch hooks (read_file / get_skills
-        // / recall) instead of inlining it, so a workspace full of large files
-        // can no longer push the prefix over the cap.
+        // with bootstrap/skills present. The prompt defers tool names and call
+        // syntax to the active schemas instead of duplicating a catalog.
         let (stable, _runtime, _) =
             cb.build_local_system_prompt_parts(None, None, None, false, None, &[]);
         let stable_tokens = TokenBudget::estimate_str_tokens(&stable);
@@ -2524,16 +2500,17 @@ mod tests {
             stable_tokens <= 1000,
             "local cached prefix ({stable_tokens} tokens) must stay within the 1000-token ceiling"
         );
-        // The stable prefix carries the model identity and the proxy hooks.
+        // The stable prefix carries the model identity and schema authority.
         assert!(stable.contains("nanobot"));
         assert!(stable.contains("mlx:Qwen3-8B-MLX-4bit"));
-        assert!(stable.contains("`get_tools` proxy"));
-        assert!(stable.contains("get_skills"));
+        assert!(stable.contains("supplied tool schemas"));
+        assert!(!stable.contains("Native tools: read_file,"));
+        assert!(!stable.contains(r#"{"tool_name":"X"}"#));
         assert!(stable.contains("recall"));
 
         // On-demand contract: AGENTS.md / MEMORY.md / skill bodies are NOT
-        // inlined into the local system prompt — the model fetches them via the
-        // tools advertised in the identity. The bootstrap *names* appear as
+        // inlined into the local system prompt — the model fetches them via
+        // the supplied tool schemas. The bootstrap *names* appear as
         // pointers, but their *bodies* never enter the cached prefix.
         assert!(system_content.contains("AGENTS.md"));
         assert!(!system_content.contains("Bootstrap directive"));

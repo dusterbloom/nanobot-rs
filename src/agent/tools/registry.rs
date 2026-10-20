@@ -32,6 +32,7 @@ pub struct ToolConfig {
     pub restrict_to_workspace: bool,
     pub max_tool_result_chars: usize,
     pub brave_api_key: Option<String>,
+    pub exa_api_key: Option<String>,
     /// When true, exclude file mutation tools.
     pub read_only: bool,
     /// If set, only register tools in this list. Empty = register all.
@@ -74,6 +75,7 @@ impl ToolConfig {
             restrict_to_workspace: false,
             max_tool_result_chars: crate::config::schema::DEFAULT_MAX_TOOL_RESULT_CHARS,
             brave_api_key: None,
+            exa_api_key: None,
             read_only: false,
             tools_filter: None,
             exec_working_dir: None,
@@ -353,6 +355,7 @@ impl ToolRegistry {
                     config.search_provider.clone(),
                     config.searxng_url.clone(),
                 )
+                .with_exa_api_key(config.exa_api_key.clone())
                 .with_health_registry(config.health_registry.clone()),
             ));
         }
@@ -2123,6 +2126,19 @@ mod tests {
             !registry.has("batch"),
             "native multi-tool responses are the single batching path"
         );
+    }
+
+    #[test]
+    fn test_standard_registry_passes_exa_key_to_web_search() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = ToolConfig {
+            exa_api_key: Some("unit-test-exa-key".to_string()),
+            search_provider: "exa".to_string(),
+            ..ToolConfig::new(workspace.path())
+        };
+        let registry = ToolRegistry::with_standard_tools(&config);
+
+        assert!(registry.get("web_search").unwrap().is_available());
     }
 
     #[test]

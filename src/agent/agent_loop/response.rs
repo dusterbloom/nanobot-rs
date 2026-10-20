@@ -1680,6 +1680,7 @@ mod tests {
                 temperature: 0.3,
                 max_context_tokens: 32_768,
                 brave_api_key: None,
+                exa_api_key: None,
                 search_provider: "searxng".to_string(),
                 searxng_url: "http://localhost:8888".to_string(),
                 crw_url: String::new(),

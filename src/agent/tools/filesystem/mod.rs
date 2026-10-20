@@ -29,14 +29,8 @@ use regex::RegexBuilder;
 use sha2::{Digest, Sha256};
 
 use super::base::{PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolResult};
-use crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES;
+use crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES;
 use crate::errors::ToolError;
-
-/// Leave room below the replay ceiling for wrappers while retaining a useful
-/// direct-file page. Crossing the ceiling stashes an otherwise contiguous
-/// source window and replaces its native `lines=` continuation with a generic
-/// artifact lookup, which costs both a tool round and prompt space.
-const READ_FILE_REPLAY_SAFE_BYTES: usize = TOOL_RESULT_REPLAY_MAX_BYTES - 400;
 
 /// Extract a required string parameter, returning an error string on missing.
 /// Typed param extractor (error protocol Phase 2): the message preserves
@@ -83,13 +77,11 @@ const MAX_READ_LINES: usize = 5000;
 
 /// Tool to read file contents.
 ///
-/// `char_budget` bounds the rendered line window so it stays UNDER the
-/// tool-result cap (`max_tool_result_chars`). This is essential: if the window
-/// exceeded the cap, `digest_tool_result` would head+tail-truncate it and
-/// insert a `"[...]"` gap — read_file is randomly accessible, so a complete
-/// window plus a next-range pointer always beats a hole. Production constructs
-/// with `new(max_tool_result_chars)`; `Default` keeps the historical 7000 for
-/// tests.
+/// `char_budget` is measured in bytes and bounds the complete rendered page to
+/// the shared inline result ceiling. The renderer reserves wrapper space and
+/// emits whole contiguous source lines with an exact next-range pointer. A
+/// single line larger than that budget remains intact and can flow through the
+/// existing lossless result-handle/inspection path.
 pub struct ReadFileTool {
     char_budget: usize,
 }
@@ -98,14 +90,14 @@ impl ReadFileTool {
     pub fn new(char_budget: usize) -> Self {
         // Floor so an absurdly small cap still renders at least a few lines.
         Self {
-            char_budget: char_budget.clamp(512, READ_FILE_REPLAY_SAFE_BYTES),
+            char_budget: char_budget.clamp(512, INLINE_TOOL_RESULT_MAX_BYTES),
         }
     }
 }
 
 impl Default for ReadFileTool {
     fn default() -> Self {
-        Self::new(7_000)
+        Self::new(INLINE_TOOL_RESULT_MAX_BYTES)
     }
 }
 
@@ -116,7 +108,7 @@ impl Tool for ReadFileTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file: returns the first chunk of numbered lines that fits the read budget (~7000 chars), plus the total line count and the exact next range to read. Output is always complete, contiguous lines — never a mid-cut — so page forward using the suggested next range (or lines=\"START:END\" for an exact 1-indexed inclusive range). Use lines=\"1:\" only on small files."
+        "Read a file as a page of numbered, complete contiguous lines within a 4,096-byte inline budget, with the total line count, SHA-256, and exact next range. Page forward using the suggested range or lines=\"START:END\" (1-indexed, inclusive). An exceptionally oversized line stays whole; if it pushes the result over the inline limit, the result is stored as a lossless handle that can be read with inspect_tool_result. Use lines=\"1:\" only when the file fits inline."
     }
 
     fn concurrency(&self) -> ToolConcurrency {
@@ -133,7 +125,7 @@ impl Tool for ReadFileTool {
                 },
                 "lines": {
                     "type": "string",
-                    "description": "Line range, e.g. \"10:50\" (1-indexed, inclusive). Omit for the first chunk; use \"1:\" for the whole file. The output header reports the total line count and the next range to read."
+                    "description": "Line range, e.g. \"10:50\" (1-indexed, inclusive). Omit for the first page; use \"1:\" only when the file fits inline. The output header reports the total line count and the next range to read."
                 },
                 "max_lines": {
                     "type": "integer",
@@ -1184,11 +1176,9 @@ fn extract_line_range(
 /// ids, or mtimes, so two reads of the same file+range are byte-identical and
 /// the inference server's prefix cache stays warm.
 ///
-/// `char_budget` is the per-read ceiling (sourced from `max_tool_result_chars`
-/// in production). The window is bounded to complete lines that fit within it
-/// (minus a header/marker reserve) so the result stays UNDER the tool-result
-/// cap — otherwise `digest_tool_result` head+tail-truncates it and inserts a
-/// `"[...]"` gap, which defeats the point of a randomly-accessible file.
+/// `char_budget` is measured in bytes and capped at the shared inline limit.
+/// The window includes only complete lines that fit after reserving space for
+/// the path, header, wrapper, and continuation marker.
 fn render_range(
     content: &str,
     start: usize,
@@ -1201,18 +1191,18 @@ fn render_range(
     let lines: Vec<&str> = content.lines().collect();
     let end = end.min(total);
 
-    // Bound the window to COMPLETE lines within the read byte budget. A file is
+    // Bound the window to COMPLETE lines within the inline byte budget. A file is
     // randomly accessible, so the model is best served by a contiguous, whole
     // window plus the exact next range to read — never a head+tail cut that
-    // destroys the middle and forces a `recall_tool_result` round-trip.
-    // Always render at least one line. The reserve covers the "# path (lines…)"
-    // header, the VERBATIM wrapper, and the next-chunk marker so the total
-    // stays under the cap and `digest_tool_result` never fires its `"[...]"`.
+    // destroys the middle and forces an `inspect_tool_result` round-trip.
+    // Always render at least one full line. The reserve covers the header,
+    // result wrapper, and next-chunk marker so ordinary pages fit inline. An
+    // exceptional oversized line remains lossless and uses the handle path.
     let budget = char_budget.saturating_sub(path.len().saturating_add(320));
     let mut eff_end = start;
     let mut cost: usize = 0;
     for i in start..=end {
-        // Use bytes, not Unicode scalar count: the replay guard is byte-based,
+        // Use bytes, not Unicode scalar count: the inline guard is byte-based,
         // and a Unicode-heavy source must not cross it after this renderer has
         // declared the page safe.
         let line_cost = format!("{:>4}: ", i).len() + lines[i - 1].len() + 1;
@@ -1548,11 +1538,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_file_default_is_bounded_with_paging_hint() {
-        // Budget-aware: a bare read returns the largest chunk of complete lines
-        // that fits the read char-budget, NOT a fixed 1000 lines. The old 1000-
-        // line default overflowed the 10k-char tool-result cap and got head+tail
-        // truncated — the #1 source of read_file truncation. Now the window is
-        // whole, under budget, and points at the next range.
+        // A bare read returns the largest chunk of complete lines that fits
+        // the inline byte budget, NOT a fixed 1000 lines. The window stays
+        // whole and points at the exact next range.
         let dir = TempDir::new().unwrap();
         let file_path = dir.path().join("big.txt");
         let content = (1..=1200)
@@ -1579,18 +1567,210 @@ mod tests {
             result.contains("more lines; next: read_file lines="),
             "must tell the model the next range: {result}"
         );
-        // Budget-bounded: never reaches line 1000 (each line renders ~13 chars,
-        // budget allows ~500). The first line is always present.
+        // Budget-bounded: never reaches line 1000 (the inline page holds only
+        // a few hundred short lines). The first line is always present.
         assert!(result.contains("   1: line 1"));
         assert!(
             !result.contains("1000: line 1000"),
-            "must not dump past the char budget"
+            "must not dump past the byte budget"
         );
         assert!(
-            result.chars().count() <= 7_600,
-            "output must stay under budget+slack, got {}",
-            result.chars().count()
+            result.len() <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+            "ordinary output must stay within the inline byte limit, got {}",
+            result.len()
         );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_configured_budget_stays_within_inline_bytes() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("large-ascii.txt");
+        let content = (0..400)
+            .map(|i| format!("item {i}: useful evidence"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        // A large configured result cap must not let an ordinary first page
+        // become a handle at the shared inline ingestion boundary.
+        let tool = ReadFileTool::new(20_000);
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[("path", file_path.to_str().unwrap())]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
+
+        assert!(
+            result.len() <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+            "ordinary source page must fit the inline byte limit, got {} bytes",
+            result.len()
+        );
+        assert!(result.contains("item 0: useful evidence"), "{result}");
+        assert!(
+            result.contains("sha256="),
+            "page must retain its source digest"
+        );
+        assert!(
+            result.contains("more lines; next: read_file lines=\""),
+            "ordinary source page must provide a line continuation: {result}"
+        );
+        assert!(!result.contains("[truncated:"), "{result}");
+
+        let displayed_end = result
+            .split_once("(lines 1-")
+            .and_then(|(_, rest)| rest.split_once(" of "))
+            .and_then(|(end, _)| end.parse::<usize>().ok())
+            .expect("page header must report the last displayed line");
+        let next_end = (displayed_end * 2).min(400);
+        assert!(
+            result.contains(&format!(
+                "read_file lines=\"{}:{}\"",
+                displayed_end + 1,
+                next_end
+            )),
+            "continuation must start at the exact next line: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_long_path_stays_within_inline_bytes() {
+        let temp = TempDir::new().unwrap();
+        let mut directory = temp.path().to_path_buf();
+        for _ in 0..10 {
+            directory.push(format!("segment_{}", "x".repeat(70)));
+            std::fs::create_dir_all(&directory).unwrap();
+        }
+        let file_path = directory.join("long-path.txt");
+        let content = (0..300)
+            .map(|i| format!("item {i}: long-path evidence"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let tool = ReadFileTool::new(20_000);
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(
+                make_params(&[("path", file_path.to_str().unwrap())]),
+                &crate::agent::tools::base::ToolContext::sandbox(),
+            )
+            .await,
+        );
+
+        assert!(
+            result.len() <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+            "long source path plus page wrapper must fit the inline byte limit, got {} bytes",
+            result.len()
+        );
+        assert!(result.contains("item 0: long-path evidence"), "{result}");
+        assert!(
+            result.contains("more lines; next: read_file lines="),
+            "{result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_file_unicode_pages_are_bounded_and_reconstruct_exactly() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("unicode.txt");
+        let content = (1..=220)
+            .map(|i| format!("line {i}: {}", "界🦀é".repeat(20)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&file_path, &content).unwrap();
+
+        let tool = ReadFileTool::new(20_000);
+        let mut start = 1;
+        let mut reconstructed = Vec::new();
+        loop {
+            let result = crate::agent::tools::base::render_result(
+                tool.execute(
+                    make_params(&[
+                        ("path", file_path.to_str().unwrap()),
+                        ("lines", &format!("{start}:220")),
+                    ]),
+                    &crate::agent::tools::base::ToolContext::sandbox(),
+                )
+                .await,
+            );
+
+            assert!(
+                result.len() <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+                "Unicode source page must fit the inline byte limit, got {} bytes",
+                result.len()
+            );
+            let header_range = result
+                .lines()
+                .next()
+                .and_then(|header| header.split_once("(lines "))
+                .and_then(|(_, rest)| rest.split_once(" of "))
+                .map(|(range, _)| range)
+                .expect("page header must report its line range");
+            let (page_start, page_end) = header_range
+                .split_once('-')
+                .and_then(|(first, last)| {
+                    Some((first.parse::<usize>().ok()?, last.parse::<usize>().ok()?))
+                })
+                .expect("page header range must parse");
+            assert_eq!(page_start, start, "pages must be contiguous: {result}");
+
+            for rendered_line in result.lines().skip(1) {
+                if rendered_line.starts_with('[') {
+                    break;
+                }
+                let (_, source_line) = rendered_line
+                    .split_once(": ")
+                    .expect("each source line must retain its numbered prefix");
+                reconstructed.push(source_line.to_string());
+            }
+
+            if page_end == 220 {
+                break;
+            }
+            let next_end = (page_end + (page_end - page_start + 1)).min(220);
+            assert!(
+                result.contains(&format!("read_file lines=\"{}:{next_end}\"", page_end + 1)),
+                "page continuation must name the exact next range: {result}"
+            );
+            start = page_end + 1;
+        }
+
+        assert_eq!(reconstructed.join("\n"), content);
+    }
+
+    #[test]
+    fn test_read_file_oversized_line_stays_whole_for_handle_inspection() {
+        let long_line = "é🦀".repeat(2_500);
+        let content = format!("{long_line}\nfollowing evidence");
+        let hash = sha256_hex(content.as_bytes());
+        let page = render_range(
+            &content,
+            1,
+            2,
+            "source.txt",
+            2,
+            crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+            &hash,
+        );
+
+        assert!(
+            page.len() > crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+            "an indivisible oversized line must flow to the existing handle path"
+        );
+        assert!(
+            page.contains(&long_line),
+            "the renderer must keep the full source line"
+        );
+        assert!(page.contains("lines 1-1 of 2"), "{page}");
+        assert!(
+            page.contains("next: read_file lines=\"2:2\""),
+            "continuation must advance by a whole line without claiming skipped bytes: {page}"
+        );
+        let tool = ReadFileTool::default();
+        let description = tool.description();
+        assert!(description.contains("oversized line"), "{description}");
+        assert!(description.contains("inspect_tool_result"), "{description}");
     }
 
     #[tokio::test]
@@ -1603,9 +1783,8 @@ mod tests {
             .join("\n");
         std::fs::write(&file_path, &content).unwrap();
 
-        // The user-facing 10K result limit must not create a 8K replay-cap
-        // cliff: direct source-file pagination is cheaper and clearer than
-        // stashing an otherwise complete window.
+        // A user-facing result limit above the inline threshold must still
+        // produce an ordinary source page that can be read immediately.
         let tool = ReadFileTool::new(10_000);
         let result = crate::agent::tools::base::render_result(
             tool.execute(
@@ -1616,8 +1795,8 @@ mod tests {
         );
 
         assert!(
-            result.len() < crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES,
-            "read_file must fit under the replay cap, got {} bytes",
+            result.len() <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+            "read_file must fit under the inline cap, got {} bytes",
             result.len()
         );
         assert!(
@@ -1629,7 +1808,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_file_replay_safe_cap_counts_utf8_bytes() {
         let dir = TempDir::new().unwrap();
-        let file_path = dir.path().join("utf8-replay-boundary.txt");
+        let file_path = dir.path().join("utf8-inline-boundary.txt");
         let content = (1..=500)
             .map(|i| format!("line {i}: {}", "界".repeat(30)))
             .collect::<Vec<_>>()
@@ -1646,8 +1825,8 @@ mod tests {
         );
 
         assert!(
-            result.len() < crate::agent::context_hygiene::TOOL_RESULT_REPLAY_MAX_BYTES,
-            "read_file must use bytes for the replay ceiling, got {} bytes",
+            result.len() <= crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES,
+            "read_file must use bytes for the inline ceiling, got {} bytes",
             result.len()
         );
         assert!(
@@ -1658,7 +1837,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_file_max_lines_caps_window() {
-        // max_lines is an upper bound honored when it sits below the char-budget
+        // max_lines is an upper bound honored when it sits below the byte-budget
         // line count. (It can no longer EXPAND past the budget — a multi-thousand-
         // line dump was exactly what overflowed the cap and got head+tail cut.)
         // Here max_lines=40 binds: 40 short lines fit the budget easily, so the
@@ -1873,7 +2052,13 @@ mod tests {
     fn test_extract_line_range_basic() {
         let content = "alpha\nbeta\ngamma\ndelta\nepsilon";
         let hash = sha256_hex(content.as_bytes());
-        let result = extract_line_range(content, "2:4", "test.txt", 7_000, &hash);
+        let result = extract_line_range(
+            content,
+            "2:4",
+            "test.txt",
+            INLINE_TOOL_RESULT_MAX_BYTES,
+            &hash,
+        );
         assert!(result.contains("lines 2-4 of 5"));
         assert!(result.contains(&format!("sha256={hash}")));
         assert!(result.contains("beta"));
@@ -1882,13 +2067,25 @@ mod tests {
 
     #[test]
     fn test_extract_line_range_invalid_format() {
-        let result = extract_line_range("content", "bad", "test.txt", 7_000, "hash");
+        let result = extract_line_range(
+            "content",
+            "bad",
+            "test.txt",
+            INLINE_TOOL_RESULT_MAX_BYTES,
+            "hash",
+        );
         assert!(result.contains("Error"));
     }
 
     #[test]
     fn test_extract_line_range_out_of_bounds() {
-        let result = extract_line_range("one\ntwo", "5:10", "test.txt", 7_000, "hash");
+        let result = extract_line_range(
+            "one\ntwo",
+            "5:10",
+            "test.txt",
+            INLINE_TOOL_RESULT_MAX_BYTES,
+            "hash",
+        );
         assert!(result.contains("exceeds file length"));
     }
 
@@ -1897,13 +2094,21 @@ mod tests {
         // A realistic large source file: 5000 lines × ~40 chars. The old behavior
         // rendered the whole requested range and let the downstream cap head+tail-
         // truncate it. Now render_range itself bounds to complete lines within the
-        // read budget, so the output is whole, contiguous, and never mid-cut.
+        // inline byte budget, so the output is whole, contiguous, and never mid-cut.
         let content: String = (1..=5000)
             .map(|i| format!("    let x_{i} = some_call(arg_one, arg_two);"))
             .collect::<Vec<_>>()
             .join("\n");
         let hash = sha256_hex(content.as_bytes());
-        let out = render_range(&content, 1, 1000, "src/big_module.rs", 5000, 7_000, &hash);
+        let out = render_range(
+            &content,
+            1,
+            1000,
+            "src/big_module.rs",
+            5000,
+            INLINE_TOOL_RESULT_MAX_BYTES,
+            &hash,
+        );
 
         assert!(
             !out.contains("[truncated:"),
@@ -1911,9 +2116,9 @@ mod tests {
             &out[..80.min(out.len())]
         );
         assert!(
-            out.chars().count() <= 7_600,
-            "output must stay under budget+slack, got {}",
-            out.chars().count()
+            out.len() <= INLINE_TOOL_RESULT_MAX_BYTES,
+            "output must stay within the inline byte limit, got {} bytes",
+            out.len()
         );
         assert!(out.contains("of 5000)"), "header reports the true total");
         assert!(
@@ -1931,11 +2136,9 @@ mod tests {
 
     #[test]
     fn render_range_under_small_cap_never_emits_ellipsis_gap() {
-        // Regression: a small `max_tool_result_chars` (e.g. 2500) must bound the
-        // window so the result stays UNDER that cap. Previously render_range
-        // hardcoded 7000, so a 2500-cap config would let read_file return ~7000
-        // chars → digest_tool_result head+tail-truncated it → a "[...]" gap. With
-        // the cap threaded in, the window fits and no "[...]" can appear.
+        // Regression: a smaller configured budget must bound the window so the
+        // result stays within that byte cap. The full wrapper reservation keeps
+        // the downstream renderer from inserting a head+tail gap.
         let content: String = (1..=5000)
             .map(|i| format!("    let x_{i} = some_call(arg_one, arg_two);"))
             .collect::<Vec<_>>()
@@ -1949,9 +2152,9 @@ mod tests {
             &out[..80.min(out.len())]
         );
         assert!(
-            out.chars().count() <= 2_500,
-            "output must stay under the 2500 cap, got {}",
-            out.chars().count()
+            out.len() <= 2_500,
+            "output must stay under the 2500-byte cap, got {} bytes",
+            out.len()
         );
         assert!(
             out.contains("more lines; next: read_file lines="),
