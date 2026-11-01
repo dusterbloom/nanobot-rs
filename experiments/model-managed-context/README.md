@@ -187,3 +187,23 @@ copying several more GB under already-tight disk).
 - **Task success is a strict substring match.** A semantically-correct but
   differently-worded answer (e.g. missing the literal colon-space) is
   scored as failure. Check the per-arm `run.log` directly for nuance.
+
+## Rerun 2026-11-01 (toolchain confound fixed)
+
+Higgs, Clover-35B-A3B-Preview-MLX-4bit, temp 0, n=1 per arm, cold restart between arms.
+
+| arm | requests | mean prompt tok/req | cache hit % | total prompt tok | success | `context` calls |
+|-----|----------|---------------------|-------------|------------------|---------|-----------------|
+| A:main | 9 | 8,009 | 82.9% | 72,079 | yes | 0 |
+| B:branch | 12 | 9,889 | 87.0% | 118,667 (+65%) | yes | 0 |
+
+PromptDelta: 0 diverged in either arm (the `[seq N]` render-time tag kept the prefix append-only).
+
+The +65% is three extra `inspect_tool_result` pages the branch arm took over the
+8,106-char `cargo test` output that main answered from the preview. Same command,
+same repo, temp 0, so the likeliest cause is the changed prompt (standing skill,
+`context` schema, `[seq N]` tags), not noise; n=1 cannot separate which.
+
+The task does not exercise the mechanism: it is a numbered script (no settled
+subproblem to checkpoint after) peaking near 9k of a 32k window. Whether Clover
+adopts `context` needs an open-ended task that crosses the window.
