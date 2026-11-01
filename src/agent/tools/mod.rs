@@ -3,6 +3,7 @@
 pub mod apply_patch;
 pub mod base;
 pub mod browser;
+pub mod context_edit;
 pub mod cron_tool;
 pub mod cua;
 pub mod email;
@@ -23,6 +24,7 @@ pub mod web;
 
 pub use base::Tool;
 pub use browser::BrowserTool;
+pub use context_edit::ContextTool;
 pub use cron_tool::CronScheduleTool;
 pub use cua::CuaTool;
 pub use email::{CheckInboxTool, SendEmailTool};

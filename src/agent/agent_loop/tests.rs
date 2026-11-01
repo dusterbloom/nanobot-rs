@@ -5790,6 +5790,406 @@ async fn resumed_core_replays_generated_history_not_the_phantom_notice() {
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
+/// Acceptance test for plan `docs/superpowers/plans/2026-11-01-model-managed-context.md`
+/// T6: a model-issued context drop, once persisted to `context_drops`,
+/// survives a restart. Core B (a brand-new process-equivalent core over the
+/// same DB) must not replay the dropped tool-call/result pair on its first
+/// wire call, while the original body remains recoverable from the LCM
+/// store (what `lcm_expand` reads) — a drop is a projection, never a
+/// deletion.
+///
+/// T5 (the in-loop wiring that calls `resolve_and_drop`/`add_context_drops`
+/// live, from a model's `context` tool call) is not implemented yet, so this
+/// test persists the drop directly via `add_context_drops` — exactly the
+/// input T5 will produce once it lands. T6 owns only the turn-start/restart
+/// projection this test targets (`LcmEngine::restore_dropped` at engine
+/// creation, `LcmEngine::is_dropped` filtering the raw history branch).
+#[tokio::test]
+async fn restart_keeps_dropped_pair_out_of_wire_but_recoverable_via_expand() {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let sessions_db_path = workspace.join("sessions.db");
+    let session_key = format!("context-drop-restart-{}", uuid::Uuid::new_v4());
+
+    // Turn 1, core A: one tool round whose result carries a unique marker,
+    // followed by a plain text reply.
+    let mut tool_call_args = std::collections::HashMap::new();
+    tool_call_args.insert("command".to_string(), json!("echo DROPPED_MARKER_XYZ"));
+    let tool_call_response = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![crate::providers::base::ToolCallRequest {
+            id: "tc_drop_1".to_string(),
+            name: "exec".to_string(),
+            arguments: tool_call_args,
+        }],
+        finish_reason: FinishReason::ToolCalls,
+        usage: std::collections::HashMap::new(),
+    };
+    let final_response = crate::providers::base::LLMResponse {
+        content: Some("turn one done".to_string()),
+        tool_calls: vec![],
+        finish_reason: FinishReason::Stop,
+        usage: std::collections::HashMap::new(),
+    };
+    let provider_a = Arc::new(WireRecordingProvider::new(
+        "local-fab-history-test",
+        vec![tool_call_response, final_response],
+    ));
+    let core_a = build_shared_db_harness(
+        provider_a.clone() as Arc<dyn LLMProvider>,
+        workspace.clone(),
+        sessions_db_path.clone(),
+    );
+
+    core_a
+        .process_direct("run a command", &session_key, "test", "offline")
+        .await;
+
+    let core_handle_a = core_a.shared.core_handle.swappable();
+    let session = core_handle_a
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .unwrap();
+    let persisted = core_handle_a.sessions.get_all_messages(&session.id).await;
+
+    let result_row = persisted
+        .iter()
+        .find(|m| {
+            m.get("role").and_then(Value::as_str) == Some("tool")
+                && m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.contains("DROPPED_MARKER_XYZ"))
+        })
+        .expect("tool result with marker must be persisted");
+    let result_id = result_row["_db_id"].as_u64().unwrap() as usize;
+    let carrier_id = persisted
+        .iter()
+        .find(|m| {
+            m.get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| {
+                    calls
+                        .iter()
+                        .any(|c| c.get("id").and_then(Value::as_str) == Some("tc_drop_1"))
+                })
+        })
+        .expect("assistant carrier for tc_drop_1 must be persisted")["_db_id"]
+        .as_u64()
+        .unwrap() as usize;
+
+    // Simulate what T5 does live (resolve_and_drop, then persist): T5 is not
+    // wired into the loop yet, so drive the persistence step directly — this
+    // is exactly the input T6's restore path consumes.
+    core_handle_a
+        .sessions
+        .add_context_drops(&session.id, &[carrier_id, result_id])
+        .await;
+
+    // Turn 2, core B: a brand-new process-equivalent core over the SAME DB.
+    let provider_b = Arc::new(WireRecordingProvider::new(
+        "local-fab-history-test",
+        vec![WireRecordingProvider::text_response("turn two reply")],
+    ));
+    let core_b = build_shared_db_harness(
+        provider_b.clone() as Arc<dyn LLMProvider>,
+        workspace.clone(),
+        sessions_db_path.clone(),
+    );
+    core_b
+        .process_direct("and now?", &session_key, "test", "offline")
+        .await;
+
+    let b_calls = provider_b.calls();
+    assert!(!b_calls.is_empty());
+    let first_wire = serde_json::to_string(&b_calls[0]).unwrap();
+    assert!(
+        !first_wire.contains("DROPPED_MARKER_XYZ"),
+        "restart must not replay the dropped tool result on the wire: {first_wire}"
+    );
+    assert!(
+        !first_wire.contains("tc_drop_1"),
+        "restart must not replay the dropped carrier's tool_call id: {first_wire}"
+    );
+    assert!(
+        first_wire.contains("turn one done"),
+        "non-dropped history must still replay: {first_wire}"
+    );
+
+    // Lossless: the original body is still recoverable from the store (what
+    // `lcm_expand` reads), even though it never re-enters `active`.
+    let engine = core_b
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&session.id)
+        .cloned()
+        .expect("resumed session must own an LCM engine");
+    let expanded = engine.lock().await.format_expanded(&[result_id]);
+    assert!(
+        expanded.contains("DROPPED_MARKER_XYZ"),
+        "dropped row must remain recoverable via lcm_expand: {expanded}"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// Acceptance test for plan `docs/superpowers/plans/2026-11-01-model-managed-context.md`
+/// T5: the live in-loop wiring (`apply_pending_context_edit`). Unlike the T6
+/// test above (which drives the persistence layer directly to prove the
+/// restart projection), this one drives the real `context` tool call through
+/// `ContextTool::execute` → `LcmEngine::queue_context_edit` →
+/// `apply_pending_context_edit` → `resolve_and_drop`/`rewrite_committed`, and
+/// checks the very next wire call in the SAME turn.
+///
+/// Turn 1 (provider_a): one `exec` tool round (result carries a unique
+/// marker) + final text. Turn 2 (provider_b): the model calls
+/// `context({"drop": <seq of that result>, "note": "..."})`, then gives a
+/// final text reply. `provider_b.calls()` therefore holds exactly two wire
+/// arrays: `[0]` = the prompt that made the model issue the context call
+/// (drop not yet applied), `[1]` = the next prompt, built after
+/// `apply_pending_context_edit` ran inside the same turn.
+#[tokio::test]
+async fn context_tool_drop_removes_pair_and_persists_note_mid_turn() {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let sessions_db_path = workspace.join("sessions.db");
+    let session_key = format!("context-drop-live-{}", uuid::Uuid::new_v4());
+
+    // Turn 1, core A: one tool round whose result carries a unique marker.
+    let mut exec_args = std::collections::HashMap::new();
+    exec_args.insert("command".to_string(), json!("echo LIVE_DROP_MARKER"));
+    let exec_call = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![crate::providers::base::ToolCallRequest {
+            id: "tc_exec_live".to_string(),
+            name: "exec".to_string(),
+            arguments: exec_args,
+        }],
+        finish_reason: FinishReason::ToolCalls,
+        usage: std::collections::HashMap::new(),
+    };
+    let turn1_text = crate::providers::base::LLMResponse {
+        content: Some("turn one done".to_string()),
+        tool_calls: vec![],
+        finish_reason: FinishReason::Stop,
+        usage: std::collections::HashMap::new(),
+    };
+    let provider_a = Arc::new(WireRecordingProvider::new(
+        "local-fab-history-test",
+        vec![exec_call, turn1_text],
+    ));
+    let core_a = build_shared_db_harness(
+        provider_a.clone() as Arc<dyn LLMProvider>,
+        workspace.clone(),
+        sessions_db_path.clone(),
+    );
+    core_a
+        .process_direct("run a command", &session_key, "test", "offline")
+        .await;
+
+    let core_handle_a = core_a.shared.core_handle.swappable();
+    let session = core_handle_a
+        .sessions
+        .get_latest_session(&session_key)
+        .await
+        .unwrap();
+    let persisted = core_handle_a.sessions.get_all_messages(&session.id).await;
+    let result_id = persisted
+        .iter()
+        .find(|m| {
+            m.get("role").and_then(Value::as_str) == Some("tool")
+                && m.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| c.contains("LIVE_DROP_MARKER"))
+        })
+        .expect("exec result with marker must be persisted")["_db_id"]
+        .as_u64()
+        .unwrap() as usize;
+
+    // Turn 2, core B: the model itself calls context(drop=<seq>, note=...).
+    let mut context_args = std::collections::HashMap::new();
+    context_args.insert("drop".to_string(), json!(result_id));
+    context_args.insert(
+        "note".to_string(),
+        json!("verified exec output, moving on"),
+    );
+    let context_call = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![crate::providers::base::ToolCallRequest {
+            id: "tc_context_live".to_string(),
+            name: "context".to_string(),
+            arguments: context_args,
+        }],
+        finish_reason: FinishReason::ToolCalls,
+        usage: std::collections::HashMap::new(),
+    };
+    let turn2_text = crate::providers::base::LLMResponse {
+        content: Some("turn two done".to_string()),
+        tool_calls: vec![],
+        finish_reason: FinishReason::Stop,
+        usage: std::collections::HashMap::new(),
+    };
+    let provider_b = Arc::new(WireRecordingProvider::new(
+        "local-fab-history-test",
+        vec![context_call, turn2_text],
+    ));
+    let core_b = build_shared_db_harness(
+        provider_b.clone() as Arc<dyn LLMProvider>,
+        workspace.clone(),
+        sessions_db_path.clone(),
+    );
+    core_b
+        .process_direct("drop that and move on", &session_key, "test", "offline")
+        .await;
+
+    let calls = provider_b.calls();
+    assert_eq!(
+        calls.len(),
+        2,
+        "expected the context-issuing round then the post-edit round"
+    );
+    let before_edit = &calls[0];
+    let after_edit = &calls[1];
+
+    // KV prefix-cache contract for a drop: bytes before the first dropped
+    // block are untouched; only the tail may re-prefill
+    // (`CacheResetReason::ContextEdit`).
+    let common_prefix_len = before_edit
+        .iter()
+        .zip(after_edit.iter())
+        .take_while(|(a, b)| {
+            serde_json::to_string(a).unwrap() == serde_json::to_string(b).unwrap()
+        })
+        .count();
+    for i in 0..common_prefix_len {
+        assert_eq!(
+            serde_json::to_string(&before_edit[i]).unwrap(),
+            serde_json::to_string(&after_edit[i]).unwrap(),
+            "message {i} must be byte-identical before the drop point"
+        );
+    }
+    assert!(
+        common_prefix_len < before_edit.len(),
+        "the edit must actually change something"
+    );
+    let dropped_carrier_text = serde_json::to_string(&before_edit[common_prefix_len]).unwrap();
+    assert!(
+        dropped_carrier_text.contains("tc_exec_live"),
+        "divergence must start exactly at the dropped exec carrier, got: {dropped_carrier_text}"
+    );
+
+    let after_text = serde_json::to_string(after_edit).unwrap();
+    assert!(
+        !after_text.contains("LIVE_DROP_MARKER"),
+        "dropped tool result must be absent from the post-edit wire: {after_text}"
+    );
+    assert!(
+        !after_text.contains("tc_exec_live"),
+        "dropped carrier's tool_call id must be absent from the post-edit wire: {after_text}"
+    );
+    assert!(
+        after_text.contains("[context note] verified exec output, moving on"),
+        "note must be persisted as an ordinary assistant row: {after_text}"
+    );
+    assert!(
+        after_text.contains("tc_context_live"),
+        "the context call's own carrier must survive: {after_text}"
+    );
+    assert!(
+        after_text.contains("turn one done"),
+        "non-dropped history must still replay: {after_text}"
+    );
+
+    // Lossless: the dropped row is still recoverable via lcm_expand, even
+    // though it never re-enters the wire.
+    let engine = core_b
+        .shared
+        .lcm_engines
+        .lock()
+        .await
+        .get(&session.id)
+        .cloned()
+        .expect("session must own an LCM engine");
+    let expanded = engine.lock().await.format_expanded(&[result_id]);
+    assert!(
+        expanded.contains("LIVE_DROP_MARKER"),
+        "dropped row must remain recoverable via lcm_expand: {expanded}"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+/// Companion to the drop test above: a note-only `context` edit (no `drop`)
+/// never calls `rewrite_committed` (see `apply_pending_context_edit`), so it
+/// must be a pure draft append — every earlier wire call stays an exact
+/// byte-prefix of the next, same contract `assert_wire_prefix` already pins
+/// for ordinary turns.
+#[tokio::test]
+async fn context_tool_note_only_edit_is_prefix_stable() {
+    let workspace = tempfile::tempdir().unwrap().keep();
+    let sessions_db_path = workspace.join("sessions.db");
+    let session_key = format!("context-note-only-{}", uuid::Uuid::new_v4());
+
+    let mut exec_args = std::collections::HashMap::new();
+    exec_args.insert("command".to_string(), json!("echo NOTE_ONLY_MARKER"));
+    let exec_call = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![crate::providers::base::ToolCallRequest {
+            id: "tc_exec_note_only".to_string(),
+            name: "exec".to_string(),
+            arguments: exec_args,
+        }],
+        finish_reason: FinishReason::ToolCalls,
+        usage: std::collections::HashMap::new(),
+    };
+    let mut context_args = std::collections::HashMap::new();
+    context_args.insert("note".to_string(), json!("checkpoint: exec verified"));
+    let context_call = crate::providers::base::LLMResponse {
+        content: Some(String::new()),
+        tool_calls: vec![crate::providers::base::ToolCallRequest {
+            id: "tc_context_note_only".to_string(),
+            name: "context".to_string(),
+            arguments: context_args,
+        }],
+        finish_reason: FinishReason::ToolCalls,
+        usage: std::collections::HashMap::new(),
+    };
+    let final_text = crate::providers::base::LLMResponse {
+        content: Some("done".to_string()),
+        tool_calls: vec![],
+        finish_reason: FinishReason::Stop,
+        usage: std::collections::HashMap::new(),
+    };
+    let provider = Arc::new(WireRecordingProvider::new(
+        "local-fab-history-test",
+        vec![exec_call, context_call, final_text],
+    ));
+    let core = build_shared_db_harness(
+        provider.clone() as Arc<dyn LLMProvider>,
+        workspace.clone(),
+        sessions_db_path.clone(),
+    );
+    core.process_direct("run then checkpoint", &session_key, "test", "offline")
+        .await;
+
+    let calls = provider.calls();
+    assert_eq!(calls.len(), 3, "exec round, context round, final round");
+    assert_wire_prefix(&calls[0], &calls[1]);
+    assert_wire_prefix(&calls[1], &calls[2]);
+
+    let final_wire = serde_json::to_string(&calls[2]).unwrap();
+    assert!(
+        final_wire.contains("[context note] checkpoint: exec verified"),
+        "note must be appended as an ordinary assistant row: {final_wire}"
+    );
+    assert!(
+        final_wire.contains("NOTE_ONLY_MARKER"),
+        "note-only edit must not drop anything: {final_wire}"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
 /// Installs a retained-byte V2 capacity contract directly on the shared
 /// capacity runtime, mirroring what `resolve_live_capacity` installs from a
 /// real Higgs `/v1/capacity` fetch. The higgs session id is only attached to
@@ -6320,6 +6720,16 @@ async fn stash_conflict_on_reused_tool_call_id_aborts_turn_preserves_body_a() {
 /// body. The body lives only in the stash, inspectable through inspect_tool_result.
 /// The handle is byte-identical live and after a SQLite round-trip (reload).
 /// Uses `exec seq` (~13KB) because read_file self-caps under the replay limit.
+
+/// What a reload sends for a persisted tool row: the same render path
+/// (`turn_from_legacy`) the wire uses, so live == reload proves cache stability.
+fn reload_rendered_tool_result(row: &Value) -> String {
+    match crate::agent::turn::turn_from_legacy(row) {
+        Some(crate::agent::turn::Turn::ToolResult { result, .. }) => result,
+        other => panic!("persisted tool row must render as a tool result, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn stashed_tool_result_persists_handle_not_body_in_messages() {
     use crate::agent::tool_engine::TOOL_RESULT_HANDLE_MARKER;
@@ -6407,8 +6817,9 @@ async fn stashed_tool_result_persists_handle_not_body_in_messages() {
         "live prompt tool-result must be a handle; got: {live_content}"
     );
     assert_eq!(
-        live_content, content,
-        "live and persisted handle must be byte-identical (cache-stable)"
+        live_content,
+        reload_rendered_tool_result(tool_msg),
+        "live and reload-rendered handle must be byte-identical (cache-stable)"
     );
 }
 
@@ -6497,8 +6908,9 @@ async fn medium_tool_result_inlines_body_not_handle() {
         .and_then(|v| v.as_str())
         .unwrap_or("");
     assert_eq!(
-        live_content, content,
-        "live and persisted inline bytes must be identical (cache-stable)"
+        live_content,
+        reload_rendered_tool_result(tool_msg),
+        "live and reload-rendered inline bytes must be identical (cache-stable)"
     );
 
     let _ = std::fs::remove_dir_all(files_dir);

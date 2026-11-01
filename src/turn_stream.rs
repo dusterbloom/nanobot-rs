@@ -598,6 +598,12 @@ pub(crate) enum CacheResetReason {
     /// other resets: the rewind is the feature; shipping the rewound prompt
     /// under the warm session id is the bug it prevents.
     Backtrack,
+    /// A model-issued `context` edit dropped settled tool-call/result blocks.
+    /// Sanctioned like the other resets: the drop is the feature (the model
+    /// chose to stop paying for those blocks); re-prefilling from the first
+    /// dropped block is the cost it knowingly accepted. A note-only edit
+    /// never reaches this reason — it stays `PrefixPreserved`.
+    ContextEdit,
 }
 
 impl CacheResetReason {
@@ -610,6 +616,7 @@ impl CacheResetReason {
             CacheResetReason::ToolBlockChange => "tool_block_change",
             CacheResetReason::HistoryReload => "history_reload",
             CacheResetReason::Backtrack => "backtrack",
+            CacheResetReason::ContextEdit => "context_edit",
         }
     }
 }
@@ -746,6 +753,7 @@ pub(crate) fn parse_control_marker(d: &str) -> Option<ControlMarker> {
                     "stalled_provider_request" => CacheResetReason::StalledProviderRequest,
                     "tool_block_change" => CacheResetReason::ToolBlockChange,
                     "history_reload" => CacheResetReason::HistoryReload,
+                    "context_edit" => CacheResetReason::ContextEdit,
                     _ => return None,
                 };
                 Some(ControlMarker::CacheStatus(CacheStatus::Reset { reason }))

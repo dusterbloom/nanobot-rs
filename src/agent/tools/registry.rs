@@ -740,11 +740,14 @@ impl ToolRegistry {
         "remember",
     ];
 
-    /// Hot tools advertised as native schemas at turn 1. Kept to the 6 the
+    /// Hot tools advertised as native schemas at turn 1. Kept to the few the
     /// model uses every turn — the rest go through the `tool` proxy to keep
     /// the tool-schema prefix small (~670 tok vs ~2000 tok for 14 native).
     /// `get_skills` is native (not proxied) so the model reads skill content
-    /// directly instead of hitting the proxy's inspect mode.
+    /// directly instead of hitting the proxy's inspect mode. `context` is
+    /// native for the same reason as `lcm_expand`: local models need the
+    /// schema advertised to use it correctly rather than guess (T4, 2026-11-01
+    /// model-managed-context plan).
     /// See commit f03c6e8 for the prior pure-proxy attempt; this is the
     /// middle ground that avoids the proxy/native arg confusion that killed
     /// pure-proxy while still cutting cold-start prefill by ~60%.
@@ -755,6 +758,7 @@ impl ToolRegistry {
         "exec",
         "get_skills",
         "inspect_tool_result",
+        "context",
     ];
 
     /// Tools kept registered and reachable via the `get_tools` proxy (call with
@@ -816,6 +820,7 @@ impl ToolRegistry {
             "recall",
             "remember",
             "inspect_tool_result",
+            "context",
         ];
         for def in &mut defs {
             Self::remove_local_hot_model_hazards(def);

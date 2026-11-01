@@ -43,7 +43,18 @@ const LCM_EXPAND_GUIDE: &str =
      lost by summarizing. The system may also auto-expand relevant summaries for you. \
      NOTE: lcm_expand only expands summaries from the CURRENT session. To retrieve the \
      FULL content of a DIFFERENT past session, use session_search(mode=\"session\", \
-     session=KEY) with that session's key — do not call lcm_expand for past sessions.";
+     session=KEY) with that session's key — do not call lcm_expand for past sessions. \
+     \n\n\
+     During substantial tool work, edit your context at useful checkpoints: after settling a \
+     subproblem (a fix proved, a file understood) and before your final answer; not after every \
+     tool call, not while a subproblem is still open (if you must, keep blocks you still use). \
+     Every tool result ends with its seq, [seq 57]. Edit in one call: \
+     context({\"drop\":\"12-56\",\"note\":\"…\"}) drops those blocks; \
+     context({\"drop\":\"all\",\"keep\":\"57\",\"note\":\"…\"}) keeps only seq 57. The note \
+     is your own words, kept at the end: constraints, decisions, verified state, open work, \
+     evidence pointers. Window headroom is not the test: kept blocks ride every request, so drop \
+     settled ones you will not reread; a drop is lossless, lcm_expand({\"message_ids\":\"57\"}) \
+     reads one back. Correctness outranks size.";
 
 /// Append the previous-session continuity note to the system message.
 ///
@@ -330,7 +341,7 @@ impl AgentLoopShared {
                 let config = LcmConfig::for_runtime(&self.lcm_config, core.mode());
                 let db_nodes = core.sessions.load_summary_nodes(&session_id).await;
 
-                let engine = if !db_nodes.is_empty() {
+                let mut engine = if !db_nodes.is_empty() {
                     let all_msgs = core.sessions.get_all_messages(&session_id).await;
                     tracing::debug!(
                         session_id = %session_id,
@@ -341,6 +352,10 @@ impl AgentLoopShared {
                 } else {
                     LcmEngine::new(config)
                 };
+                // Restore model-issued context-edit drops before the engine is
+                // shared: both the `new` and `rebuild` paths must reproduce the
+                // same projection a restart would (plan 2026-11-01-model-managed-context T6).
+                engine.restore_dropped(core.sessions.load_context_drops(&session_id).await);
                 engines.insert(
                     session_id.clone(),
                     std::sync::Arc::new(tokio::sync::Mutex::new(engine)),
@@ -360,6 +375,7 @@ impl AgentLoopShared {
         };
         use crate::agent::lcm::LcmExpandTool;
         tools.register(Box::new(LcmExpandTool::new(lcm_engine.clone())));
+        tools.register(Box::new(crate::agent::tools::ContextTool::new(lcm_engine.clone())));
 
         let lcm_setup_ms = lap_ms();
 
@@ -438,7 +454,7 @@ impl AgentLoopShared {
         // budget with the very messages compaction already condensed, so the
         // trim would gut recent turns instead. Ingest first (idempotent by
         // `_db_id`) so a live session's rows are in the store, then adopt.
-        let history = {
+        let history: Vec<Value> = {
             // The session admission held above prevents a new compaction start
             // between reaping and this normal cancellation-safe lock await.
             let rewrite_unpublished = compaction.has_pending().await;
@@ -458,7 +474,14 @@ impl AgentLoopShared {
             // the existing checkpoint installer is the sole publication
             // point for both the prompt rewrite and cache rotation.
             if engine.dag().is_empty() || rewrite_unpublished {
+                // `active_context()` below never carries dropped rows (ingest
+                // and restore_dropped both exclude them), but this raw branch
+                // replays SQLite history directly, so it needs the same
+                // projection applied explicitly.
                 history
+                    .into_iter()
+                    .filter(|m| !engine.is_dropped(m))
+                    .collect()
             } else {
                 engine
                     .active_context()

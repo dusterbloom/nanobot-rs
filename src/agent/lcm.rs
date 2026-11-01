@@ -445,6 +445,143 @@ impl ContextEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Model-managed context editing (T3 — nodecode-style `context` tool)
+// ---------------------------------------------------------------------------
+
+/// What a `context` edit drops: everything eligible, or an explicit id list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropSpec {
+    /// Drop every eligible message below the edit's cutoff.
+    All,
+    /// Drop exactly these message ids (still subject to the cutoff/role
+    /// filter and to `keep`).
+    Ids(Vec<MessageId>),
+}
+
+/// One model-issued context edit, queued by the `context` tool and resolved
+/// by [`LcmEngine::resolve_and_drop`] against the live message log.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextEdit {
+    /// What to drop. `None` means a note-only edit (no ids touched).
+    pub drop: Option<DropSpec>,
+    /// Ids exempted from `drop`, including from pair-closure expansion.
+    pub keep: Vec<MessageId>,
+    /// The model's own checkpoint text, appended verbatim as an assistant
+    /// `[context note] …` message. `None` means drop-only, no note.
+    pub note: Option<String>,
+}
+
+/// Lookup of tool-call relationships within a message log, used to keep a
+/// dropped tool result's carrier (and vice versa) together: the wire is
+/// invalid if an assistant's `tool_calls` entry has no matching `tool`
+/// result, or if a `tool` result's carrier is missing.
+struct ToolPairIndex<'a> {
+    /// `tool_call_id` -> id of the assistant message that issued it.
+    carrier_of: HashMap<&'a str, MessageId>,
+    /// `tool_call_id` -> id of the `tool` message that answered it.
+    result_of: HashMap<&'a str, MessageId>,
+    /// Carrier message id -> the call ids it issued.
+    calls_of: HashMap<MessageId, Vec<&'a str>>,
+    /// Result message id -> the call id it answered.
+    call_of_result: HashMap<MessageId, &'a str>,
+}
+
+impl<'a> ToolPairIndex<'a> {
+    fn build(log: &'a [Value]) -> Self {
+        let mut index = Self {
+            carrier_of: HashMap::new(),
+            result_of: HashMap::new(),
+            calls_of: HashMap::new(),
+            call_of_result: HashMap::new(),
+        };
+        for message in log {
+            let Some(id) = db_id(message) else { continue };
+            if let Some(call_id) = message.get("tool_call_id").and_then(Value::as_str) {
+                index.result_of.insert(call_id, id);
+                index.call_of_result.insert(id, call_id);
+            }
+            let call_ids: Vec<&str> = message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|calls| {
+                    calls
+                        .iter()
+                        .filter_map(|c| c.get("id").and_then(Value::as_str))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for &call_id in &call_ids {
+                index.carrier_of.insert(call_id, id);
+            }
+            if !call_ids.is_empty() {
+                index.calls_of.insert(id, call_ids);
+            }
+        }
+        index
+    }
+
+    /// Ids that must join `id` in the drop set to keep every tool-call pair
+    /// intact: `id`'s carrier (if `id` is a result) and `id`'s results (if
+    /// `id` is a carrier).
+    fn partners(&self, id: MessageId) -> Vec<MessageId> {
+        let mut partners = Vec::new();
+        if let Some(call_id) = self.call_of_result.get(&id) {
+            partners.extend(self.carrier_of.get(call_id).copied());
+        }
+        if let Some(call_ids) = self.calls_of.get(&id) {
+            partners.extend(call_ids.iter().filter_map(|c| self.result_of.get(c).copied()));
+        }
+        partners
+    }
+}
+
+fn db_id(message: &Value) -> Option<MessageId> {
+    message
+        .get("_db_id")
+        .and_then(Value::as_u64)
+        .map(|id| id as MessageId)
+}
+
+/// Messages eligible for a context edit: persisted (`_db_id` present and
+/// below the cutoff), not system/developer, not a synthetic scaffold.
+fn droppable_ids(log: &[Value], below: MessageId) -> std::collections::BTreeSet<MessageId> {
+    log.iter()
+        .filter_map(|message| {
+            let id = db_id(message)?;
+            if id >= below {
+                return None;
+            }
+            let role = message.get("role").and_then(Value::as_str);
+            if matches!(role, Some("system" | "developer")) {
+                return None;
+            }
+            if crate::agent::markers::is_synthetic(message) {
+                return None;
+            }
+            Some(id)
+        })
+        .collect()
+}
+
+/// Expand `drop_set` to a fixed point over tool-call pairs, never adding an
+/// id that is in `keep` (an explicit `keep` wins over pair closure).
+fn close_tool_pairs(
+    drop_set: &mut std::collections::BTreeSet<MessageId>,
+    log: &[Value],
+    keep: &std::collections::BTreeSet<MessageId>,
+) {
+    let index = ToolPairIndex::build(log);
+    let mut frontier: Vec<MessageId> = drop_set.iter().copied().collect();
+    while let Some(id) = frontier.pop() {
+        for partner in index.partners(id) {
+            if !keep.contains(&partner) && drop_set.insert(partner) {
+                frontier.push(partner);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // LCM Engine
 // ---------------------------------------------------------------------------
 
@@ -580,6 +717,15 @@ pub struct LcmEngine {
     /// Cut position computed during an in-flight compaction, committed to
     /// `pinned_prefix_entries` only when that compaction succeeds.
     pending_pinned_prefix: Option<usize>,
+    /// Ids dropped by a model-issued `context` edit. Physically retained in
+    /// `store` (lossless — `lcm_expand` still reads them); excluded from
+    /// `active` and from future `ingest`. Restored from `context_drops` on
+    /// engine creation (`restore_dropped`) so a restart reproduces the same
+    /// projection.
+    dropped: std::collections::BTreeSet<MessageId>,
+    /// A `context` edit queued by the tool this turn, applied by the loop
+    /// (`apply_pending_context_edit`) before the next request goes out.
+    pending_edit: Option<ContextEdit>,
 }
 
 /// Mutable LCM state that must advance only after its SQLite checkpoint does.
@@ -603,6 +749,8 @@ impl LcmEngine {
             fold_watermarks: std::collections::HashMap::new(),
             pinned_prefix_entries: 0,
             pending_pinned_prefix: None,
+            dropped: std::collections::BTreeSet::new(),
+            pending_edit: None,
         }
     }
 
@@ -645,8 +793,74 @@ impl LcmEngine {
             return Some(msg_id);
         }
         self.store.insert(msg_id, message.clone());
-        self.active.push(ContextEntry::Raw { msg_id, message });
+        // A row restored as dropped (`restore_dropped`, e.g. turn-start
+        // rebuild of a fresh engine) stays in the immutable store but never
+        // re-enters the provider-facing window.
+        if !self.dropped.contains(&msg_id) {
+            self.active.push(ContextEntry::Raw { msg_id, message });
+        }
         Some(msg_id)
+    }
+
+    /// Queue a model-issued context edit for the loop to apply before the
+    /// next request. Overwrites any edit already queued this turn.
+    pub fn queue_context_edit(&mut self, edit: ContextEdit) {
+        self.pending_edit = Some(edit);
+    }
+
+    /// Take the queued context edit, if any, leaving none queued.
+    pub fn take_context_edit(&mut self) -> Option<ContextEdit> {
+        self.pending_edit.take()
+    }
+
+    /// Whether `message` (a `_db_id`-tagged row) is a currently dropped id.
+    /// Messages without `_db_id` are never dropped.
+    pub fn is_dropped(&self, message: &Value) -> bool {
+        db_id(message).is_some_and(|id| self.dropped.contains(&id))
+    }
+
+    /// Mark `ids` as dropped without touching `store` — used to restore
+    /// persisted drop state (`context_drops`) into a freshly built engine at
+    /// turn start / restart, before history is ingested.
+    pub fn restore_dropped(&mut self, ids: Vec<MessageId>) {
+        self.dropped.extend(ids);
+        let dropped = &self.dropped;
+        self.active.retain(
+            |entry| !matches!(entry, ContextEntry::Raw { msg_id, .. } if dropped.contains(msg_id)),
+        );
+    }
+
+    /// Resolve a queued edit's `drop`/`keep` against `log` (every message
+    /// there already carries `_db_id`) and apply it: candidates are rows with
+    /// `_db_id < below`, excluding system/developer and synthetic scaffolds.
+    /// `All`/`Ids` sets the initial drop set, `keep` subtracts from it, then
+    /// tool-call pairs are closed over (dropping a result pulls in its
+    /// carrier and vice versa) so the wire never ends up with an orphaned
+    /// `tool_calls` entry or a `tool` result missing its carrier. Returns the
+    /// final dropped ids (empty for a note-only edit or a no-op drop).
+    pub fn resolve_and_drop(
+        &mut self,
+        edit: &ContextEdit,
+        log: &[Value],
+        below: MessageId,
+    ) -> Vec<MessageId> {
+        let candidates = droppable_ids(log, below);
+        let mut drop_set = match &edit.drop {
+            None => std::collections::BTreeSet::new(),
+            Some(DropSpec::All) => candidates,
+            Some(DropSpec::Ids(ids)) => ids
+                .iter()
+                .copied()
+                .filter(|id| candidates.contains(id))
+                .collect(),
+        };
+        let keep: std::collections::BTreeSet<MessageId> = edit.keep.iter().copied().collect();
+        drop_set.retain(|id| !keep.contains(id));
+        close_tool_pairs(&mut drop_set, log, &keep);
+
+        let ids: Vec<MessageId> = drop_set.iter().copied().collect();
+        self.restore_dropped(ids.clone());
+        ids
     }
 
     /// Replace already-ingested replay projections with their authoritative
@@ -2039,6 +2253,9 @@ const MECHANICAL_RESULT_MAX_CHARS: usize = 500;
 /// Per-message cap on user/assistant text, so one long turn cannot crowd every
 /// older turn out of the bounded checkpoint.
 const MECHANICAL_TEXT_MAX_CHARS: usize = 1_200;
+/// Cap on `[context note]` blocks, which are the model's own checkpoints and must
+/// survive folds intact.
+const MECHANICAL_NOTE_MAX_CHARS: usize = 6_000;
 /// Cap on the rendered arguments of one tool-call signature.
 const MECHANICAL_ARGS_MAX_CHARS: usize = 160;
 const MECHANICAL_ORIENTATION_HEADER: &str = "Earlier turns, condensed mechanically \
@@ -2115,7 +2332,13 @@ fn mechanical_assistant_line(id: MessageId, message: &Value) -> Option<String> {
     let text = message_plain_text(message);
     let mut parts: Vec<String> = Vec::new();
     if !text.trim().is_empty() {
-        parts.push(clip_chars(text.trim(), MECHANICAL_TEXT_MAX_CHARS));
+        let trimmed = text.trim();
+        let char_limit = if trimmed.starts_with("[context note]") {
+            MECHANICAL_NOTE_MAX_CHARS
+        } else {
+            MECHANICAL_TEXT_MAX_CHARS
+        };
+        parts.push(clip_chars(trimmed, char_limit));
     }
     let calls = message
         .get("tool_calls")
@@ -2409,7 +2632,7 @@ impl crate::agent::tools::base::Tool for LcmExpandTool {
 
 /// Extract message IDs from whatever shape the model produced: an integer array,
 /// a comma/space-separated string, a `"5-8"` range, or numbers embedded in prose.
-fn parse_message_ids(v: &Value) -> Vec<usize> {
+pub(crate) fn parse_message_ids(v: &Value) -> Vec<usize> {
     match v {
         Value::Array(arr) => arr
             .iter()
@@ -4491,6 +4714,60 @@ mod tests {
         assert!(
             first_user < last_result,
             "orientation reads oldest-first: {text}"
+        );
+    }
+
+    #[test]
+    fn mechanical_checkpoint_keeps_full_context_notes() {
+        let note_text = "x".repeat(3000);
+        let ordinary_text = "y".repeat(3000);
+
+        let messages = vec![
+            (1, msg(1, "user", "Start here")),
+            (
+                2,
+                json!({
+                    "role": "assistant",
+                    "content": format!("[context note] {}", note_text),
+                    "_db_id": 2
+                }),
+            ),
+            (
+                3,
+                json!({
+                    "role": "assistant",
+                    "content": ordinary_text.clone(),
+                    "_db_id": 3
+                }),
+            ),
+        ];
+
+        let text =
+            deterministic_recovery_index(&[1, 2, 3], &messages, 10_000, 2_048, usize::MAX)
+                .expect("checkpoint fits");
+
+        // The context note should be included in full (3000 chars + marker)
+        assert!(
+            text.contains(&format!("[context note] {}", note_text)),
+            "context note must survive fold intact: {text}"
+        );
+
+        // The ordinary assistant text should be clipped to MECHANICAL_TEXT_MAX_CHARS (1200)
+        assert!(
+            text.contains(&format!("[msg 3] assistant: {}", "y".repeat(1200))),
+            "ordinary assistant text clipped to 1200: {text}"
+        );
+
+        // Verify the clipped text doesn't include more than expected
+        let ordinary_section = text
+            .split("[msg 3] assistant:")
+            .nth(1)
+            .unwrap_or("");
+        let ordinary_content = ordinary_section.lines().next().unwrap_or("");
+        assert!(
+            ordinary_content.len() <= 1300,  // Leave some margin for formatting
+            "ordinary text should not exceed MECHANICAL_TEXT_MAX_CHARS: {}",
+            ordinary_content.len()
         );
     }
 
@@ -7047,6 +7324,124 @@ mod tests {
             after[0].1["content"], "SECOND question",
             "ids must resolve to their own rows, never shifted"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Model-managed context editing (T3)
+    // -----------------------------------------------------------------------
+
+    fn context_edit_test_config() -> LcmConfig {
+        LcmConfig {
+            tau_soft: 0.5,
+            tau_hard: 0.9,
+            deterministic_target: 128,
+            keep_prefix_fraction: 0.35,
+            checkpoint: CheckpointWriter::Model,
+        }
+    }
+
+    /// Ingest a two-call carrier plus both of its tool results, mirroring a
+    /// turn that fanned out to two tools before answering.
+    fn ingest_two_call_turn(engine: &mut LcmEngine, user_id: usize, carrier_id: usize) {
+        ingest(engine, user_id, "user", "question");
+        assert_eq!(
+            engine.ingest(json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "exec", "arguments": "{}"}},
+                    {"id": "c2", "type": "function", "function": {"name": "exec", "arguments": "{}"}},
+                ],
+                "_db_id": carrier_id,
+            })),
+            Some(carrier_id)
+        );
+        assert_eq!(
+            engine.ingest(json!({
+                "role": "tool", "tool_call_id": "c1", "content": "result one",
+                "_db_id": carrier_id + 1,
+            })),
+            Some(carrier_id + 1)
+        );
+        assert_eq!(
+            engine.ingest(json!({
+                "role": "tool", "tool_call_id": "c2", "content": "result two",
+                "_db_id": carrier_id + 2,
+            })),
+            Some(carrier_id + 2)
+        );
+    }
+
+    /// Dropping one result of a two-call turn must pull in both its carrier
+    /// and its sibling result (an orphaned `tool_calls` entry, or a `tool`
+    /// result without its carrier, is an invalid wire); the current turn
+    /// (at/after `below`) is never touched; the drop is lossless; re-ingest
+    /// (as a reload would do) does not resurrect a dropped id into `active`.
+    #[test]
+    fn resolve_and_drop_closes_tool_pairs_and_respects_keep() {
+        let mut engine = LcmEngine::new(context_edit_test_config());
+        ingest_two_call_turn(&mut engine, 1, 2); // user(1), carrier(2: c1,c2), results(3,4)
+        ingest(&mut engine, 5, "user", "question two");
+        assert_eq!(
+            engine.ingest(json!({
+                "role": "assistant", "content": null,
+                "tool_calls": [{"id": "c3", "type": "function", "function": {"name": "context", "arguments": "{}"}}],
+                "_db_id": 6,
+            })),
+            Some(6)
+        );
+        assert_eq!(
+            engine.ingest(json!({"role": "tool", "tool_call_id": "c3", "content": "queued", "_db_id": 7})),
+            Some(7)
+        );
+        let before_tokens = engine.conversation_tokens();
+        let log = engine.active_context();
+
+        let edit = ContextEdit {
+            drop: Some(DropSpec::Ids(vec![3])),
+            keep: vec![],
+            note: None,
+        };
+        let dropped = engine.resolve_and_drop(&edit, &log, 6);
+        assert_eq!(dropped, vec![2, 3, 4], "pair closure must pull in carrier and sibling result");
+
+        let active_ids: Vec<MessageId> = engine.active_context().iter().filter_map(db_id).collect();
+        assert_eq!(active_ids, vec![1, 5, 6, 7], "dropped ids leave active; current turn (6,7) survives");
+        assert!(
+            engine.conversation_tokens() < before_tokens,
+            "dropping a block must reduce the counted conversation size"
+        );
+
+        // Lossless: the body is still readable via lcm_expand.
+        assert!(engine.format_expanded(&[3]).contains("result one"));
+
+        // A reload re-ingests every stored row; a dropped one must not
+        // reappear in the provider-facing window.
+        assert_eq!(
+            engine.ingest(json!({"role": "tool", "tool_call_id": "c1", "content": "result one", "_db_id": 3})),
+            Some(3)
+        );
+        let active_ids_after_reingest: Vec<MessageId> =
+            engine.active_context().iter().filter_map(db_id).collect();
+        assert_eq!(active_ids_after_reingest, active_ids);
+
+        // `All` + an explicit `keep` overrides pair closure: keeping one
+        // result of a pair is honored even though its carrier drops.
+        let mut engine2 = LcmEngine::new(context_edit_test_config());
+        ingest_two_call_turn(&mut engine2, 1, 2);
+        ingest(&mut engine2, 5, "user", "question two");
+        let log2 = engine2.active_context();
+
+        let edit_all = ContextEdit {
+            drop: Some(DropSpec::All),
+            keep: vec![4],
+            note: None,
+        };
+        let dropped_all = engine2.resolve_and_drop(&edit_all, &log2, 6);
+        assert_eq!(dropped_all, vec![1, 2, 3, 5], "keep wins over pair closure");
+
+        let active_ids2: Vec<MessageId> = engine2.active_context().iter().filter_map(db_id).collect();
+        assert_eq!(active_ids2, vec![4], "only the explicitly kept id survives");
     }
 
     #[test]

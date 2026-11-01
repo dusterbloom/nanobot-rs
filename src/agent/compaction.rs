@@ -55,7 +55,8 @@ or content type. Include, when present:
 - artifacts, references, and exact identifiers whose form matters;
 - actions, outcomes, completed results, failures, and verification;
 - uncertainty, unresolved questions, blockers, commitments, and next steps;
-- chronology, relationships, and state changes when they affect meaning.
+- chronology, relationships, and state changes when they affect meaning;
+- every `[context note]` block verbatim: it is the model's own checkpoint of what was leaving.
 
 Distinguish observation, claim, inference, request, attempt, and completed outcome. Do not
 invent facts or completion. Do not discard durable earlier information merely because later
@@ -79,7 +80,7 @@ of subject or content type: goals, intent, constraints, prohibitions, preference
 evidence, source attribution, conflicts, corrections, decisions, rationale, artifacts,
 references, exact identifiers, actions, outcomes, completed results, failures, verification,
 uncertainty, unresolved questions, blockers, commitments, next steps, chronology,
-relationships, and meaningful state changes.
+relationships, meaningful state changes, and every `[context note]` block verbatim.
 
 Distinguish observation, claim, inference, request, attempt, and completed outcome. Do not
 invent facts or completion, and do not discard durable earlier information because later
@@ -1378,7 +1379,7 @@ mod tests {
         ]));
         let compactor = ContextCompactor::new(provider.clone(), "test".into(), 8_192)
             .with_runtime_limits(2_048, 2_048);
-        let input = "A factual source. ".repeat(200);
+        let input = "A factual source. ".repeat(195);
         let initial_required = compactor.required_context_tokens(
             &input,
             SUMMARIZE_PROMPT,
