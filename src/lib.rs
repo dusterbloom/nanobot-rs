@@ -47,6 +47,7 @@ pub mod heartbeat;
 pub(crate) mod higgs;
 pub mod lms;
 pub(crate) mod local_discovery;
+pub(crate) mod process_group;
 pub mod providers;
 pub(crate) mod repl;
 pub mod searxng;

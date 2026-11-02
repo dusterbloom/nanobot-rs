@@ -10,6 +10,7 @@
 //! Install: `npm install -g agent-browser && agent-browser install`
 
 use std::collections::HashMap;
+use std::process::Stdio;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -202,9 +203,15 @@ impl BrowserTool {
         if !*BINARY_AVAILABLE.get_or_init(check_binary) {
             return Err(INSTALL_HINT.to_string());
         }
-        let output = Command::new("agent-browser").args(args).output();
-
-        let output = tokio::time::timeout(self.timeout, output)
+        let mut command = Command::new("agent-browser");
+        command
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        // Process-group guard: if the timeout below fires, dropping the
+        // in-flight future kills the whole group (agent-browser subprocess and
+        // anything it forked), not just the immediate child.
+        let output = tokio::time::timeout(self.timeout, crate::process_group::output(&mut command))
             .await
             .map_err(|_| format!("agent-browser timed out after {}s", self.timeout.as_secs()))?
             .map_err(|e| format!("failed to run agent-browser: {}", e))?;

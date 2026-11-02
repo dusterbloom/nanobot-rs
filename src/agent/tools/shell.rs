@@ -482,13 +482,18 @@ impl Tool for ExecTool {
         let timeout_dur = Duration::from_secs(timeout);
 
         let result = tokio::time::timeout(timeout_dur, async {
-            let mut child = match pipefail_shell_command("sh", command)
+            let mut command = pipefail_shell_command("sh", command);
+            command
                 .current_dir(&cwd)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-            {
+                .stderr(Stdio::piped());
+
+            // Spawned into its own process group: dropping this guard (on
+            // cancellation below, or when the outer `timeout` fires) kills
+            // the whole group, including any pipeline grandchildren `sh`
+            // forked — not just `sh` itself.
+            let mut child = match crate::process_group::spawn(&mut command) {
                 Ok(c) => c,
                 Err(e) => {
                     return self.spawn_error_hint(&e, &cwd);
@@ -543,7 +548,8 @@ impl Tool for ExecTool {
                         }
                     }
                     _ = ctx.cancellation_token().cancelled() => {
-                        let _ = child.kill().await;
+                        // Dropping `child` (the process-group guard) on this
+                        // return kills the whole group; no explicit kill needed.
                         return "Error: Command cancelled".to_string();
                     }
                     _ = ticker.tick() => {
@@ -1662,6 +1668,50 @@ mod tests {
             result.contains("simpler command"),
             "Expected 'simpler command' hint: {}",
             result
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_execute_timeout_kills_pipeline_grandchildren() {
+        // General logic under test: when `exec` times out, the ENTIRE
+        // process group spawned for the command must die — not just the
+        // immediate `sh`. A pipeline (`sleep ... | cat`) makes `sleep` a
+        // grandchild of this tool's `sh`; before the process-group guard,
+        // killing only `sh` left `sleep` (and anything downstream of it)
+        // running forever (observed: orphaned pipelines alive for a day).
+        //
+        // The sleep duration (41.7s) is a unique argument so `pgrep -f`
+        // cannot match an unrelated process on the test machine.
+        let tool = ExecTool::new(1, None, None, None, false);
+        let mut params = HashMap::new();
+        params.insert(
+            "command".to_string(),
+            serde_json::Value::String("sleep 41.7 | cat".to_string()),
+        );
+        let result = crate::agent::tools::base::render_result(
+            tool.execute(params, &crate::agent::tools::base::ToolContext::sandbox())
+                .await,
+        );
+        assert!(
+            result.contains("timed out"),
+            "Expected timeout error, got: {}",
+            result
+        );
+
+        // Give the OS a moment to finish reaping after the kill signal.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let still_running = tokio::process::Command::new("pgrep")
+            .arg("-f")
+            .arg("sleep 41.7")
+            .status()
+            .await
+            .map(|status| status.success())
+            .unwrap_or(false);
+        assert!(
+            !still_running,
+            "sleep grandchild from the timed-out pipeline must not survive"
         );
     }
 

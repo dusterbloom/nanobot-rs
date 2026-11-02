@@ -97,9 +97,16 @@ impl CuaTool {
 
     /// Run a driver subcommand; returns (stdout, stderr, success).
     async fn run_driver(&self, args: &[&str]) -> (String, String, bool) {
+        let mut command = Command::new(&self.binary);
+        command
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        // Process-group guard: if the timeout below fires, dropping the
+        // in-flight future kills the whole group (driver subprocess and
+        // anything it forked), not just the immediate child.
         let result =
-            tokio::time::timeout(self.timeout, Command::new(&self.binary).args(args).output())
-                .await;
+            tokio::time::timeout(self.timeout, crate::process_group::output(&mut command)).await;
         match result {
             Ok(Ok(output)) => (
                 String::from_utf8_lossy(&output.stdout).to_string(),
@@ -129,27 +136,20 @@ impl CuaTool {
     }
 
     /// Run `cua-driver call`, racing the timeout against cooperative
-    /// cancellation. `kill_on_drop` aborts the child on the timeout/cancel
-    /// path. `None` means cancelled.
+    /// cancellation. The process-group guard (see `crate::process_group`)
+    /// kills the whole child process group on the timeout/cancel path.
+    /// `None` means cancelled.
     async fn run_call(&self, args: &[&str], ctx: &ToolContext) -> Option<(String, String, bool)> {
-        let child = match Command::new(&self.binary)
+        let mut command = Command::new(&self.binary);
+        command
             .args(args)
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return Some((
-                    String::new(),
-                    format!("failed to run cua-driver: {e}"),
-                    false,
-                ))
-            }
-        };
+            .stderr(std::process::Stdio::piped());
+        // Process-group guard: dropping the in-flight future on timeout or
+        // on the cancellation branch below kills the whole group, not just
+        // the immediate `cua-driver` process.
         tokio::select! {
-            output = tokio::time::timeout(self.timeout, child.wait_with_output()) => {
+            output = tokio::time::timeout(self.timeout, crate::process_group::output(&mut command)) => {
                 match output {
                     Ok(Ok(out)) => Some((
                         String::from_utf8_lossy(&out.stdout).to_string(),
