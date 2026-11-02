@@ -15,6 +15,11 @@ REPO="/Users/peppi/Dev/nanobot-rs"
 REAL_CONFIG="${REAL_CONFIG:-$HOME/.nanobot/config.json}"
 REAL_HOME="$HOME"  # isolated runs still need the real rust toolchain
 
+# TASK_NAME selects which benchmark task runs (see TASK_SCRIPTED/TASK_PRESSURE
+# below): "scripted" (default, unchanged) peaks ~9k of the 32k local window —
+# below the 0.5 size-notice threshold. "pressure" is sized to cross it.
+TASK_NAME="${TASK_NAME:-scripted}"
+
 # Arm binaries. Build once with:
 #   (cd "$REPO" && cargo build --release)                     # arm B (this tree)
 #   git worktree add /some/sibling/dir main                   # arm A, see note below
@@ -27,12 +32,13 @@ BIN_B="${BIN_B:-/tmp/mmc-bin/nanobot-armB-branch}"
 
 HIGGS_PORT="${HIGGS_PORT:-9000}"
 HIGGS_HEALTH_TIMEOUT_S=120
-TASK_TIMEOUT_S="${TASK_TIMEOUT_S:-900}"
-
-# The factual answer lives verbatim in src/agent/tools/cron_tool.rs (identical
-# on both arms — not touched by this branch's diff). Grading just checks this
-# exact string shows up in the arm's stdout transcript.
-EXPECT_SUBSTRING='Unknown action: foo'
+# pressure's 4 phases (~27k tokens of tool output, see README) need more wall
+# time than scripted's 9 steps.
+if [[ "$TASK_NAME" == "pressure" ]]; then
+  TASK_TIMEOUT_S="${TASK_TIMEOUT_S:-1800}"
+else
+  TASK_TIMEOUT_S="${TASK_TIMEOUT_S:-900}"
+fi
 
 for bin in "$BIN_A" "$BIN_B"; do
   if [[ ! -x "$bin" ]]; then
@@ -64,7 +70,17 @@ fi
 RUN_DIR="$(mktemp -d /tmp/mmc-run.XXXXXX)"
 echo "run dir: $RUN_DIR"
 
-TASK="$(cat <<'TASKEOF'
+# Grading note (checked against src/repl/mod.rs's stream_and_render_inner):
+# the CLI only echoes the user's `-m` text to stdout when
+# `std::io::stdout().is_terminal()` is true. Both arms run here with stdout
+# redirected to run.log (a regular file), so is_terminal() is false and the
+# task prompt below is NEVER echoed into run.log -- a plain substring check
+# against run.log cannot be satisfied by the prompt itself. That is why both
+# TASK_SCRIPTED's and TASK_PRESSURE's expected substrings are safe to grade
+# with the straight "all substrings in run_log_text" check in summarize.py,
+# with no need to slice the log down to "after the prompt".
+
+TASK_SCRIPTED="$(cat <<'TASKEOF'
 You are running inside a controlled, scripted benchmark. Follow these steps in
 order, one tool call per step unless told otherwise. Do not read beyond the
 line ranges given -- they are deliberately bounded so this run stays
@@ -86,6 +102,89 @@ comparable across repeats.
    capitalization and punctuation, as it would appear for action="foo".
 TASKEOF
 )"
+# The factual answer lives verbatim in src/agent/tools/cron_tool.rs (identical
+# on both arms — not touched by this branch's diff). Grading checks this
+# exact string shows up in the arm's run.log (see the TTY-echo note above).
+EXPECT_SUBSTRINGS_SCRIPTED='Unknown action: foo'
+
+# pressure: 4 settled-subproblem phases sized so cumulative tool output
+# (~27k tokens, see README "pressure task" section for the per-phase budget)
+# clearly crosses the branch's size notice (fires at 0.5 of the 32k local
+# window, i.e. ~16k) and nears the window ceiling -- unlike scripted, which
+# peaks ~9k and never fires it. The model is never told to use the `context`
+# tool; only the standing skill (T7) and the notice itself (T8) can prompt it.
+TASK_PRESSURE="$(cat <<'TASKEOF'
+You are running inside a controlled benchmark with four phases. Work phase by
+phase; when a phase is done its raw output is no longer needed. Within each
+phase, follow the steps in order, one tool call per step. Do not read beyond
+the line ranges given -- they are deliberately bounded so this run stays
+comparable across repeats.
+
+PHASE 1
+Read src/agent/tools/stash_search.rs in these 9 consecutive bounded ranges,
+one read per step, in this exact order: lines 1-90, 91-180, 181-270, 271-360,
+361-450, 451-540, 541-630, 631-675, 676-720.
+Fact A: somewhere in that range, this file's code returns an exact error
+message when a search `query` parameter fails to compile as a pattern. Find
+it and remember its exact text, including capitalization and punctuation.
+
+PHASE 2
+Read src/agent/tools/web.rs in these 13 consecutive bounded ranges, one read
+per step, in this exact order: lines 1-90, 91-180, 181-270, 271-360, 361-450,
+451-540, 541-630, 631-720, 721-810, 811-900, 901-990, 991-1080, 1081-1170.
+Fact B: somewhere in that range, a constant named WEB_FETCH_EVIDENCE_MARKER is
+defined with a short string literal value. Find it and remember its exact
+string value, including capitalization.
+
+PHASE 3
+Run this exact shell command: cd /Users/peppi/Dev/nanobot-rs && cargo test --lib -- agent::tools::shell
+Then run this exact shell command: cd /Users/peppi/Dev/nanobot-rs && cargo test --lib -- agent::tools::spawn
+Fact C: remember the "N passed" count from the FIRST command's (the
+agent::tools::shell one) test-result summary line, in the form "N passed".
+
+PHASE 4
+Read src/agent/tools/recall.rs in these 7 consecutive bounded ranges, one read
+per step, in this exact order: lines 1-90, 91-180, 181-270, 271-360, 361-450,
+451-540, 541-630.
+Fact D: somewhere in that range, this file's `execute_fetch` function returns
+an exact string when its `mode` argument does not match any of "latest",
+"session", "in_session", or "extract". Find it and remember its exact text,
+including capitalization and punctuation.
+
+FINAL STEP
+Without re-reading any file and without re-running any command, answer from
+memory of phases 1-4 above. State all four facts in order -- Fact A, Fact B,
+Fact C, Fact D -- each as the exact verbatim string or number you found,
+including capitalization and punctuation.
+TASKEOF
+)"
+# Facts A/B/D live verbatim in src/agent/tools/stash_search.rs,
+# src/agent/tools/web.rs, and src/agent/tools/recall.rs respectively --
+# `git diff main..HEAD --stat -- <those 3 files>` is empty, so each is
+# identical on both arms. Fact C is the "N passed" line from a real
+# `cargo test` run against src/agent/tools/shell.rs, also untouched by this
+# branch's diff (confirmed the same way) -- the count (93, measured
+# 2026-11-02 against this repo's current test suite) is a snapshot, not a
+# hardcoded invariant, same caveat as scripted's cron_tool.rs answer.
+EXPECT_SUBSTRINGS_PRESSURE='query could not be compiled.
+WEB_FETCH_EVIDENCE v1
+93 passed
+Error: unsupported fetch mode.'
+
+case "$TASK_NAME" in
+  scripted)
+    TASK="$TASK_SCRIPTED"
+    EXPECT_SUBSTRINGS="$EXPECT_SUBSTRINGS_SCRIPTED"
+    ;;
+  pressure)
+    TASK="$TASK_PRESSURE"
+    EXPECT_SUBSTRINGS="$EXPECT_SUBSTRINGS_PRESSURE"
+    ;;
+  *)
+    echo "error: unknown TASK_NAME '$TASK_NAME' (expected 'scripted' or 'pressure')" >&2
+    exit 1
+    ;;
+esac
 
 higgs_pid=""
 
@@ -153,8 +252,8 @@ run_arm "armA-main"    "$BIN_A" "$RUN_DIR/home-A"
 run_arm "armB-branch"  "$BIN_B" "$RUN_DIR/home-B"
 
 echo
-echo "=== results ($RUN_DIR) ==="
+echo "=== results ($RUN_DIR) — task: $TASK_NAME ==="
 python3 "$HERE/summarize.py" \
   "$RUN_DIR/home-A" "A:main" \
   "$RUN_DIR/home-B" "B:branch" \
-  "$EXPECT_SUBSTRING"
+  "$EXPECT_SUBSTRINGS"

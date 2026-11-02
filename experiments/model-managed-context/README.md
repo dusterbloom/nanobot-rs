@@ -5,7 +5,7 @@ before/after comparison of Arm A (`main`, no `[seq N]` tags, no `context`
 tool) vs Arm B (this branch's working tree, T1-T8 landed) on one matched
 tool-heavy task.
 
-Primary arm is **local, against Higgs** (not cloud) — the 32k local context
+Primary arm is **local, against Higgs** (not cloud) — the 66k local context
 window is small enough that a 9-step tool-heavy task produces real pressure,
 which is the regime the `context` tool is meant to help with. The cloud arm
 from the original plan text is intentionally **not** run here: this repo's
@@ -120,7 +120,9 @@ experiments/model-managed-context/run.sh
 ```
 
 Env overrides: `BIN_A`, `BIN_B`, `HIGGS_PORT` (default 9000), `TASK_TIMEOUT_S`
-(default 900s per arm), `REAL_CONFIG` (default `$HOME/.nanobot/config.json`).
+(default 900s per arm, 1800s for `TASK_NAME=pressure`), `REAL_CONFIG` (default
+`$HOME/.nanobot/config.json`), `TASK_NAME` (`scripted` default, or
+`pressure` — see below).
 
 To rerun later against Higgs (the only arm this script runs):
 
@@ -132,6 +134,80 @@ To point at a different local server instead of Higgs, this script would
 need a second code path (it currently hardcodes the `higgs serve` startup
 command and `--local` discovery) — not built here since only Higgs was
 available to test against.
+
+## Pressure task
+
+`TASK_SCRIPTED` (above) peaks ~9k tokens of the 66k local window — below the
+branch's size notice, which fires at 0.5 of the window (~33k). It never
+exercises the `context` tool because nothing in it ever gets large enough to
+need dropping. `TASK_PRESSURE` (`TASK_NAME=pressure`) is a second, larger
+task built to actually cross that threshold, so adoption of `context` can be
+observed rather than assumed absent.
+
+**Purpose:** four phases, each a settled subproblem whose raw tool output is
+needed only to extract one fact, structured so that by the final phase the
+model has three earlier phases' worth of now-irrelevant tool output sitting
+in its context — exactly the shape the `context` tool exists to clean up.
+The model is never told to use it; only the standing skill (T7) and the size
+notice itself (T8) can prompt it.
+
+**Phases** (facts verified with `rg`; source files confirmed byte-identical
+between `main` and `HEAD` via `git diff main..HEAD --stat -- <file>`):
+
+1. Read `src/agent/tools/stash_search.rs` lines 1-720 (9 bounded page reads).
+   Fact A — the literal error string returned when a search `query` fails to
+   compile as a pattern: `"query could not be compiled."`
+   (`src/agent/tools/stash_search.rs:710`).
+2. Read `src/agent/tools/web.rs` lines 1-1170 (13 bounded page reads — the
+   "large file in consecutive pages" phase). Fact B — the value of the
+   `WEB_FETCH_EVIDENCE_MARKER` constant: `"WEB_FETCH_EVIDENCE v1"`
+   (`src/agent/tools/web.rs:72`).
+3. Run `cargo test --lib -- agent::tools::shell` then
+   `cargo test --lib -- agent::tools::spawn`. Fact C — the `"N passed"` count
+   from the first command: `93 passed` (measured 2026-11-02 against this
+   repo's current test suite; a snapshot, not a hardcoded invariant, same
+   caveat as `TASK_SCRIPTED`'s cron_tool.rs answer).
+4. Read `src/agent/tools/recall.rs` lines 1-630 (7 bounded page reads).
+   Fact D — the literal string `execute_fetch` returns for an unrecognized
+   `mode`: `"Error: unsupported fetch mode."` (`src/agent/tools/recall.rs:558`).
+
+Final step: state facts A-D verbatim, from memory, with no re-reading.
+
+Every read uses an explicit `start_line`/`end_line` range sized to fit
+Higgs' ~4096-byte inline-read page in one shot (so the step count is
+deterministic — no model-dependent auto-pagination), matching the existing
+note already respected by `TASK_SCRIPTED`.
+
+**Size estimate** (bytes measured directly against this repo; tokens ≈
+bytes/4):
+
+| phase | source | bytes | ~tokens |
+|-------|--------|-------|---------|
+| 1 | `stash_search.rs` 1-720 (9 reads) | 27,679 | 6,920 |
+| 2 | `web.rs` 1-1170 (13 reads) | 44,383 | 11,096 |
+| 3 | `cargo test` ×2 (shell + spawn, warm target dir) | 11,635 | 2,909 |
+| 4 | `recall.rs` 1-630 (7 reads) | 25,253 | 6,313 |
+| **total** | | **108,950** | **~27,238** |
+
+~27.2k tokens of cumulative tool output — inside the 26-30k target, comfortably
+past the ~33k size-notice threshold and nearing the 66k window by the end of
+the run. Phase 3's bytes assume a warm `target/` build dir (true in this repo
+during active development); a stone-cold `cargo test` would add a one-time
+compile log on top, not reflected in the table above.
+
+**Grading:** `run.sh` passes `summarize.py` a single argument containing all
+expected substrings newline-separated; success requires ALL of them to
+appear in the last non-empty `role='assistant'` message's `content` (highest
+`id`) in the arm's isolated `sessions.db`, not `run.log` — `run.log` streams
+every assistant message (so a fact quoted mid-run would pass even if lost
+from the final answer) with ANSI color codes that can split a fact across
+escape sequences.
+
+**How to run:**
+
+```bash
+TASK_NAME=pressure experiments/model-managed-context/run.sh
+```
 
 ## Results (last run, 2026-11-01)
 
@@ -205,7 +281,7 @@ same repo, temp 0, so the likeliest cause is the changed prompt (standing skill,
 `context` schema, `[seq N]` tags), not noise; n=1 cannot separate which.
 
 The task does not exercise the mechanism: it is a numbered script (no settled
-subproblem to checkpoint after) peaking near 9k of a 32k window. Whether Clover
+subproblem to checkpoint after) peaking near 9k of a 66k window. Whether Clover
 adopts `context` needs an open-ended task that crosses the window.
 
 ## Rerun 2026-11-02 (guidance fixes: drop scope, required note, DRY text, size notice)
@@ -220,5 +296,15 @@ Arm A = main incl. d9ec349/e2fa758; Arm B = branch with the fixes.
 
 PromptDelta: 0 diverged in either arm. The +65% from the previous rerun is gone
 (no extra `inspect_tool_result` pages). Still no adoption signal: the task peaks
-near 9k of 32k, below the 0.5 size-notice threshold, so the notice never fires.
-Adoption needs a task that crosses ~16k.
+near 9k of 66k, below the 0.5 size-notice threshold, so the notice never fires.
+Adoption needs a task that crosses ~33k.
+## Pressure run 2026-11-02 (size notice; reverted)
+
+`TASK_NAME=pressure`, Higgs, Clover-35B-A3B-Preview-MLX-4bit, n=1 per arm. Window is 66k (not 32k).
+
+| arm | requests | mean prompt tok/req | peak prompt tok/req | cache hit % | total prompt tok | facts | `context` calls | size notices |
+|-----|----------|---------------------|---------------------|-------------|------------------|-------|-----------------|--------------|
+| A:main | 39 | 27,736 | 52,091 | 85.9% | 1,081,687 | 4/4 | 0 | 0 |
+| B:branch | 38 | 27,605 | 47,604 | 95.4% | 1,048,986 | 3/4 (D missed) | 0 | 1 |
+
+The notice (`[System notice] Context ~33k/66k tokens. Largest tool results: seq 2-63 (~31k)…`) landed mid-Phase-4 as a user turn. The model abandoned its remaining recall.rs reads, spent 6 calls searching the old Phase-3 cargo output for `execute_fetch`, and answered without Fact D. The suggested range covered the whole run (runs only break on user rows; a single-request agentic task has one), including the active phase. The notice was removed; a non-interrupting variant (hint appended to the latest tool result, excluding the recent working set) is a possible follow-up experiment.
