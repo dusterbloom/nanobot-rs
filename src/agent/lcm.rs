@@ -604,112 +604,6 @@ fn close_tool_pairs(
 // Proactive context-size notice
 // ---------------------------------------------------------------------------
 
-/// Hysteresis state for [`LcmEngine::context_size_notice`]. A notice fires
-/// once per "crossing" of the threshold: after it fires, `Notified` records
-/// the conversation size it fired at so the same crossing cannot repeat
-/// every round. Two states, but the second carries data a bool cannot
-/// (the size to compare future growth against), so this is a tagged union,
-/// not a flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextNoticeState {
-    /// Below threshold, or a drop/reset cleared the last notice.
-    Unarmed,
-    /// A notice already fired with the conversation at this many tokens;
-    /// suppressed until a drop resets to `Unarmed` or the conversation grows
-    /// another [`CONTEXT_NOTICE_GROWTH_STEP`] past this level.
-    Notified { at_tokens: usize },
-}
-
-/// Fraction of the context window the conversation must grow by, past the
-/// size at which the last proactive size notice fired, before another one
-/// is allowed for the same crossing. Keeps the notice from repeating every
-/// round once the model is already above the threshold.
-const CONTEXT_NOTICE_GROWTH_STEP: f64 = 0.1;
-
-/// Group `log`'s droppable rows into maximal runs **by log order**, not by
-/// numerically-adjacent ids: a tool result's carrier sits right before it in
-/// the log but several ids away from the *previous* pair's result (carrier
-/// 40, result 41, carrier 42, result 43, …), so grouping by `id+1 == next`
-/// alone never merges a real two-call turn into one range. A run is a
-/// maximal consecutive stretch of [`is_droppable_role`] rows; any other row
-/// (user, plain-text assistant, …) ends the current run. A run's range is
-/// its first..last `_db_id`; its size is the sum of its tool-RESULT tokens
-/// only (carriers carry no reusable content). Returns the `top_n` runs by
-/// size descending.
-fn largest_tool_result_ranges(log: &[Value], top_n: usize) -> Vec<(MessageId, MessageId, usize)> {
-    let mut runs: Vec<(MessageId, MessageId, usize)> = Vec::new();
-    let mut current: Option<(MessageId, MessageId, usize)> = None;
-    for message in log {
-        if !is_droppable_role(message) {
-            if let Some(run) = current.take() {
-                runs.push(run);
-            }
-            continue;
-        }
-        let Some(id) = db_id(message) else {
-            continue; // droppable but not yet persisted: skip, don't break the run
-        };
-        let result_tokens = if message.get("role").and_then(Value::as_str) == Some("tool") {
-            TokenBudget::estimate_message_tokens(message)
-        } else {
-            0 // the tool-call carrier itself carries no result content
-        };
-        match &mut current {
-            Some(run) => {
-                run.1 = id;
-                run.2 += result_tokens;
-            }
-            None => current = Some((id, id, result_tokens)),
-        }
-    }
-    if let Some(run) = current.take() {
-        runs.push(run);
-    }
-    runs.sort_by(|a, b| b.2.cmp(&a.2));
-    runs.truncate(top_n);
-    runs
-}
-
-/// Render `tokens` as an approximate "Nk" label (rounded up, minimum 1k) —
-/// the advisory notice is a size hint, not an exact count.
-fn approx_k_label(tokens: usize) -> String {
-    format!("{}k", tokens.max(1).div_ceil(1000))
-}
-
-/// Build the `[System notice]` text for [`LcmEngine::context_size_notice`]:
-/// the conversation's approximate size against the window, the largest
-/// droppable tool-result ranges, and one worked `context` call for the
-/// single largest range.
-fn format_context_size_notice(conversation_tokens: usize, max_context: usize, log: &[Value]) -> String {
-    let ranges = largest_tool_result_ranges(log, 2);
-    let range_text = ranges
-        .iter()
-        .map(|&(start, end, tokens)| {
-            if start == end {
-                format!("seq {start} (~{})", approx_k_label(tokens))
-            } else {
-                format!("seq {start}-{end} (~{})", approx_k_label(tokens))
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let drop_spec = ranges
-        .first()
-        .map(|&(start, end, _)| {
-            if start == end {
-                start.to_string()
-            } else {
-                format!("{start}-{end}")
-            }
-        })
-        .unwrap_or_default();
-    format!(
-        "[System notice] Context ~{}/{} tokens. Largest tool results: {range_text}. \
-         If settled, context({{\"drop\":\"{drop_spec}\",\"note\":\"\u{2026}\"}}).",
-        approx_k_label(conversation_tokens),
-        approx_k_label(max_context),
-    )
-}
 
 // ---------------------------------------------------------------------------
 // LCM Engine
@@ -759,14 +653,6 @@ impl Default for LcmConfig {
 }
 
 impl LcmConfig {
-    /// Fraction of the context window the active (non-system) conversation
-    /// must exceed, with tool results present, before
-    /// [`LcmEngine::context_size_notice`] injects a `[System notice]`
-    /// pointing the model at `context`. Distinct from `tau_soft` (which
-    /// drives background compaction): this constant only shapes model-visible
-    /// advisory text, so it is fixed rather than a per-schema field.
-    pub const CONTEXT_NOTICE_THRESHOLD: f64 = 0.5;
-
     /// Bind the schema to the live runtime. Local runtimes checkpoint
     /// mechanically: a summary request there prefills the whole retired span
     /// and decodes a handoff on the same GPU the agent is waiting for, while
@@ -864,9 +750,6 @@ pub struct LcmEngine {
     /// A `context` edit queued by the tool this turn, applied by the loop
     /// (`apply_pending_context_edit`) before the next request goes out.
     pending_edit: Option<ContextEdit>,
-    /// Hysteresis state for the proactive context-size notice (see
-    /// [`ContextNoticeState`]).
-    notice_state: ContextNoticeState,
 }
 
 /// Mutable LCM state that must advance only after its SQLite checkpoint does.
@@ -892,7 +775,6 @@ impl LcmEngine {
             pending_pinned_prefix: None,
             dropped: std::collections::BTreeSet::new(),
             pending_edit: None,
-            notice_state: ContextNoticeState::Unarmed,
         }
     }
 
@@ -1002,54 +884,7 @@ impl LcmEngine {
 
         let ids: Vec<MessageId> = drop_set.iter().copied().collect();
         self.restore_dropped(ids.clone());
-        if !ids.is_empty() {
-            // The model just acted on the proactive notice (or dropped on its
-            // own initiative); either way the crossing it was about is gone.
-            self.notice_state = ContextNoticeState::Unarmed;
-        }
         ids
-    }
-
-    /// Build a proactive `[System notice]` nudging the model toward
-    /// `context` when the active conversation (excluding system) has grown
-    /// past `LcmConfig::CONTEXT_NOTICE_THRESHOLD` of `max_context` and the
-    /// live log carries tool results to drop. `log` is the round's live
-    /// message log (e.g. `ctx.messages`), not this engine's own `active`
-    /// mirror, so the estimate reflects tool results from the round still
-    /// being assembled. `None` below threshold, with no tool results, or
-    /// once already notified at this size — see [`ContextNoticeState`] for
-    /// the hysteresis that stops the notice from repeating every round.
-    pub fn context_size_notice(&mut self, log: &[Value], max_context: usize) -> Option<String> {
-        if max_context == 0 {
-            return None;
-        }
-        let has_tool_results = log
-            .iter()
-            .any(|m| m.get("role").and_then(Value::as_str) == Some("tool"));
-        if !has_tool_results {
-            self.notice_state = ContextNoticeState::Unarmed;
-            return None;
-        }
-
-        let tokens: usize = log
-            .iter()
-            .filter(|m| m.get("role").and_then(Value::as_str) != Some("system"))
-            .map(TokenBudget::estimate_message_tokens)
-            .sum();
-        let fraction = tokens as f64 / max_context as f64;
-        if fraction < LcmConfig::CONTEXT_NOTICE_THRESHOLD {
-            self.notice_state = ContextNoticeState::Unarmed;
-            return None;
-        }
-        if let ContextNoticeState::Notified { at_tokens } = self.notice_state {
-            let growth_step = (max_context as f64 * CONTEXT_NOTICE_GROWTH_STEP) as usize;
-            if tokens < at_tokens.saturating_add(growth_step) {
-                return None; // same crossing already notified
-            }
-        }
-
-        self.notice_state = ContextNoticeState::Notified { at_tokens: tokens };
-        Some(format_context_size_notice(tokens, max_context, log))
     }
 
     /// Replace already-ingested replay projections with their authoritative
@@ -7690,103 +7525,6 @@ mod tests {
             "the explicit id list drops the tool result (and its carrier via pair closure) \
              but silently refuses the user id"
         );
-    }
-
-    /// Proactive size notice: silent below the threshold, fires exactly once
-    /// naming the largest tool-result seq when the conversation (with tool
-    /// results present) crosses `LcmConfig::CONTEXT_NOTICE_THRESHOLD` of the
-    /// window, stays silent on the next round at the same size, and fires
-    /// again only once the conversation has grown past the hysteresis step.
-    #[test]
-    fn context_size_notice_fires_once_per_crossing_above_threshold() {
-        let mut engine = LcmEngine::new(context_edit_test_config());
-        // Realistic interleaved log: a tool result's carrier sits right
-        // before it, but the *next* pair's carrier is several ids past the
-        // previous pair's result — ranges must be built from log order, not
-        // from `id + 1 == next_id` over tool-result ids alone. A user row
-        // splits runs: pairs (2,3) and (4,5) share one run; (7,8) is a
-        // separate run after user(6) breaks it.
-        ingest(&mut engine, 1, "user", "question");
-        ingest_tool_pair(&mut engine, 1, "c1", "x".repeat(4000)); // carrier(2), result(3)
-        assert_eq!(
-            engine.ingest(json!({
-                "role": "assistant", "content": null,
-                "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "exec", "arguments": "{}"}}],
-                "_db_id": 4,
-            })),
-            Some(4)
-        );
-        assert_eq!(
-            engine.ingest(json!({
-                "role": "tool", "tool_call_id": "c2", "content": "y".repeat(4000), "_db_id": 5,
-            })),
-            Some(5)
-        );
-        ingest(&mut engine, 6, "user", "question two");
-        assert_eq!(
-            engine.ingest(json!({
-                "role": "assistant", "content": null,
-                "tool_calls": [{"id": "c3", "type": "function", "function": {"name": "exec", "arguments": "{}"}}],
-                "_db_id": 7,
-            })),
-            Some(7)
-        );
-        assert_eq!(
-            engine.ingest(json!({
-                "role": "tool", "tool_call_id": "c3", "content": "z".repeat(500), "_db_id": 8,
-            })),
-            Some(8)
-        );
-        let log = engine.active_context();
-        let tokens: usize = TokenBudget::estimate_tokens(
-            &log.iter()
-                .filter(|m| m.get("role").and_then(Value::as_str) != Some("system"))
-                .cloned()
-                .collect::<Vec<_>>(),
-        );
-        assert!(tokens > 0, "fixture must carry a non-trivial token count");
-
-        // Below threshold: a window ten times the conversation's size.
-        assert_eq!(
-            engine.context_size_notice(&log, tokens * 10),
-            None,
-            "below threshold must not fire"
-        );
-
-        // Above threshold: shrink the window so the conversation is exactly
-        // half of it (meets the 0.5 default threshold).
-        let max_context = tokens * 2;
-        let notice = engine
-            .context_size_notice(&log, max_context)
-            .expect("crossing the threshold with tool results present must fire");
-        assert!(notice.starts_with("[System notice]"));
-        assert!(
-            notice.contains("seq 2-5"),
-            "largest run must span carrier..result across both pairs, \
-             joined through the log (not just numerically adjacent tool-result ids); \
-             got: {notice}"
-        );
-
-        // Same round, no growth: suppressed (same crossing already notified).
-        assert_eq!(
-            engine.context_size_notice(&log, max_context),
-            None,
-            "must not repeat for the same crossing"
-        );
-
-        // Grow well past the hysteresis step (10% of the window) with
-        // another tool result; the next call fires again.
-        assert_eq!(
-            engine.ingest(json!({
-                "role": "tool", "tool_call_id": "c4", "content": "w".repeat(4000), "_db_id": 9,
-            })),
-            Some(9)
-        );
-        let grown_log = engine.active_context();
-        let notice2 = engine
-            .context_size_notice(&grown_log, max_context)
-            .expect("growth past the hysteresis step must fire again");
-        assert!(notice2.starts_with("[System notice]"));
     }
 
     #[test]

@@ -5091,7 +5091,6 @@ impl AgentLoopShared {
             return StepResult::Done(IterationOutcome::Error(e));
         }
         self.apply_pending_context_edit(ctx).await;
-        self.inject_context_size_notice(ctx).await;
         let executed = ctx
             .turn_tool_entries
             .len()
@@ -5166,33 +5165,6 @@ impl AgentLoopShared {
             if let Err(error) = ctx.persist_pending_protocol_messages().await {
                 warn!(session = %ctx.session_id, %error, "context note persistence failed");
             }
-        }
-    }
-
-    /// Proactively nudge the model toward `context` when the active
-    /// conversation has grown past `LcmConfig::CONTEXT_NOTICE_THRESHOLD` of
-    /// the window and there are tool results to drop.
-    ///
-    /// Reuses the exact tail-notice mechanism as the iteration-budget nudge
-    /// above (`push_draft` a synthetic user scaffold, picked up by
-    /// `render_to_wire` at the next `step_pre_call`): it only ever appends
-    /// to the unsent draft, so it can't touch `messages[0]` or any byte
-    /// already sent (KV prefix-cache contract). Gated on the `context` tool
-    /// actually being registered for this turn (e.g. absent under
-    /// `NANOBOT_TOOLS_ONLY`); the once-per-crossing hysteresis lives on the
-    /// per-session `LcmEngine` (`LcmEngine::context_size_notice`).
-    async fn inject_context_size_notice(&self, ctx: &mut TurnContext) {
-        if !ctx.tools.contains("context") {
-            return;
-        }
-        let Some(engine) = self.lcm_engines.lock().await.get(&ctx.session_id).cloned() else {
-            return;
-        };
-        let max_context = ctx.effective_budget.max_context();
-        let notice = engine.lock().await.context_size_notice(&ctx.messages, max_context);
-        if let Some(notice) = notice {
-            ctx.messages
-                .push_draft(crate::agent::markers::scaffold_user(notice));
         }
     }
 }
