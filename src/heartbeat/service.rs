@@ -287,13 +287,17 @@ impl HeartbeatService {
         }
 
         debug!("Maintenance: running `{}`", cmd);
-        let result = tokio::process::Command::new("sh")
+        let mut command = tokio::process::Command::new("sh");
+        command
             .arg("-c")
             .arg(cmd)
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .output();
+            .stderr(std::process::Stdio::piped());
+        // Process-group guard: `kill_on_drop` alone only reaches `sh`, not
+        // any grandchildren a pipeline in `cmd` forked. Dropping the
+        // in-flight future when the timeout below fires now kills the
+        // whole group.
+        let result = crate::process_group::output(&mut command);
 
         match tokio::time::timeout(Duration::from_secs(30), result).await {
             Ok(Ok(output)) => {

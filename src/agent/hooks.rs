@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::process::Stdio;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -74,7 +75,12 @@ pub async fn run_hook(
         cmd.env("NANOBOT_TOOL_OK", if ok { "true" } else { "false" });
     }
 
-    let output = match tokio::time::timeout(HOOK_TIMEOUT, cmd.output()).await {
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    // Process-group guard: if the timeout below fires, dropping the
+    // in-flight future kills the whole hook subprocess.
+    let output = match tokio::time::timeout(HOOK_TIMEOUT, crate::process_group::output(&mut cmd)).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
             warn!("Hook {} failed: {}", script.display(), e);
