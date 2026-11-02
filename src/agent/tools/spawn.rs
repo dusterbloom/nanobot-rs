@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use super::base::{PermissionLevel, Tool, ToolContext, ToolOutput, ToolResult};
+use super::base::{require_non_empty_string, PermissionLevel, Tool, ToolContext, ToolOutput, ToolResult};
 use crate::agent::host_bridge::{
     CancelRequest, CheckRequest, HostBridge, HostRequest, ListSubagentsRequest, LoopRequest,
     PipelineRequest, SpawnRequest, WaitRequest,
@@ -85,6 +85,14 @@ impl Tool for SpawnToolLite {
                 }
             }
         })
+    }
+
+    fn normalize_params(
+        &self,
+        called_as: &str,
+        params: &mut HashMap<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        self.0.normalize_params(called_as, params)
     }
 
     async fn execute(
@@ -435,6 +443,65 @@ impl Tool for SpawnTool {
             },
             "required": []
         })
+    }
+
+    /// Repairs model-emitted drift before `execute`: translates the
+    /// `wait/check/list/cancel` alias names the model sometimes calls
+    /// directly into `action`, aliases `id` -> `task_id`, and validates the
+    /// required arg for the resolved action (byte-identical error strings to
+    /// the pre-refactor registry-level checks).
+    fn normalize_params(
+        &self,
+        called_as: &str,
+        params: &mut HashMap<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        if !params.contains_key("action")
+            && matches!(called_as, "wait" | "check" | "list" | "cancel")
+        {
+            params.insert(
+                "action".to_string(),
+                serde_json::Value::String(called_as.to_string()),
+            );
+        }
+
+        let action = params
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("spawn")
+            .to_ascii_lowercase();
+        params.insert(
+            "action".to_string(),
+            serde_json::Value::String(action.clone()),
+        );
+
+        // Alias normalization for task_id.
+        if !params.contains_key("task_id") {
+            if let Some(id) = params.get("id").cloned() {
+                params.insert("task_id".to_string(), id);
+            }
+        }
+
+        match action.as_str() {
+            "spawn" | "loop" => require_non_empty_string(params, "task", "spawn")?,
+            "check" | "wait" | "cancel" => require_non_empty_string(params, "task_id", "spawn")?,
+            "pipeline" => match params.get("steps").and_then(|v| v.as_array()) {
+                Some(arr) if !arr.is_empty() => {}
+                _ => {
+                    return Err(
+                        "Tool 'spawn' with action='pipeline' requires non-empty 'steps' array"
+                            .to_string(),
+                    )
+                }
+            },
+            "list" => {}
+            _ => {
+                return Err(format!(
+                    "Tool 'spawn' has invalid action '{}'. Allowed: spawn, list, check, wait, cancel, pipeline, loop",
+                    action
+                ))
+            }
+        }
+        Ok(())
     }
 
     /// Typed entry point: parses the params into a typed [`SpawnAction`]
@@ -952,6 +1019,39 @@ mod tests {
             result,
             "Error parsing pipeline steps: invalid type: string \"not-an-array\", expected a sequence at line 1 column 14"
         );
+    }
+
+    #[test]
+    fn normalize_params_maps_alias_action_and_task_id_alias() {
+        let tool = SpawnTool::new(test_host(EchoHost));
+        let mut params = HashMap::new();
+        params.insert("id".to_string(), json!("abc123"));
+
+        tool.normalize_params("wait", &mut params).unwrap();
+
+        assert_eq!(params.get("action"), Some(&json!("wait")));
+        assert_eq!(params.get("task_id"), Some(&json!("abc123")));
+    }
+
+    #[test]
+    fn normalize_params_spawn_action_requires_task() {
+        let tool = SpawnTool::new(test_host(EchoHost));
+        let mut params = HashMap::new();
+
+        let err = tool.normalize_params("spawn", &mut params).unwrap_err();
+
+        assert!(err.contains("requires non-empty 'task'"), "{err}");
+    }
+
+    #[test]
+    fn normalize_params_check_action_requires_task_id() {
+        let tool = SpawnTool::new(test_host(EchoHost));
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), json!("check"));
+
+        let err = tool.normalize_params("spawn", &mut params).unwrap_err();
+
+        assert!(err.contains("requires non-empty 'task_id'"), "{err}");
     }
 
     #[test]

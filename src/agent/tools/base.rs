@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::audit::ToolEvent;
@@ -34,6 +35,43 @@ macro_rules! require_param {
     };
 }
 pub(crate) use require_param;
+
+/// Promote the first present alias to `canonical`, if `canonical` is absent.
+///
+/// Shared by tools whose params drift under common alternate names the model
+/// invents (e.g. `file_path`/`filepath`/`file` -> `path`). Called from each
+/// tool's own [`Tool::normalize_params`] so alias repair lives with the tool
+/// that owns the canonical param name, not in the registry.
+pub(crate) fn normalize_param_aliases(
+    params: &mut HashMap<String, Value>,
+    canonical: &str,
+    aliases: &[&str],
+) {
+    if params.contains_key(canonical) {
+        return;
+    }
+    for alias in aliases {
+        if let Some(v) = params.get(*alias).cloned() {
+            params.insert(canonical.to_string(), v);
+            return;
+        }
+    }
+}
+
+/// Validate that `params[key]` is present and a non-empty (trimmed) string.
+pub(crate) fn require_non_empty_string(
+    params: &HashMap<String, Value>,
+    key: &str,
+    tool_name: &str,
+) -> Result<(), String> {
+    match params.get(key).and_then(|v| v.as_str()).map(str::trim) {
+        Some(s) if !s.is_empty() => Ok(()),
+        _ => Err(format!(
+            "Tool '{}' requires non-empty '{}' parameter",
+            tool_name, key
+        )),
+    }
+}
 
 /// Permission level required to execute a tool.
 ///
@@ -313,6 +351,16 @@ pub trait Tool: Send + Sync {
 
     /// JSON Schema for tool parameters.
     fn parameters(&self) -> serde_json::Value;
+
+    /// Repair alias/drifted params and validate required ones before execute.
+    /// `called_as` is the name the model used (may be an alias, e.g. "wait" for spawn).
+    fn normalize_params(
+        &self,
+        _called_as: &str,
+        _params: &mut HashMap<String, Value>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
 
     /// Execute the tool with given parameters (error protocol §2.6 Phase 3:
     /// the one execution method — typed result, context always carried).

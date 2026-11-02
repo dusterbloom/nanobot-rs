@@ -28,9 +28,21 @@ use async_trait::async_trait;
 use regex::RegexBuilder;
 use sha2::{Digest, Sha256};
 
-use super::base::{PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolResult};
+use super::base::{
+    normalize_param_aliases, require_non_empty_string, PermissionLevel, Tool, ToolConcurrency,
+    ToolContext, ToolResult,
+};
 use crate::agent::context_hygiene::INLINE_TOOL_RESULT_MAX_BYTES;
 use crate::errors::ToolError;
+
+/// Param aliases a model sometimes sends instead of `path` on a file tool
+/// (`read_file`/`write_file`/`edit_file`). Shared so every file tool's
+/// `normalize_params` repairs the same drift the same way.
+pub(crate) const FILE_PATH_ALIASES: &[&str] = &["file_path", "filepath", "file"];
+
+/// Param aliases a model sometimes sends instead of `path` on a directory
+/// tool (`list_dir`/`search_files`).
+pub(crate) const DIR_PATH_ALIASES: &[&str] = &["dir_path", "directory", "dir"];
 
 /// Extract a required string parameter, returning an error string on missing.
 /// Typed param extractor (error protocol Phase 2): the message preserves
@@ -113,6 +125,17 @@ impl Tool for ReadFileTool {
 
     fn concurrency(&self) -> ToolConcurrency {
         ToolConcurrency::ParallelSafe
+    }
+
+    /// Promotes `file_path`/`filepath`/`file` aliases to `path`, then
+    /// requires a non-empty `path`.
+    fn normalize_params(
+        &self,
+        _called_as: &str,
+        params: &mut HashMap<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        normalize_param_aliases(params, "path", FILE_PATH_ALIASES);
+        require_non_empty_string(params, "path", self.name())
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -361,6 +384,17 @@ impl Tool for EditFileTool {
         PermissionLevel::Write
     }
 
+    /// Promotes `file_path`/`filepath`/`file` aliases to `path`, then
+    /// requires a non-empty `path`.
+    fn normalize_params(
+        &self,
+        _called_as: &str,
+        params: &mut HashMap<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        normalize_param_aliases(params, "path", FILE_PATH_ALIASES);
+        require_non_empty_string(params, "path", self.name())
+    }
+
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -556,6 +590,16 @@ impl Tool for ListDirTool {
         ToolConcurrency::ParallelSafe
     }
 
+    /// Promotes `dir_path`/`directory`/`dir` aliases to `path`.
+    fn normalize_params(
+        &self,
+        _called_as: &str,
+        params: &mut HashMap<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        normalize_param_aliases(params, "path", DIR_PATH_ALIASES);
+        Ok(())
+    }
+
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -689,6 +733,16 @@ impl Tool for SearchFilesTool {
 
     fn description(&self) -> &str {
         "Recursively search file contents under a directory. Supports plain text or regex queries, file glob filters, context lines, depth/size/limit bounds, and skips common vendor/build directories by default."
+    }
+
+    /// Promotes `dir_path`/`directory`/`dir` aliases to `path`.
+    fn normalize_params(
+        &self,
+        _called_as: &str,
+        params: &mut HashMap<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        normalize_param_aliases(params, "path", DIR_PATH_ALIASES);
+        Ok(())
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -1515,6 +1569,27 @@ mod tests {
     // ReadFileTool tests
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn test_read_file_normalize_params_promotes_path_aliases() {
+        let tool = ReadFileTool::default();
+
+        // file_path wins over file when both are present.
+        let mut params = make_params(&[("file_path", "/correct.txt"), ("file", "/wrong.txt")]);
+        tool.normalize_params("read_file", &mut params).unwrap();
+        assert_eq!(params["path"], serde_json::json!("/correct.txt"));
+
+        for alias in ["file_path", "filepath", "file"] {
+            let mut params = make_params(&[(alias, "/tmp/test.txt")]);
+            tool.normalize_params("read_file", &mut params).unwrap();
+            assert_eq!(params["path"], serde_json::json!("/tmp/test.txt"), "{alias}");
+        }
+
+        let err = tool
+            .normalize_params("read_file", &mut HashMap::new())
+            .unwrap_err();
+        assert!(err.contains("requires non-empty 'path'"), "{err}");
+    }
+
     // make_params is defined at module level (above this `mod tests`) so that
     // per-tool submodules can access it via `super::super::make_params`.
     #[tokio::test]
@@ -2171,6 +2246,20 @@ mod tests {
     // EditFileTool tests
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn test_edit_file_normalize_params_promotes_path_aliases() {
+        let tool = EditFileTool::default();
+
+        let mut params = make_params(&[("filepath", "/tmp/edit.txt")]);
+        tool.normalize_params("edit_file", &mut params).unwrap();
+        assert_eq!(params["path"], serde_json::json!("/tmp/edit.txt"));
+
+        let err = tool
+            .normalize_params("edit_file", &mut HashMap::new())
+            .unwrap_err();
+        assert!(err.contains("requires non-empty 'path'"), "{err}");
+    }
+
     #[tokio::test]
     async fn test_edit_file_replace_string() {
         let dir = TempDir::new().unwrap();
@@ -2433,6 +2522,16 @@ mod tests {
     // ListDirTool tests
     // -----------------------------------------------------------------------
 
+    #[test]
+    fn test_list_dir_normalize_params_promotes_dir_aliases() {
+        let tool = ListDirTool;
+        for alias in ["directory", "dir", "dir_path"] {
+            let mut params = make_params(&[(alias, "/tmp")]);
+            tool.normalize_params("list_dir", &mut params).unwrap();
+            assert_eq!(params["path"], serde_json::json!("/tmp"), "{alias}");
+        }
+    }
+
     #[tokio::test]
     async fn test_list_dir_basic() {
         let dir = TempDir::new().unwrap();
@@ -2511,6 +2610,14 @@ mod tests {
     // -----------------------------------------------------------------------
     // SearchFilesTool tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_search_files_normalize_params_promotes_dir_aliases() {
+        let tool = SearchFilesTool;
+        let mut params = make_params(&[("directory", "/tmp")]);
+        tool.normalize_params("search_files", &mut params).unwrap();
+        assert_eq!(params["path"], serde_json::json!("/tmp"));
+    }
 
     #[tokio::test]
     async fn test_search_files_finds_plain_text_with_context() {
