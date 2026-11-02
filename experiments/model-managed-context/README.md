@@ -207,3 +207,18 @@ same repo, temp 0, so the likeliest cause is the changed prompt (standing skill,
 The task does not exercise the mechanism: it is a numbered script (no settled
 subproblem to checkpoint after) peaking near 9k of a 32k window. Whether Clover
 adopts `context` needs an open-ended task that crosses the window.
+
+## Rerun 2026-11-02 (guidance fixes: drop scope, required note, DRY text, size notice)
+
+Same setup (Higgs, Clover-35B-A3B-Preview-MLX-4bit, temp 0, n=1 per arm, cold restart).
+Arm A = main incl. d9ec349/e2fa758; Arm B = branch with the fixes.
+
+| arm | requests | mean prompt tok/req | cache hit % | total prompt tok | success | `context` calls |
+|-----|----------|---------------------|-------------|------------------|---------|-----------------|
+| A:main | 9 | 8,037 | 83.0% | 72,332 | yes | 0 |
+| B:branch | 9 | 8,222 | 83.1% | 74,000 (+2.3%) | yes | 0 |
+
+PromptDelta: 0 diverged in either arm. The +65% from the previous rerun is gone
+(no extra `inspect_tool_result` pages). Still no adoption signal: the task peaks
+near 9k of 32k, below the 0.5 size-notice threshold, so the notice never fires.
+Adoption needs a task that crosses ~16k.

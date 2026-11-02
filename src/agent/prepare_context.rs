@@ -46,15 +46,12 @@ const LCM_EXPAND_GUIDE: &str =
      session=KEY) with that session's key — do not call lcm_expand for past sessions. \
      \n\n\
      During substantial tool work, edit your context at useful checkpoints: after settling a \
-     subproblem (a fix proved, a file understood) and before your final answer; not after every \
-     tool call, not while a subproblem is still open (if you must, keep blocks you still use). \
-     Every tool result ends with its seq, [seq 57]. Edit in one call: \
-     context({\"drop\":\"12-56\",\"note\":\"…\"}) drops those blocks; \
-     context({\"drop\":\"all\",\"keep\":\"57\",\"note\":\"…\"}) keeps only seq 57. The note \
-     is your own words, kept at the end: constraints, decisions, verified state, open work, \
-     evidence pointers. Window headroom is not the test: kept blocks ride every request, so drop \
-     settled ones you will not reread; a drop is lossless, lcm_expand({\"message_ids\":\"57\"}) \
-     reads one back. Correctness outranks size.";
+     subproblem, before your final answer — not after every tool call. Every tool result ends \
+     with its seq, [seq 57]. Edit in one call: context({\"drop\":\"12-56\",\"note\":\"…\"}), \
+     noting constraints, decisions, and open work. A note is required whenever you drop. Only \
+     tool-call/result blocks are ever dropped — your own and the user's messages are never \
+     touched. A drop is lossless: lcm_expand({\"message_ids\":\"57\"}) reads any block back. \
+     Correctness outranks size.";
 
 /// Append the previous-session continuity note to the system message.
 ///
