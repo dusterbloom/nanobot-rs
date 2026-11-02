@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tokio::process::Command;
 
-use super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
+use super::base::{require_non_empty_string, PermissionLevel, Tool, ToolContext, ToolResult};
 use crate::errors::ToolError;
 
 /// Default command timeout in seconds.
@@ -126,6 +126,25 @@ impl Tool for BrowserTool {
 
     fn is_available(&self) -> bool {
         *BINARY_AVAILABLE.get_or_init(check_binary)
+    }
+
+    /// Promotes the `element`/`selector` aliases a model sometimes sends
+    /// instead of `ref`, then requires a non-empty `action`.
+    fn normalize_params(
+        &self,
+        _called_as: &str,
+        params: &mut HashMap<String, Value>,
+    ) -> Result<(), String> {
+        if !params.contains_key("ref") {
+            if let Some(v) = params
+                .get("element")
+                .cloned()
+                .or_else(|| params.get("selector").cloned())
+            {
+                params.insert("ref".to_string(), v);
+            }
+        }
+        require_non_empty_string(params, "action", "browser")
     }
 
     async fn execute(&self, params: HashMap<String, Value>, _ctx: &ToolContext) -> ToolResult {
@@ -358,6 +377,33 @@ mod tests {
         assert!(actions.contains(&Value::String("wait".to_string())));
         let required = params["required"].as_array().unwrap();
         assert_eq!(required, &[Value::String("action".to_string())]);
+    }
+
+    #[test]
+    fn test_normalize_params_promotes_element_and_selector_to_ref() {
+        let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
+
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), Value::String("click".to_string()));
+        params.insert("element".to_string(), Value::String("@e2".to_string()));
+        tool.normalize_params("browser", &mut params).unwrap();
+        assert_eq!(params.get("ref"), Some(&Value::String("@e2".to_string())));
+
+        let mut params = HashMap::new();
+        params.insert("action".to_string(), Value::String("click".to_string()));
+        params.insert("selector".to_string(), Value::String("#id".to_string()));
+        tool.normalize_params("browser", &mut params).unwrap();
+        assert_eq!(params.get("ref"), Some(&Value::String("#id".to_string())));
+    }
+
+    #[test]
+    fn test_normalize_params_rejects_missing_action() {
+        let tool = BrowserTool::new(TEST_MAX_OUTPUT_CHARS);
+        let mut params = HashMap::new();
+
+        let err = tool.normalize_params("browser", &mut params).unwrap_err();
+
+        assert!(err.contains("requires non-empty 'action'"), "{err}");
     }
 
     #[test]

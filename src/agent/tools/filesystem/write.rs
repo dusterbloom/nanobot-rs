@@ -14,9 +14,13 @@ use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use super::super::base::{PermissionLevel, Tool, ToolContext, ToolResult};
+use super::super::base::{
+    normalize_param_aliases, require_non_empty_string, PermissionLevel, Tool, ToolContext,
+    ToolResult,
+};
 use super::{
     expand_path, idle_write_allowed, idle_write_denied_err, normalize_lexical, require_param,
+    FILE_PATH_ALIASES,
 };
 use crate::errors::ToolError;
 
@@ -369,6 +373,17 @@ impl Tool for WriteFileTool {
         PermissionLevel::Write
     }
 
+    /// Promotes `file_path`/`filepath`/`file` aliases to `path`, then
+    /// requires a non-empty `path`.
+    fn normalize_params(
+        &self,
+        _called_as: &str,
+        params: &mut HashMap<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        normalize_param_aliases(params, "path", FILE_PATH_ALIASES);
+        require_non_empty_string(params, "path", self.name())
+    }
+
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -512,6 +527,22 @@ mod tests {
     use super::super::make_params;
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn test_write_file_normalize_params_promotes_path_aliases() {
+        let tool = WriteFileTool::default();
+
+        for alias in ["file_path", "filepath", "file"] {
+            let mut params = make_params(&[(alias, "/tmp/out.txt")]);
+            tool.normalize_params("write_file", &mut params).unwrap();
+            assert_eq!(params["path"], serde_json::json!("/tmp/out.txt"), "{alias}");
+        }
+
+        let err = tool
+            .normalize_params("write_file", &mut HashMap::new())
+            .unwrap_err();
+        assert!(err.contains("requires non-empty 'path'"), "{err}");
+    }
 
     #[tokio::test]
     async fn test_write_file_creates_file() {

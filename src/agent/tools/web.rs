@@ -20,7 +20,10 @@ use reqwest::Client;
 use std::sync::{Arc, LazyLock};
 use url::Url;
 
-use super::base::{require_param, PermissionLevel, Tool, ToolConcurrency, ToolContext, ToolResult};
+use super::base::{
+    require_non_empty_string, require_param, PermissionLevel, Tool, ToolConcurrency, ToolContext,
+    ToolResult,
+};
 use crate::agent::audit::ToolEvent;
 use crate::errors::ToolError;
 
@@ -433,6 +436,23 @@ impl Tool for WebSearchTool {
             },
             "required": ["query"]
         })
+    }
+
+    /// Promotes the `q`/`search_query` aliases a model sometimes sends
+    /// instead of `query`, then requires a non-empty `query`.
+    fn normalize_params(
+        &self,
+        _called_as: &str,
+        params: &mut HashMap<String, serde_json::Value>,
+    ) -> Result<(), String> {
+        if !params.contains_key("query") {
+            if let Some(v) = params.get("q").cloned() {
+                params.insert("query".to_string(), v);
+            } else if let Some(v) = params.get("search_query").cloned() {
+                params.insert("query".to_string(), v);
+            }
+        }
+        require_non_empty_string(params, "query", "web_search")
     }
 
     /// Returns `true` when at least one search backend is configured.
@@ -1841,6 +1861,39 @@ mod tests {
             "http://localhost:8888".to_string(),
         );
         assert_eq!(tool.name(), "web_search");
+    }
+
+    #[test]
+    fn test_normalize_params_promotes_q_alias_to_query() {
+        let tool = WebSearchTool::new(
+            None,
+            5,
+            "searxng".to_string(),
+            "http://localhost:8888".to_string(),
+        );
+        let mut params = HashMap::new();
+        params.insert("q".to_string(), serde_json::json!("latest news"));
+
+        tool.normalize_params("web_search", &mut params).unwrap();
+
+        assert_eq!(params.get("query"), Some(&serde_json::json!("latest news")));
+    }
+
+    #[test]
+    fn test_normalize_params_rejects_empty_query() {
+        let tool = WebSearchTool::new(
+            None,
+            5,
+            "searxng".to_string(),
+            "http://localhost:8888".to_string(),
+        );
+        let mut params = HashMap::new();
+
+        let err = tool
+            .normalize_params("web_search", &mut params)
+            .unwrap_err();
+
+        assert!(err.contains("requires non-empty 'query'"), "{err}");
     }
 
     #[tokio::test]

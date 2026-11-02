@@ -129,11 +129,15 @@ enum ProxyCall {
 impl ToolRegistry {
     /// Normalize model-emitted tool names/params into canonical tool contract.
     ///
-    /// This keeps small/local models focused by repairing common drift:
-    /// - alias tool names (`wait/check/list/cancel` -> `spawn` with action)
-    /// - parameter aliases (`q` -> `query`, `file` -> `path`, etc.)
-    /// - strict required-arg validation by action
+    /// This keeps small/local models focused by repairing common drift. Only
+    /// generic stages live here: alias tool-name resolution, and unwrapping a
+    /// mistaken dispatcher envelope. Everything tool-specific (param aliases,
+    /// required-arg validation) is delegated to the resolved tool's own
+    /// [`Tool::normalize_params`] — a call naming a tool that isn't
+    /// registered simply skips that stage, so execution reports "not found"
+    /// exactly as before.
     fn normalize_tool_request(
+        &self,
         name: &str,
         mut params: HashMap<String, Value>,
     ) -> Result<(String, HashMap<String, Value>), String> {
@@ -147,125 +151,58 @@ impl ToolRegistry {
             other => other,
         };
 
-        if canonical_name == "spawn" {
-            // If the model called alias tools directly, translate to spawn actions.
-            if !params.contains_key("action") {
-                if matches!(name, "wait" | "check" | "list" | "cancel") {
-                    params.insert("action".to_string(), Value::String(name.to_string()));
-                }
-            }
+        params = Self::unwrap_dispatcher_envelope(name, canonical_name, params);
 
-            let action = params
-                .get("action")
-                .and_then(|v| v.as_str())
-                .unwrap_or("spawn")
-                .to_ascii_lowercase();
-            params.insert("action".to_string(), Value::String(action.clone()));
-
-            // Alias normalization for task_id.
-            if !params.contains_key("task_id") {
-                if let Some(id) = params.get("id").cloned() {
-                    params.insert("task_id".to_string(), id);
-                }
-            }
-
-            match action.as_str() {
-                "spawn" | "loop" => {
-                    Self::require_non_empty_string(&params, "task", "spawn")?;
-                }
-                "check" | "wait" | "cancel" => {
-                    Self::require_non_empty_string(&params, "task_id", "spawn")?;
-                }
-                "pipeline" => match params.get("steps").and_then(|v| v.as_array()) {
-                    Some(arr) if !arr.is_empty() => {}
-                    _ => {
-                        return Err(
-                            "Tool 'spawn' with action='pipeline' requires non-empty 'steps' array"
-                                .to_string(),
-                        )
-                    }
-                },
-                "list" => {}
-                _ => {
-                    return Err(format!(
-                        "Tool 'spawn' has invalid action '{}'. Allowed: spawn, list, check, wait, cancel, pipeline, loop",
-                        action
-                    ))
-                }
-            }
-        }
-
-        if canonical_name == "web_search" {
-            if !params.contains_key("query") {
-                if let Some(v) = params.get("q").cloned() {
-                    params.insert("query".to_string(), v);
-                } else if let Some(v) = params.get("search_query").cloned() {
-                    params.insert("query".to_string(), v);
-                }
-            }
-            Self::require_non_empty_string(&params, "query", "web_search")?;
-        }
-
-        if canonical_name == "browser" {
-            // Normalize element/selector → ref
-            if !params.contains_key("ref") {
-                if let Some(v) = params
-                    .get("element")
-                    .cloned()
-                    .or_else(|| params.get("selector").cloned())
-                {
-                    params.insert("ref".to_string(), v);
-                }
-            }
-            Self::require_non_empty_string(&params, "action", "browser")?;
-        }
-
-        // Normalize path aliases for file tools.
-        let file_aliases: &[&str] = &["file_path", "filepath", "file"];
-        let dir_aliases: &[&str] = &["dir_path", "directory", "dir"];
-
-        match canonical_name {
-            "read_file" | "write_file" | "edit_file" => {
-                Self::normalize_param_aliases(&mut params, "path", file_aliases);
-                Self::require_non_empty_string(&params, "path", canonical_name)?;
-            }
-            "list_dir" | "search_files" => {
-                Self::normalize_param_aliases(&mut params, "path", dir_aliases);
-            }
-            _ => {}
+        if let Some(tool) = self.tools.get(canonical_name) {
+            tool.normalize_params(name, &mut params)?;
         }
 
         Ok((canonical_name.to_string(), params))
     }
 
-    fn normalize_param_aliases(
-        params: &mut HashMap<String, Value>,
-        canonical: &str,
-        aliases: &[&str],
-    ) {
-        if params.contains_key(canonical) {
-            return;
+    /// Unwraps a direct tool call whose arguments got mistakenly wrapped in
+    /// the dispatcher's `{tool_name, tool_args}` envelope, e.g. local models
+    /// sometimes emit `spawn({"tool_args":{"action":"spawn","task":"x"}})`
+    /// instead of `spawn({"action":"spawn","task":"x"})`.
+    ///
+    /// Only unwraps when `params` is exactly a (possibly stringified)
+    /// `tool_args` object, with no key other than an optional `tool_name`
+    /// that names this same call (`name` or `canonical_name`). Anything else
+    /// — extra keys, a mismatched `tool_name`, a non-object `tool_args` — is
+    /// left untouched, since those are real tool parameters, not drift.
+    fn unwrap_dispatcher_envelope(
+        name: &str,
+        canonical_name: &str,
+        params: HashMap<String, Value>,
+    ) -> HashMap<String, Value> {
+        // This is the dispatcher's own call shape, not drift to repair.
+        if matches!(name, "get_tools" | "tool") {
+            return params;
         }
-        for alias in aliases {
-            if let Some(v) = params.get(*alias).cloned() {
-                params.insert(canonical.to_string(), v);
-                return;
+        let Some(tool_args) = params.get("tool_args") else {
+            return params;
+        };
+        let only_envelope_keys = params
+            .keys()
+            .all(|k| k == "tool_args" || k == "tool_name");
+        if !only_envelope_keys {
+            return params;
+        }
+        if let Some(selector) = params.get("tool_name").and_then(|v| v.as_str()) {
+            if selector != name && selector != canonical_name {
+                return params;
             }
         }
-    }
 
-    fn require_non_empty_string(
-        params: &HashMap<String, Value>,
-        key: &str,
-        tool_name: &str,
-    ) -> Result<(), String> {
-        match params.get(key).and_then(|v| v.as_str()).map(str::trim) {
-            Some(s) if !s.is_empty() => Ok(()),
-            _ => Err(format!(
-                "Tool '{}' requires non-empty '{}' parameter",
-                tool_name, key
-            )),
-        }
+        let unwrapped = match tool_args {
+            Value::Object(map) => Some(map.clone()),
+            Value::String(s) => match serde_json::from_str::<Value>(s) {
+                Ok(Value::Object(map)) => Some(map),
+                _ => None,
+            },
+            _ => None,
+        };
+        unwrapped.map_or(params, |map| map.into_iter().collect())
     }
 
     /// Create a new, empty registry.
@@ -618,7 +555,7 @@ impl ToolRegistry {
         params: HashMap<String, serde_json::Value>,
         ctx: Option<&ToolContext>,
     ) -> ToolExecutionResult {
-        let (name, params) = match Self::normalize_tool_request(name, params) {
+        let (name, params) = match self.normalize_tool_request(name, params) {
             Ok(v) => v,
             Err(e) => return ToolExecutionResult::failure(e),
         };
@@ -1780,272 +1717,51 @@ mod tests {
         assert!(result.error().unwrap_or_default().contains("not found"));
     }
 
+    // Spawn's own alias-mapping and action-validation behavior (wait/check →
+    // action, task_id required, etc.) is exercised in
+    // `spawn.rs`'s `normalize_params` tests — the logic now lives on
+    // `SpawnTool` itself, not in the registry.
+
     #[tokio::test]
-    async fn test_execute_alias_wait_maps_to_spawn_action() {
+    async fn test_execute_unwraps_dispatcher_envelope_on_direct_call() {
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(ParamEchoTool::new("spawn")));
 
+        // Bare envelope, no tool_name: spawn({"tool_args":{"action":"list"}})
         let mut params = HashMap::new();
         params.insert(
-            "task_id".to_string(),
-            serde_json::Value::String("abc123".to_string()),
+            "tool_args".to_string(),
+            serde_json::json!({"action": "list"}),
         );
-
-        let result = registry.execute("wait", params).await;
-        assert!(result.ok(), "{}", result.data());
-        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
-        assert_eq!(parsed["action"], "wait");
-        assert_eq!(parsed["task_id"], "abc123");
-    }
-
-    #[tokio::test]
-    async fn test_execute_spawn_requires_task_for_spawn_action() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ParamEchoTool::new("spawn")));
-
-        let result = registry.execute("spawn", HashMap::new()).await;
-        assert!(!result.ok());
-        assert!(result
-            .error()
-            .unwrap_or_default()
-            .contains("requires non-empty 'task'"));
-    }
-
-    #[tokio::test]
-    async fn test_execute_spawn_check_requires_task_id() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ParamEchoTool::new("spawn")));
-
-        let mut params = HashMap::new();
-        params.insert(
-            "action".to_string(),
-            serde_json::Value::String("check".to_string()),
-        );
-
         let result = registry.execute("spawn", params).await;
-        assert!(!result.ok());
-        assert!(result
-            .error()
-            .unwrap_or_default()
-            .contains("requires non-empty 'task_id'"));
-    }
-
-    #[tokio::test]
-    async fn test_execute_web_search_normalizes_q_to_query() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ParamEchoTool::new("web_search")));
-
-        let mut params = HashMap::new();
-        params.insert(
-            "q".to_string(),
-            serde_json::Value::String("latest news".to_string()),
-        );
-
-        let result = registry.execute("web_search", params).await;
         assert!(result.ok(), "{}", result.data());
-        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
-        assert_eq!(parsed["query"], "latest news");
-    }
+        let parsed: serde_json::Value = serde_json::from_str(result.data()).unwrap();
+        assert_eq!(parsed["action"], "list");
+        assert!(parsed.get("tool_args").is_none());
 
-    #[tokio::test]
-    async fn test_read_file_file_path_alias() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ParamEchoTool::new("read_file")));
-
+        // Envelope with matching tool_name: spawn({"tool_name":"spawn","tool_args":{"action":"spawn","task":"x"}})
         let mut params = HashMap::new();
         params.insert(
-            "file_path".to_string(),
-            serde_json::Value::String("/tmp/test.txt".to_string()),
+            "tool_name".to_string(),
+            serde_json::Value::String("spawn".to_string()),
         );
-
-        let result = registry.execute("read_file", params).await;
-        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
-        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
-        assert_eq!(parsed["path"], "/tmp/test.txt");
+        params.insert(
+            "tool_args".to_string(),
+            serde_json::json!({"action": "spawn", "task": "x"}),
+        );
+        let result = registry.execute("spawn", params).await;
+        assert!(result.ok(), "{}", result.data());
+        let parsed: serde_json::Value = serde_json::from_str(result.data()).unwrap();
+        assert_eq!(parsed["action"], "spawn");
+        assert_eq!(parsed["task"], "x");
+        assert!(parsed.get("tool_name").is_none());
     }
 
-    #[tokio::test]
-    async fn test_read_file_filepath_alias() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ParamEchoTool::new("read_file")));
-
-        let mut params = HashMap::new();
-        params.insert(
-            "filepath".to_string(),
-            serde_json::Value::String("/tmp/test.txt".to_string()),
-        );
-
-        let result = registry.execute("read_file", params).await;
-        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
-        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
-        assert_eq!(parsed["path"], "/tmp/test.txt");
-    }
-
-    #[tokio::test]
-    async fn test_read_file_file_alias_still_works() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ParamEchoTool::new("read_file")));
-
-        let mut params = HashMap::new();
-        params.insert(
-            "file".to_string(),
-            serde_json::Value::String("/tmp/test.txt".to_string()),
-        );
-
-        let result = registry.execute("read_file", params).await;
-        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
-        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
-        assert_eq!(parsed["path"], "/tmp/test.txt");
-    }
-
-    #[tokio::test]
-    async fn test_read_file_path_alias_priority_file_path_over_file() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ParamEchoTool::new("read_file")));
-
-        // When both file_path and file are present, file_path wins.
-        let mut params = HashMap::new();
-        params.insert(
-            "file_path".to_string(),
-            serde_json::Value::String("/correct.txt".to_string()),
-        );
-        params.insert(
-            "file".to_string(),
-            serde_json::Value::String("/wrong.txt".to_string()),
-        );
-
-        let result = registry.execute("read_file", params).await;
-        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
-        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
-        assert_eq!(parsed["path"], "/correct.txt");
-    }
-
-    #[tokio::test]
-    async fn test_write_file_file_path_alias() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ParamEchoTool::new("write_file")));
-
-        let mut params = HashMap::new();
-        params.insert(
-            "file_path".to_string(),
-            serde_json::Value::String("/tmp/out.txt".to_string()),
-        );
-        params.insert(
-            "content".to_string(),
-            serde_json::Value::String("hello".to_string()),
-        );
-
-        let result = registry.execute("write_file", params).await;
-        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
-        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
-        assert_eq!(parsed["path"], "/tmp/out.txt");
-    }
-
-    #[tokio::test]
-    async fn test_write_file_filepath_alias() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ParamEchoTool::new("write_file")));
-
-        let mut params = HashMap::new();
-        params.insert(
-            "filepath".to_string(),
-            serde_json::Value::String("/tmp/out.txt".to_string()),
-        );
-        params.insert(
-            "content".to_string(),
-            serde_json::Value::String("hello".to_string()),
-        );
-
-        let result = registry.execute("write_file", params).await;
-        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
-        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
-        assert_eq!(parsed["path"], "/tmp/out.txt");
-    }
-
-    #[tokio::test]
-    async fn test_edit_file_file_path_alias() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ParamEchoTool::new("edit_file")));
-
-        let mut params = HashMap::new();
-        params.insert(
-            "file_path".to_string(),
-            serde_json::Value::String("/tmp/edit.txt".to_string()),
-        );
-
-        let result = registry.execute("edit_file", params).await;
-        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
-        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
-        assert_eq!(parsed["path"], "/tmp/edit.txt");
-    }
-
-    #[tokio::test]
-    async fn test_edit_file_filepath_alias() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ParamEchoTool::new("edit_file")));
-
-        let mut params = HashMap::new();
-        params.insert(
-            "filepath".to_string(),
-            serde_json::Value::String("/tmp/edit.txt".to_string()),
-        );
-
-        let result = registry.execute("edit_file", params).await;
-        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
-        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
-        assert_eq!(parsed["path"], "/tmp/edit.txt");
-    }
-
-    #[tokio::test]
-    async fn test_list_dir_directory_alias() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ParamEchoTool::new("list_dir")));
-
-        let mut params = HashMap::new();
-        params.insert(
-            "directory".to_string(),
-            serde_json::Value::String("/tmp".to_string()),
-        );
-
-        let result = registry.execute("list_dir", params).await;
-        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
-        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
-        assert_eq!(parsed["path"], "/tmp");
-    }
-
-    #[tokio::test]
-    async fn test_list_dir_dir_alias() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ParamEchoTool::new("list_dir")));
-
-        let mut params = HashMap::new();
-        params.insert(
-            "dir".to_string(),
-            serde_json::Value::String("/tmp".to_string()),
-        );
-
-        let result = registry.execute("list_dir", params).await;
-        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
-        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
-        assert_eq!(parsed["path"], "/tmp");
-    }
-
-    #[tokio::test]
-    async fn test_list_dir_dir_path_alias() {
-        let mut registry = ToolRegistry::new();
-        registry.register(Box::new(ParamEchoTool::new("list_dir")));
-
-        let mut params = HashMap::new();
-        params.insert(
-            "dir_path".to_string(),
-            serde_json::Value::String("/tmp".to_string()),
-        );
-
-        let result = registry.execute("list_dir", params).await;
-        assert!(result.ok(), "Expected ok, got error: {:?}", result.error());
-        let parsed: serde_json::Value = serde_json::from_str(&result.data()).unwrap();
-        assert_eq!(parsed["path"], "/tmp");
-    }
+    // web_search's query-alias normalization and the file tools' path-alias
+    // normalization (read_file/write_file/edit_file/list_dir/search_files)
+    // are exercised directly on each tool's `normalize_params` in
+    // `web.rs` and `filesystem/mod.rs`/`filesystem/write.rs` — that logic
+    // now lives on the tools themselves, not in the registry.
 
     // -----------------------------------------------------------------------
     // condense_description tests
@@ -3133,8 +2849,9 @@ mod tests {
     /// a separate follow-up — not yet applied — so they aren't aliased here.)
     #[test]
     fn normalize_routes_old_tool_names_to_new_targets() {
+        let reg = ToolRegistry::new();
         for (old, new) in [("session_search", "recall"), ("search_context", "recall")] {
-            let (c, _) = ToolRegistry::normalize_tool_request(old, HashMap::new()).unwrap();
+            let (c, _) = reg.normalize_tool_request(old, HashMap::new()).unwrap();
             assert_eq!(c, new, "alias {old} -> {new}");
         }
     }
