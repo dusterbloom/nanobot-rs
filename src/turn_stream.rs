@@ -598,7 +598,7 @@ pub(crate) enum CacheResetReason {
     /// other resets: the rewind is the feature; shipping the rewound prompt
     /// under the warm session id is the bug it prevents.
     Backtrack,
-    /// A model-issued `context` edit dropped settled tool-call/result blocks.
+    /// A model-issued `context_edit` edit dropped settled tool-call/result blocks.
     /// Sanctioned like the other resets: the drop is the feature (the model
     /// chose to stop paying for those blocks); re-prefilling from the first
     /// dropped block is the cost it knowingly accepted. A note-only edit

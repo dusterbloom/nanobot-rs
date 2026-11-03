@@ -62,7 +62,7 @@ def count_context_tool_calls(home: Path) -> int:
             e = json.loads(raw)
         except json.JSONDecodeError:
             continue
-        if e.get("tool_name") == "context":
+        if e.get("tool_name") == "context_edit":
             n += 1
     return n
 
@@ -89,7 +89,7 @@ def context_call_details(home: Path) -> list:
             continue
         for tc in tool_calls:
             fn = tc.get("function", {})
-            if fn.get("name") != "context":
+            if fn.get("name") != "context_edit":
                 continue
             try:
                 args = json.loads(fn.get("arguments", "{}"))

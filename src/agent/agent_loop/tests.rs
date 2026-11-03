@@ -1875,8 +1875,10 @@ async fn drive_skewed_tool_loop(
 }
 
 fn first_wire_after_fold(calls: &[Vec<Value>]) -> Option<usize> {
+    // Skip the system message: its fixed Context Management guide teaches
+    // `lcm_expand(` on every call, while fold output lands in history.
     calls.iter().position(|call| {
-        call.iter().any(|m| {
+        call.iter().skip(1).any(|m| {
             m["content"]
                 .as_str()
                 .is_some_and(|content| content.contains("lcm_expand("))
@@ -5799,7 +5801,7 @@ async fn resumed_core_replays_generated_history_not_the_phantom_notice() {
 /// deletion.
 ///
 /// T5 (the in-loop wiring that calls `resolve_and_drop`/`add_context_drops`
-/// live, from a model's `context` tool call) is not implemented yet, so this
+/// live, from a model's `context_edit` tool call) is not implemented yet, so this
 /// test persists the drop directly via `add_context_drops` — exactly the
 /// input T5 will produce once it lands. T6 owns only the turn-start/restart
 /// projection this test targets (`LcmEngine::restore_dropped` at engine
@@ -5937,14 +5939,14 @@ async fn restart_keeps_dropped_pair_out_of_wire_but_recoverable_via_expand() {
 /// Acceptance test for plan `docs/superpowers/plans/2026-11-01-model-managed-context.md`
 /// T5: the live in-loop wiring (`apply_pending_context_edit`). Unlike the T6
 /// test above (which drives the persistence layer directly to prove the
-/// restart projection), this one drives the real `context` tool call through
+/// restart projection), this one drives the real `context_edit` tool call through
 /// `ContextTool::execute` → `LcmEngine::queue_context_edit` →
 /// `apply_pending_context_edit` → `resolve_and_drop`/`rewrite_committed`, and
 /// checks the very next wire call in the SAME turn.
 ///
 /// Turn 1 (provider_a): one `exec` tool round (result carries a unique
 /// marker) + final text. Turn 2 (provider_b): the model calls
-/// `context({"drop": <seq of that result>, "note": "..."})`, then gives a
+/// `context_edit({"drop": <seq of that result>, "note": "..."})`, then gives a
 /// final text reply. `provider_b.calls()` therefore holds exactly two wire
 /// arrays: `[0]` = the prompt that made the model issue the context call
 /// (drop not yet applied), `[1]` = the next prompt, built after
@@ -6006,7 +6008,7 @@ async fn context_tool_drop_removes_pair_and_persists_note_mid_turn() {
         .as_u64()
         .unwrap() as usize;
 
-    // Turn 2, core B: the model itself calls context(drop=<seq>, note=...).
+    // Turn 2, core B: the model itself calls context_edit(drop=<seq>, note=...).
     let mut context_args = std::collections::HashMap::new();
     context_args.insert("drop".to_string(), json!(result_id));
     context_args.insert(
@@ -6017,7 +6019,7 @@ async fn context_tool_drop_removes_pair_and_persists_note_mid_turn() {
         content: Some(String::new()),
         tool_calls: vec![crate::providers::base::ToolCallRequest {
             id: "tc_context_live".to_string(),
-            name: "context".to_string(),
+            name: "context_edit".to_string(),
             arguments: context_args,
         }],
         finish_reason: FinishReason::ToolCalls,
@@ -6119,7 +6121,7 @@ async fn context_tool_drop_removes_pair_and_persists_note_mid_turn() {
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
-/// Companion to the drop test above: a note-only `context` edit (no `drop`)
+/// Companion to the drop test above: a note-only `context_edit` edit (no `drop`)
 /// never calls `rewrite_committed` (see `apply_pending_context_edit`), so it
 /// must be a pure draft append — every earlier wire call stays an exact
 /// byte-prefix of the next, same contract `assert_wire_prefix` already pins
@@ -6148,7 +6150,7 @@ async fn context_tool_note_only_edit_is_prefix_stable() {
         content: Some(String::new()),
         tool_calls: vec![crate::providers::base::ToolCallRequest {
             id: "tc_context_note_only".to_string(),
-            name: "context".to_string(),
+            name: "context_edit".to_string(),
             arguments: context_args,
         }],
         finish_reason: FinishReason::ToolCalls,

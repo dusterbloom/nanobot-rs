@@ -5127,7 +5127,7 @@ impl AgentLoopShared {
         StepResult::Done(IterationOutcome::Continue)
     }
 
-    /// Apply a `context` edit queued this round by the `context` tool
+    /// Apply a `context_edit` edit queued this round by the `context_edit` tool
     /// (`ContextTool::execute` → `LcmEngine::queue_context_edit`): resolve it
     /// against the live log, drop the resolved ids from the committed prefix,
     /// and append the model's note as an ordinary assistant row. A no-op
@@ -5169,7 +5169,7 @@ impl AgentLoopShared {
     }
 }
 
-/// `_db_id` of the assistant carrier that issued this round's `context` tool
+/// `_db_id` of the assistant carrier that issued this round's `context_edit` tool
 /// call — the edit's cutoff, so it can only drop messages strictly before it
 /// (never the carrier itself, its own `[seq N]`-tagged receipt, or anything
 /// later in the same round).
@@ -5186,7 +5186,7 @@ fn context_edit_carrier_db_id(messages: &[Value]) -> Option<usize> {
                             c.get("function")
                                 .and_then(|f| f.get("name"))
                                 .and_then(Value::as_str)
-                                == Some("context")
+                                == Some(crate::agent::tools::context_edit::CONTEXT_EDIT_TOOL)
                         })
                     })
         })

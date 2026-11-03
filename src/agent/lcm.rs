@@ -445,10 +445,10 @@ impl ContextEntry {
 }
 
 // ---------------------------------------------------------------------------
-// Model-managed context editing (T3 — nodecode-style `context` tool)
+// Model-managed context editing (T3 — nodecode-style `context_edit` tool)
 // ---------------------------------------------------------------------------
 
-/// What a `context` edit drops: everything eligible, or an explicit id list.
+/// What a `context_edit` edit drops: everything eligible, or an explicit id list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DropSpec {
     /// Drop every eligible message below the edit's cutoff.
@@ -458,7 +458,7 @@ pub enum DropSpec {
     Ids(Vec<MessageId>),
 }
 
-/// One model-issued context edit, queued by the `context` tool and resolved
+/// One model-issued context edit, queued by the `context_edit` tool and resolved
 /// by [`LcmEngine::resolve_and_drop`] against the live message log.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextEdit {
@@ -741,13 +741,13 @@ pub struct LcmEngine {
     /// Cut position computed during an in-flight compaction, committed to
     /// `pinned_prefix_entries` only when that compaction succeeds.
     pending_pinned_prefix: Option<usize>,
-    /// Ids dropped by a model-issued `context` edit. Physically retained in
+    /// Ids dropped by a model-issued `context_edit` edit. Physically retained in
     /// `store` (lossless — `lcm_expand` still reads them); excluded from
     /// `active` and from future `ingest`. Restored from `context_drops` on
     /// engine creation (`restore_dropped`) so a restart reproduces the same
     /// projection.
     dropped: std::collections::BTreeSet<MessageId>,
-    /// A `context` edit queued by the tool this turn, applied by the loop
+    /// A `context_edit` edit queued by the tool this turn, applied by the loop
     /// (`apply_pending_context_edit`) before the next request goes out.
     pending_edit: Option<ContextEdit>,
 }
@@ -1612,12 +1612,11 @@ impl LcmEngine {
             output.push_str(&format!("[msg {}] {}: {}\n\n", id, role, content));
         }
         if output.is_empty() {
-            output = "No messages found for the given IDs. lcm_expand only expands \
-                      LCM summary blocks from the CURRENT session — the IDs you passed \
-                      are not in this session's compaction graph (they may belong to a \
-                      past session). To retrieve a different past session's full \
-                      transcript, use session_search(mode=\"session\", session=KEY) with \
-                      that session's key."
+            output = "No messages found for the given IDs. lcm_expand only reads ids \
+                      from the CURRENT session ([seq N] tags and [Summary of messages X-Y] \
+                      ranges) — the IDs you passed are not in this session (they may belong \
+                      to a past session). To read a past session's full transcript, use \
+                      recall({\"session\":\"KEY\"}) with that session's key."
                 .to_string();
         }
         output
@@ -2601,14 +2600,12 @@ impl crate::agent::tools::base::Tool for LcmExpandTool {
     }
 
     fn description(&self) -> &str {
-        "Retrieve the exact original messages behind a compressed \
-         [Summary of messages …] block FROM THE CURRENT SESSION. Copy the range \
-         from that block, e.g. lcm_expand({\"message_ids\": \"120-158\"}). \
-         Expansion is lossless — the originals are always available. \
-         NOTE: this only works on summary blocks in the current conversation; it \
-         cannot reach past sessions. To retrieve the FULL transcript of a DIFFERENT \
-         past session, use session_search(mode=\"session\", session=KEY) with that \
-         session's key instead."
+        "Read back exact original messages FROM THE CURRENT SESSION: a block removed \
+         by context (use its [seq N] id, e.g. lcm_expand({\"message_ids\": \"57\"})) or \
+         a compressed [Summary of messages X-Y] block (copy its range, e.g. \
+         lcm_expand({\"message_ids\": \"120-158\"})). Lossless — the originals are \
+         always available. It cannot reach past sessions: for a past session's full \
+         transcript use recall({\"session\":\"KEY\"}) instead."
     }
 
     fn parameters(&self) -> Value {
@@ -2640,11 +2637,11 @@ impl crate::agent::tools::base::Tool for LcmExpandTool {
 
         if msg_ids.is_empty() {
             return Err(crate::errors::ToolError::InvalidArgs {
-                message: "no valid message IDs provided. lcm_expand only expands LCM \
-                    summary blocks from the CURRENT session, and needs IDs from a \
-                    [Summary … (IDs: …)] block as an array, e.g. [5, 6, 7, 8]. To read a \
-                    PAST session's full transcript, use session_search(mode=\"session\", \
-                    session=KEY) with that session's key (search first to get the key)."
+                message: "no valid message IDs provided. Pass ids from the CURRENT \
+                    session: a [seq N] tag or a [Summary of messages X-Y] range, e.g. \
+                    lcm_expand({\"message_ids\": \"57\"}) or \"120-158\". To read a PAST \
+                    session's full transcript, use recall({\"session\":\"KEY\"}) with that \
+                    session's key (search first to get the key)."
                     .to_string(),
             });
         }
@@ -7409,7 +7406,7 @@ mod tests {
         assert_eq!(
             engine.ingest(json!({
                 "role": "assistant", "content": null,
-                "tool_calls": [{"id": "c3", "type": "function", "function": {"name": "context", "arguments": "{}"}}],
+                "tool_calls": [{"id": "c3", "type": "function", "function": {"name": "context_edit", "arguments": "{}"}}],
                 "_db_id": 6,
             })),
             Some(6)

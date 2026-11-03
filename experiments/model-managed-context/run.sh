@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # T9 benchmark: model-managed context (nodecode port).
 #
-# Arm A = nanobot built from `main` (no [seq N] tags, no `context` tool).
+# Arm A = nanobot built from `main` (no [seq N] tags, no `context_edit` tool).
 # Arm B = nanobot built from this branch's working tree (T1-T8 landed).
 #
 # Both arms run the SAME matched tool-heavy task, once each, against a
@@ -111,7 +111,7 @@ EXPECT_SUBSTRINGS_SCRIPTED='Unknown action: foo'
 # (~27k tokens, see README "pressure task" section for the per-phase budget)
 # clearly crosses the branch's size notice (fires at 0.5 of the 32k local
 # window, i.e. ~16k) and nears the window ceiling -- unlike scripted, which
-# peaks ~9k and never fires it. The model is never told to use the `context`
+# peaks ~9k and never fires it. The model is never told to use the `context_edit`
 # tool; only the standing skill (T7) and the notice itself (T8) can prompt it.
 TASK_PRESSURE="$(cat <<'TASKEOF'
 You are running inside a controlled benchmark with four phases. Work phase by

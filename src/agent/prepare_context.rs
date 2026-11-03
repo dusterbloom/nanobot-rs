@@ -31,27 +31,31 @@ use crate::agent::token_budget::TokenBudget;
 use crate::agent::tool_guard::ToolGuard;
 use crate::bus::events::InboundMessage;
 
-/// System-prompt guidance teaching the LCM expand workflow, with a worked call.
-/// Shared by the local and cloud advertisement paths so the wording (and the
-/// worked example small models copy) stays in one place.
-const LCM_EXPAND_GUIDE: &str =
-    "Your conversation history is managed by LCM. When earlier turns are \
-     compressed, you will see a block marked [Summary of messages X-Y. …]. \
-     To read the exact originals, copy that range into lcm_expand — for example \
-     lcm_expand({\"message_ids\": \"120-158\"}). Expansion is lossless and safe: \
-     the full originals are always retrievable, so nothing is ever permanently \
-     lost by summarizing. The system may also auto-expand relevant summaries for you. \
-     NOTE: lcm_expand only expands summaries from the CURRENT session. To retrieve the \
-     FULL content of a DIFFERENT past session, use session_search(mode=\"session\", \
-     session=KEY) with that session's key — do not call lcm_expand for past sessions. \
-     \n\n\
-     During substantial tool work, edit your context at useful checkpoints: after settling a \
-     subproblem, before your final answer — not after every tool call. Every tool result ends \
-     with its seq, [seq 57]. Edit in one call: context({\"drop\":\"12-56\",\"note\":\"…\"}), \
-     noting constraints, decisions, and open work. A note is required whenever you drop. Only \
-     tool-call/result blocks are ever dropped — your own and the user's messages are never \
-     touched. A drop is lossless: lcm_expand({\"message_ids\":\"57\"}) reads any block back. \
-     Correctness outranks size.";
+/// System-prompt contract for managing the context window: when and how to
+/// call `context_edit`, and how to read anything back with `lcm_expand`. Plain
+/// short sentences plus copyable calls, so the smallest local model can follow
+/// it. Shared by the local and cloud paths so the wording stays in one place;
+/// the `context_edit` tool description repeats the call shape so a chat template
+/// that hides the system prompt from tool reasoning still teaches it.
+const LCM_EXPAND_GUIDE: &str = "\
+Your context window is limited. Two tools manage it:
+- context_edit: removes old tool calls and their results that you no longer need, and saves a note.
+- lcm_expand: reads back anything removed or summarized. Nothing is ever lost.
+
+Every tool result ends with its id, like [seq 57].
+
+When to call context_edit: after you finish a step that took several tool calls, and before your \
+final answer. Not after every tool call.
+How: context_edit({\"drop\":\"12-56\",\"note\":\"Bug is in parse.rs line 40. Fixed it. Next: run tests.\"})
+- drop: [seq] ids to remove: \"all\", a range \"12-56\", or a list \"3,7,9\".
+- note: required. Write the facts, decisions, and remaining work you will need later.
+- Only tool calls and tool results are removed. User and assistant messages always stay.
+- To read block 57 again: lcm_expand({\"message_ids\":\"57\"}).
+Getting the task right matters more than saving space.
+
+Older turns may also be compressed into a block marked [Summary of messages X-Y. ...]. To read \
+the originals, copy that range: lcm_expand({\"message_ids\":\"120-158\"}). lcm_expand only \
+works in the current session; for a past session use recall({\"session\":\"KEY\"}).";
 
 /// Append the previous-session continuity note to the system message.
 ///
@@ -136,7 +140,7 @@ impl AgentLoopShared {
         // LCM context awareness: advertised unconditionally so it stays in the
         // stable cached prefix from turn 1 (see build_local_runtime_blocks).
         sections.push(SectionEntry {
-            section: PromptSection::ToolUse,
+            section: PromptSection::ContextManagement,
             block: PromptBlock::new("Context Management", LCM_EXPAND_GUIDE),
             allocated_tokens: 0,
             actual_tokens: 0,
@@ -571,8 +575,9 @@ impl AgentLoopShared {
                 detected_language.as_deref(),
                 &local_runtime_blocks,
             );
-            // System message = STABLE ONLY. Runtime sections (Context Management,
-            // WorkingMemory, SessionMetadata, etc.) are dropped entirely — they
+            // System message = STABLE ONLY. Context Management is a Static
+            // section, so it is part of `stable_prompt`. Runtime sections
+            // (WorkingMemory, SessionMetadata, etc.) are dropped entirely — they
             // are either empty, meta-instructions the model ignores, or low-
             // quality observations that add ~250 tokens of noise, break the
             // prefix cache every turn, and cost ~4.5s of prefill time.

@@ -1,13 +1,13 @@
 # T9 — model-managed context benchmark
 
 Implements T9 of `docs/superpowers/plans/2026-11-01-model-managed-context.md`:
-before/after comparison of Arm A (`main`, no `[seq N]` tags, no `context`
+before/after comparison of Arm A (`main`, no `[seq N]` tags, no `context_edit`
 tool) vs Arm B (this branch's working tree, T1-T8 landed) on one matched
 tool-heavy task.
 
 Primary arm is **local, against Higgs** (not cloud) — the 66k local context
 window is small enough that a 9-step tool-heavy task produces real pressure,
-which is the regime the `context` tool is meant to help with. The cloud arm
+which is the regime the `context_edit` tool is meant to help with. The cloud arm
 from the original plan text is intentionally **not** run here: this repo's
 config resolves the default model via a provider-prefixed model string
 (`zhipu-coding/glm-5.2`), and local mode is *also* auto-selected by
@@ -47,7 +47,7 @@ empty), so the correct answer — `Unknown action: foo` — is identical on both
 arms; grading is a strict substring check against the merged log, nothing
 fuzzy.
 
-The model is never told to use the `context` tool. Arm B only has it because
+The model is never told to use the `context_edit` tool. Arm B only has it because
 `src/agent/prepare_context.rs` registers it in `CORE_NATIVE_TOOLS`, and the
 standing skill text (T7) only *suggests* using it "during substantial tool
 work ... not after every tool call." Whether it actually gets called is part
@@ -74,7 +74,7 @@ of the result, not an assumption.
   client-side fingerprint comparison (ours, not Higgs'), so it's unaffected
   by the 409.
 - **context tool calls** (arm B) — `sessions.db`'s `session_events` table,
-  counting `tool_pre_execute` rows with `tool_name == "context"`.
+  counting `tool_pre_execute` rows with `tool_name == "context_edit"`.
 - **task success** — the exact string `Unknown action: foo` found anywhere
   in the arm's merged log.
 
@@ -139,15 +139,15 @@ available to test against.
 
 `TASK_SCRIPTED` (above) peaks ~9k tokens of the 66k local window — below the
 branch's size notice, which fires at 0.5 of the window (~33k). It never
-exercises the `context` tool because nothing in it ever gets large enough to
+exercises the `context_edit` tool because nothing in it ever gets large enough to
 need dropping. `TASK_PRESSURE` (`TASK_NAME=pressure`) is a second, larger
-task built to actually cross that threshold, so adoption of `context` can be
+task built to actually cross that threshold, so adoption of `context_edit` can be
 observed rather than assumed absent.
 
 **Purpose:** four phases, each a settled subproblem whose raw tool output is
 needed only to extract one fact, structured so that by the final phase the
 model has three earlier phases' worth of now-irrelevant tool output sitting
-in its context — exactly the shape the `context` tool exists to clean up.
+in its context — exactly the shape the `context_edit` tool exists to clean up.
 The model is never told to use it; only the standing skill (T7) and the size
 notice itself (T8) can prompt it.
 
@@ -221,7 +221,7 @@ PromptDelta proxy (both arms mostly `append_only`, 0 `diverged`, 1
 `cold_start` each, as expected for one cold-started turn 1): A =
 cold=1/append=8/diverged=0/reset=0; B = cold=1/append=11/diverged=0/reset=0.
 
-**The model never called the `context` tool, even though it was available
+**The model never called the `context_edit` tool, even though it was available
 and the standing skill (T7) was in the system prompt.** This is the honest
 headline result, not a tooling failure on this script's part — both arms
 answered the factual question correctly (task success true/true), and
@@ -239,7 +239,7 @@ rustc than whatever already populated `target/debug` in this repo, forcing
 a full from-scratch recompile that took several minutes and 3 extra `exec`
 calls beyond the 2 instructed. That is why arm B's request/token counts run
 higher — it reflects the model's differing persistence on a broken troubleshooting
-side-quest, not anything about `[seq N]` tags or the `context` tool. The
+side-quest, not anything about `[seq N]` tags or the `context_edit` tool. The
 factual-answer and context-tool-usage columns are unaffected by this (both
 come from step 2's file read and the standing skill, neither of which
 touches cargo/rustup), but the token/request columns for this run should be
@@ -268,7 +268,7 @@ copying several more GB under already-tight disk).
 
 Higgs, Clover-35B-A3B-Preview-MLX-4bit, temp 0, n=1 per arm, cold restart between arms.
 
-| arm | requests | mean prompt tok/req | cache hit % | total prompt tok | success | `context` calls |
+| arm | requests | mean prompt tok/req | cache hit % | total prompt tok | success | `context_edit` calls |
 |-----|----------|---------------------|-------------|------------------|---------|-----------------|
 | A:main | 9 | 8,009 | 82.9% | 72,079 | yes | 0 |
 | B:branch | 12 | 9,889 | 87.0% | 118,667 (+65%) | yes | 0 |
@@ -278,18 +278,18 @@ PromptDelta: 0 diverged in either arm (the `[seq N]` render-time tag kept the pr
 The +65% is three extra `inspect_tool_result` pages the branch arm took over the
 8,106-char `cargo test` output that main answered from the preview. Same command,
 same repo, temp 0, so the likeliest cause is the changed prompt (standing skill,
-`context` schema, `[seq N]` tags), not noise; n=1 cannot separate which.
+`context_edit` schema, `[seq N]` tags), not noise; n=1 cannot separate which.
 
 The task does not exercise the mechanism: it is a numbered script (no settled
 subproblem to checkpoint after) peaking near 9k of a 66k window. Whether Clover
-adopts `context` needs an open-ended task that crosses the window.
+adopts `context_edit` needs an open-ended task that crosses the window.
 
 ## Rerun 2026-11-02 (guidance fixes: drop scope, required note, DRY text, size notice)
 
 Same setup (Higgs, Clover-35B-A3B-Preview-MLX-4bit, temp 0, n=1 per arm, cold restart).
 Arm A = main incl. d9ec349/e2fa758; Arm B = branch with the fixes.
 
-| arm | requests | mean prompt tok/req | cache hit % | total prompt tok | success | `context` calls |
+| arm | requests | mean prompt tok/req | cache hit % | total prompt tok | success | `context_edit` calls |
 |-----|----------|---------------------|-------------|------------------|---------|-----------------|
 | A:main | 9 | 8,037 | 83.0% | 72,332 | yes | 0 |
 | B:branch | 9 | 8,222 | 83.1% | 74,000 (+2.3%) | yes | 0 |
@@ -302,7 +302,7 @@ Adoption needs a task that crosses ~33k.
 
 `TASK_NAME=pressure`, Higgs, Clover-35B-A3B-Preview-MLX-4bit, n=1 per arm. Window is 66k (not 32k).
 
-| arm | requests | mean prompt tok/req | peak prompt tok/req | cache hit % | total prompt tok | facts | `context` calls | size notices |
+| arm | requests | mean prompt tok/req | peak prompt tok/req | cache hit % | total prompt tok | facts | `context_edit` calls | size notices |
 |-----|----------|---------------------|---------------------|-------------|------------------|-------|-----------------|--------------|
 | A:main | 39 | 27,736 | 52,091 | 85.9% | 1,081,687 | 4/4 | 0 | 0 |
 | B:branch | 38 | 27,605 | 47,604 | 95.4% | 1,048,986 | 3/4 (D missed) | 0 | 1 |

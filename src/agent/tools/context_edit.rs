@@ -1,4 +1,4 @@
-//! `context` tool — model-managed context editing (T4, nodecode port).
+//! `context_edit` tool — model-managed context editing (T4, nodecode port).
 //!
 //! Lets the model drop settled tool-call/result blocks it will not reread and
 //! leave a checkpoint note in its own words. The tool only queues the edit on
@@ -17,9 +17,13 @@ use crate::agent::lcm::{parse_message_ids, ContextEdit, DropSpec, LcmEngine};
 use crate::agent::tools::base::{Tool, ToolContext, ToolResult};
 use crate::errors::ToolError;
 
+/// Wire name of the tool. Shared with the loop, which finds the carrier of
+/// the round's edit by this name.
+pub const CONTEXT_EDIT_TOOL: &str = "context_edit";
+
 /// Canonical call shape echoed in the "note required" error so the model
 /// sees exactly what to send instead of guessing.
-const CANONICAL_CALL_SHAPE: &str = "context({\"drop\":\"12-56\",\"note\":\"...\"})";
+const CANONICAL_CALL_SHAPE: &str = "context_edit({\"drop\":\"12-56\",\"note\":\"...\"})";
 
 /// Parse the `drop` argument: `"all"` (case-insensitive), or the same lenient
 /// id shapes `lcm_expand` accepts (range string, comma list, integer array).
@@ -74,31 +78,43 @@ impl ContextTool {
 #[async_trait]
 impl Tool for ContextTool {
     fn name(&self) -> &str {
-        "context"
+        CONTEXT_EDIT_TOOL
     }
 
     fn description(&self) -> &str {
-        "Drop settled tool-call/result blocks by [seq] and leave a checkpoint note; see system \
-         guidance."
+        // Self-contained: some chat templates render tool schemas far from the
+        // system prompt, so the call shape and rules must live here too.
+        "Frees context space: removes old tool calls and their results that you no longer need, \
+         and saves a note of what mattered. Every tool result ends with its id, like [seq 57]. \
+         Example: context_edit({\"drop\":\"12-56\",\"note\":\"Bug is in parse.rs line 40. Fixed it. \
+         Next: run tests.\"}). Call it after finishing a step that took several tool calls and \
+         before your final answer, not after every call. Only tool calls and results are \
+         removed; user and assistant messages stay. Removed blocks can be read back with \
+         lcm_expand."
     }
 
     fn parameters(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
+                // Typed as string for the clearest schema; `parse_drop` still
+                // accepts integer arrays and bare numbers models send anyway.
                 "drop": {
-                    // No "type": accepts "all", a range string ("12-56",
-                    // "12-20,30-40"), or an array of seq integers.
-                    "description": "\"all\", a seq range like \"12-56\", or an array of seq integers. Omit for a note-only edit."
+                    "type": "string",
+                    "description": "[seq] ids to remove: \"all\", a range \"12-56\", or a list \"3,7,9\". Omit to only save a note."
                 },
                 "keep": {
-                    "description": "Seq ids exempted from drop. Optional."
+                    "type": "string",
+                    "description": "Optional. [seq] ids inside drop to keep, same format as drop."
                 },
                 "note": {
                     "type": "string",
-                    "description": "Checkpoint note, kept verbatim. Required whenever drop is set."
+                    "description": "Facts, decisions, and remaining work you will need later. Kept word for word."
                 }
-            }
+            },
+            // Every valid call carries a note: a drop requires one, and a
+            // call without drop is a note-only edit.
+            "required": ["note"]
         })
     }
 
@@ -118,7 +134,7 @@ impl Tool for ContextTool {
             .is_some_and(|s| !s.trim().is_empty());
         if has_drop && !has_note {
             return Err(format!(
-                "Tool 'context' requires 'note' whenever 'drop' is present. Call as {CANONICAL_CALL_SHAPE}."
+                "Tool 'context_edit' requires 'note' whenever 'drop' is present. Call as {CANONICAL_CALL_SHAPE}."
             ));
         }
         Ok(())
@@ -136,7 +152,7 @@ impl Tool for ContextTool {
             return Err(ToolError::InvalidArgs {
                 message: format!(
                     "requires at least one of 'drop' or 'note'. Call as {CANONICAL_CALL_SHAPE} \
-                     or context({{\"note\":\"...\"}})."
+                     or context_edit({{\"note\":\"...\"}})."
                 ),
             });
         }
@@ -210,7 +226,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("drop".to_string(), json!("12-56"));
         let err = tool
-            .normalize_params("context", &mut params)
+            .normalize_params("context_edit", &mut params)
             .expect_err("drop without note must be rejected");
         assert!(err.contains("note"));
         assert!(err.contains(CANONICAL_CALL_SHAPE));
@@ -219,23 +235,23 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("drop".to_string(), json!("12-56"));
         params.insert("note".to_string(), json!("   "));
-        assert!(tool.normalize_params("context", &mut params).is_err());
+        assert!(tool.normalize_params("context_edit", &mut params).is_err());
 
         // drop + note -> accepted.
         let mut params = HashMap::new();
         params.insert("drop".to_string(), json!("12-56"));
         params.insert("note".to_string(), json!("settled the fix"));
-        assert!(tool.normalize_params("context", &mut params).is_ok());
+        assert!(tool.normalize_params("context_edit", &mut params).is_ok());
 
         // note only, no drop -> accepted (note-only edit).
         let mut params = HashMap::new();
         params.insert("note".to_string(), json!("checkpoint"));
-        assert!(tool.normalize_params("context", &mut params).is_ok());
+        assert!(tool.normalize_params("context_edit", &mut params).is_ok());
 
         // neither -> accepted here; `execute` is the layer that rejects an
         // empty call entirely (see `execute_queues_context_edit_from_params`).
         assert!(tool
-            .normalize_params("context", &mut HashMap::new())
+            .normalize_params("context_edit", &mut HashMap::new())
             .is_ok());
     }
 }

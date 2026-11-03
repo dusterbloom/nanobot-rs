@@ -407,7 +407,7 @@ impl ContextBuilder {
         for block in runtime_blocks {
             let title = block.report_title();
             let section = match title.as_str() {
-                "Context Management" => PromptSection::ToolUse,
+                "Context Management" => PromptSection::ContextManagement,
                 "Working Memory" => PromptSection::WorkingMemory,
                 "Background Tasks" => PromptSection::BackgroundTasks,
                 "Session Metadata" => PromptSection::SessionMetadata,
@@ -1586,6 +1586,33 @@ mod tests {
         );
     }
 
+    /// The context-management contract must reach the model on the local
+    /// path at every window size: production sends only the stable prefix, so
+    /// the guide must land there (not the discarded runtime tail) and survive
+    /// the stable-prefix budget, including the 50-token cap of <=4K windows.
+    #[test]
+    fn test_local_context_management_guide_in_stable_prefix() {
+        let guide = "GUIDE_MARKER ".repeat(100);
+        for max_context_tokens in [4_096, 32_768] {
+            let (_tmp, mut cb) = make_context();
+            cb.local_prompt_mode = true;
+            cb.set_lite_mode(max_context_tokens);
+            let (stable, runtime, _) = cb.build_local_system_prompt_parts(
+                None,
+                None,
+                None,
+                false,
+                None,
+                &[PromptBlock::new("Context Management", &guide)],
+            );
+            assert!(
+                stable.contains(guide.trim()),
+                "guide missing at {max_context_tokens} tokens: {stable}"
+            );
+            assert!(!runtime.contains("GUIDE_MARKER"), "{runtime}");
+        }
+    }
+
     #[test]
     fn test_local_system_prefix_stable_when_runtime_varies() {
         let (_tmp, cb) = make_context();
@@ -1596,7 +1623,7 @@ mod tests {
             None,
             false,
             None,
-            &[PromptBlock::new("Context Management", "A")],
+            &[PromptBlock::new("Working Memory", "A")],
         );
 
         let (stable_2, runtime_2, _) = cb.build_local_system_prompt_parts(
@@ -1606,7 +1633,7 @@ mod tests {
             false,
             None,
             &[PromptBlock::new(
-                "Context Management",
+                "Working Memory",
                 "Completely different runtime body",
             )],
         );
