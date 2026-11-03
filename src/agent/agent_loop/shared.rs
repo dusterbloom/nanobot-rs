@@ -5090,6 +5090,7 @@ impl AgentLoopShared {
         if let Some(e) = ctx.flow.infra_error.take() {
             return StepResult::Done(IterationOutcome::Error(e));
         }
+        self.apply_pending_context_edit(ctx).await;
         let executed = ctx
             .turn_tool_entries
             .len()
@@ -5125,6 +5126,72 @@ impl AgentLoopShared {
         ctx.flow.last_round_keys = dispatched_keys.clone();
         StepResult::Done(IterationOutcome::Continue)
     }
+
+    /// Apply a `context_edit` edit queued this round by the `context_edit` tool
+    /// (`ContextTool::execute` → `LcmEngine::queue_context_edit`): resolve it
+    /// against the live log, drop the resolved ids from the committed prefix,
+    /// and append the model's note as an ordinary assistant row. A no-op
+    /// (nothing queued, or a note-only edit) touches neither the log nor the
+    /// prompt cache — resolution and projection both live in the engine
+    /// (`LcmEngine::resolve_and_drop`/`is_dropped`), this is only the hatch
+    /// that wires the result into `TurnContext`.
+    async fn apply_pending_context_edit(&self, ctx: &mut TurnContext) {
+        let Some(engine) = self.lcm_engines.lock().await.get(&ctx.session_id).cloned() else {
+            return;
+        };
+        let mut guard = engine.lock().await;
+        let Some(edit) = guard.take_context_edit() else {
+            return;
+        };
+        let Some(below) = context_edit_carrier_db_id(&ctx.messages) else {
+            warn!(session = %ctx.session_id, "context edit discarded: carrier has no _db_id");
+            return;
+        };
+        let ids = guard.resolve_and_drop(&edit, &ctx.messages, below);
+        let note = edit.note;
+        if !ids.is_empty() {
+            ctx.core.sessions.add_context_drops(&ctx.session_id, &ids).await;
+            let kept: Vec<Value> = ctx.messages.iter().filter(|m| !guard.is_dropped(m)).cloned().collect();
+            drop(guard);
+            ctx.rewrite_committed(kept, CacheResetReason::ContextEdit);
+        } else {
+            drop(guard);
+        }
+        if let Some(note) = note {
+            ctx.messages.push_draft(json!({
+                "role": "assistant",
+                "content": format!("[context note] {note}"),
+            }));
+            if let Err(error) = ctx.persist_pending_protocol_messages().await {
+                warn!(session = %ctx.session_id, %error, "context note persistence failed");
+            }
+        }
+    }
+}
+
+/// `_db_id` of the assistant carrier that issued this round's `context_edit` tool
+/// call — the edit's cutoff, so it can only drop messages strictly before it
+/// (never the carrier itself, its own `[seq N]`-tagged receipt, or anything
+/// later in the same round).
+fn context_edit_carrier_db_id(messages: &[Value]) -> Option<usize> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| {
+            m.get("role").and_then(Value::as_str) == Some("assistant")
+                && m.get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| {
+                        calls.iter().any(|c| {
+                            c.get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(Value::as_str)
+                                == Some(crate::agent::tools::context_edit::CONTEXT_EDIT_TOOL)
+                        })
+                    })
+        })
+        .and_then(|m| m.get("_db_id").and_then(Value::as_u64))
+        .map(|id| id as usize)
 }
 
 // ============================================================================

@@ -427,7 +427,7 @@ impl ToolRegistry {
             if let Some(func) = def.get_mut("function") {
                 let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
                 if let Some(desc) = func.get("description").and_then(|d| d.as_str()) {
-                    if !matches!(name, "exec" | "get_skills" | "inspect_tool_result") {
+                    if !matches!(name, "exec" | "get_skills" | "inspect_tool_result" | "context_edit") {
                         let condensed = Self::condense_description(desc);
                         func["description"] = serde_json::Value::String(condensed);
                     }
@@ -677,11 +677,14 @@ impl ToolRegistry {
         "remember",
     ];
 
-    /// Hot tools advertised as native schemas at turn 1. Kept to the 6 the
+    /// Hot tools advertised as native schemas at turn 1. Kept to the few the
     /// model uses every turn — the rest go through the `tool` proxy to keep
     /// the tool-schema prefix small (~670 tok vs ~2000 tok for 14 native).
     /// `get_skills` is native (not proxied) so the model reads skill content
-    /// directly instead of hitting the proxy's inspect mode.
+    /// directly instead of hitting the proxy's inspect mode. `context_edit` is
+    /// native for the same reason as `lcm_expand`: local models need the
+    /// schema advertised to use it correctly rather than guess (T4, 2026-11-01
+    /// model-managed-context plan).
     /// See commit f03c6e8 for the prior pure-proxy attempt; this is the
     /// middle ground that avoids the proxy/native arg confusion that killed
     /// pure-proxy while still cutting cold-start prefill by ~60%.
@@ -692,6 +695,7 @@ impl ToolRegistry {
         "exec",
         "get_skills",
         "inspect_tool_result",
+        "context_edit",
     ];
 
     /// Tools kept registered and reachable via the `get_tools` proxy (call with
@@ -753,6 +757,7 @@ impl ToolRegistry {
             "recall",
             "remember",
             "inspect_tool_result",
+            "context_edit",
         ];
         for def in &mut defs {
             Self::remove_local_hot_model_hazards(def);
@@ -2114,6 +2119,11 @@ mod tests {
                 "session".to_string(),
             ),
         ));
+        registry.register(Box::new(crate::agent::tools::ContextTool::new(
+            std::sync::Arc::new(tokio::sync::Mutex::new(crate::agent::lcm::LcmEngine::new(
+                crate::agent::lcm::LcmConfig::default(),
+            ))),
+        )));
 
         let defs = registry.get_core_plus_proxy_definitions();
         let description = |name: &str| {
@@ -2141,6 +2151,21 @@ mod tests {
         assert!(
             inspect.contains("stored") && inspect.contains("next_char"),
             "stored-result paging contract was truncated: {inspect}"
+        );
+        // `context_edit` must teach its own call shape: the worked example sits
+        // past the second sentence, so condensing would strip it.
+        let context = description("context_edit");
+        assert!(
+            context.contains("context_edit({") && context.contains("lcm_expand"),
+            "context contract was truncated: {context}"
+        );
+        let context_def = defs
+            .iter()
+            .find(|def| def["function"]["name"] == "context_edit")
+            .expect("context_edit is a native core tool");
+        assert_eq!(
+            context_def["function"]["parameters"]["required"],
+            serde_json::json!(["note"])
         );
     }
 

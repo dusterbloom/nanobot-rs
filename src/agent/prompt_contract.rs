@@ -24,21 +24,26 @@ use crate::agent::token_budget::TokenBudget;
 #[repr(u8)]
 pub enum PromptSection {
     Identity = 0,
-    Verification = 1,
-    WorkspaceContext = 2,
-    OnDemandContext = 3,
-    Skills = 4,
-    RequestedSkills = 5,
-    SessionMetadata = 6,
-    ToolUse = 7,
-    WorkingMemory = 8,
-    BackgroundTasks = 9,
-    MemoryBriefing = 10,
+    /// Fixed context-management contract (LCM summaries, `context_edit` drops).
+    /// Right after Identity so overflow never drops it before workspace or
+    /// skills content: a model that cannot see it cannot manage its context.
+    ContextManagement = 1,
+    Verification = 2,
+    WorkspaceContext = 3,
+    OnDemandContext = 4,
+    Skills = 5,
+    RequestedSkills = 6,
+    SessionMetadata = 7,
+    ToolUse = 8,
+    WorkingMemory = 9,
+    BackgroundTasks = 10,
+    MemoryBriefing = 11,
 }
 
 #[cfg(test)]
-static ALL_SECTIONS: [PromptSection; 11] = [
+static ALL_SECTIONS: [PromptSection; 12] = [
     PromptSection::Identity,
+    PromptSection::ContextManagement,
     PromptSection::Verification,
     PromptSection::WorkspaceContext,
     PromptSection::OnDemandContext,
@@ -67,7 +72,12 @@ impl PromptSection {
             // belongs in the cached radix prefix — classifying it Static lets Higgs
             // reuse the prefix across turns instead of re-prefilling the whole
             // system prompt every turn.
-            Self::Verification | Self::Skills | Self::WorkspaceContext => PromptBlockKind::Static,
+            // ContextManagement is constant text, so it rides in the cached
+            // prefix from turn 1 instead of a per-turn tail.
+            Self::ContextManagement
+            | Self::Verification
+            | Self::Skills
+            | Self::WorkspaceContext => PromptBlockKind::Static,
             // These vary per-request (depend on user message content, loaded
             // files, workspace state) → Runtime so they don't poison the
             // byte-stable system prefix that higgs radix-caches.
@@ -79,6 +89,15 @@ impl PromptSection {
             | Self::BackgroundTasks
             | Self::MemoryBriefing => PromptBlockKind::Runtime,
         }
+    }
+
+    /// Contract sections that survive overflow even when the budget is too
+    /// small to hold them. Identity is the byte-stable cached prefix
+    /// (dropping it forces a full re-prefill every turn). ContextManagement
+    /// teaches the always-advertised `context_edit` tool; without it the smallest
+    /// windows (stable cap 50 tokens) would see the tool but not how to use it.
+    pub fn never_dropped(&self) -> bool {
+        matches!(self, Self::Identity | Self::ContextManagement)
     }
 
     /// Whether this section's content can be truncated during overflow.
@@ -96,6 +115,7 @@ impl PromptSection {
     pub fn default_budget_pct(&self) -> f64 {
         match self {
             Self::Identity => 10.0,
+            Self::ContextManagement => 5.0,
             Self::Verification => 3.0,
             Self::WorkspaceContext => 8.0,
             Self::OnDemandContext => 5.0,
@@ -239,12 +259,7 @@ fn enforce_budget(sections: &mut [SectionEntry], cap: usize) {
                 target_tokens -= deficit;
             }
         } else {
-            // Never drop the Identity section: it is the byte-stable cached
-            // prefix contract (the harness identity + model line) and must
-            // survive even when the budget is too small to hold everything.
-            // Dropping it would empty the cached prefix and force a full
-            // re-prefill every turn — the worst possible cache outcome.
-            if sections[i].section == PromptSection::Identity {
+            if sections[i].section.never_dropped() {
                 continue;
             }
             tracing::warn!(
@@ -391,7 +406,8 @@ mod tests {
     #[test]
     fn test_prompt_section_ord_ordering() {
         // Identity must be less than Verification, which must be less than WorkspaceContext, etc.
-        assert!(PromptSection::Identity < PromptSection::Verification);
+        assert!(PromptSection::Identity < PromptSection::ContextManagement);
+        assert!(PromptSection::ContextManagement < PromptSection::Verification);
         assert!(PromptSection::Verification < PromptSection::WorkspaceContext);
         assert!(PromptSection::WorkspaceContext < PromptSection::OnDemandContext);
         assert!(PromptSection::OnDemandContext < PromptSection::Skills);
@@ -406,7 +422,7 @@ mod tests {
     #[test]
     fn test_prompt_section_all_returns_canonical_variants() {
         let all = PromptSection::all();
-        assert_eq!(all.len(), 11);
+        assert_eq!(all.len(), 12);
         // Must be in order
         for i in 1..all.len() {
             assert!(all[i - 1] < all[i], "all() not sorted at index {}", i);
@@ -418,6 +434,10 @@ mod tests {
         assert_eq!(PromptSection::Identity.kind(), PromptBlockKind::Prefix);
         // Static sections: hard-coded/bounded content that doesn't vary
         // per-request, so it's safe in the byte-stable cached prefix.
+        assert_eq!(
+            PromptSection::ContextManagement.kind(),
+            PromptBlockKind::Static
+        );
         assert_eq!(PromptSection::Verification.kind(), PromptBlockKind::Static);
         assert_eq!(PromptSection::Skills.kind(), PromptBlockKind::Static);
         // Runtime sections: vary per-request (user message content, loaded
@@ -462,6 +482,7 @@ mod tests {
         assert!(PromptSection::Skills.shrinkable());
         // Non-shrinkable
         assert!(!PromptSection::Identity.shrinkable());
+        assert!(!PromptSection::ContextManagement.shrinkable());
         assert!(!PromptSection::Verification.shrinkable());
         assert!(!PromptSection::OnDemandContext.shrinkable());
         assert!(!PromptSection::ToolUse.shrinkable());

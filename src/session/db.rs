@@ -180,6 +180,13 @@ CREATE TABLE IF NOT EXISTS session_events (
 );
 CREATE INDEX IF NOT EXISTS idx_session_events_order
     ON session_events(session_id, id);
+
+CREATE TABLE IF NOT EXISTS context_drops (
+    session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    message_id    INTEGER NOT NULL,
+    created_at    TEXT NOT NULL,
+    PRIMARY KEY (session_id, message_id)
+);
 "#;
 
 const WORKING_MEMORY_COLUMNS: &str = "\
@@ -3542,6 +3549,54 @@ impl SessionDb {
                     "Failed to load summary nodes for session {}: {}",
                     session_id, e
                 );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Add context drop message IDs to the store. Multiple calls accumulate
+    /// (union semantics); duplicates are ignored. Uses `INSERT OR IGNORE`.
+    pub async fn add_context_drops(&self, session_id: &str, ids: &[usize]) {
+        let conn = self.conn.lock().await;
+        let now = Utc::now().to_rfc3339();
+        for &id in ids {
+            #[allow(clippy::cast_possible_wrap)]
+            let id_i64 = id as i64;
+            if let Err(e) = conn.execute(
+                "INSERT OR IGNORE INTO context_drops (session_id, message_id, created_at) \
+                 VALUES (?1, ?2, ?3)",
+                params![session_id, id_i64, now],
+            ) {
+                warn!(
+                    "Failed to add context drop {} for session {}: {}",
+                    id, session_id, e
+                );
+            }
+        }
+    }
+
+    /// Load all context drop message IDs for a session, ordered by `message_id`.
+    pub async fn load_context_drops(&self, session_id: &str) -> Vec<usize> {
+        let conn = self.conn.lock().await;
+        let mut stmt = match conn.prepare(
+            "SELECT message_id FROM context_drops WHERE session_id = ?1 ORDER BY message_id ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("Failed to prepare load_context_drops query: {}", e);
+                return Vec::new();
+            }
+        };
+
+        let rows = stmt.query_map(params![session_id], |row| {
+            let id: i64 = row.get(0)?;
+            Ok(id as usize)
+        });
+
+        match rows {
+            Ok(r) => r.flatten().collect(),
+            Err(e) => {
+                warn!("Failed to load context drops for session {}: {}", session_id, e);
                 Vec::new()
             }
         }
@@ -6949,6 +7004,25 @@ mod tests {
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].3, "Updated.");
         assert_eq!(nodes[0].4, 6);
+    }
+
+    #[tokio::test]
+    async fn test_context_drops_persistence_and_ordering() {
+        let (db, dir) = make_db();
+        let meta = db.create_session("cli:context-drops").await;
+
+        // Add [5, 3], then [3, 7]. Verify deduplication and ordering.
+        db.add_context_drops(&meta.id, &[5, 3]).await;
+        db.add_context_drops(&meta.id, &[3, 7]).await;
+
+        let drops = db.load_context_drops(&meta.id).await;
+        assert_eq!(drops, vec![3, 5, 7], "drops should be deduplicated and ordered");
+
+        // Reopen the database and verify persistence.
+        let db_path = dir.path().join("sessions.db");
+        let db2 = SessionDb::new(&db_path);
+        let drops2 = db2.load_context_drops(&meta.id).await;
+        assert_eq!(drops2, vec![3, 5, 7], "drops should persist across reopens");
     }
 
     #[tokio::test]

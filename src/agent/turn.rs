@@ -182,11 +182,14 @@ pub fn turn_from_legacy(v: &Value) -> Option<Turn> {
                 .and_then(|n| n.as_str())
                 .unwrap_or("unknown")
                 .to_string();
-            let result = v
+            let mut result = v
                 .get("content")
                 .and_then(|c| c.as_str())
                 .unwrap_or("")
                 .to_string();
+            if let Some(db_id) = v.get("_db_id").and_then(|id| id.as_u64()) {
+                result = format!("{}\n[seq {}]", result, db_id);
+            }
             let ok = v
                 .get("ok")
                 .and_then(|ok| ok.as_bool())
@@ -590,6 +593,43 @@ mod tests {
             assert_eq!(level, 1);
         } else {
             panic!("expected Turn::Summary");
+        }
+    }
+
+    #[test]
+    fn legacy_tool_result_appends_seq_tag_when_db_id_present() {
+        // With _db_id: the result should end with [seq N]
+        let v = json!({
+            "role": "tool",
+            "tool_call_id": "tc_abc",
+            "name": "read_file",
+            "content": "file contents",
+            "_db_id": 57u64
+        });
+        let t = turn_from_legacy(&v).unwrap();
+        if let Turn::ToolResult { result, .. } = t {
+            assert!(
+                result.ends_with("\n[seq 57]"),
+                "result should end with seq tag, got: {:?}",
+                result
+            );
+            assert!(result.starts_with("file contents"));
+        } else {
+            panic!("expected tool_result");
+        }
+
+        // Without _db_id: result should be unchanged
+        let v2 = json!({
+            "role": "tool",
+            "tool_call_id": "tc_abc",
+            "name": "read_file",
+            "content": "file contents"
+        });
+        let t2 = turn_from_legacy(&v2).unwrap();
+        if let Turn::ToolResult { result, .. } = t2 {
+            assert_eq!(result, "file contents", "result without _db_id should be unchanged");
+        } else {
+            panic!("expected tool_result");
         }
     }
 }
